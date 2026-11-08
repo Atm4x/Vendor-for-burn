@@ -141,3 +141,6 @@ pub mod attention;
 pub mod encoder;
 
 pub mod text_encoder;
+
+pub mod checkpoint;
+pub mod flow;

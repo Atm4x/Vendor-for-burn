@@ -5,10 +5,23 @@ use tts_with_rvc_rs::{TextFrontFixture, attention::AttentionFixture, encoder::En
 fn run() -> Result<(), String> {
     let mut args = env::args().skip(1);
     let command = args.next().ok_or("missing command")?;
-    if !matches!(command.as_str(), "verify-text-front" | "verify-attention" | "verify-encoder-layer" | "verify-text-encoder") {
+    if command == "inspect-pth" {
+        let path = args.next().ok_or("missing checkpoint path")?;
+        let checkpoint = tts_with_rvc_rs::checkpoint::RvcCheckpoint::open(&path)?;
+        println!("checkpoint={} tensor_count={}", path, checkpoint.tensor_count());
+        for name in args {
+            let (shape, values) = checkpoint.tensor_f32(&name)?;
+            println!("tensor={name} shape={shape:?} elements={} first={:?}", values.len(), &values[..values.len().min(4)]);
+        }
+        return Ok(());
+    }
+    if !matches!(command.as_str(), "verify-text-front" | "verify-attention" | "verify-encoder-layer" | "verify-text-encoder" | "verify-flow") {
         return Err("usage: tts-with-rvc-rs verify-text-front|verify-attention|verify-encoder-layer|verify-text-encoder <fixture.json> [flex|cpu|cuda|wgpu]".into());
     }
-    let path = args.next().ok_or("missing fixture path")?;
+    let path = args.next().ok_or("missing fixture or checkpoint path")?;
+    let flow_fixture_path = if command == "verify-flow" {
+        Some(args.next().ok_or("missing flow fixture path")?)
+    } else { None };
     let backend = args.next().unwrap_or_else(|| "flex".to_owned());
     let device = match backend.as_str() {
         #[cfg(feature = "flex")]
@@ -22,6 +35,24 @@ fn run() -> Result<(), String> {
         other => return Err(format!("backend {other} is not compiled into this binary")),
     };
     let data = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    if let Some(flow_fixture_path) = flow_fixture_path {
+        let checkpoint = tts_with_rvc_rs::checkpoint::RvcCheckpoint::open(&path)?;
+        let data = fs::read_to_string(flow_fixture_path).map_err(|error| error.to_string())?;
+        let fixture: tts_with_rvc_rs::flow::FlowFixture = serde_json::from_str(&data).map_err(|error| error.to_string())?;
+        let flow = tts_with_rvc_rs::flow::ResidualCouplingBlock::load(&checkpoint, &device)?;
+        let (input, mask, condition) = fixture.tensors(&device);
+        let forward = flow.forward(input, mask.clone(), Some(condition.clone()), false);
+        let actual = forward.clone().into_data().try_into_vec::<f32>().map_err(|error| error.to_string())?;
+        let error = max_abs_error(&actual, &fixture.expected_forward);
+        let reverse = flow.forward(forward, mask, Some(condition), true);
+        let actual = reverse.into_data().try_into_vec::<f32>().map_err(|error| error.to_string())?;
+        let reverse_error = max_abs_error(&actual, &fixture.expected_reverse);
+        println!("backend={backend} flow_layers={} max_abs_flow_forward={error:.9} max_abs_flow_reverse={reverse_error:.9}", flow.len());
+        if !error.is_finite() || error > 1e-4 || !reverse_error.is_finite() || reverse_error > 1e-4 {
+            return Err("Torch/Burn ResidualCouplingBlock parity exceeded tolerance".into());
+        }
+        return Ok(());
+    }
     if command == "verify-text-encoder" {
         let fixture: TextEncoderFixture = serde_json::from_str(&data).map_err(|e| e.to_string())?;
         let output = fixture.forward(&device, None);

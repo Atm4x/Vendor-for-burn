@@ -72,3 +72,39 @@ fn full_text_encoder_matches_pytorch_reference() {
           &fixture.expected_skip_mean, &fixture.expected_skip_log_scale,
           &fixture.expected_skip_mask);
 }
+
+#[test]
+fn direct_pytorch_checkpoint_reads_half_and_reconstructs_weight_norm() {
+    use tts_with_rvc_rs::checkpoint::RvcCheckpoint;
+    let checkpoint = RvcCheckpoint::open(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/synthetic_checkpoint.pth")).unwrap();
+    assert_eq!(checkpoint.tensor_count(), 5);
+    assert!(!checkpoint.contains("other"));
+    let (shape, values) = checkpoint.tensor_f32("enc_p.emb_pitch.weight").unwrap();
+    assert_eq!(shape, vec![1, 3]);
+    assert_eq!(values, vec![1.5, -2.25, 3.0]);
+    assert_eq!(checkpoint.tensor_f32("roundtrip.bfloat16").unwrap().1, vec![1.5, -2.25]);
+    let values = checkpoint.weight_norm_conv1d("flow.flows.0.enc.in_layers.0", &Device::flex())
+        .unwrap().into_data().try_into_vec::<f32>().unwrap();
+    let expected = [1.2, 1.6, 0.0, 0.0, 0.0, 0.0, 3.0_f32 / 5.0_f32.sqrt(), 6.0_f32 / 5.0_f32.sqrt()];
+    assert!(max_abs_error(&values, &expected) < 1e-6);
+    assert!(checkpoint.tensor_f32("nonexistent").is_err());
+}
+
+#[test]
+fn residual_coupling_flow_matches_original_pytorch_model() {
+    use tts_with_rvc_rs::{checkpoint::RvcCheckpoint, flow::{FlowFixture, ResidualCouplingBlock}};
+    let checkpoint = RvcCheckpoint::open(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/synthetic_flow.pth")).unwrap();
+    let reference: FlowFixture = serde_json::from_str(include_str!("fixtures/flow.json")).unwrap();
+    let device = Device::flex();
+    let flow = ResidualCouplingBlock::load(&checkpoint, &device).unwrap();
+    assert_eq!(flow.len(), 2);
+    let (x, mask, condition) = reference.tensors(&device);
+    let forward = flow.forward(x, mask.clone(), Some(condition.clone()), false);
+    let actual = forward.clone().into_data().try_into_vec::<f32>().unwrap();
+    let error = max_abs_error(&actual, &reference.expected_forward);
+    assert!(error <= 1e-4, "flow forward max absolute deviation {error}");
+    let reverse = flow.forward(forward, mask, Some(condition), true);
+    let actual = reverse.into_data().try_into_vec::<f32>().unwrap();
+    let error = max_abs_error(&actual, &reference.expected_reverse);
+    assert!(error <= 1e-4, "flow reverse max absolute deviation {error}");
+}

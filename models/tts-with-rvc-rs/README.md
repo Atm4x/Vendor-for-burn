@@ -58,3 +58,15 @@ cargo run -p tts-with-rvc-rs --locked --offline -- verify-text-encoder PRIVATE_T
 ```
 
 The model's convolution and attention code runs natively with Burn; checkpoint parsing and persistent model lifecycle remain separate upcoming tasks.
+
+### Stage 5 — direct `.pth` and RVC flow
+
+`checkpoint::RvcCheckpoint` reads native PyTorch ZIP checkpoints through the vendored `pytorch-reader` without starting Python. It selects the `weight` dictionary, decodes F16/BF16/F32/F64 into Burn FP32 and reconstructs weight-normalized Conv1d kernels from `weight_v` and `weight_g`.
+
+`flow::ResidualCouplingBlock` reconstructs all mean-only coupling layers from `flow.flows.{0,2,4,...}`, including WN dilated convolutions (RVC's flow uses dilation rate 1), speaker conditioning, gated tanh/sigmoid, residual/skip convolutions, channel flips and forward/reverse order. Loaded tensors remain resident until the model instance is dropped.
+
+Check a checkpoint's native weight decoder with `tts-with-rvc-rs inspect-pth model.pth enc_p.emb_phone.weight`.
+
+Compare a native checkpoint to an independently generated Torch reference with `tts-with-rvc-rs verify-flow model.pth flow-reference.json flex`. For generating tests, `tools/reference_flow.py` imports the original RVC classes from the supplied source ZIP. No private checkpoint, reference audio or index should be committed.
+
+These milestones do **not** constitute complete speech synthesis: NSF-HiFiGAN, HuBERT, F0 and retrieval remain unported, and GPU parity is not yet validated.
