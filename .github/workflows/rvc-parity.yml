@@ -1,0 +1,42 @@
+name: RVC Rust Burn parity
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'models/tts-with-rvc-rs/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/rvc-parity.yml'
+  pull_request:
+    paths:
+      - 'models/tts-with-rvc-rs/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/rvc-parity.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - name: Run Burn parity with vendored dependencies
+        run: |
+          cargo test -p tts-with-rvc-rs --locked --offline
+          cargo run -p tts-with-rvc-rs --locked --offline -- verify-text-front models/tts-with-rvc-rs/tests/fixtures/text_front.json flex
+      - name: Package native Linux parity runner
+        shell: bash
+        run: |
+          strip target/debug/tts-with-rvc-rs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rvc-burn-parity-linux
+          path: target/debug/tts-with-rvc-rs
+          if-no-files-found: error
+          retention-days: 3

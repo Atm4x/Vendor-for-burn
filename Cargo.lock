@@ -6724,6 +6724,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tts-with-rvc-rs"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "twox-hash"
 version = "2.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
