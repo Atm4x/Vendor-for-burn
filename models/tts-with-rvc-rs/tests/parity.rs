@@ -37,3 +37,14 @@ fn relative_attention_matches_pytorch_reference() {
     let error = max_abs_error(&actual, &fixture.expected);
     assert!(error <= 1e-4, "relative attention max absolute deviation {error}");
 }
+
+#[test]
+fn encoder_layer_matches_pytorch_reference() {
+    let fixture: tts_with_rvc_rs::encoder::EncoderLayerFixture =
+        serde_json::from_str(include_str!("fixtures/encoder_layer.json")).unwrap();
+    let output = fixture.forward(&Device::flex());
+    assert_eq!(output.dims(), [fixture.attention.batch, fixture.attention.channels, fixture.attention.time]);
+    let actual = output.into_data().try_into_vec::<f32>().unwrap();
+    let error = max_abs_error(&actual, &fixture.expected_encoder);
+    assert!(error <= 1e-4, "encoder layer max absolute deviation {error}");
+}

@@ -1,12 +1,12 @@
 use burn::tensor::Device;
 use std::{env, fs, process::ExitCode};
-use tts_with_rvc_rs::{TextFrontFixture, attention::AttentionFixture, max_abs_error};
+use tts_with_rvc_rs::{TextFrontFixture, attention::AttentionFixture, encoder::EncoderLayerFixture, max_abs_error};
 
 fn run() -> Result<(), String> {
     let mut args = env::args().skip(1);
     let command = args.next().ok_or("missing command")?;
-    if !matches!(command.as_str(), "verify-text-front" | "verify-attention") {
-        return Err("usage: tts-with-rvc-rs verify-text-front|verify-attention <fixture.json> [flex|cpu|cuda|wgpu]".into());
+    if !matches!(command.as_str(), "verify-text-front" | "verify-attention" | "verify-encoder-layer") {
+        return Err("usage: tts-with-rvc-rs verify-text-front|verify-attention|verify-encoder-layer <fixture.json> [flex|cpu|cuda|wgpu]".into());
     }
     let path = args.next().ok_or("missing fixture path")?;
     let backend = args.next().unwrap_or_else(|| "flex".to_owned());
@@ -22,6 +22,17 @@ fn run() -> Result<(), String> {
         other => return Err(format!("backend {other} is not compiled into this binary")),
     };
     let data = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    if command == "verify-encoder-layer" {
+        let fixture: EncoderLayerFixture = serde_json::from_str(&data).map_err(|e| e.to_string())?;
+        let actual = fixture.forward(&device).into_data().try_into_vec::<f32>()
+            .map_err(|e| e.to_string())?;
+        let error = max_abs_error(&actual, &fixture.expected_encoder);
+        println!("backend={backend} max_abs_encoder_layer={error:.9}");
+        if !error.is_finite() || error > 1e-4 {
+            return Err("Torch/Burn encoder layer parity exceeded tolerance".into());
+        }
+        return Ok(());
+    }
     if command == "verify-attention" {
         let fixture: AttentionFixture = serde_json::from_str(&data).map_err(|e| e.to_string())?;
         let actual = fixture.forward(&device).into_data().try_into_vec::<f32>()

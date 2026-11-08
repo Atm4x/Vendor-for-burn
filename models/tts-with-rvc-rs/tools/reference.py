@@ -70,12 +70,15 @@ def main():
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--attention", action="store_true")
+    parser.add_argument("--encoder-layer", action="store_true")
     args = parser.parse_args()
     output = args.output or Path(__file__).parent.parent / "tests" / "fixtures" / "text_front.json"
     output.parent.mkdir(parents=True, exist_ok=True)
-    fixture = make_attention_fixture(args.checkpoint) if args.attention else make_text_front_fixture(args.checkpoint)
+    fixture = (make_encoder_layer_fixture(args.checkpoint) if args.encoder_layer else
+               make_attention_fixture(args.checkpoint) if args.attention else
+               make_text_front_fixture(args.checkpoint))
     output.write_text(json.dumps(fixture, indent=2), encoding="utf-8")
-    if args.checkpoint is None and not args.attention:
+    if args.checkpoint is None and not args.attention and not args.encoder_layer:
         (output.parent / "wavenet_gate.json").write_text(json.dumps(make_gate_fixture(), indent=2), encoding="utf-8")
     print(output)
 
@@ -149,6 +152,60 @@ def make_attention_fixture(checkpoint: Path | None):
     result["relative_keys"] = weight["emb_rel_k"].flatten().tolist()
     result["relative_values"] = weight["emb_rel_v"].flatten().tolist()
     return result
+
+
+def make_encoder_layer_fixture(checkpoint: Path | None):
+    fixture = make_attention_fixture(checkpoint)
+    torch.manual_seed(181)
+    channels = fixture["channels"]
+    filter_channels = 768 if checkpoint else 16
+    kernel = 3
+    if checkpoint:
+        raw = torch.load(checkpoint, map_location="cpu", weights_only=True)["weight"]
+        prefix = "enc_p.encoder."
+        load = lambda key: raw[prefix + key].float().contiguous()
+        conv1_weight = load("ffn_layers.0.conv_1.weight")
+        conv1_bias = load("ffn_layers.0.conv_1.bias")
+        conv2_weight = load("ffn_layers.0.conv_2.weight")
+        conv2_bias = load("ffn_layers.0.conv_2.bias")
+        norm1_gamma = load("norm_layers_1.0.gamma")
+        norm1_beta = load("norm_layers_1.0.beta")
+        norm2_gamma = load("norm_layers_2.0.gamma")
+        norm2_beta = load("norm_layers_2.0.beta")
+    else:
+        conv1_weight = torch.randn(filter_channels, channels, kernel) * 0.10
+        conv1_bias = torch.randn(filter_channels) * 0.03
+        conv2_weight = torch.randn(channels, filter_channels, kernel) * 0.10
+        conv2_bias = torch.randn(channels) * 0.03
+        norm1_gamma = torch.ones(channels) + torch.randn(channels) * 0.05
+        norm1_beta = torch.randn(channels) * 0.03
+        norm2_gamma = torch.ones(channels) + torch.randn(channels) * 0.05
+        norm2_beta = torch.randn(channels) * 0.03
+    batch,time = fixture["batch"],fixture["time"]
+    x = torch.tensor(fixture["input"], dtype=torch.float32).reshape(batch, channels, time)
+    mask = (torch.arange(time)[None, :] < torch.tensor(fixture["lengths"])[:, None]).float()[:, None, :]
+    attn = torch.tensor(fixture["expected"], dtype=torch.float32).reshape(batch, channels, time)
+    x = F.layer_norm((x + attn).transpose(1, 2), (channels,), norm1_gamma, norm1_beta, 1e-5).transpose(1, 2)
+    hidden = F.conv1d(x * mask, conv1_weight, conv1_bias, padding=(kernel - 1) // 2)
+    hidden = torch.relu(hidden)
+    y = F.conv1d(hidden * mask, conv2_weight, conv2_bias, padding=(kernel - 1) // 2) * mask
+    output = F.layer_norm((x + y).transpose(1, 2), (channels,), norm2_gamma, norm2_beta, 1e-5).transpose(1, 2)
+    output = output * mask
+    fixture.update(
+        filter_channels=filter_channels,
+        kernel=kernel,
+        norm_attention_gamma=norm1_gamma.tolist(),
+        norm_attention_beta=norm1_beta.tolist(),
+        norm_feed_forward_gamma=norm2_gamma.tolist(),
+        norm_feed_forward_beta=norm2_beta.tolist(),
+        conv1_weight=conv1_weight.flatten().tolist(),
+        conv1_bias=conv1_bias.tolist(),
+        conv2_weight=conv2_weight.flatten().tolist(),
+        conv2_bias=conv2_bias.tolist(),
+        expected_encoder=output.contiguous().flatten().tolist(),
+    )
+    return fixture
+
 
 if __name__ == "__main__":
     main()

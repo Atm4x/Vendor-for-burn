@@ -144,12 +144,8 @@ pub struct AttentionFixture {
 }
 
 impl AttentionFixture {
-    pub fn forward(&self, device: &Device) -> Tensor<3> {
-        let (batch, channels, time) = (self.batch, self.channels, self.time);
-        assert_eq!(self.input.len(), batch * channels * time);
-        assert_eq!(self.lengths.len(), batch);
-        assert!(self.lengths.iter().all(|&length| length <= time));
-        assert_eq!(self.expected.len(), self.input.len());
+    pub fn model(&self, device: &Device) -> RelativeSelfAttention {
+        let channels = self.channels;
         let projection = |weight: &Vec<f32>, bias: &Vec<f32>| {
             assert_eq!(weight.len(), channels * channels);
             assert_eq!(bias.len(), channels);
@@ -165,7 +161,7 @@ impl AttentionFixture {
                 TensorData::new(values.clone(), [self.window * 2 + 1, dimension]), device,
             )
         };
-        let attention = RelativeSelfAttention::new(
+        RelativeSelfAttention::new(
             projection(&self.query_weight, &self.query_bias),
             projection(&self.key_weight, &self.key_bias),
             projection(&self.value_weight, &self.value_bias),
@@ -174,7 +170,15 @@ impl AttentionFixture {
             relative(&self.relative_values),
             self.heads,
             self.window,
-        );
+        )
+    }
+
+    pub fn inputs(&self, device: &Device) -> (Tensor<3>, Tensor<3>) {
+        let (batch, channels, time) = (self.batch, self.channels, self.time);
+        assert_eq!(self.input.len(), batch * channels * time);
+        assert_eq!(self.lengths.len(), batch);
+        assert!(self.lengths.iter().all(|&length| length <= time));
+        assert_eq!(self.expected.len(), self.input.len());
         let inputs = Tensor::from_data(
             TensorData::new(self.input.clone(), [batch, channels, time]), device,
         );
@@ -182,6 +186,11 @@ impl AttentionFixture {
             .flat_map(|&length| (0..time).map(move |step| if step < length { 1.0 } else { 0.0 }))
             .collect();
         let mask = Tensor::from_data(TensorData::new(mask_values, [batch, 1, time]), device);
-        attention.forward(inputs, mask)
+        (inputs, mask)
+    }
+
+    pub fn forward(&self, device: &Device) -> Tensor<3> {
+        let (inputs, mask) = self.inputs(device);
+        self.model(device).forward(inputs, mask)
     }
 }

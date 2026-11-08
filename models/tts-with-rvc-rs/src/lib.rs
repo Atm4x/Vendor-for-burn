@@ -133,3 +133,4 @@ pub fn max_abs_error(actual: &[f32], expected: &[f32]) -> f32 {
 }
 
 pub mod attention;
+pub mod encoder;
