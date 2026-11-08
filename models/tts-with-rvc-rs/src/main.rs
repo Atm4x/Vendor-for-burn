@@ -34,7 +34,6 @@ fn run() -> Result<(), String> {
         "wgpu" => Device::wgpu(Default::default()),
         other => return Err(format!("backend {other} is not compiled into this binary")),
     };
-    let data = fs::read_to_string(path).map_err(|e| e.to_string())?;
     if let Some(flow_fixture_path) = flow_fixture_path {
         let checkpoint = tts_with_rvc_rs::checkpoint::RvcCheckpoint::open(&path)?;
         let data = fs::read_to_string(flow_fixture_path).map_err(|error| error.to_string())?;
@@ -53,6 +52,7 @@ fn run() -> Result<(), String> {
         }
         return Ok(());
     }
+    let data = fs::read_to_string(&path).map_err(|e| e.to_string())?;
     if command == "verify-text-encoder" {
         let fixture: TextEncoderFixture = serde_json::from_str(&data).map_err(|e| e.to_string())?;
         let output = fixture.forward(&device, None);
