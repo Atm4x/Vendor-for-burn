@@ -131,3 +131,5 @@ pub fn max_abs_error(actual: &[f32], expected: &[f32]) -> f32 {
         .map(|(actual, expected)| (actual - expected).abs())
         .fold(0.0, f32::max)
 }
+
+pub mod attention;

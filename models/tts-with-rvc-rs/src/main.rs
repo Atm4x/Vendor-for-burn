@@ -1,11 +1,12 @@
 use burn::tensor::Device;
 use std::{env, fs, process::ExitCode};
-use tts_with_rvc_rs::{TextFrontFixture, max_abs_error};
+use tts_with_rvc_rs::{TextFrontFixture, attention::AttentionFixture, max_abs_error};
 
 fn run() -> Result<(), String> {
     let mut args = env::args().skip(1);
-    if args.next().as_deref() != Some("verify-text-front") {
-        return Err("usage: tts-with-rvc-rs verify-text-front <fixture.json> [flex|cpu|cuda|wgpu]".into());
+    let command = args.next().ok_or("missing command")?;
+    if !matches!(command.as_str(), "verify-text-front" | "verify-attention") {
+        return Err("usage: tts-with-rvc-rs verify-text-front|verify-attention <fixture.json> [flex|cpu|cuda|wgpu]".into());
     }
     let path = args.next().ok_or("missing fixture path")?;
     let backend = args.next().unwrap_or_else(|| "flex".to_owned());
@@ -20,8 +21,19 @@ fn run() -> Result<(), String> {
         "wgpu" => Device::wgpu(Default::default()),
         other => return Err(format!("backend {other} is not compiled into this binary")),
     };
-    let fixture: TextFrontFixture = serde_json::from_str(&fs::read_to_string(path).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+    let data = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    if command == "verify-attention" {
+        let fixture: AttentionFixture = serde_json::from_str(&data).map_err(|e| e.to_string())?;
+        let actual = fixture.forward(&device).into_data().try_into_vec::<f32>()
+            .map_err(|e| e.to_string())?;
+        let error = max_abs_error(&actual, &fixture.expected);
+        println!("backend={backend} max_abs_attention={error:.9}");
+        if !error.is_finite() || error > 1e-4 {
+            return Err("Torch/Burn attention parity exceeded tolerance".into());
+        }
+        return Ok(());
+    }
+    let fixture: TextFrontFixture = serde_json::from_str(&data).map_err(|e| e.to_string())?;
     let result = fixture.forward(&device);
     let actual_features = result.features.into_data().try_into_vec::<f32>().map_err(|e| e.to_string())?;
     let actual_mask = result.mask.into_data().try_into_vec::<f32>().map_err(|e| e.to_string())?;

@@ -39,6 +39,7 @@ jobs:
         run: |
           cargo test -p tts-with-rvc-rs --locked --offline
           cargo run -p tts-with-rvc-rs --locked --offline -- verify-text-front models/tts-with-rvc-rs/tests/fixtures/text_front.json flex
+          cargo run -p tts-with-rvc-rs --locked --offline -- verify-attention models/tts-with-rvc-rs/tests/fixtures/relative_attention.json flex
       - name: Package native Linux parity runner
         shell: bash
         run: |

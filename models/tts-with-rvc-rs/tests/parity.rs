@@ -26,3 +26,14 @@ fn wavenet_gate_matches_pytorch_reference() {
         .into_data().try_into_vec::<f32>().unwrap();
     assert!(max_abs_error(&result, &read("expected")) <= 1e-6);
 }
+
+#[test]
+fn relative_attention_matches_pytorch_reference() {
+    let fixture: tts_with_rvc_rs::attention::AttentionFixture =
+        serde_json::from_str(include_str!("fixtures/relative_attention.json")).unwrap();
+    let result = fixture.forward(&Device::flex());
+    assert_eq!(result.dims(), [fixture.batch, fixture.channels, fixture.time]);
+    let actual = result.into_data().try_into_vec::<f32>().unwrap();
+    let error = max_abs_error(&actual, &fixture.expected);
+    assert!(error <= 1e-4, "relative attention max absolute deviation {error}");
+}
