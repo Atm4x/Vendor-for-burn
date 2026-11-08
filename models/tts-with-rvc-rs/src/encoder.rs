@@ -110,11 +110,9 @@ pub struct EncoderLayerFixture {
 }
 
 impl EncoderLayerFixture {
-    pub fn forward(&self, device: &Device) -> Tensor<3> {
+    pub fn model(&self, device: &Device) -> TextEncoderLayer {
         let channels = self.attention.channels;
-        let (inputs, mask) = self.attention.inputs(device);
         assert!(self.kernel > 0);
-        assert_eq!(self.expected_encoder.len(), self.attention.input.len());
         let norm = |gamma: &Vec<f32>, beta: &Vec<f32>| {
             assert_eq!(gamma.len(), channels);
             assert_eq!(beta.len(), channels);
@@ -131,7 +129,7 @@ impl EncoderLayerFixture {
                 Tensor::from_data(TensorData::new(bias.clone(), [output]), device),
             )
         };
-        let layer = TextEncoderLayer::new(
+        TextEncoderLayer::new(
             self.attention.model(device),
             norm(&self.norm_attention_gamma, &self.norm_attention_beta),
             FeedForward::new(
@@ -139,7 +137,12 @@ impl EncoderLayerFixture {
                 conv(&self.conv2_weight, &self.conv2_bias, self.filter_channels, channels),
             ),
             norm(&self.norm_feed_forward_gamma, &self.norm_feed_forward_beta),
-        );
-        layer.forward(inputs, mask.clone()) * mask
+        )
+    }
+
+    pub fn forward(&self, device: &Device) -> Tensor<3> {
+        let (inputs, mask) = self.attention.inputs(device);
+        assert_eq!(self.expected_encoder.len(), self.attention.input.len());
+        self.model(device).forward(inputs, mask.clone()) * mask
     }
 }

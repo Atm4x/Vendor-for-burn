@@ -41,3 +41,20 @@ Both commands should report maximum absolute difference below `1e-4`; success mu
 Relative attention matches the original RVC shared-head relative-window convention (`heads_share=True`), with zero relative embeddings outside the window, -1e4 masked logits, no dropout in evaluation mode, and `out_channels == channels` as used by the RVC v2 text encoder. Other attention options (`heads_share=False`, cross-attention, proximal or block masks) are not implemented. Runtime layer weights are still supplied by a fixture; native PyTorch `.pth` loading is not implemented. Runtime tensors are FP32.
 
 Stage 3 verifies one RVC v2 attention/FFN encoder layer, not yet the full six-layer stack or final mean/log-std projection. It uses exact source layer weights supplied via a private fixture and checks only FP32 CPU parity.
+
+## Full RVC v2 TextEncoder (stage 4)
+
+`src/text_encoder.rs` composes the existing projection and six relative-attention / FFN layers into the original inference-only `TextEncoder.forward` path. It returns two channels of statistics (`mean`, `log_scale`) plus sequence mask, with optional `skip_head` slicing before projection. Modules stay resident in the owning Rust process; model file decoding is not yet integrated.
+
+The standalone reference generator `tools/reference_text_encoder.py` imports the original Python `TextEncoder` from a developer-provided source ZIP. It creates a synthetic six-layer fixture or validates the real RVC v2/F0 `.pth` checkpoint locally, without publishing private weights.
+
+The checked-in synthetic fixture tests both normal forward and `skip_head`; the private full checkpoint fixture is **not** committed. Example build-time reference commands:
+
+```text
+python models/tts-with-rvc-rs/tools/reference_text_encoder.py --source-zip ORIGINAL_SOURCE.zip --output models/tts-with-rvc-rs/tests/fixtures/text_encoder.json
+python models/tts-with-rvc-rs/tools/reference_text_encoder.py --source-zip ORIGINAL_SOURCE.zip --checkpoint MODEL.pth --output PRIVATE_TEXT_ENCODER.json
+cargo test -p tts-with-rvc-rs --locked --offline
+cargo run -p tts-with-rvc-rs --locked --offline -- verify-text-encoder PRIVATE_TEXT_ENCODER.json flex
+```
+
+The model's convolution and attention code runs natively with Burn; checkpoint parsing and persistent model lifecycle remain separate upcoming tasks.

@@ -105,18 +105,23 @@ pub struct TextFrontFixture {
 }
 
 impl TextFrontFixture {
-    pub fn forward(&self, device: &Device) -> TextEncoderFrontOutput {
+    pub fn model(&self, device: &Device) -> TextEncoderFront {
         let (b, t, i, h) = (self.batch, self.time, self.in_channels, self.hidden_channels);
         assert_eq!(self.phone.len(), b * t * i);
         assert_eq!(self.pitch.len(), b * t);
         assert_eq!(self.phone_weight.len(), h * i);
         assert_eq!(self.phone_bias.len(), h);
         assert_eq!(self.pitch_weight.len(), 256 * h);
-        let front = TextEncoderFront::new(
+        TextEncoderFront::new(
             Tensor::from_data(TensorData::new(self.phone_weight.clone(), [h, i]), device),
             Tensor::from_data(TensorData::new(self.phone_bias.clone(), [h]), device),
             Some(Tensor::from_data(TensorData::new(self.pitch_weight.clone(), [256, h]), device)),
-        );
+        )
+    }
+
+    pub fn forward(&self, device: &Device) -> TextEncoderFrontOutput {
+        let (b, t, i) = (self.batch, self.time, self.in_channels);
+        let front = self.model(device);
         let phone = Tensor::from_data(TensorData::new(self.phone.clone(), [b, t, i]), device);
         let pitch = Tensor::<2, Int>::from_data(TensorData::new(self.pitch.clone(), [b, t]), device);
         front.forward(phone, Some(pitch), &self.lengths)
@@ -134,3 +139,5 @@ pub fn max_abs_error(actual: &[f32], expected: &[f32]) -> f32 {
 
 pub mod attention;
 pub mod encoder;
+
+pub mod text_encoder;

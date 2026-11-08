@@ -1,12 +1,12 @@
 use burn::tensor::Device;
 use std::{env, fs, process::ExitCode};
-use tts_with_rvc_rs::{TextFrontFixture, attention::AttentionFixture, encoder::EncoderLayerFixture, max_abs_error};
+use tts_with_rvc_rs::{TextFrontFixture, attention::AttentionFixture, encoder::EncoderLayerFixture, text_encoder::TextEncoderFixture, max_abs_error};
 
 fn run() -> Result<(), String> {
     let mut args = env::args().skip(1);
     let command = args.next().ok_or("missing command")?;
-    if !matches!(command.as_str(), "verify-text-front" | "verify-attention" | "verify-encoder-layer") {
-        return Err("usage: tts-with-rvc-rs verify-text-front|verify-attention|verify-encoder-layer <fixture.json> [flex|cpu|cuda|wgpu]".into());
+    if !matches!(command.as_str(), "verify-text-front" | "verify-attention" | "verify-encoder-layer" | "verify-text-encoder") {
+        return Err("usage: tts-with-rvc-rs verify-text-front|verify-attention|verify-encoder-layer|verify-text-encoder <fixture.json> [flex|cpu|cuda|wgpu]".into());
     }
     let path = args.next().ok_or("missing fixture path")?;
     let backend = args.next().unwrap_or_else(|| "flex".to_owned());
@@ -22,6 +22,32 @@ fn run() -> Result<(), String> {
         other => return Err(format!("backend {other} is not compiled into this binary")),
     };
     let data = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    if command == "verify-text-encoder" {
+        let fixture: TextEncoderFixture = serde_json::from_str(&data).map_err(|e| e.to_string())?;
+        let output = fixture.forward(&device, None);
+        let mean = output.mean.into_data().try_into_vec::<f32>().map_err(|e| e.to_string())?;
+        let logs = output.log_scale.into_data().try_into_vec::<f32>().map_err(|e| e.to_string())?;
+        let mask = output.mask.into_data().try_into_vec::<f32>().map_err(|e| e.to_string())?;
+        let error = max_abs_error(&mean, &fixture.expected_mean)
+            .max(max_abs_error(&logs, &fixture.expected_log_scale));
+        let mask_error = max_abs_error(&mask, &fixture.expected_mask);
+        println!("backend={backend} max_abs_text_encoder={error:.9} max_abs_mask={mask_error:.9}");
+        if !error.is_finite() || error > 1e-4 || mask_error > 0.0 {
+            return Err("Torch/Burn full TextEncoder parity exceeded tolerance".into());
+        }
+        let skipped = fixture.forward(&device, Some(fixture.skip_head));
+        let mean = skipped.mean.into_data().try_into_vec::<f32>().map_err(|e| e.to_string())?;
+        let logs = skipped.log_scale.into_data().try_into_vec::<f32>().map_err(|e| e.to_string())?;
+        let mask = skipped.mask.into_data().try_into_vec::<f32>().map_err(|e| e.to_string())?;
+        let error = max_abs_error(&mean, &fixture.expected_skip_mean)
+            .max(max_abs_error(&logs, &fixture.expected_skip_log_scale));
+        let mask_error = max_abs_error(&mask, &fixture.expected_skip_mask);
+        println!("backend={backend} max_abs_skip_head={error:.9} max_abs_skip_mask={mask_error:.9}");
+        if !error.is_finite() || error > 1e-4 || mask_error > 0.0 {
+            return Err("Torch/Burn TextEncoder skip_head parity exceeded tolerance".into());
+        }
+        return Ok(());
+    }
     if command == "verify-encoder-layer" {
         let fixture: EncoderLayerFixture = serde_json::from_str(&data).map_err(|e| e.to_string())?;
         let actual = fixture.forward(&device).into_data().try_into_vec::<f32>()

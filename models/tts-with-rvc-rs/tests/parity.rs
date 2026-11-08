@@ -48,3 +48,27 @@ fn encoder_layer_matches_pytorch_reference() {
     let error = max_abs_error(&actual, &fixture.expected_encoder);
     assert!(error <= 1e-4, "encoder layer max absolute deviation {error}");
 }
+
+#[test]
+fn full_text_encoder_matches_pytorch_reference() {
+    use tts_with_rvc_rs::text_encoder::TextEncoderFixture;
+    let fixture: TextEncoderFixture =
+        serde_json::from_str(include_str!("fixtures/text_encoder.json")).unwrap();
+    assert_eq!(fixture.layers.len(), 6);
+    let device = Device::flex();
+    let check = |output: tts_with_rvc_rs::text_encoder::TextEncoderOutput,
+                 expected_mean: &[f32], expected_log_scale: &[f32], expected_mask: &[f32]| {
+        let mean = output.mean.into_data().try_into_vec::<f32>().unwrap();
+        let log_scale = output.log_scale.into_data().try_into_vec::<f32>().unwrap();
+        let mask = output.mask.into_data().try_into_vec::<f32>().unwrap();
+        let error = max_abs_error(&mean, expected_mean)
+            .max(max_abs_error(&log_scale, expected_log_scale));
+        assert!(error <= 1e-4, "full TextEncoder max abs deviation {error}");
+        assert_eq!(max_abs_error(&mask, expected_mask), 0.0);
+    };
+    check(fixture.forward(&device, None),
+          &fixture.expected_mean, &fixture.expected_log_scale, &fixture.expected_mask);
+    check(fixture.forward(&device, Some(fixture.skip_head)),
+          &fixture.expected_skip_mean, &fixture.expected_skip_log_scale,
+          &fixture.expected_skip_mask);
+}

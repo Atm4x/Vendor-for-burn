@@ -41,6 +41,7 @@ jobs:
           cargo run -p tts-with-rvc-rs --locked --offline -- verify-text-front models/tts-with-rvc-rs/tests/fixtures/text_front.json flex
           cargo run -p tts-with-rvc-rs --locked --offline -- verify-attention models/tts-with-rvc-rs/tests/fixtures/relative_attention.json flex
           cargo run -p tts-with-rvc-rs --locked --offline -- verify-encoder-layer models/tts-with-rvc-rs/tests/fixtures/encoder_layer.json flex
+          cargo run -p tts-with-rvc-rs --locked --offline -- verify-text-encoder models/tts-with-rvc-rs/tests/fixtures/text_encoder.json flex
       - name: Package native Linux parity runner
         shell: bash
         run: |
