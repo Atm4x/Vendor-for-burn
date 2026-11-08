@@ -1,0 +1,257 @@
+use std::{vec, vec::Vec};
+
+use crate::scalar::Fallback;
+
+use bytemuck::Zeroable;
+use half::f16;
+use num_traits::NumCast;
+use paste::paste;
+
+use crate::{vload_unaligned, vstore_unaligned, Scalar, Simd, VAdd, VDiv, VMul, VMulAdd, VSub};
+
+use super::{assert_approx_eq, binop, for_each_backend, test_binop, testgen_binop, SIZE};
+
+#[inline(always)]
+fn test_add_impl<S: Simd, T: VAdd>(lhs: &[T], rhs: &[T]) -> Vec<T> {
+    binop!(VAdd, |a, b| a + b);
+    test_binop::<S, T, VAddOp<T>>(lhs, rhs)
+}
+#[inline(always)]
+fn test_sub_impl<S: Simd, T: VSub>(lhs: &[T], rhs: &[T]) -> Vec<T> {
+    binop!(VSub, |a, b| a - b);
+    test_binop::<S, T, VSubOp<T>>(lhs, rhs)
+}
+#[inline(always)]
+fn test_mul_impl<S: Simd, T: VMul>(lhs: &[T], rhs: &[T]) -> Vec<T> {
+    binop!(VMul, |a, b| a * b);
+    test_binop::<S, T, VMulOp<T>>(lhs, rhs)
+}
+#[inline(always)]
+fn test_div_impl<S: Simd, T: VDiv>(lhs: &[T], rhs: &[T]) -> Vec<T> {
+    binop!(VDiv, |a, b| a / b);
+    test_binop::<S, T, VDivOp<T>>(lhs, rhs)
+}
+#[inline(always)]
+fn test_fma_impl<S: Simd, T: VMulAdd>(a: &[T], b: &[T], c: &[T]) -> Vec<T> {
+    let lanes = T::lanes::<S>();
+    let mut output = vec![Zeroable::zeroed(); a.len()];
+    let a = a.chunks_exact(lanes);
+    let b = b.chunks_exact(lanes);
+    let c = c.chunks_exact(lanes);
+    let out = output.chunks_exact_mut(lanes);
+    for (((a, b), c), out) in a.zip(b).zip(c).zip(out) {
+        let a = unsafe { vload_unaligned::<S, _>(a.as_ptr()) };
+        let b = unsafe { vload_unaligned(b.as_ptr()) };
+        let c = unsafe { vload_unaligned(c.as_ptr()) };
+        unsafe { vstore_unaligned(out.as_mut_ptr(), a.mul_add(b, c)) };
+    }
+    output
+}
+
+testgen_binop!(
+    test_add,
+    |a, b| a + b,
+    u8,
+    i8,
+    u16,
+    i16,
+    #[cfg_attr(all(miri, any(x86_v3, x86_v4, aarch64)), ignore)]
+    f16,
+    u32,
+    i32,
+    f32,
+    u64,
+    i64,
+    f64
+);
+
+testgen_binop!(
+    test_sub,
+    |a, b| a - b,
+    u8,
+    i8,
+    u16,
+    i16,
+    #[cfg_attr(all(miri, any(x86_v3, x86_v4, aarch64)), ignore)]
+    f16,
+    u32,
+    i32,
+    f32,
+    u64,
+    i64,
+    f64
+);
+testgen_binop!(
+    test_div,
+    |a, b| a / b,
+    #[cfg_attr(all(miri, any(x86_v3, x86_v4, aarch64)), ignore)]
+    f16,
+    f32,
+    f64
+);
+testgen_binop!(
+    test_mul,
+    |a, b| a * b,
+    u8,
+    i8,
+    u16,
+    i16,
+    #[cfg_attr(all(miri, any(x86_v3, x86_v4, aarch64)), ignore)]
+    f16,
+    u32,
+    i32,
+    f32,
+    f64
+);
+
+macro_rules! testgen_fma {
+    ($test_fn: ident, $($(#[$meta:meta])* $ty: ty),*) => {
+        $(paste! {
+            $(#[$meta])*
+            #[::wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
+            fn [<$test_fn _ $ty>]() {
+                let a = super::random(NumCast::from(0).unwrap(), NumCast::from(8).unwrap());
+                let b = super::random(NumCast::from(0).unwrap(), NumCast::from(8).unwrap());
+                let c = super::random(NumCast::from(0).unwrap(), NumCast::from(64).unwrap());
+                let out_ref = a
+                    .iter()
+                    .zip(b.iter()).zip(c.iter())
+                    .map(|((a, b), c)| a * b + c)
+                    .collect::<Vec<_>>();
+                #[cfg(x86)]
+                unsafe {
+                    use crate::backend::x86::*;
+                    #[cfg(avx512_fp16)]
+                    if V4FP16::is_available() {
+                        let out = V4FP16::run_vectorized(|| [<$test_fn _impl>]::<V4FP16, $ty>(&a, &b, &c));
+                        assert_approx_eq(&out_ref, &out);
+                    }
+                    #[cfg(avx512)]
+                    if V4::is_available() {
+                        let out = V4::run_vectorized(|| [<$test_fn _impl>]::<V4, $ty>(&a, &b, &c));
+                        assert_approx_eq(&out_ref, &out);
+                    }
+                    if V3::is_available() {
+                        let out = V3::run_vectorized(|| [<$test_fn _impl>]::<V3, $ty>(&a, &b, &c));
+                        assert_approx_eq(&out_ref, &out);
+                    }
+                    if V2::is_available() {
+                        let out = V2::run_vectorized(|| [<$test_fn _impl>]::<V2, $ty>(&a, &b, &c));
+                        assert_approx_eq(&out_ref, &out);
+                    }
+                }
+                #[cfg(aarch64)]
+                unsafe {
+                    use crate::backend::aarch64::*;
+                    #[cfg(feature = "fp16")]
+                    if NeonFP16::is_available() {
+                        let out = NeonFP16::run_vectorized(|| [<$test_fn _impl>]::<NeonFP16, $ty>(&a, &b, &c));
+                        assert_approx_eq(&out_ref, &out);
+                    }
+                    if NeonFma::is_available() {
+                        let out = NeonFma::run_vectorized(|| [<$test_fn _impl>]::<NeonFma, $ty>(&a, &b, &c));
+                        assert_approx_eq(&out_ref, &out);
+                    }
+                }
+                #[cfg(loong64)]
+                unsafe {
+                    use crate::backend::loong64::*;
+                    if Lasx::is_available() {
+                        let out = Lasx::run_vectorized(|| [<$test_fn _impl>]::<Lasx, $ty>(&a, &b, &c));
+                        assert_approx_eq(&out_ref, &out);
+                    }
+                    if Lsx::is_available() {
+                        let out = Lsx::run_vectorized(|| [<$test_fn _impl>]::<Lsx, $ty>(&a, &b, &c));
+                        assert_approx_eq(&out_ref, &out);
+                    }
+                }
+                #[cfg(wasm32)]
+                unsafe {
+                    use crate::backend::wasm32;
+                    #[cfg(relaxed_simd)]
+                    if wasm32::Simd128Relaxed::is_available() {
+                        let out = wasm32::Simd128Relaxed::run_vectorized(|| [<$test_fn _impl>]::<wasm32::Simd128Relaxed, $ty>(&a, &b, &c));
+                        assert_approx_eq(&out_ref, &out);
+                    }
+                    if wasm32::Simd128Fallback::is_available() {
+                        let out = wasm32::Simd128Fallback::run_vectorized(|| [<$test_fn _impl>]::<wasm32::Simd128Fallback, $ty>(&a, &b, &c));
+                        assert_approx_eq(&out_ref, &out);
+                    }
+                }
+                let out = [<$test_fn _impl>]::<Fallback, $ty>(&a, &b, &c);
+                assert_approx_eq(&out_ref, &out);
+            }
+        })*
+    };
+}
+
+testgen_fma!(
+    test_fma,
+    #[cfg_attr(all(miri, any(x86_v3, x86_v4, aarch64)), ignore)]
+    f16,
+    f32,
+    f64
+);
+
+/// Loads and stores at `ptr + 1`, which is not aligned to the vector even when
+/// the allocation is.
+#[inline(always)]
+fn test_unaligned_roundtrip_impl<S: Simd, T: Scalar>(src: &[T]) -> Vec<T> {
+    let lanes = T::lanes::<S>();
+    let mut out = vec![T::default(); lanes + 1];
+    unsafe {
+        let v = vload_unaligned::<S, T>(src.as_ptr().add(1));
+        vstore_unaligned(out.as_mut_ptr().add(1), v);
+    }
+    out[1..].to_vec()
+}
+
+#[::wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
+fn test_unaligned_roundtrip() {
+    let src: Vec<f32> = (0..65).map(|i| i as f32).collect();
+    super::for_each_backend!(test_unaligned_roundtrip_impl, f32, &src, |out: &[f32]| {
+        assert_eq!(out, &src[1..out.len() + 1])
+    });
+}
+#[inline(always)]
+fn test_wrapping_impl<S: Simd, T: VAdd + VSub + VMul + VMulAdd>(
+    inputs: &(Vec<T>, Vec<T>),
+) -> Vec<T> {
+    let (lhs, rhs) = inputs;
+    let mut out = test_add_impl::<S, T>(lhs, rhs);
+    out.extend(test_sub_impl::<S, T>(lhs, rhs));
+    out.extend(test_mul_impl::<S, T>(lhs, rhs));
+    out.extend(test_fma_impl::<S, T>(lhs, rhs, rhs));
+    out
+}
+
+/// Integer lanes wrap on overflow on every backend, including where a lane op
+/// is emulated with scalar code. Only meaningful with overflow checks on (the
+/// default for tests), where overflowing scalar arithmetic panics.
+macro_rules! testgen_wrapping {
+    ($($ty: ty),*) => {
+        $(paste! {
+            #[::wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
+            fn [<test_wrapping_ $ty>]() {
+                let values = [<$ty>::MAX, <$ty>::MAX - 1, <$ty>::MIN, 0, 1, 2, <$ty>::MAX / 2 + 1];
+                let n = values.len();
+                let lhs: Vec<$ty> = (0..SIZE).map(|i| values[i % n]).collect();
+                let rhs: Vec<$ty> = (0..SIZE).map(|i| values[(i / n) % n]).collect();
+                let ops: [fn($ty, $ty) -> $ty; 3] =
+                    [<$ty>::wrapping_add, <$ty>::wrapping_sub, <$ty>::wrapping_mul];
+                let mut expected: Vec<$ty> = ops
+                    .iter()
+                    .flat_map(|op| lhs.iter().zip(&rhs).map(|(a, b)| op(*a, *b)))
+                    .collect();
+                // mul_add(a, b, b)
+                expected.extend(lhs.iter().zip(&rhs).map(|(a, b)| a.wrapping_mul(*b).wrapping_add(*b)));
+                let inputs = (lhs, rhs);
+                for_each_backend!(test_wrapping_impl, $ty, &inputs, |out: &[$ty]| {
+                    assert_eq!(expected, out)
+                });
+            }
+        })*
+    };
+}
+
+testgen_wrapping!(u8, i8, u16, i16, u32, i32, u64, i64);

@@ -1,0 +1,83 @@
+use cubecl::{
+    benchmark::{Benchmark, TimingMethod},
+    client::Client,
+    future,
+    prelude::*,
+    std::tensor::TensorHandle,
+};
+use cubek_test_utils::RunSamples;
+
+use crate::eval::benchmarks::contiguous::problem::ContiguousProblem;
+use crate::eval::benchmarks::contiguous::strategy::ContiguousStrategy;
+
+pub fn bench(
+    _strategy: &ContiguousStrategy,
+    problem: &ContiguousProblem,
+    num_samples: usize,
+) -> Result<RunSamples, String> {
+    let device = cubecl::test_device();
+    let client = device.client();
+    let dtype = f32::elem_type_native();
+
+    let bench = IntoContiguousBench {
+        shape: problem.shape.clone(),
+        dims: problem.dims.clone(),
+        device,
+        client,
+        dtype,
+        samples: num_samples,
+    };
+
+    let durations = bench
+        .run(cubek_test_utils::timing_method(TimingMethod::Device))
+        .map_err(|e| format!("benchmark failed: {e}"))?
+        .durations;
+
+    Ok(RunSamples::new(durations))
+}
+
+struct IntoContiguousBench {
+    shape: Vec<usize>,
+    dims: Vec<(usize, usize)>,
+    device: cubecl::Device,
+    client: Client,
+    dtype: ElemType,
+    samples: usize,
+}
+
+impl Benchmark for IntoContiguousBench {
+    type Input = TensorHandle;
+    type Output = TensorHandle;
+
+    fn prepare(&self) -> Self::Input {
+        let mut handle = TensorHandle::empty(&self.client, self.shape.clone(), self.dtype);
+        for (dim0, dim1) in self.dims.iter() {
+            handle.metadata.swap(*dim0, *dim1);
+        }
+        handle
+    }
+
+    fn execute(&self, input: Self::Input) -> Result<TensorHandle, String> {
+        Ok(cubecl::std::tensor::into_contiguous(
+            &self.client,
+            input.binding(),
+            self.dtype,
+        ))
+    }
+
+    fn num_samples(&self) -> usize {
+        self.samples
+    }
+
+    fn name(&self) -> String {
+        format!(
+            "into_contiguous-{:?}-{:?}-{:?}-{:?}",
+            self.dtype, self.dims, self.device, self.shape,
+        )
+        .to_lowercase()
+    }
+
+    fn sync(&self) {
+        future::block_on(self.client.sync()).unwrap()
+    }
+}

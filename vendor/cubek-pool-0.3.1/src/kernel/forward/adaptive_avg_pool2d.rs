@@ -1,0 +1,106 @@
+use super::{
+    super::{
+        accumulator_dtype, adaptive_end_index as end_index, adaptive_start_index as start_index,
+        decompose_linear, shape_divmod,
+    },
+    pool2d::{Position, view4d},
+};
+use crate::definition::{AdaptiveAvgPoolOptions, PoolError};
+use cubecl::{
+    CubeDim, calculate_cube_count_elemwise,
+    num_traits::Zero,
+    prelude::{TensorBinding, *},
+    std::{FastDivmod, tensor::ViewMut},
+    tensor_vector_size_parallel,
+};
+
+/// One over the sum and its tap: the read is memory bound, and wider vectors measured slower.
+const LIVE_VECTORS: usize = 3;
+#[cube(launch, address_type = "dynamic")]
+fn adaptive_avg_pool2d_direct<E: Numeric, EA: Numeric, N: Size>(
+    input: &Tensor<Vector<E, N>>,
+    mut output: ViewMut<'_, Vector<E, N>, Position>,
+    out_shape: Sequence<FastDivmod<usize>>,
+    working_units: usize,
+    #[define(E)] _dtype: ElemType,
+    #[define(EA)] _acc_dtype: ElemType,
+) {
+    if ABSOLUTE_POS >= working_units {
+        terminate!();
+    }
+
+    let (b, oh, ow, c) = decompose_linear(ABSOLUTE_POS * output.vector_size(), &out_shape);
+
+    let (_, out_h, out_w, _) = output.shape();
+    let (in_stride_h, in_stride_w) = (input.stride(1), input.stride(2));
+    let (in_h, in_w) = (input.shape(1), input.shape(2));
+
+    let ih_start = start_index(oh, out_h, in_h);
+    let ih_end = end_index(oh, out_h, in_h);
+
+    let iw_start = start_index(ow, out_w, in_w);
+    let iw_end = end_index(ow, out_w, in_w);
+
+    let mut sum = Vector::<EA, N>::zero();
+
+    let index_input_base = b * input.stride(0) + c * input.stride(3);
+
+    for ih in ih_start..ih_end {
+        let index_input_2 = ih * in_stride_h;
+
+        for iw in iw_start..iw_end {
+            let index_input_3 = iw * in_stride_w;
+
+            let index_input = index_input_base + index_input_2 + index_input_3;
+            sum += Vector::cast_from(input[index_input / input.vector_size()]);
+        }
+    }
+
+    let num_ih = ih_end - ih_start;
+    let num_iw = iw_end - iw_start;
+
+    let average = sum / Vector::cast_from(num_ih * num_iw);
+    output.write((b, oh, ow, c), Vector::cast_from(average));
+}
+
+pub(crate) fn adaptive_avg_pool2d_launch(
+    client: &Client,
+    input: TensorBinding,
+    output: TensorBinding,
+    _options: AdaptiveAvgPoolOptions<2>,
+    dtype: ElemType,
+) -> Result<(), PoolError> {
+    let acc_dtype = accumulator_dtype(dtype);
+    let vector_size = tensor_vector_size_parallel(
+        client
+            .properties()
+            .vector_sizes_in_registers(acc_dtype.size(), LIVE_VECTORS),
+        &input.shape,
+        &input.strides,
+        input.shape.len() - 1,
+    );
+
+    let working_units = output.shape.iter().product::<usize>() / vector_size as usize;
+    let cube_dim = CubeDim::new(client, working_units);
+    let cube_count = calculate_cube_count_elemwise(client, working_units, cube_dim);
+
+    let address_type = input
+        .required_address_type(dtype.size())
+        .max(output.required_address_type(dtype.size()));
+
+    adaptive_avg_pool2d_direct::launch(
+        client,
+        cube_count,
+        cube_dim,
+        address_type,
+        vector_size,
+        input.into_tensor_arg(),
+        view4d(output.clone(), vector_size),
+        shape_divmod(&output),
+        working_units,
+        dtype,
+        acc_dtype,
+    );
+
+    Ok(())
+}

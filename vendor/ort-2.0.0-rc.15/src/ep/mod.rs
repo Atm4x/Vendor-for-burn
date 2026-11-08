@@ -1,0 +1,529 @@
+//! [`ExecutionProvider`]s provide hardware acceleration to [`Session`](crate::session::Session)s.
+//!
+//! Sessions can be configured with execution providers via [`SessionBuilder::with_execution_providers`]:
+//!
+//! ```no_run
+//! # use ort::{ep, session::Session};
+//! # fn main() -> ort::Result<()> {
+//! # let env = ort::test_util::test_env().clone();
+//! let session = Session::builder(&env)?
+//! 	.with_execution_providers([
+//! 		#[cfg(feature = "cuda")]
+//! 		ep::CUDA::default().build()
+//! 	])?
+//! 	.commit_from_file("model.onnx")?;
+//! # Ok(())
+//! # }
+//! ```
+
+use alloc::{ffi::CString, string::ToString, sync::Arc, vec::Vec};
+use core::{
+	ffi::c_char,
+	fmt::{self, Debug},
+	ptr
+};
+
+use crate::{
+	AsPointer,
+	error::Result,
+	ortsys,
+	session::builder::SessionBuilder,
+	util::{MiniMap, char_p_to_string, run_on_drop}
+};
+
+pub trait ExecutionProvider: Send + Sync {
+	/// The identifier of this execution provider used internally by ONNX Runtime.
+	///
+	/// This is the same as what's used in ONNX Runtime's Python API to register this execution provider, i.e.
+	/// [`TVM`]'s identifier is `TvmExecutionProvider`.
+	const NAME: &'static str;
+
+	/// Returns `Ok(true)` if ONNX Runtime was *compiled with support* for this execution provider, and `Ok(false)`
+	/// otherwise.
+	///
+	/// An `Err` may be returned if a serious internal error occurs, in which case your application should probably
+	/// just abort.
+	///
+	/// **Note that this does not always mean the execution provider is *usable* for a specific session.** A model may
+	/// use operators not supported by an execution provider, or the EP may encounter an error while attempting to load
+	/// dependencies during session creation. In most cases (i.e. showing the user an error message if CUDA could not be
+	/// enabled), you'll instead want to manually register this EP via [`ExecutionProvider::register`] and detect
+	/// and handle any errors returned by that function.
+	fn is_available() -> Result<bool> {
+		is_ep_available(Self::NAME)
+	}
+
+	/// Attempts to register this execution provider on the given session.
+	fn register(&self, session_builder: &mut SessionBuilder) -> Result<()>;
+}
+
+/// Trait used for execution providers that can have arbitrary configuration keys applied.
+///
+/// Most execution providers have a small set of configuration options which don't change between ONNX Runtime releases;
+/// others, like the CUDA execution provider, often have options added that go undocumented and thus unimplemented by
+/// `ort`. This allows you to configure these options regardless.
+pub trait ArbitrarilyConfigurableExecutionProvider: Sized {
+	fn options_mut(&mut self) -> &mut ExecutionProviderOptions;
+
+	fn with_arbitrary_config(mut self, key: impl ToString, value: impl ToString) -> Self {
+		self.options_mut().set(key.to_string(), value.to_string());
+		self
+	}
+}
+
+pub(crate) trait SimpleExecutionProvider: ArbitrarilyConfigurableExecutionProvider + Send + Sync + 'static {
+	const CANONICAL_NAME: &'static str;
+	const SHORT_NAME: &'static str;
+
+	fn options(&self) -> &ExecutionProviderOptions;
+}
+
+impl<E: SimpleExecutionProvider> ExecutionProvider for E {
+	const NAME: &'static str = Self::CANONICAL_NAME;
+
+	fn register(&self, session_builder: &mut SessionBuilder) -> Result<()> {
+		let ffi_options = self.options().to_ffi();
+		// 1.22 lets us use canonical EP names instead of the weird short names. Prefer those for clarity.
+		let name = CString::new(if cfg!(feature = "api-22") { Self::CANONICAL_NAME } else { Self::SHORT_NAME }).expect("EP name has no NUL");
+		ortsys![unsafe SessionOptionsAppendExecutionProvider(
+			session_builder.ptr_mut(),
+			name.as_ptr(),
+			ffi_options.key_ptrs(),
+			ffi_options.value_ptrs(),
+			ffi_options.len(),
+		)?];
+		Ok(())
+	}
+}
+
+struct ExecutionProviderVTable {
+	name: &'static str,
+	register: fn(*const (), session_builder: &mut SessionBuilder) -> Result<()>,
+	drop: fn(*mut ())
+}
+
+/// Dynamic execution provider container, used to provide a list of multiple types of execution providers when
+/// configuring execution providers for a [`SessionBuilder`] or
+/// [`EnvironmentBuilder`](crate::environment::EnvironmentBuilder).
+///
+/// See [`ExecutionProvider`] for more info on execution providers.
+pub struct ExecutionProviderDispatch {
+	ep: *mut (),
+	vtable: &'static ExecutionProviderVTable,
+	error_on_failure: bool
+}
+
+impl Clone for ExecutionProviderDispatch {
+	fn clone(&self) -> Self {
+		unsafe { Arc::increment_strong_count(self.ep) };
+
+		ExecutionProviderDispatch {
+			ep: self.ep,
+			vtable: self.vtable,
+			error_on_failure: self.error_on_failure
+		}
+	}
+}
+
+// SAFETY: `self.ep` is an erased `Arc<dyn ExecutionProvider>`, which is `Send + Sync` when `T` is (and
+// `ExecutionProvider` requires `Send` + `Sync`)
+unsafe impl Send for ExecutionProviderDispatch {}
+unsafe impl Sync for ExecutionProviderDispatch {}
+
+impl ExecutionProviderDispatch {
+	pub(crate) fn new<E: ExecutionProvider>(ep: E) -> ExecutionProviderDispatch {
+		fn register<E: ExecutionProvider>(ep: *const (), session_builder: &mut SessionBuilder) -> Result<()> {
+			let ep = unsafe { &*ep.cast::<E>() };
+			ep.register(session_builder)
+		}
+
+		fn ep_drop<E: ExecutionProvider>(ep: *mut ()) {
+			let _ = unsafe { Arc::from_raw(ep.cast::<E>()) };
+		}
+
+		ExecutionProviderDispatch {
+			ep: (Arc::into_raw(Arc::new(ep)) as *mut E).cast(),
+			vtable: &ExecutionProviderVTable {
+				name: E::NAME,
+				register: register::<E>,
+				drop: ep_drop::<E>
+			},
+			error_on_failure: false
+		}
+	}
+
+	/// Configures this execution provider to silently log an error if registration of the EP fails.
+	/// This is the default behavior; it can be overridden with [`ExecutionProviderDispatch::error_on_failure`].
+	pub fn fail_silently(mut self) -> Self {
+		self.error_on_failure = false;
+		self
+	}
+
+	/// Configures this execution provider to return an error upon EP registration if registration of this EP fails.
+	/// The default behavior is to silently fail and fall back to the next execution provider, or the CPU provider if no
+	/// registrations succeed.
+	pub fn error_on_failure(mut self) -> Self {
+		self.error_on_failure = true;
+		self
+	}
+
+	#[inline(always)]
+	pub fn name(&self) -> &'static str {
+		self.vtable.name
+	}
+
+	#[inline(always)]
+	pub fn register(&self, session_builder: &mut SessionBuilder) -> Result<()> {
+		(self.vtable.register)(self.ep, session_builder)
+	}
+}
+
+impl Drop for ExecutionProviderDispatch {
+	fn drop(&mut self) {
+		(self.vtable.drop)(self.ep);
+	}
+}
+
+/// The strategy for extending the device memory arena.
+#[derive(Debug, Default, Clone)]
+pub enum ArenaExtendStrategy {
+	/// (Default) Subsequent extensions extend by larger amounts (multiplied by powers of two)
+	#[default]
+	NextPowerOfTwo,
+	/// Memory extends by the requested amount.
+	SameAsRequested
+}
+
+impl fmt::Display for ArenaExtendStrategy {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::NextPowerOfTwo => f.write_str("kNextPowerOfTwo"),
+			Self::SameAsRequested => f.write_str("kSameAsRequested")
+		}
+	}
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct ExecutionProviderOptions(MiniMap<CString, CString>);
+
+impl ExecutionProviderOptions {
+	pub fn set(&mut self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) {
+		self.0
+			.insert(CString::new(key).expect("unexpected nul in key string"), CString::new(value).expect("unexpected nul in value string"));
+	}
+
+	#[allow(unused)]
+	pub(crate) fn to_ffi(&self) -> ExecutionProviderOptionsFFI {
+		let (key_ptrs, value_ptrs) = self.0.iter().map(|(k, v)| (k.as_ptr(), v.as_ptr())).unzip();
+		ExecutionProviderOptionsFFI { key_ptrs, value_ptrs }
+	}
+}
+
+#[allow(unused)]
+pub(crate) struct ExecutionProviderOptionsFFI {
+	key_ptrs: Vec<*const c_char>,
+	value_ptrs: Vec<*const c_char>
+}
+
+#[allow(unused)]
+impl ExecutionProviderOptionsFFI {
+	pub fn key_ptrs(&self) -> *const *const c_char {
+		self.key_ptrs.as_ptr()
+	}
+
+	pub fn value_ptrs(&self) -> *const *const c_char {
+		self.value_ptrs.as_ptr()
+	}
+
+	pub fn len(&self) -> usize {
+		self.key_ptrs.len()
+	}
+}
+
+#[allow(unused)]
+macro_rules! define_ep_register {
+	($symbol:ident($($id:ident: $type:ty),*) -> $rt:ty) => {
+		#[cfg(all(feature = "load-dynamic", not(all(target_family = "wasm", target_os = "unknown"))))]
+		#[allow(non_snake_case)]
+		let $symbol = unsafe {
+			let dylib = $crate::load_dynamic::G_ORT_LIB.get().expect("dylib not yet initialized");
+			let symbol: ::core::result::Result<
+				::libloading::Symbol<unsafe extern "C" fn($($id: $type),*) -> $rt>,
+				::libloading::Error
+			> = dylib.get(stringify!($symbol).as_bytes());
+			match symbol {
+				Ok(symbol) => symbol.into_raw(),
+				Err(e) => {
+					return ::core::result::Result::Err($crate::Error::new(::alloc::format!("Error attempting to load symbol `{}` from dynamic library: {}", stringify!($symbol), e)));
+				}
+			}
+		};
+		#[cfg(not(all(feature = "load-dynamic", not(all(target_family = "wasm", target_os = "unknown")))))]
+		unsafe extern "C" {
+			fn $symbol($($id: $type),*) -> $rt;
+		}
+	};
+}
+#[allow(unused)]
+pub(crate) use define_ep_register;
+
+/// Registers an EP whose options go through a `Create*ProviderOptions` struct, filled via `Update*ProviderOptions`.
+#[allow(unused)]
+macro_rules! register_with_options_struct {
+	($options:expr, $session_builder:expr, $ty:ty, $create:ident, $update:ident, $release:ident, $append:ident) => {{
+		let mut options: *mut $ty = ::core::ptr::null_mut();
+		$crate::ortsys![unsafe $create(&mut options)?];
+		let _guard = $crate::util::run_on_drop(|| $crate::ortsys![unsafe $release(options)]);
+
+		let ffi_options = $options.to_ffi();
+		$crate::ortsys![unsafe $update(options, ffi_options.key_ptrs(), ffi_options.value_ptrs(), ffi_options.len())?];
+		$crate::ortsys![unsafe $append($session_builder.ptr_mut(), options)?];
+		Ok(())
+	}};
+}
+#[allow(unused)]
+pub(crate) use register_with_options_struct;
+
+macro_rules! impl_ep {
+	(arbitrary; $symbol:ident) => {
+		$crate::ep::impl_ep!($symbol);
+
+		impl $crate::ep::ArbitrarilyConfigurableExecutionProvider for $symbol {
+			fn options_mut(&mut self) -> &mut $crate::ep::ExecutionProviderOptions {
+				&mut self.0
+			}
+		}
+	};
+	($symbol:ident) => {
+		impl $symbol {
+			#[must_use]
+			pub fn build(self) -> $crate::ep::ExecutionProviderDispatch {
+				self.into()
+			}
+		}
+
+		impl From<$symbol> for $crate::ep::ExecutionProviderDispatch {
+			fn from(value: $symbol) -> Self {
+				$crate::ep::ExecutionProviderDispatch::new(value)
+			}
+		}
+	};
+}
+pub(crate) use impl_ep;
+
+macro_rules! define_options {
+	($(
+        $(#[$attr:meta])*
+		$vis:vis fn $fn_name:ident(mut self, $arg_name:ident: $type:ty) -> Self = $opt_name:expr;
+	)*) => {
+		$(
+			$(#[$attr])*
+			#[must_use]
+			$vis fn $fn_name(mut self, $arg_name: $type) -> Self {
+				self.0.set($opt_name, define_options!(@to_str($arg_name: $type)));
+				self
+			}
+		)*
+	};
+
+	(@to_str($v:ident: bool)) => { if $v { "1" } else { "0" } };
+	(@to_str($v:ident: $ty:ty)) => { ::alloc::string::ToString::to_string(&($v)) };
+}
+pub(crate) use define_options;
+
+pub(crate) fn apply_execution_providers(session_builder: &mut SessionBuilder, eps: &[ExecutionProviderDispatch], source: &'static str) -> Result<()> {
+	fn register_inner(session_builder: &mut SessionBuilder, ep: &ExecutionProviderDispatch, #[allow(unused)] source: &'static str) -> Result<bool> {
+		if let Err(e) = ep.register(session_builder) {
+			if ep.error_on_failure {
+				return Err(e);
+			}
+
+			crate::error!(%source, "An error occurred when attempting to register `{}`: {e}", ep.vtable.name);
+			Ok(false)
+		} else {
+			crate::info!(%source, "Successfully registered `{}`", ep.vtable.name);
+			Ok(true)
+		}
+	}
+
+	let mut fallback_to_cpu = !eps.is_empty();
+	for ep in eps {
+		if register_inner(session_builder, ep, source)? {
+			fallback_to_cpu = false;
+		}
+	}
+	if fallback_to_cpu {
+		crate::warn!("No execution providers from {source} registered successfully; may fall back to CPU.");
+	}
+	Ok(())
+}
+
+fn is_ep_available(name: &str) -> Result<bool> {
+	let mut providers: *mut *mut c_char = ptr::null_mut();
+	let mut num_providers = 0;
+	ortsys![unsafe GetAvailableProviders(&mut providers, &mut num_providers)?];
+	if providers.is_null() {
+		return Ok(false);
+	}
+
+	let _guard = run_on_drop(|| ortsys![unsafe ReleaseAvailableProviders(providers, num_providers).expect("infallible")]);
+
+	for i in 0..num_providers {
+		if name == char_p_to_string(unsafe { *providers.offset(i as isize) })? {
+			return Ok(true);
+		}
+	}
+
+	Ok(false)
+}
+
+pub trait ExecutionProviderResource {
+	type Type;
+
+	const VERSION: u32;
+
+	fn id(&self) -> u32;
+
+	#[doc(hidden)]
+	fn convert(value: *const core::ffi::c_void) -> Self::Type;
+}
+
+pub mod cpu;
+pub use self::cpu::CPU;
+
+// I hope you like attributes!
+#[cfg(feature = "cuda")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cuda")))]
+pub mod cuda;
+#[cfg(feature = "cuda")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cuda")))]
+pub use self::cuda::CUDA;
+#[cfg(feature = "tensorrt")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tensorrt")))]
+pub mod tensorrt;
+#[cfg(feature = "tensorrt")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tensorrt")))]
+pub use self::tensorrt::TensorRT;
+#[cfg(feature = "onednn")]
+#[cfg_attr(docsrs, doc(cfg(feature = "onednn")))]
+#[doc(alias = "dnnl")]
+pub mod onednn;
+#[cfg(feature = "onednn")]
+#[cfg_attr(docsrs, doc(cfg(feature = "onednn")))]
+#[doc(alias = "DNNL")]
+pub use self::onednn::OneDNN;
+#[cfg(feature = "acl")]
+#[cfg_attr(docsrs, doc(cfg(feature = "acl")))]
+pub mod acl;
+#[cfg(feature = "acl")]
+#[cfg_attr(docsrs, doc(cfg(feature = "acl")))]
+pub use self::acl::ACL;
+#[cfg(feature = "openvino")]
+#[cfg_attr(docsrs, doc(cfg(feature = "openvino")))]
+pub mod openvino;
+#[cfg(feature = "openvino")]
+#[cfg_attr(docsrs, doc(cfg(feature = "openvino")))]
+pub use self::openvino::OpenVINO;
+#[cfg(feature = "coreml")]
+#[cfg_attr(docsrs, doc(cfg(feature = "coreml")))]
+pub mod coreml;
+#[cfg(feature = "coreml")]
+#[cfg_attr(docsrs, doc(cfg(feature = "coreml")))]
+pub use self::coreml::CoreML;
+#[cfg(feature = "rocm")]
+#[cfg_attr(docsrs, doc(cfg(feature = "rocm")))]
+pub mod rocm;
+#[cfg(feature = "rocm")]
+#[cfg_attr(docsrs, doc(cfg(feature = "rocm")))]
+pub use self::rocm::ROCm;
+#[cfg(feature = "cann")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cann")))]
+pub mod cann;
+#[cfg(feature = "cann")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cann")))]
+pub use self::cann::CANN;
+#[cfg(feature = "directml")]
+#[cfg_attr(docsrs, doc(cfg(feature = "directml")))]
+pub mod directml;
+#[cfg(feature = "directml")]
+#[cfg_attr(docsrs, doc(cfg(feature = "directml")))]
+pub use self::directml::DirectML;
+#[cfg(feature = "tvm")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tvm")))]
+pub mod tvm;
+#[cfg(feature = "tvm")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tvm")))]
+pub use self::tvm::TVM;
+#[cfg(feature = "nnapi")]
+#[cfg_attr(docsrs, doc(cfg(feature = "nnapi")))]
+pub mod nnapi;
+#[cfg(feature = "nnapi")]
+#[cfg_attr(docsrs, doc(cfg(feature = "nnapi")))]
+pub use self::nnapi::NNAPI;
+#[cfg(feature = "qnn")]
+#[cfg_attr(docsrs, doc(cfg(feature = "qnn")))]
+pub mod qnn;
+#[cfg(feature = "qnn")]
+#[cfg_attr(docsrs, doc(cfg(feature = "qnn")))]
+pub use self::qnn::QNN;
+#[cfg(feature = "xnnpack")]
+#[cfg_attr(docsrs, doc(cfg(feature = "xnnpack")))]
+pub mod xnnpack;
+#[cfg(feature = "xnnpack")]
+#[cfg_attr(docsrs, doc(cfg(feature = "xnnpack")))]
+pub use self::xnnpack::XNNPACK;
+#[cfg(feature = "armnn")]
+#[cfg_attr(docsrs, doc(cfg(feature = "armnn")))]
+pub mod armnn;
+#[cfg(feature = "armnn")]
+#[cfg_attr(docsrs, doc(cfg(feature = "armnn")))]
+#[allow(deprecated)]
+pub use self::armnn::ArmNN;
+#[cfg(feature = "migraphx")]
+#[cfg_attr(docsrs, doc(cfg(feature = "migraphx")))]
+pub mod migraphx;
+#[cfg(feature = "migraphx")]
+#[cfg_attr(docsrs, doc(cfg(feature = "migraphx")))]
+pub use self::migraphx::MIGraphX;
+#[cfg(all(feature = "api-18", feature = "vitis"))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "api-18", feature = "vitis"))))]
+pub mod vitis;
+#[cfg(all(feature = "api-18", feature = "vitis"))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "api-18", feature = "vitis"))))]
+pub use self::vitis::Vitis;
+#[cfg(feature = "rknpu")]
+#[cfg_attr(docsrs, doc(cfg(feature = "rknpu")))]
+pub mod rknpu;
+#[cfg(feature = "rknpu")]
+#[cfg_attr(docsrs, doc(cfg(feature = "rknpu")))]
+pub use self::rknpu::RKNPU;
+#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "webgpu"))]
+#[cfg_attr(docsrs, doc(cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "webgpu"))))]
+pub mod webgpu;
+#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "webgpu"))]
+#[cfg_attr(docsrs, doc(cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "webgpu"))))]
+pub use self::webgpu::WebGPU;
+#[cfg(feature = "azure")]
+#[cfg_attr(docsrs, doc(cfg(feature = "azure")))]
+pub mod azure;
+#[cfg(feature = "azure")]
+#[cfg_attr(docsrs, doc(cfg(feature = "azure")))]
+pub use self::azure::Azure;
+#[cfg(feature = "vsinpu")]
+#[cfg_attr(docsrs, doc(cfg(feature = "vsinpu")))]
+pub mod vsinpu;
+#[cfg(feature = "vsinpu")]
+#[cfg_attr(docsrs, doc(cfg(feature = "vsinpu")))]
+pub use self::vsinpu::VSINPU;
+#[cfg(feature = "nvrtx")]
+#[cfg_attr(docsrs, doc(cfg(feature = "nvrtx")))]
+pub mod nvrtx;
+#[cfg(feature = "nvrtx")]
+#[cfg_attr(docsrs, doc(cfg(feature = "nvrtx")))]
+pub use self::nvrtx::NVRTX;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+pub mod wasm;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+pub mod webnn;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+pub use self::{wasm::WASM, webnn::WebNN};

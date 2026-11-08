@@ -1,0 +1,996 @@
+use super::prelude::*;
+
+impl NodeCodegen for onnx_ir::modulo::ModNode {
+    fn inputs(&self) -> &[Argument] {
+        // Filter inputs only dynamic and constant
+        &self.inputs
+    }
+
+    fn outputs(&self) -> &[Argument] {
+        &self.outputs
+    }
+
+    fn forward(&self, scope: &mut ScopeAtPosition<'_>) -> TokenStream {
+        let output = arg_to_ident(self.outputs.first().unwrap());
+
+        let lhs_arg = &self.inputs[0];
+        let rhs_arg = &self.inputs[1];
+
+        let lhs = scope.arg(lhs_arg);
+        let rhs = scope.arg(rhs_arg);
+
+        match (&lhs_arg.ty, &rhs_arg.ty) {
+            (lhs_ty, rhs_ty) if lhs_ty.is_on_device() && rhs_ty.is_on_device() => {
+                let lhs_rank = lhs_ty.rank();
+                let rhs_rank = rhs_ty.rank();
+
+                let lhs_bc =
+                    broadcast_helpers::leading_broadcast(quote! { #lhs }, lhs_rank, rhs_rank);
+                let rhs_bc =
+                    broadcast_helpers::leading_broadcast(quote! { #rhs }, rhs_rank, lhs_rank);
+
+                let expr = if self.config.fmod {
+                    fmod(lhs_bc, rhs_bc, &lhs_ty.elem_type())
+                } else {
+                    quote! { #lhs_bc.remainder(#rhs_bc) }
+                };
+                quote! {
+                    let #output = #expr;
+                }
+            }
+            (lhs_ty, ArgType::ScalarNative(_)) if lhs_ty.is_on_device() => {
+                let expr = if self.config.fmod {
+                    fmod_scalar(lhs, rhs, &lhs_ty.elem_type())
+                } else {
+                    quote! { #lhs.remainder_scalar(#rhs) }
+                };
+                quote! {
+                    let #output = #expr;
+                }
+            }
+            (ArgType::ScalarNative(lhs_dtype), ArgType::ScalarNative(_)) => {
+                let lhs = arg_to_ident(lhs_arg);
+                let rhs = arg_to_ident(rhs_arg);
+                // ONNX Mod with fmod=0 (default) is Python-style: the result
+                // has the sign of the divisor. Rust's `%` is C-style: the
+                // result has the sign of the dividend. They coincide on
+                // non-negative integers and on floats, but diverge on signed
+                // integers with a negative operand. Use `rem_euclid` for the
+                // signed-integer fmod=0 case to get Python semantics. For
+                // floats and for fmod=1 (C-style fmod), `%` is already
+                // correct. Unsigned ints can never produce a negative result
+                // so `%` is also correct there.
+                let expr = if !self.config.fmod && lhs_dtype.is_int() {
+                    quote! { #lhs.rem_euclid(#rhs) }
+                } else {
+                    quote! { #lhs % #rhs }
+                };
+                quote! {
+                    let #output = #expr;
+                }
+            }
+            (ArgType::ScalarNative(dtype), rhs_ty) if rhs_ty.is_on_device() => {
+                let dtype_tokens = dtype.to_tokens();
+                let rhs_rank = rhs_ty.rank();
+
+                let (tensor_type, cast_as) = if dtype.is_float() {
+                    (quote! { Tensor::<1> }, quote! { f64 })
+                } else {
+                    (quote! { Tensor::<1, burn::tensor::Int> }, quote! { i64 })
+                };
+
+                let lhs_tensor = if rhs_rank > 1 {
+                    let dims: Vec<isize> = (0..rhs_rank - 1).map(|i| i as isize).collect();
+                    quote! {
+                        #tensor_type::from_data(
+                            burn::tensor::TensorData::from([#lhs as #cast_as]),
+                            (&self.device, #dtype_tokens)
+                        ).unsqueeze_dims(&[#(#dims),*])
+                    }
+                } else {
+                    quote! {
+                        #tensor_type::from_data(
+                            burn::tensor::TensorData::from([#lhs as #cast_as]),
+                            (&self.device, #dtype_tokens)
+                        )
+                    }
+                };
+
+                let expr = if self.config.fmod {
+                    fmod(lhs_tensor, quote! { #rhs }, dtype)
+                } else {
+                    quote! { #lhs_tensor.remainder(#rhs) }
+                };
+                quote! {
+                    let #output = #expr;
+                }
+            }
+            // Shape values are `[i64; N]` arrays representing tensor dimensions.
+            // In practice they come from the ONNX `Shape` op (always non-negative)
+            // or from Shape arithmetic like sub.rs, which uses `saturating_sub` to
+            // clamp at 0. For non-negative integers Rust's `%`, ONNX fmod, and ONNX
+            // remainder all coincide, so a plain elementwise `%` covers both
+            // config.fmod variants here. If a future producer ever lets negative
+            // Shape values reach this arm, the `fmod=0` path would need to switch
+            // to `rem_euclid` to match ONNX semantics.
+            (ArgType::Shape(lhs_len), ArgType::Shape(rhs_len)) => {
+                let expr = broadcast_helpers::shape_binary_elementwise(
+                    quote! { #lhs },
+                    *lhs_len,
+                    quote! { #rhs },
+                    *rhs_len,
+                    |a, b| quote! { #a % #b },
+                );
+                quote! {
+                    let #output = #expr;
+                }
+            }
+            (ArgType::Shape(_), rhs_ty) if rhs_ty.is_scalar() => {
+                let scalar_expr = scalar_as_i64(rhs_arg, rhs.clone());
+                quote! {
+                    let #output = {
+                        let mut result = #lhs;
+                        let scalar = #scalar_expr;
+                        for result_item in result.iter_mut() {
+                            *result_item %= scalar;
+                        }
+                        result
+                    };
+                }
+            }
+            (lhs_ty, ArgType::Shape(_)) if lhs_ty.is_scalar() => {
+                let scalar_expr = scalar_as_i64(lhs_arg, lhs.clone());
+                quote! {
+                    let #output = {
+                        let mut result = #rhs;
+                        let scalar = #scalar_expr;
+                        for result_item in result.iter_mut() {
+                            *result_item = scalar % *result_item;
+                        }
+                        result
+                    };
+                }
+            }
+            (ArgType::Shape(_), rhs_ty) if rhs_ty.is_on_device() => {
+                let dtype_tokens = rhs_ty.elem_type().to_tokens();
+                let lhs_tensor = quote! {
+                    Tensor::<1, burn::tensor::Int>::from_data(
+                        burn::tensor::TensorData::from(&#lhs as &[i64]),
+                        (&self.device, #dtype_tokens)
+                    )
+                };
+                let expr = if self.config.fmod {
+                    fmod(lhs_tensor, quote! { #rhs }, &rhs_ty.elem_type())
+                } else {
+                    quote! { #lhs_tensor.remainder(#rhs) }
+                };
+                quote! {
+                    let #output = #expr;
+                }
+            }
+            (lhs_ty, ArgType::Shape(_)) if lhs_ty.is_on_device() => {
+                let dtype_tokens = lhs_ty.elem_type().to_tokens();
+                let rhs_tensor = quote! {
+                    Tensor::<1, burn::tensor::Int>::from_data(
+                        burn::tensor::TensorData::from(&#rhs as &[i64]),
+                        (&self.device, #dtype_tokens)
+                    )
+                };
+                let expr = if self.config.fmod {
+                    fmod(quote! { #lhs }, rhs_tensor, &lhs_ty.elem_type())
+                } else {
+                    quote! { #lhs.remainder(#rhs_tensor) }
+                };
+                quote! {
+                    let #output = #expr;
+                }
+            }
+            _ => panic!(
+                "Unsupported Mod input types: lhs={:?}, rhs={:?}",
+                lhs_arg.ty, rhs_arg.ty
+            ),
+        }
+    }
+}
+
+/// ONNX `fmod=1` (truncated: the result takes the dividend's sign) of two tensors.
+///
+/// burn's `fmod` is float-only. For integers, `|a| mod |b|` agrees between the floored
+/// `remainder` burn has and truncation, so the dividend's sign is applied afterwards.
+/// Unsigned values have no sign to fix.
+fn fmod(lhs: TokenStream, rhs: TokenStream, dtype: &DType) -> TokenStream {
+    if dtype.is_float() {
+        quote! { #lhs.fmod(#rhs) }
+    } else if dtype.is_uint() {
+        quote! { #lhs.remainder(#rhs) }
+    } else {
+        quote! {{
+            let dividend = #lhs;
+            dividend.clone().abs().remainder(#rhs.abs()) * dividend.sign()
+        }}
+    }
+}
+
+/// [`fmod`] with a native scalar divisor.
+fn fmod_scalar(lhs: TokenStream, rhs: TokenStream, dtype: &DType) -> TokenStream {
+    if dtype.is_float() {
+        quote! { #lhs.fmod_scalar(#rhs) }
+    } else if dtype.is_uint() {
+        quote! { #lhs.remainder_scalar(#rhs) }
+    } else {
+        quote! {{
+            let dividend = #lhs;
+            dividend.clone().abs().remainder_scalar((#rhs).abs()) * dividend.sign()
+        }}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_helpers::*;
+    use burn::tensor::DType;
+    use insta::assert_snapshot;
+    use onnx_ir::modulo::{ModConfig, ModNodeBuilder};
+
+    #[test]
+    fn swapped_operand_names_are_accepted() {
+        // remainder is called on the operands directly, with no `lhs`/`rhs`
+        // temporaries that operands with those names could shadow.
+        let config = ModConfig::new(false);
+        let node = ModNodeBuilder::new("mod1")
+            .input_tensor("rhs", 2, DType::F32)
+            .input_tensor("lhs", 2, DType::F32)
+            .output_tensor("output", 2, DType::F32)
+            .config(config)
+            .build();
+        assert!(shadow_check_result(&node).is_ok());
+    }
+
+    // --- on_device + on_device (same rank) ---
+
+    #[test]
+    fn test_remainder_tensor_tensor_same_rank() {
+        let config = ModConfig::new(false);
+        let node = ModNodeBuilder::new("mod1")
+            .input_tensor("a", 2, DType::F32)
+            .input_tensor("b", 2, DType::F32)
+            .output_tensor("output", 2, DType::F32)
+            .config(config)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, a: Tensor<2>, b: Tensor<2>) -> Tensor<2> {
+            let output = a.remainder(b);
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_fmod_tensor_tensor_same_rank() {
+        let config = ModConfig::new(true);
+        let node = ModNodeBuilder::new("mod1")
+            .input_tensor("a", 2, DType::F32)
+            .input_tensor("b", 2, DType::F32)
+            .output_tensor("output", 2, DType::F32)
+            .config(config)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, a: Tensor<2>, b: Tensor<2>) -> Tensor<2> {
+            let output = a.fmod(b);
+            output
+        }
+        ");
+    }
+
+    // --- on_device + on_device (broadcast) ---
+
+    #[test]
+    fn test_remainder_broadcast_lhs_smaller() {
+        let config = ModConfig::new(false);
+        let node = ModNodeBuilder::new("mod1")
+            .input_tensor("a", 2, DType::F32)
+            .input_tensor("b", 3, DType::F32)
+            .output_tensor("output", 3, DType::F32)
+            .config(config)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, a: Tensor<2>, b: Tensor<3>) -> Tensor<3> {
+            let output = (a).unsqueeze_dims(&[0isize]).remainder(b);
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_remainder_broadcast_rhs_smaller() {
+        let config = ModConfig::new(false);
+        let node = ModNodeBuilder::new("mod1")
+            .input_tensor("a", 3, DType::F32)
+            .input_tensor("b", 2, DType::F32)
+            .output_tensor("output", 3, DType::F32)
+            .config(config)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, a: Tensor<3>, b: Tensor<2>) -> Tensor<3> {
+            let output = a.remainder((b).unsqueeze_dims(&[0isize]));
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_fmod_broadcast_lhs_smaller() {
+        let config = ModConfig::new(true);
+        let node = ModNodeBuilder::new("mod1")
+            .input_tensor("a", 2, DType::F32)
+            .input_tensor("b", 3, DType::F32)
+            .output_tensor("output", 3, DType::F32)
+            .config(config)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, a: Tensor<2>, b: Tensor<3>) -> Tensor<3> {
+            let output = (a).unsqueeze_dims(&[0isize]).fmod(b);
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_fmod_broadcast_rhs_smaller() {
+        let config = ModConfig::new(true);
+        let node = ModNodeBuilder::new("mod1")
+            .input_tensor("a", 3, DType::F32)
+            .input_tensor("b", 2, DType::F32)
+            .output_tensor("output", 3, DType::F32)
+            .config(config)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, a: Tensor<3>, b: Tensor<2>) -> Tensor<3> {
+            let output = a.fmod((b).unsqueeze_dims(&[0isize]));
+            output
+        }
+        ");
+    }
+
+    // --- on_device + on_device (ScalarTensor broadcast) ---
+
+    #[test]
+    fn test_remainder_tensor_scalar_tensor() {
+        let config = ModConfig::new(false);
+        let node = ModNodeBuilder::new("mod1")
+            .input_tensor("a", 3, DType::F32)
+            .input_scalar_tensor("b", DType::F32)
+            .output_tensor("output", 3, DType::F32)
+            .config(config)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, a: Tensor<3>, b: Tensor<1>) -> Tensor<3> {
+            let output = a.remainder((b).unsqueeze_dims(&[0isize, 1isize]));
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_fmod_tensor_scalar_tensor() {
+        let config = ModConfig::new(true);
+        let node = ModNodeBuilder::new("mod1")
+            .input_tensor("a", 3, DType::F32)
+            .input_scalar_tensor("b", DType::F32)
+            .output_tensor("output", 3, DType::F32)
+            .config(config)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, a: Tensor<3>, b: Tensor<1>) -> Tensor<3> {
+            let output = a.fmod((b).unsqueeze_dims(&[0isize, 1isize]));
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_remainder_scalar_tensor_scalar_tensor() {
+        let config = ModConfig::new(false);
+        let node = ModNodeBuilder::new("mod1")
+            .input_scalar_tensor("a", DType::F32)
+            .input_scalar_tensor("b", DType::F32)
+            .output_scalar_tensor("output", DType::F32)
+            .config(config)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, a: Tensor<1>, b: Tensor<1>) -> Tensor<1> {
+            let output = a.remainder(b);
+            output
+        }
+        ");
+    }
+
+    // --- ScalarNative + ScalarNative ---
+
+    #[test]
+    fn test_remainder_scalar_native_scalar_native_signed_int() {
+        // ONNX Mod fmod=0 on signed ints is Python-style: sign follows
+        // divisor. Rust's `%` is C-style (sign follows dividend), so we
+        // must lower to `rem_euclid` to match ONNX semantics on negative
+        // inputs. Without this fix, Mod(-7, 3) would emit `a % b`, which
+        // evaluates to -1 in Rust versus ONNX's 2.
+        let config = ModConfig::new(false);
+        let node = ModNodeBuilder::new("mod1")
+            .input_scalar("a", DType::I64)
+            .input_scalar("b", DType::I64)
+            .output_scalar("output", DType::I64)
+            .config(config)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, a: i64, b: i64) -> i64 {
+            let output = a.rem_euclid(b);
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_fmod_scalar_native_scalar_native_signed_int() {
+        // fmod=1 is C-style (sign follows dividend), which matches Rust's
+        // `%` directly. No `rem_euclid` call.
+        let config = ModConfig::new(true);
+        let node = ModNodeBuilder::new("mod1")
+            .input_scalar("a", DType::I64)
+            .input_scalar("b", DType::I64)
+            .output_scalar("output", DType::I64)
+            .config(config)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, a: i64, b: i64) -> i64 {
+            let output = a % b;
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_remainder_scalar_native_scalar_native_float() {
+        // ONNX Mod with `fmod=0` on float operands is out of spec: the
+        // ONNX Mod op requires `fmod=1` whenever the operands are
+        // floating-point, so a well-formed graph never reaches this
+        // branch with floats and `fmod=0`. We keep Rust's `%` here
+        // because it matches C-style fmod (which is what `fmod=1` asks
+        // for) and because the signed-int-only `rem_euclid` guard
+        // naturally skips floats. This test just pins that the emitted
+        // code is a plain `%` so any future refactor that conflates the
+        // float and signed-int arms shows up as a snapshot diff.
+        let config = ModConfig::new(false);
+        let node = ModNodeBuilder::new("mod1")
+            .input_scalar("a", DType::F32)
+            .input_scalar("b", DType::F32)
+            .output_scalar("output", DType::F32)
+            .config(config)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, a: f32, b: f32) -> f32 {
+            let output = a % b;
+            output
+        }
+        ");
+    }
+
+    // --- on_device + ScalarNative ---
+
+    #[test]
+    fn test_remainder_tensor_scalar_native() {
+        let config = ModConfig::new(false);
+        let node = ModNodeBuilder::new("mod1")
+            .input_tensor("a", 2, DType::F32)
+            .input_scalar("b", DType::F32)
+            .output_tensor("output", 2, DType::F32)
+            .config(config)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, a: Tensor<2>, b: f32) -> Tensor<2> {
+            let output = a.remainder_scalar(b);
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_fmod_tensor_scalar_native() {
+        let config = ModConfig::new(true);
+        let node = ModNodeBuilder::new("mod1")
+            .input_tensor("a", 2, DType::F32)
+            .input_scalar("b", DType::F32)
+            .output_tensor("output", 2, DType::F32)
+            .config(config)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, a: Tensor<2>, b: f32) -> Tensor<2> {
+            let output = a.fmod_scalar(b);
+            output
+        }
+        ");
+    }
+
+    // --- ScalarNative + on_device ---
+
+    #[test]
+    fn test_remainder_scalar_native_tensor() {
+        let config = ModConfig::new(false);
+        let node = ModNodeBuilder::new("mod1")
+            .input_scalar("a", DType::F32)
+            .input_tensor("b", 2, DType::F32)
+            .output_tensor("output", 2, DType::F32)
+            .config(config)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, a: f32, b: Tensor<2>) -> Tensor<2> {
+            let output = Tensor::<
+                1,
+            >::from_data(
+                    burn::tensor::TensorData::from([a as f64]),
+                    (&self.device, burn::tensor::DType::F32),
+                )
+                .unsqueeze_dims(&[0isize])
+                .remainder(b);
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_fmod_scalar_native_tensor() {
+        let config = ModConfig::new(true);
+        let node = ModNodeBuilder::new("mod1")
+            .input_scalar("a", DType::F32)
+            .input_tensor("b", 2, DType::F32)
+            .output_tensor("output", 2, DType::F32)
+            .config(config)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, a: f32, b: Tensor<2>) -> Tensor<2> {
+            let output = Tensor::<
+                1,
+            >::from_data(
+                    burn::tensor::TensorData::from([a as f64]),
+                    (&self.device, burn::tensor::DType::F32),
+                )
+                .unsqueeze_dims(&[0isize])
+                .fmod(b);
+            output
+        }
+        ");
+    }
+
+    // --- Shape + Shape ---
+
+    // `fmod` coverage for the Shape/Shape, Shape/ScalarNative, and
+    // ScalarNative/Shape arms: these arms deliberately ignore config.fmod
+    // because Shape values are non-negative in practice and Rust's `%`
+    // coincides with both fmod and remainder on non-negative integers.
+    // These tests pin that behavior so any accidental split of an arm into
+    // fmod/remainder branches shows up as a snapshot diff.
+    #[test]
+    fn test_fmod_shape_shape() {
+        let config = ModConfig::new(true);
+        let node = ModNodeBuilder::new("mod1")
+            .input_shape("lhs", 4)
+            .input_shape("rhs", 4)
+            .output_shape("output", 4)
+            .config(config)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, lhs: [i64; 4], rhs: [i64; 4]) -> [i64; 4] {
+            let output = {
+                let __lhs = lhs;
+                let __rhs = rhs;
+                core::array::from_fn::<i64, 4usize, _>(|__i| __lhs[__i] % __rhs[__i])
+            };
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_shape_shape() {
+        let config = ModConfig::new(false);
+        let node = ModNodeBuilder::new("mod1")
+            .input_shape("lhs", 4)
+            .input_shape("rhs", 4)
+            .output_shape("output", 4)
+            .config(config)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, lhs: [i64; 4], rhs: [i64; 4]) -> [i64; 4] {
+            let output = {
+                let __lhs = lhs;
+                let __rhs = rhs;
+                core::array::from_fn::<i64, 4usize, _>(|__i| __lhs[__i] % __rhs[__i])
+            };
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_shape_shape_broadcast_lhs() {
+        let config = ModConfig::new(false);
+        let node = ModNodeBuilder::new("mod1")
+            .input_shape("lhs", 1)
+            .input_shape("rhs", 4)
+            .output_shape("output", 4)
+            .config(config)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, lhs: [i64; 1], rhs: [i64; 4]) -> [i64; 4] {
+            let output = {
+                let __lhs = lhs;
+                let __rhs = rhs;
+                core::array::from_fn::<i64, 4usize, _>(|__i| __lhs[0] % __rhs[__i])
+            };
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_shape_shape_broadcast_rhs() {
+        let config = ModConfig::new(false);
+        let node = ModNodeBuilder::new("mod1")
+            .input_shape("lhs", 4)
+            .input_shape("rhs", 1)
+            .output_shape("output", 4)
+            .config(config)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, lhs: [i64; 4], rhs: [i64; 1]) -> [i64; 4] {
+            let output = {
+                let __lhs = lhs;
+                let __rhs = rhs;
+                core::array::from_fn::<i64, 4usize, _>(|__i| __lhs[__i] % __rhs[0])
+            };
+            output
+        }
+        ");
+    }
+
+    // --- Shape + ScalarNative ---
+
+    #[test]
+    fn test_mod_shape_scalar_native() {
+        let config = ModConfig::new(false);
+        let node = ModNodeBuilder::new("mod1")
+            .input_shape("lhs", 3)
+            .input_scalar("rhs", DType::I64)
+            .output_shape("output", 3)
+            .config(config)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, lhs: [i64; 3], rhs: i64) -> [i64; 3] {
+            let output = {
+                let mut result = lhs;
+                let scalar = rhs;
+                for result_item in result.iter_mut() {
+                    *result_item %= scalar;
+                }
+                result
+            };
+            output
+        }
+        ");
+    }
+
+    // --- ScalarNative + Shape ---
+
+    #[test]
+    fn test_mod_scalar_native_shape() {
+        let config = ModConfig::new(false);
+        let node = ModNodeBuilder::new("mod1")
+            .input_scalar("lhs", DType::I64)
+            .input_shape("rhs", 3)
+            .output_shape("output", 3)
+            .config(config)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, lhs: i64, rhs: [i64; 3]) -> [i64; 3] {
+            let output = {
+                let mut result = rhs;
+                let scalar = lhs;
+                for result_item in result.iter_mut() {
+                    *result_item = scalar % *result_item;
+                }
+                result
+            };
+            output
+        }
+        ");
+    }
+
+    // --- Shape + on_device ---
+
+    #[test]
+    fn test_mod_shape_tensor() {
+        let config = ModConfig::new(false);
+        let node = ModNodeBuilder::new("mod1")
+            .input_shape("lhs", 3)
+            .input_tensor("rhs", 1, DType::I64)
+            .output_tensor("output", 1, DType::I64)
+            .config(config)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, lhs: [i64; 3], rhs: Tensor<1, Int>) -> Tensor<1, Int> {
+            let output = Tensor::<
+                1,
+                burn::tensor::Int,
+            >::from_data(
+                    burn::tensor::TensorData::from(&lhs as &[i64]),
+                    (&self.device, burn::tensor::DType::I64),
+                )
+                .remainder(rhs);
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_fmod_shape_tensor() {
+        let config = ModConfig::new(true);
+        let node = ModNodeBuilder::new("mod1")
+            .input_shape("lhs", 3)
+            .input_tensor("rhs", 1, DType::I64)
+            .output_tensor("output", 1, DType::I64)
+            .config(config)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, lhs: [i64; 3], rhs: Tensor<1, Int>) -> Tensor<1, Int> {
+            let output = {
+                let dividend = Tensor::<
+                    1,
+                    burn::tensor::Int,
+                >::from_data(
+                    burn::tensor::TensorData::from(&lhs as &[i64]),
+                    (&self.device, burn::tensor::DType::I64),
+                );
+                dividend.clone().abs().remainder(rhs.abs()) * dividend.sign()
+            };
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_mod_tensor_shape() {
+        let config = ModConfig::new(false);
+        let node = ModNodeBuilder::new("mod1")
+            .input_tensor("lhs", 1, DType::I64)
+            .input_shape("rhs", 3)
+            .output_tensor("output", 1, DType::I64)
+            .config(config)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, lhs: Tensor<1, Int>, rhs: [i64; 3]) -> Tensor<1, Int> {
+            let output = lhs
+                .remainder(
+                    Tensor::<
+                        1,
+                        burn::tensor::Int,
+                    >::from_data(
+                        burn::tensor::TensorData::from(&rhs as &[i64]),
+                        (&self.device, burn::tensor::DType::I64),
+                    ),
+                );
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_fmod_tensor_shape() {
+        let config = ModConfig::new(true);
+        let node = ModNodeBuilder::new("mod1")
+            .input_tensor("lhs", 1, DType::I64)
+            .input_shape("rhs", 3)
+            .output_tensor("output", 1, DType::I64)
+            .config(config)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, lhs: Tensor<1, Int>, rhs: [i64; 3]) -> Tensor<1, Int> {
+            let output = {
+                let dividend = lhs;
+                dividend
+                    .clone()
+                    .abs()
+                    .remainder(
+                        Tensor::<
+                            1,
+                            burn::tensor::Int,
+                        >::from_data(
+                                burn::tensor::TensorData::from(&rhs as &[i64]),
+                                (&self.device, burn::tensor::DType::I64),
+                            )
+                            .abs(),
+                    ) * dividend.sign()
+            };
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_fmod_shape_scalar_native() {
+        let config = ModConfig::new(true);
+        let node = ModNodeBuilder::new("mod1")
+            .input_shape("lhs", 3)
+            .input_scalar("rhs", DType::I64)
+            .output_shape("output", 3)
+            .config(config)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, lhs: [i64; 3], rhs: i64) -> [i64; 3] {
+            let output = {
+                let mut result = lhs;
+                let scalar = rhs;
+                for result_item in result.iter_mut() {
+                    *result_item %= scalar;
+                }
+                result
+            };
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_fmod_scalar_native_shape() {
+        let config = ModConfig::new(true);
+        let node = ModNodeBuilder::new("mod1")
+            .input_scalar("lhs", DType::I64)
+            .input_shape("rhs", 3)
+            .output_shape("output", 3)
+            .config(config)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, lhs: i64, rhs: [i64; 3]) -> [i64; 3] {
+            let output = {
+                let mut result = rhs;
+                let scalar = lhs;
+                for result_item in result.iter_mut() {
+                    *result_item = scalar % *result_item;
+                }
+                result
+            };
+            output
+        }
+        ");
+    }
+
+    // Shape + ScalarTensor variants exercise the `is_scalar_tensor()` arm
+    // of `Shape op scalar` / `scalar op Shape`, which uses `on_device_to_native`
+    // to pull the scalar out of a rank-1 tensor.
+
+    #[test]
+    fn test_mod_shape_scalar_tensor() {
+        let config = ModConfig::new(false);
+        let node = ModNodeBuilder::new("mod1")
+            .input_shape("lhs", 3)
+            .input_scalar_tensor("rhs", DType::I64)
+            .output_shape("output", 3)
+            .config(config)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, lhs: [i64; 3], rhs: Tensor<1, Int>) -> [i64; 3] {
+            let output = {
+                let mut result = lhs;
+                let scalar = (rhs).into_scalar::<i64>();
+                for result_item in result.iter_mut() {
+                    *result_item %= scalar;
+                }
+                result
+            };
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_mod_scalar_tensor_shape() {
+        let config = ModConfig::new(false);
+        let node = ModNodeBuilder::new("mod1")
+            .input_scalar_tensor("lhs", DType::I64)
+            .input_shape("rhs", 3)
+            .output_shape("output", 3)
+            .config(config)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, lhs: Tensor<1, Int>, rhs: [i64; 3]) -> [i64; 3] {
+            let output = {
+                let mut result = rhs;
+                let scalar = (lhs).into_scalar::<i64>();
+                for result_item in result.iter_mut() {
+                    *result_item = scalar % *result_item;
+                }
+                result
+            };
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_int_fmod_tensor() {
+        let node = ModNodeBuilder::new("mod1")
+            .input_tensor("x", 1, DType::I64)
+            .input_tensor("y", 1, DType::I64)
+            .output_tensor("output", 1, DType::I64)
+            .config(ModConfig::new(true))
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, x: Tensor<1, Int>, y: Tensor<1, Int>) -> Tensor<1, Int> {
+            let output = {
+                let dividend = x;
+                dividend.clone().abs().remainder(y.abs()) * dividend.sign()
+            };
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_int_fmod_scalar() {
+        let node = ModNodeBuilder::new("mod1")
+            .input_tensor("x", 1, DType::I64)
+            .input_scalar("y", DType::I64)
+            .output_tensor("output", 1, DType::I64)
+            .config(ModConfig::new(true))
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, x: Tensor<1, Int>, y: i64) -> Tensor<1, Int> {
+            let output = {
+                let dividend = x;
+                dividend.clone().abs().remainder_scalar((y).abs()) * dividend.sign()
+            };
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_int_fmod_unsigned() {
+        // Unsigned values never differ in sign, so remainder is already fmod.
+        let node = ModNodeBuilder::new("mod1")
+            .input_tensor("x", 2, DType::U32)
+            .input_tensor("y", 1, DType::U32)
+            .output_tensor("output", 2, DType::U32)
+            .config(ModConfig::new(true))
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, x: Tensor<2, Int>, y: Tensor<1, Int>) -> Tensor<2, Int> {
+            let output = x.remainder((y).unsqueeze_dims(&[0isize]));
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_int_fmod_scalar_native_tensor() {
+        let node = ModNodeBuilder::new("mod1")
+            .input_scalar("a", DType::I64)
+            .input_tensor("b", 1, DType::I64)
+            .output_tensor("output", 1, DType::I64)
+            .config(ModConfig::new(true))
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, a: i64, b: Tensor<1, Int>) -> Tensor<1, Int> {
+            let output = {
+                let dividend = Tensor::<
+                    1,
+                    burn::tensor::Int,
+                >::from_data(
+                    burn::tensor::TensorData::from([a as i64]),
+                    (&self.device, burn::tensor::DType::I64),
+                );
+                dividend.clone().abs().remainder(b.abs()) * dividend.sign()
+            };
+            output
+        }
+        ");
+    }
+}

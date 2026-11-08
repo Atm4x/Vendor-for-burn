@@ -1,0 +1,246 @@
+//! Graph simplification passes
+//!
+//! Runs optimization passes on the IR graph after post-processing but before finalization.
+//! Each pass is a function that takes and returns `(nodes, inputs, outputs)`.
+//!
+//! ## Current passes (in execution order per iteration)
+//!
+//! 1. **Attention coalescing** - decomposed SDPA pattern -> single Attention node
+//! 2. **Permute-reshape detection** - Shape+Gather+Unsqueeze+Concat+Reshape -> Transpose
+//! 3. **Constant shape propagation** - Shape->Gather and Shape->Slice elimination,
+//!    and Size of a Shape-typed value
+//! 4. **Constant folding** - evaluate nodes with all-constant inputs at compile time
+//! 5. **Idempotent op elimination** - f(f(x)) -> f(x) for Relu, Ceil, Floor, etc.
+//! 6. **Identity element elimination** - x+0, x*1, x/1, x**1 -> x
+//! 7. **Common subexpression elimination** - merge duplicate nodes
+//! 8. **Dead node elimination** - remove unreferenced nodes (cascading)
+//!
+//! All passes run in a fixed-point loop until the graph stabilizes. Constant lifting
+//! then re-runs once, so inputs that only became constant during simplification are
+//! lifted into their consumers' configs like any other constant.
+//!
+//! ## Design note: constant_shape never folds a bare `Shape(x)`
+//!
+//! The constant shape pass intentionally does NOT replace bare `Shape(x)` nodes
+//! with constant arrays, even when all input dimensions are statically known.
+//! This is because `static_shape` values come from the ONNX export-time graph
+//! and may not match runtime shapes for models with dynamic spatial dimensions
+//! (e.g., rf-detr exports with fixed dims but runs with variable input sizes).
+//!
+//! `Shape->Gather(idx)` and `Shape->Slice(start,end)` are folded because these
+//! patterns extract specific dimensions that are typically batch/channel/head
+//! dims which remain constant across inputs. The constant_fold pass then cascades
+//! on these scalar/array constants (e.g., `Cast(const_3)`, `Sqrt(const_3.0)`).
+//!
+//! `Size` on a `Shape(N)`-typed input is folded on different grounds: it reads
+//! only the rank, never a dimension value, so no `static_shape` assumption is
+//! involved and dynamic dims cannot invalidate it.
+
+mod coalesce_attention;
+pub(crate) mod constant_fold;
+mod constant_shape;
+mod dead_nodes;
+mod idempotent;
+mod identity_element;
+mod permute_reshape;
+mod redundant_nodes;
+pub(crate) mod split_to_sequence;
+
+use std::{cell::RefCell, rc::Rc};
+
+use crate::{
+    graph_state::GraphState,
+    ir::{Argument, RawNode},
+    processor::get_processor_registry,
+};
+
+use coalesce_attention::coalesce_attention;
+use constant_fold::fold_constants;
+use constant_shape::simplify_constant_shape;
+use dead_nodes::eliminate_dead_nodes;
+use idempotent::eliminate_idempotent_ops;
+use identity_element::eliminate_identity_elements;
+use permute_reshape::simplify_permute_reshape;
+use redundant_nodes::eliminate_redundant_nodes;
+
+/// Maximum number of fixed-point iterations to prevent runaway loops.
+const MAX_ITERATIONS: usize = 10;
+
+/// Run all simplification passes on the graph.
+///
+/// Applies passes in a fixed-point loop: repeats until the graph stops changing
+/// or `MAX_ITERATIONS` is reached. Each iteration runs all passes in order,
+/// since one pass may create opportunities for another.
+pub(crate) fn simplify_graph(
+    mut nodes: Vec<RawNode>,
+    inputs: Vec<Argument>,
+    mut outputs: Vec<Argument>,
+    _state: &Rc<RefCell<GraphState>>,
+    opset: usize,
+) -> (Vec<RawNode>, Vec<Argument>, Vec<Argument>) {
+    for iteration in 0..MAX_ITERATIONS {
+        let node_count_before = nodes.len();
+
+        // Attention coalescing (must run before permute-reshape, since attention
+        // pattern uses native Transpose nodes, not Reshape-based transposes)
+        nodes = coalesce_attention(nodes);
+
+        // Structural pattern detection (must run before constant folding, which
+        // replaces Gather/Slice nodes with Constants and destroys the patterns)
+        nodes = simplify_permute_reshape(nodes);
+
+        // Constant propagation (may eliminate Shape->Gather chains)
+        nodes = simplify_constant_shape(nodes, &mut outputs, _state);
+
+        // Constant folding (evaluate nodes with all-constant inputs)
+        nodes = fold_constants(nodes, &mut outputs, _state);
+
+        // Idempotent op elimination: f(f(x)) -> f(x)
+        nodes = eliminate_idempotent_ops(nodes);
+
+        // Identity element elimination: x + 0 -> x, x * 1 -> x, etc.
+        nodes = eliminate_identity_elements(nodes);
+
+        // Common subexpression elimination (rewrites inputs, creates dead nodes)
+        nodes = eliminate_redundant_nodes(nodes);
+
+        // Dead node elimination (cleans up nodes orphaned by pattern passes)
+        nodes = eliminate_dead_nodes(nodes, &outputs);
+
+        let removed = node_count_before - nodes.len();
+        if removed == 0 {
+            log::debug!(
+                "Simplification: converged after {} iteration(s)",
+                iteration + 1
+            );
+            break;
+        }
+
+        log::info!(
+            "Simplification: iteration {} removed {} node(s)",
+            iteration + 1,
+            removed
+        );
+    }
+
+    relift_constants(&mut nodes, opset);
+
+    (nodes, inputs, outputs)
+}
+
+/// Re-run constant lifting for inputs that became constant during simplification.
+///
+/// Lifting first runs in post-processing, before these passes. Folding can later turn a
+/// Dynamic input into a Constant (e.g. `Reshape(x, Concat(Slice(Shape(x)), [-1]))`), and
+/// the consumer reads the value into its config without lifting it. The consumer then
+/// still references the Constant, so finalization keeps it and codegen emits an unused
+/// binding for it.
+fn relift_constants(nodes: &mut [RawNode], opset: usize) {
+    let registry = get_processor_registry();
+    for node in nodes.iter_mut() {
+        // Best effort, as in post-processing: inputs that are already Static or still
+        // Dynamic cannot be lifted, so failures are logged rather than propagated.
+        if let Err(e) = registry.get(&node.node_type).lift_constants(node, opset) {
+            log::debug!(
+                "Could not lift constants for node '{}' (type: {:?}): {}",
+                node.name,
+                node.node_type,
+                e
+            );
+        }
+    }
+}
+
+/// Update downstream inputs that reference newly-created constant outputs.
+///
+/// After a pass replaces nodes with Constants, downstream consumers still have
+/// `ValueSource::Dynamic` on their inputs. This updates them to `ValueSource::Constant`
+/// with the correct `value_store` so that `arg.value()` works for cascading passes.
+pub(super) fn update_constant_references(
+    nodes: &mut [RawNode],
+    graph_outputs: &mut [Argument],
+    constant_outputs: &[String],
+) {
+    use crate::ir::ValueSource;
+
+    // Build map: constant output name -> value_store from the producing node
+    let mut store_map: std::collections::HashMap<String, crate::tensor_store::ValueStore> =
+        std::collections::HashMap::new();
+    for node in nodes.iter() {
+        for output in &node.outputs {
+            if output.value_source == ValueSource::Constant
+                && let Some(ref store) = output.value_store
+            {
+                store_map.insert(output.name.clone(), store.clone());
+            }
+        }
+    }
+
+    let constant_set: std::collections::HashSet<&str> =
+        constant_outputs.iter().map(|s| s.as_str()).collect();
+    for node in nodes.iter_mut() {
+        for input in &mut node.inputs {
+            if input.value_source == ValueSource::Dynamic
+                && constant_set.contains(input.name.as_str())
+            {
+                input.value_source = ValueSource::Constant;
+                input.value_store = store_map.get(input.name.as_str()).cloned();
+            }
+        }
+    }
+    for output in graph_outputs.iter_mut() {
+        if output.value_source == ValueSource::Dynamic
+            && constant_set.contains(output.name.as_str())
+        {
+            output.value_source = ValueSource::Constant;
+            output.value_store = store_map.get(output.name.as_str()).cloned();
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use crate::ir::{ArgType, Argument, DType, NodeType, RawNode, TensorType, ValueSource};
+
+    pub fn arg(name: &str) -> Argument {
+        Argument {
+            name: name.to_string(),
+            ty: ArgType::Tensor(TensorType {
+                dtype: DType::F32,
+                rank: 2,
+                static_shape: None,
+            }),
+            value_source: ValueSource::Dynamic,
+            value_store: None,
+        }
+    }
+
+    pub fn node(name: &str, node_type: NodeType, inputs: &[&str], outputs: &[&str]) -> RawNode {
+        RawNode {
+            custom_identity: None,
+            node_type,
+            name: name.to_string(),
+            inputs: inputs.iter().map(|n| arg(n)).collect(),
+            outputs: outputs.iter().map(|n| arg(n)).collect(),
+            attrs: Default::default(),
+        }
+    }
+
+    #[test]
+    fn relift_uses_model_opset() {
+        use crate::node::test_utils::TestNodeBuilder;
+
+        // DFT only takes `axis` as an input from opset 20, so it is only lifted there.
+        let dft = TestNodeBuilder::new(NodeType::Dft, "dft1")
+            .input_tensor_f32("input", 3, Some(vec![1, 16, 1]))
+            .input_tensor_i64_data("dft_length", vec![16], vec![])
+            .input_tensor_i64_data("axis", vec![1], vec![])
+            .output_tensor_f32("output", 3, None)
+            .build_with_graph_data(20);
+        assert!(dft.inputs[2].is_constant());
+
+        let mut nodes = vec![dft];
+        super::relift_constants(&mut nodes, 20);
+        assert!(nodes[0].inputs[2].is_static());
+    }
+}

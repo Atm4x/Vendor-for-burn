@@ -1,0 +1,902 @@
+//! An attention whose softmax runs through [`OnlineSoftmax`] where its holder keeps the score: each unit owning
+//! its rows in registers, or each plane owning its rows in its own window, from loading to
+//! writing.
+//!
+//! A unit reads its query, keys and values where they lie, holds its score in a register block,
+//! and contracts the probabilities it just computed with the values without leaving registers.
+//!
+//! One partitioning spans both contractions: `score = q · kᵀ` contracts `D` and `out = p · v`
+//! contracts `S`, and each walks its own axes of the fragment level, the other's routed to one
+//! step. The plane stages its query once and its keys and values a block at a time, in stages of
+//! its own met on `sync_plane`; the score lands in the plane's own window, the softmax takes it
+//! in there, and the output's fragments are corrected through the plane's own scratch.
+//!
+//! The same kernel serves planes that split the keys of the same queries: the partitioning says
+//! so, each plane walks its share, the softmax normalizer merges the planes' states
+//! ([`OnlineSoftmax::normalizer`]), and the cube's output sums their products before writing
+//! them ([`PlanesOutput`](cubek_tile::kind::PlanesOutput)).
+
+use cubecl::{client::Client, prelude::*, zspace::Shape};
+use cubek_test_utils::{HostData, HostDataType, TestInput, TestOutcome, ValidationResult};
+use cubek_tile::{
+    Accumulate, AccumulateExpand, Axis, Instruction, Levels, Partitioning, RegisterBlock, Scratch,
+    Semiring, Space, StageStorage, Stages, Tile, TileArg, TileArgLaunch, TileSpec,
+    ops::softmax::OnlineSoftmax,
+    procedural::{Procedural, Reads, Recipe, RecipeCoords, RecipeExpand},
+};
+
+use super::relay::relays;
+use super::{Form, implied};
+
+const Q: Axis = Axis(0);
+const S: Axis = Axis(1);
+const D: Axis = Axis(2);
+const V: Axis = Axis(3);
+
+/// The bias a query's scores are summed with: zero at a key it sees, the minimum value past the
+/// attended keys and, under `causal`, past its own position aligned at the bottom right.
+#[derive(CubeType, Clone)]
+struct Attended {
+    keys: u32,
+    queries: u32,
+    #[cube(comptime)]
+    causal: bool,
+}
+
+#[cube]
+impl Recipe<f32> for Attended {
+    fn evaluate(&self, coordinates: &RecipeCoords) -> f32 {
+        let s = coordinates.along(S);
+        let mut seen = s < self.keys;
+        if self.causal {
+            seen = seen && s + self.queries <= coordinates.along(Q) + self.keys;
+        }
+        select(seen, 0.0, f32::min_value())
+    }
+}
+
+impl Reads for AttendedExpand {
+    fn reads(&self, _scope: &cubecl::ir::Scope, axis: Axis) -> bool {
+        axis == S || (self.causal && axis == Q)
+    }
+}
+
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+fn plane_attention<E: Float>(
+    q: &TileArg<'_, E, Const<1>>,
+    k: &TileArg<'_, E, Const<1>>,
+    v: &TileArg<'_, E, Const<1>>,
+    out: &TileArg<'_, f32, Const<1>>,
+    keys: u32,
+    queries: u32,
+    scale: f32,
+    space: Partitioning,
+    #[comptime] causal: bool,
+    #[comptime] block_keys: usize,
+    #[define(E)] _dtype: ElemType,
+) {
+    let q = q.tile(comptime!(space.clone()));
+    // Past the attended keys a read is zero: a masked probability never meets a stale value.
+    let k = k.tile(comptime!(space.clone())).within(S, 0, keys as usize);
+    let v = v.tile(comptime!(space.clone())).within(S, 0, keys as usize);
+    let out = out.tile(comptime!(space.clone()));
+    let bias = Procedural::<f32>::new::<Attended>(
+        comptime!(space.space().subspace(&[Q, S])),
+        Attended {
+            keys,
+            queries,
+            causal,
+        },
+    )
+    .tile_in(&space);
+    for cube in space {
+        let mut out_cube = out.at(&cube).planes_output::<f32>(&cube);
+        for plane in cube {
+            let (q_p, k_p, v_p) = (q.at(&plane), k.at(&plane), v.at(&plane));
+            let bias_p = bias.at(&plane);
+            // The plane's own keys, all of them or its share, and of those no block past the
+            // attended keys.
+            let origin = plane.origin(S);
+            let reach = select(keys as usize > origin, keys as usize - origin, 0usize);
+            let keys_walk = plane.walk();
+            let blocks = reach.div_ceil(block_keys).min(keys_walk.total());
+            let walk = keys_walk.range(0, blocks);
+            let score = Tile::<f32>::scratch(&walk, comptime!(vec![Q, S]), StageStorage::Strided);
+            let mut p = Tile::<E>::scratch(&walk, comptime!(vec![Q, S]), StageStorage::Strided);
+            let acc = out
+                .at(&plane)
+                .accumulator::<f32, f32, E>(&bias_p, &v_p, Instruction::Cmma, Semiring::SUM_PROD)
+                .with_scratch(Scratch::OneTile);
+            let mut softmax = OnlineSoftmax::<f32>::along(&score, S);
+            // The query spans no key: staged once, before the walk, where the keys are staged.
+            let mut q_s = q_p.stage_for(&walk, StageStorage::Strided);
+            q_s.copy_from(&q_p);
+            sync_plane();
+            let mut stages = Stages::smem(&walk, &k_p, &v_p, StageStorage::Strided, 1usize);
+            stages.pipelined(walk, |slot, stage| {
+                let bias_s = bias_p.at(stage);
+                slot.consume(|k_s, v_s| {
+                    let logits = score.accumulator::<f32, E, E>(
+                        &q_s,
+                        k_s,
+                        Instruction::Cmma,
+                        Semiring::SUM_PROD,
+                    );
+                    for fragment in stage.walk().routed(V, 0).unrolled() {
+                        let mut cell = logits.at(&fragment);
+                        cell.mma(&q_s.at(&fragment), &k_s.at(&fragment));
+                    }
+                    logits.drained_into(&score);
+                    // The score's cells were stored in the fragments' layout; the softmax reads
+                    // them slice by slice.
+                    sync_plane();
+                    let correction = softmax.step(&score, &bias_s, scale);
+                    p.copy_cast_from(&score);
+                    // The probabilities land before the fragments load them.
+                    sync_plane();
+                    acc.along(V).mul(&correction);
+                    for fragment in stage.walk().routed(D, 0).unrolled() {
+                        let mut cell = acc.at(&fragment);
+                        cell.mma(&p.at(&fragment), &v_s.at(&fragment));
+                    }
+                });
+            });
+            acc.along(V).mul(&softmax.normalizer(&plane));
+            out_cube.drain(&acc, &plane);
+        }
+        out_cube.write();
+    }
+}
+
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+fn unit_attention<E: Float>(
+    q: &TileArg<'_, E, Const<1>>,
+    k: &TileArg<'_, E, Const<1>>,
+    v: &TileArg<'_, E, Const<1>>,
+    out: &TileArg<'_, f32, Const<1>>,
+    keys: u32,
+    queries: u32,
+    scale: f32,
+    space: Partitioning,
+    #[comptime] causal: bool,
+    #[comptime] block_keys: usize,
+    #[comptime] rows: usize,
+    #[define(E)] _dtype: ElemType,
+) {
+    let q = q.tile(comptime!(space.clone()));
+    let k = k.tile(comptime!(space.clone())).within(S, 0, keys as usize);
+    let v = v.tile(comptime!(space.clone())).within(S, 0, keys as usize);
+    let out = out.tile(comptime!(space.clone()));
+    let bias = Procedural::<f32>::new::<Attended>(
+        comptime!(space.space().subspace(&[Q, S])),
+        Attended {
+            keys,
+            queries,
+            causal,
+        },
+    )
+    .tile_in(&space);
+    let value = comptime!(space.space().extent(V));
+    for cube in space {
+        for unit in cube {
+            let (q_u, k_u, v_u, out_u, bias_u) = (
+                q.at(&unit),
+                k.at(&unit),
+                v.at(&unit),
+                out.at(&unit),
+                bias.at(&unit),
+            );
+            let mut acc = out_u.accumulator::<f32, f32, E>(
+                &bias_u,
+                &v_u,
+                comptime!(Instruction::Registers {
+                    config: RegisterBlock::new(rows * value)
+                }),
+                Semiring::SUM_PROD,
+            );
+            let mut softmax = OnlineSoftmax::<f32>::along(&bias_u, S);
+            for step in unit.walk().range(0, (keys as usize).div_ceil(block_keys)) {
+                let (q_s, k_s, v_s, bias_s) = (
+                    q_u.at(&step),
+                    k_u.at(&step),
+                    v_u.at(&step),
+                    bias_u.at(&step),
+                );
+                let mut score = bias_s.accumulator::<f32, E, E>(
+                    &q_s,
+                    &k_s,
+                    comptime!(Instruction::Registers {
+                        config: RegisterBlock::new(rows * block_keys)
+                    }),
+                    Semiring::SUM_PROD,
+                );
+                score.mma(&q_s, &k_s);
+                let correction = softmax.step(&score, &bias_s, scale);
+                acc.along(V).mul(&correction);
+                acc.mma(&score, &v_s);
+            }
+            acc.along(V).mul(&softmax.recip_l());
+            acc.drained_into(&out_u);
+        }
+    }
+}
+
+/// [`plane_attention`] with the keys split across cubes: each cube walks its run of the blocks
+/// with one plane, the cube level stepping the keys itself, then takes its turn at the rows'
+/// carry. In its turn the plane merges its rows' state into `carried_max` and `carried_sum`,
+/// rescales the carry and its own sum by the factors that returns, and adds its sum in.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+fn relayed_attention<E: Float>(
+    q: &TileArg<'_, E, Const<1>>,
+    k: &TileArg<'_, E, Const<1>>,
+    v: &TileArg<'_, E, Const<1>>,
+    out: &TileArg<'_, f32, Const<1>>,
+    carry: &TileArg<'_, f32, Const<1>>,
+    carried_max: &TileArg<'_, f32, Const<1>>,
+    carried_sum: &TileArg<'_, f32, Const<1>>,
+    turns: &[Atomic<u32>],
+    keys: u32,
+    queries: u32,
+    scale: f32,
+    space: Partitioning,
+    #[comptime] causal: bool,
+    #[comptime] block_keys: usize,
+    #[define(E)] _dtype: ElemType,
+) {
+    let relay = carry.relay(&space, turns);
+    // Uniform across the cube, so it leaves before any barrier.
+    if !relay.has_turn() {
+        terminate!();
+    }
+    let q = q.tile(comptime!(space.clone()));
+    let k = k.tile(comptime!(space.clone())).within(S, 0, keys as usize);
+    let v = v.tile(comptime!(space.clone())).within(S, 0, keys as usize);
+    let mut out = out.tile(comptime!(space.clone()));
+    let state_max = carried_max.tile(comptime!(space.clone()));
+    let state_sum = carried_sum.tile(comptime!(space.clone()));
+    let bias = Procedural::<f32>::new::<Attended>(
+        comptime!(space.space().subspace(&[Q, S])),
+        Attended {
+            keys,
+            queries,
+            causal,
+        },
+    )
+    .tile_in(&space);
+    // The cube level's walk is this cube's run of blocks, its planes directly below each block.
+    let run = space.walk();
+    let first = run.region(0);
+    let origin = first.origin(S);
+    let reach = select(keys as usize > origin, keys as usize - origin, 0usize);
+    let blocks = reach.div_ceil(block_keys).min(run.total());
+    let walk = run.range(0, blocks);
+    let sum = relay.tile();
+    let score = Tile::<f32>::scratch(&walk, comptime!(vec![Q, S]), StageStorage::Strided);
+    let p = Tile::<E>::scratch(&walk, comptime!(vec![Q, S]), StageStorage::Strided);
+    let acc = sum
+        .accumulator::<f32, f32, E>(&bias, &v, Instruction::Cmma, Semiring::SUM_PROD)
+        .with_scratch(Scratch::OneTile);
+    let mut softmax = OnlineSoftmax::<f32>::along(&score, S);
+    // The query spans no key: its box is the first block's, staged once before the walk.
+    let q_c = q.at(&first);
+    let mut q_s = q_c.stage_for(&walk, StageStorage::Strided);
+    q_s.copy_from(&q_c);
+    sync_cube();
+    let mut stages = Stages::smem(&walk, &k, &v, StageStorage::Strided, 1usize);
+    stages.pipelined(walk, |slot, stage| {
+        slot.consume(|k_s, v_s| {
+            for plane in stage {
+                let score_p = score.at(&plane);
+                let logits = score_p.accumulator::<f32, E, E>(
+                    &q_s.at(&plane),
+                    &k_s.at(&plane),
+                    Instruction::Cmma,
+                    Semiring::SUM_PROD,
+                );
+                for fragment in plane.walk().routed(V, 0).unrolled() {
+                    let mut cell = logits.at(&fragment);
+                    cell.mma(&q_s.at(&fragment), &k_s.at(&fragment));
+                }
+                logits.drained_into(&score_p);
+                sync_plane();
+                let correction = softmax.step(&score_p, &bias.at(&plane), scale);
+                let mut p_p = p.at(&plane);
+                p_p.copy_cast_from(&score_p);
+                sync_plane();
+                acc.at(&plane).along(V).mul(&correction);
+                for fragment in plane.walk().routed(D, 0).unrolled() {
+                    let mut cell = acc.at(&fragment);
+                    cell.mma(&p.at(&fragment), &v_s.at(&fragment));
+                }
+            }
+        });
+    });
+    relay.take();
+    let carried = relay.carried();
+    let first_turn = relay.is_first();
+    for plane in first.clone() {
+        let factors = softmax.relayed(&relay, &mut state_max.at(&plane), &mut state_sum.at(&plane));
+        acc.at(&plane).along(V).mul(&factors.sum);
+        // The first turn's drain replaces the carry, which holds nothing yet.
+        if !first_turn {
+            carried.at(&plane).along(V).mul(&factors.carried);
+        }
+    }
+    // Every row of the carry is rescaled before any plane's sum lands in it.
+    sync_storage();
+    for plane in first {
+        acc.at(&plane).drained_into(&sum.at(&plane));
+    }
+    relay.pass(&mut out);
+}
+
+/// Which axis a cube's planes split: the queries, each plane owning its own rows, or the keys,
+/// the planes merging what each computed of the same rows.
+#[derive(Clone, Copy)]
+enum PlanesAlong {
+    Queries,
+    Keys,
+}
+
+/// The walk over the blocks of keys and the planes above it: every block walked by each plane
+/// owning its own queries, or a share of the `blocks` walked by each plane splitting the keys.
+fn planes_over(steps: Levels, along: PlanesAlong, planes: usize, blocks: usize) -> Levels {
+    match along {
+        PlanesAlong::Queries => steps.walk_every(&[S]).planes(&[(Q, planes)]),
+        PlanesAlong::Keys => steps.walk(&[(S, blocks / planes)]).planes(&[(S, planes)]),
+    }
+}
+
+/// The problem's shape and how the kernel cuts it.
+#[derive(Clone, Copy)]
+struct Case {
+    queries: usize,
+    keys: usize,
+    /// Keys attended, at most `keys`: the rest is poisoned.
+    attended: usize,
+    head: usize,
+    value: usize,
+    /// Fragment edge: the instruction is `edge × edge × edge`.
+    edge: usize,
+    /// Fragments a plane holds along the queries, and along a block of keys.
+    rows: usize,
+    block: usize,
+    planes: usize,
+    along: PlanesAlong,
+    causal: bool,
+}
+
+fn run<E: Float + CubeElement>(case: Case) {
+    let client: Client = cubecl::test_device().client();
+    let e_ty = E::elem_type_native();
+    let f32_ty = f32::elem_type_native();
+    let offered = client.properties().features.matmul.cmma.iter().any(|cfg| {
+        cfg.a_type == e_ty
+            && cfg.b_type == e_ty
+            && cfg.cd_type == f32_ty
+            && [cfg.m, cfg.n, cfg.k] == [case.edge as u32; 3]
+    });
+    if !offered {
+        TestOutcome::Validated(ValidationResult::Skipped(format!(
+            "no {0}x{0}x{0} {e_ty:?} fragment summing in f32",
+            case.edge
+        )))
+        .enforce();
+        return;
+    }
+    let Case {
+        queries,
+        keys,
+        attended,
+        head,
+        value,
+        edge,
+        rows,
+        block,
+        planes,
+        along,
+        causal,
+    } = case;
+    let launcher = implied(
+        &client,
+        Partitioning::new(
+            Space::new(&[(Q, queries), (S, keys), (D, head), (V, value)]),
+            planes_over(
+                Levels::leaf(&[(Q, edge), (S, edge), (D, edge), (V, edge)]).walk(&[
+                    (Q, rows),
+                    (S, block),
+                    (D, head / edge),
+                    (V, value / edge),
+                ]),
+                along,
+                planes,
+                keys / (edge * block),
+            )
+            .cubes(&[Q])
+            .build(),
+        ),
+        Form::Static,
+    );
+    let (q_data, k_data, v_data, q_handle, k_handle, v_handle) =
+        inputs::<E>(&client, queries, keys, attended, head, value, false);
+    let out_handle = TestInput::builder(client.clone(), Shape::new([queries, value]))
+        .dtype(f32_ty)
+        .zeros()
+        .generate_without_host_data();
+    let scale = 1. / (head as f32).sqrt();
+
+    let (q_tensor, k_tensor, v_tensor, out_tensor) = (
+        q_handle.binding().into_tensor_arg(),
+        k_handle.binding().into_tensor_arg(),
+        v_handle.binding().into_tensor_arg(),
+        out_handle.clone().binding().into_tensor_arg(),
+    );
+    plane_attention::launch(
+        &client,
+        launcher.cube_count(),
+        launcher.cube_dim(),
+        TileArgLaunch::new(q_tensor, TileSpec::direct(&[Q, D])),
+        TileArgLaunch::new(k_tensor, TileSpec::direct(&[S, D])),
+        TileArgLaunch::new(v_tensor, TileSpec::direct(&[S, V])),
+        TileArgLaunch::new(out_tensor, TileSpec::direct(&[Q, V])),
+        attended as u32,
+        queries as u32,
+        scale,
+        launcher.partitioning_arg(),
+        causal,
+        edge * block,
+        e_ty,
+    );
+    let out = HostData::from_tensor_handle(&client, out_handle, HostDataType::F32);
+    check(
+        &out, &q_data, &k_data, &v_data, queries, keys, attended, head, value, causal, false,
+    );
+}
+
+/// A case whose keys `cubes` cubes split, each walking its run of blocks with one plane.
+fn run_relayed<E: Float + CubeElement>(case: Case, cubes: usize) {
+    let client: Client = cubecl::test_device().client();
+    if !relays(&client) {
+        return;
+    }
+    let e_ty = E::elem_type_native();
+    let f32_ty = f32::elem_type_native();
+    let offered = client.properties().features.matmul.cmma.iter().any(|cfg| {
+        cfg.a_type == e_ty
+            && cfg.b_type == e_ty
+            && cfg.cd_type == f32_ty
+            && [cfg.m, cfg.n, cfg.k] == [case.edge as u32; 3]
+    });
+    if !offered {
+        TestOutcome::Validated(ValidationResult::Skipped(format!(
+            "no {0}x{0}x{0} {e_ty:?} fragment summing in f32",
+            case.edge
+        )))
+        .enforce();
+        return;
+    }
+    let Case {
+        queries,
+        keys,
+        attended,
+        head,
+        value,
+        edge,
+        rows,
+        block,
+        causal,
+        ..
+    } = case;
+    let launcher = implied(
+        &client,
+        Partitioning::new(
+            Space::new(&[(Q, queries), (S, keys), (D, head), (V, value)]),
+            Levels::leaf(&[(Q, edge), (S, edge), (D, edge), (V, edge)])
+                .walk(&[(Q, rows), (S, block), (D, head / edge), (V, value / edge)])
+                .planes(&[(Q, 1)])
+                .cubes(&[Q, S])
+                .across(S, cubes)
+                .build(),
+        ),
+        Form::Static,
+    );
+    let (q_data, k_data, v_data, q_handle, k_handle, v_handle) =
+        inputs::<E>(&client, queries, keys, attended, head, value, false);
+    let buffer = |shape: Shape| {
+        TestInput::builder(client.clone(), shape)
+            .dtype(f32_ty)
+            .zeros()
+            .generate_without_host_data()
+    };
+    let out_handle = buffer(Shape::new([queries, value]));
+    let (carry, carried_max, carried_sum) = (
+        buffer(Shape::new([queries, value])),
+        buffer(Shape::new([queries])),
+        buffer(Shape::new([queries])),
+    );
+    let counters = launcher.partitioning().relay_counters();
+    let turns = client.create_from_slice(u32::as_bytes(&vec![0u32; counters]));
+    let tensor = |handle: cubecl::std::tensor::TensorHandle| handle.binding().into_tensor_arg();
+    relayed_attention::launch(
+        &client,
+        launcher.cube_count(),
+        launcher.cube_dim(),
+        TileArgLaunch::new(tensor(q_handle), TileSpec::direct(&[Q, D])),
+        TileArgLaunch::new(tensor(k_handle), TileSpec::direct(&[S, D])),
+        TileArgLaunch::new(tensor(v_handle), TileSpec::direct(&[S, V])),
+        TileArgLaunch::new(tensor(out_handle.clone()), TileSpec::direct(&[Q, V])),
+        TileArgLaunch::new(tensor(carry), TileSpec::direct(&[Q, V])),
+        TileArgLaunch::new(tensor(carried_max), TileSpec::direct(&[Q])),
+        TileArgLaunch::new(tensor(carried_sum), TileSpec::direct(&[Q])),
+        unsafe { BufferArg::from_raw_parts(turns, counters) },
+        attended as u32,
+        queries as u32,
+        1. / (head as f32).sqrt(),
+        launcher.partitioning_arg(),
+        causal,
+        edge * block,
+        e_ty,
+    );
+    let out = HostData::from_tensor_handle(&client, out_handle, HostDataType::F32);
+    check(
+        &out, &q_data, &k_data, &v_data, queries, keys, attended, head, value, causal, false,
+    );
+}
+
+/// The query, keys and values of a case and their host copies. Every key past the attended ones
+/// is NaN, so reading one shows; the keys are stored `[head, keys]` where `transposed_keys`.
+#[allow(clippy::type_complexity)]
+fn inputs<E: Float + CubeElement>(
+    client: &Client,
+    queries: usize,
+    keys: usize,
+    attended: usize,
+    head: usize,
+    value: usize,
+    transposed_keys: bool,
+) -> (
+    HostData,
+    HostData,
+    HostData,
+    cubecl::std::tensor::TensorHandle,
+    cubecl::std::tensor::TensorHandle,
+    cubecl::std::tensor::TensorHandle,
+) {
+    let e_ty = E::elem_type_native();
+    let wobble =
+        |i: usize, salt: usize| ((i * 2654435761 + salt * 40503) % 2048) as f32 / 512. - 2.;
+    let key_cell = |j: usize, d: usize| match j < attended {
+        true => wobble(j * head + d, 2),
+        false => f32::NAN,
+    };
+    let key_values: Vec<f32> = match transposed_keys {
+        true => (0..head * keys)
+            .map(|i| key_cell(i % keys, i / keys))
+            .collect(),
+        false => (0..keys * head)
+            .map(|i| key_cell(i / head, i % head))
+            .collect(),
+    };
+    let key_shape = match transposed_keys {
+        true => Shape::new([head, keys]),
+        false => Shape::new([keys, head]),
+    };
+    let (q_handle, q_data) = TestInput::builder(client.clone(), Shape::new([queries, head]))
+        .dtype(e_ty)
+        .custom((0..queries * head).map(|i| wobble(i, 1)).collect())
+        .generate_with_f32_host_data();
+    let (k_handle, k_data) = TestInput::builder(client.clone(), key_shape)
+        .dtype(e_ty)
+        .custom(key_values)
+        .generate_with_f32_host_data();
+    let (v_handle, v_data) = TestInput::builder(client.clone(), Shape::new([keys, value]))
+        .dtype(e_ty)
+        .custom(
+            (0..keys * value)
+                .map(|i| match i / value < attended {
+                    true => wobble(i, 3),
+                    false => f32::NAN,
+                })
+                .collect(),
+        )
+        .generate_with_f32_host_data();
+    (q_data, k_data, v_data, q_handle, k_handle, v_handle)
+}
+
+/// `out` against the attention computed on the host in `f64`: a query sees the attended keys,
+/// and under `causal` none past its own position aligned at the bottom right.
+#[allow(clippy::too_many_arguments)]
+fn check(
+    out: &HostData,
+    q_data: &HostData,
+    k_data: &HostData,
+    v_data: &HostData,
+    queries: usize,
+    keys: usize,
+    attended: usize,
+    head: usize,
+    value: usize,
+    causal: bool,
+    transposed_keys: bool,
+) {
+    let scale = 1. / (head as f64).sqrt();
+    let key = |j: usize, d: usize| match transposed_keys {
+        true => k_data.get_f32(&[d, j]),
+        false => k_data.get_f32(&[j, d]),
+    };
+    for i in 0..queries {
+        let seen = |j: usize| j < attended && (!causal || j + queries <= i + attended);
+        let logits: Vec<(usize, f64)> = (0..keys)
+            .filter(|&j| seen(j))
+            .map(|j| {
+                let dot: f64 = (0..head)
+                    .map(|d| q_data.get_f32(&[i, d]) as f64 * key(j, d) as f64)
+                    .sum();
+                (j, dot * scale)
+            })
+            .collect();
+        let max = logits.iter().fold(f64::NEG_INFINITY, |m, &(_, s)| m.max(s));
+        let sum: f64 = logits.iter().map(|&(_, s)| (s - max).exp()).sum();
+        for c in 0..value {
+            let expected = match logits.is_empty() {
+                true => 0.,
+                false => {
+                    logits
+                        .iter()
+                        .map(|&(j, s)| (s - max).exp() * v_data.get_f32(&[j, c]) as f64)
+                        .sum::<f64>()
+                        / sum
+                }
+            };
+            let actual = out.get_f32(&[i, c]) as f64;
+            // f16 operands and probabilities: a few ulps of each through two contractions.
+            let tolerance = 2e-2 * (1. + expected.abs());
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "out[{i}, {c}] = {actual}, expected {expected}"
+            );
+        }
+    }
+}
+
+/// A unit-owned case: `rows` queries a unit, `units` units a cube, `block` keys a step.
+#[derive(Clone, Copy)]
+struct UnitCase {
+    queries: usize,
+    keys: usize,
+    attended: usize,
+    head: usize,
+    value: usize,
+    rows: usize,
+    units: usize,
+    block: usize,
+    causal: bool,
+}
+
+fn run_units<E: Float + CubeElement>(case: UnitCase) {
+    let client: Client = cubecl::test_device().client();
+    let e_ty = E::elem_type_native();
+    let f32_ty = f32::elem_type_native();
+    let UnitCase {
+        queries,
+        keys,
+        attended,
+        head,
+        value,
+        rows,
+        units,
+        block,
+        causal,
+    } = case;
+    let launcher = implied(
+        &client,
+        Partitioning::new(
+            Space::new(&[(Q, queries), (S, keys), (D, head), (V, value)]),
+            Levels::leaf(&[(Q, rows), (S, block), (D, head), (V, value)])
+                .walk_every(&[S])
+                .units_distributed(Q, units)
+                .cubes(&[Q])
+                .build(),
+        ),
+        Form::Static,
+    );
+    let (q_data, k_data, v_data, q_handle, k_handle, v_handle) =
+        inputs::<E>(&client, queries, keys, attended, head, value, true);
+    let out_handle = TestInput::builder(client.clone(), Shape::new([queries, value]))
+        .dtype(f32_ty)
+        .zeros()
+        .generate_without_host_data();
+    let scale = 1. / (head as f32).sqrt();
+    unit_attention::launch(
+        &client,
+        launcher.cube_count(),
+        launcher.cube_dim(),
+        TileArgLaunch::new(
+            q_handle.binding().into_tensor_arg(),
+            TileSpec::direct(&[Q, D]),
+        ),
+        // The keys are stored transposed, so a step's rhs runs along the keys it scores.
+        TileArgLaunch::new(
+            k_handle.binding().into_tensor_arg(),
+            TileSpec::direct(&[D, S]),
+        ),
+        TileArgLaunch::new(
+            v_handle.binding().into_tensor_arg(),
+            TileSpec::direct(&[S, V]),
+        ),
+        TileArgLaunch::new(
+            out_handle.clone().binding().into_tensor_arg(),
+            TileSpec::direct(&[Q, V]),
+        ),
+        attended as u32,
+        queries as u32,
+        scale,
+        launcher.partitioning_arg(),
+        causal,
+        block,
+        rows,
+        e_ty,
+    );
+    let out = HostData::from_tensor_handle(&client, out_handle, HostDataType::F32);
+    check(
+        &out, &q_data, &k_data, &v_data, queries, keys, attended, head, value, causal, true,
+    );
+}
+
+const PREFILL: Case = Case {
+    queries: 32,
+    keys: 64,
+    attended: 64,
+    head: 16,
+    value: 16,
+    edge: 8,
+    rows: 2,
+    block: 2,
+    planes: 2,
+    along: PlanesAlong::Queries,
+    causal: false,
+};
+
+#[test]
+fn plane_attention_matches_the_reference() {
+    run::<half::f16>(PREFILL);
+}
+
+#[test]
+fn plane_attention_reads_nothing_past_the_attended_keys() {
+    run::<half::f16>(Case {
+        attended: 40,
+        ..PREFILL
+    });
+}
+
+#[test]
+fn plane_attention_masks_causally_from_the_bottom_right() {
+    run::<half::f16>(Case {
+        attended: 50,
+        causal: true,
+        ..PREFILL
+    });
+}
+
+#[test]
+fn plane_attention_in_f32() {
+    run::<f32>(Case {
+        value: 24,
+        ..PREFILL
+    });
+}
+
+/// Planes splitting the keys of the same queries: two, then four, each walking a share.
+const SPLIT_KEYS: Case = Case {
+    queries: 16,
+    keys: 128,
+    attended: 128,
+    planes: 2,
+    along: PlanesAlong::Keys,
+    ..PREFILL
+};
+
+#[test]
+fn plane_attention_split_keys_matches_the_reference() {
+    run::<half::f16>(SPLIT_KEYS);
+    run::<half::f16>(Case {
+        planes: 4,
+        ..SPLIT_KEYS
+    });
+}
+
+/// A share past the attended keys walks nothing, and its plane still meets the others: every
+/// slice it holds is masked, so it adds nothing to the merged sum.
+#[test]
+fn plane_attention_split_keys_reads_nothing_past_the_attended_keys() {
+    run::<half::f16>(Case {
+        attended: 40,
+        planes: 4,
+        ..SPLIT_KEYS
+    });
+}
+
+#[test]
+fn plane_attention_split_keys_masks_causally_from_the_bottom_right() {
+    run::<half::f16>(Case {
+        attended: 100,
+        causal: true,
+        ..SPLIT_KEYS
+    });
+}
+
+/// Cubes splitting the keys of the same queries: two, then four, each walking a run of the
+/// blocks and taking its turn at the rows.
+#[test]
+fn relayed_attention_matches_the_reference() {
+    run_relayed::<half::f16>(SPLIT_KEYS, 2);
+    run_relayed::<half::f16>(SPLIT_KEYS, 4);
+}
+
+/// A run past the attended keys walks nothing, and its cube still takes its turn: every slice it
+/// holds is masked, so it rescales nothing away and adds nothing.
+#[test]
+fn relayed_attention_reads_nothing_past_the_attended_keys() {
+    run_relayed::<half::f16>(
+        Case {
+            attended: 40,
+            ..SPLIT_KEYS
+        },
+        4,
+    );
+}
+
+#[test]
+fn relayed_attention_masks_causally_from_the_bottom_right() {
+    run_relayed::<half::f16>(
+        Case {
+            attended: 100,
+            causal: true,
+            ..SPLIT_KEYS
+        },
+        4,
+    );
+}
+
+const UNIT: UnitCase = UnitCase {
+    queries: 24,
+    keys: 40,
+    attended: 40,
+    head: 16,
+    value: 8,
+    rows: 2,
+    units: 4,
+    block: 4,
+    causal: false,
+};
+
+#[test]
+fn unit_attention_matches_the_reference() {
+    run_units::<f32>(UNIT);
+}
+
+#[test]
+fn unit_attention_reads_nothing_past_the_attended_keys() {
+    run_units::<f32>(UnitCase {
+        attended: 27,
+        ..UNIT
+    });
+}
+
+#[test]
+fn unit_attention_masks_causally_from_the_bottom_right() {
+    run_units::<f32>(UnitCase {
+        attended: 30,
+        causal: true,
+        ..UNIT
+    });
+}
+
+#[test]
+fn unit_attention_in_f16() {
+    run_units::<half::f16>(UNIT);
+}

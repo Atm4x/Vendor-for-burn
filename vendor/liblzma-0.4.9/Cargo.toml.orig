@@ -1,0 +1,49 @@
+[package]
+name = "liblzma"
+version = "0.4.9"
+authors = ["Alex Crichton <alex@alexcrichton.com>", "Portable-Network-Archive Developers"]
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["lzma", "xz", "encoding", "wasm"]
+repository = "https://github.com/portable-network-archive/liblzma-rs"
+homepage = "https://github.com/portable-network-archive/liblzma-rs"
+description = """
+Rust bindings to liblzma providing Read/Write streams as well as low-level
+in-memory encoding/decoding. forked from xz2.
+"""
+categories = ["compression", "api-bindings"]
+edition = "2021"
+rust-version = "1.60"
+exclude = [".github/"]
+
+[workspace]
+members = ["systest"]
+
+[dependencies]
+liblzma-sys = { path = "liblzma-sys", version = "0.4.8", default-features = false }
+
+[dev-dependencies]
+rand = "0.8.0"
+quickcheck = "1.0.1"
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
+[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+[features]
+default = ["bindgen"]
+static = ["liblzma-sys/static"]
+parallel = ["liblzma-sys/parallel"]
+bindgen = ["liblzma-sys/bindgen"]
+wasm = ["liblzma-sys/wasm"]
+uncheck_liblzma_version = ["liblzma-sys/uncheck_liblzma_version"] # Disables version checking for the system-installed liblzma. This is not recommended under normal circumstances.
+
+# These two are for cross-language LTO.
+# Will only work if `clang` is used to build the C library.
+fat-lto = ["liblzma-sys/fat-lto"] # Enable fat-lto, will override thin-lto if specified
+thin-lto = ["liblzma-sys/thin-lto"] # Enable thin-lto, will fall back to fat-lto if not supported
+
+[package.metadata.docs.rs]
+features = ["parallel"]

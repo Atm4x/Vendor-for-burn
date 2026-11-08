@@ -1,0 +1,42 @@
+[package]
+authors = ["nathanielsimard <nathaniel.simard.42@gmail.com>"]
+categories = ["science"]
+description = "ROCm HIP backend for the Burn framework"
+edition.workspace = true
+keywords = ["deep-learning", "machine-learning", "gpu", "rocm", "hip"]
+license.workspace = true
+name = "burn-rocm"
+readme = "README.md"
+repository = "https://github.com/tracel-ai/burn/tree/main/crates/burn-rocm"
+documentation = "https://docs.rs/burn-rocm"
+version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["fusion", "burn-cubecl/default", "cubecl/default"]
+doc = ["burn-cubecl/doc"]
+std = ["burn-cubecl/std", "cubecl/std"]
+
+tracing = [
+    "cubecl/tracing",
+    "burn-cubecl/tracing",
+    "burn-backend/tracing",
+    "burn-fusion?/tracing",
+]
+
+fusion = ["burn-fusion", "burn-cubecl/fusion"]
+persistence = ["burn-cubecl/persistence"]
+autotune = ["burn-cubecl/autotune"]
+autotune-checks = ["burn-cubecl/autotune-checks"]
+
+[dependencies]
+cubecl = { workspace = true, features = ["hip"] }
+burn-cubecl = { workspace = true }
+burn-backend = { workspace = true, features = ["cubecl-hip"] }
+burn-fusion = { workspace = true, optional = true, features = ["default"] }
+
+[package.metadata.docs.rs]
+features = ["doc"]
+rustdoc-args = ["--cfg", "docsrs"]

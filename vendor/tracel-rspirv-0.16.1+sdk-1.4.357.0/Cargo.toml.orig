@@ -1,0 +1,29 @@
+[package]
+authors = ["Lei Zhang <antiagainst@gmail.com>"]
+edition = "2018"
+name = "tracel-rspirv"
+version = { workspace = true }
+
+description = "Rust library APIs for SPIR-V module manipulation"
+documentation = "https://docs.rs/tracel-rspirv"
+keywords = ["spirv", "vulkan", "opengl", "opencl"]
+license = "Apache-2.0"
+repository = "https://github.com/tracel-ai/tracel-rspirv"
+
+[lib]
+path = "lib.rs"
+
+[features]
+deserialize = ['serde', 'bitflags/serde']
+pliron = ['dep:pliron']
+serialize = ['serde', 'bitflags/serde']
+
+[dependencies]
+bitflags = "2.9.4"
+rustc-hash = "2.1.0"
+serde = { version = "1", features = ["derive"], optional = true }
+
+pliron = { workspace = true, optional = true }
+
+[dev-dependencies]
+assert_matches = "1.1"

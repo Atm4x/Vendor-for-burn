@@ -1,0 +1,603 @@
+#![allow(clippy::transmute_num_to_bytes)]
+
+use core::{
+    ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Sub},
+    ptr::{read, read_unaligned, write, write_unaligned},
+};
+
+use bytemuck::{Pod, Zeroable};
+use half::f16;
+use num_traits::Float;
+use paste::paste;
+
+use crate::{MaskOps, Scalar};
+
+use super::{
+    cast, impl_convert_scalar, wrapping_add, wrapping_mul, wrapping_sub, RoundTiesEven, Simd, VRegister, WithSimd, impl_fma_scalar,
+};
+
+impl VRegister for u64 {}
+
+pub struct Fallback;
+
+impl super::seal::Sealed for Fallback {}
+
+macro_rules! impl_binop_scalar {
+    ($func: ident, $intrinsic: path, $($ty: ty),*) => {
+        $(paste! {
+            #[inline(always)]
+            fn [<$func _ $ty>](a: Self::Register, b: Self::Register) -> Self::Register {
+                const LANES: usize = 8 / size_of::<$ty>();
+                let a: [$ty; LANES] = cast!(a);
+                let b: [$ty; LANES] = cast!(b);
+                let mut out = [$ty::default(); LANES];
+
+                for i in 0..LANES {
+                    out[i] = $intrinsic(a[i], b[i]);
+                }
+                cast!(out)
+            }
+            #[inline(always)]
+            fn [<$func _ $ty _supported>]() -> bool {
+                false
+            }
+        })*
+    };
+}
+
+macro_rules! impl_unop_scalar {
+    ($func: ident, $intrinsic: path, $($ty: ty),*) => {
+        $(paste! {
+            #[inline(always)]
+            fn [<$func _ $ty>](a: Self::Register) -> Self::Register {
+                const LANES: usize = 8 / size_of::<$ty>();
+                let a: [$ty; LANES] = cast!(a);
+                let mut out = [$ty::default(); LANES];
+
+                for i in 0..LANES {
+                    out[i] = a[i].$intrinsic();
+                }
+                cast!(out)
+            }
+            #[inline(always)]
+            fn [<$func _ $ty _supported>]() -> bool {
+                false
+            }
+        })*
+    };
+}
+
+macro_rules! impl_binop_scalar_full {
+    ($func: ident, $intrinsic: path) => {
+        paste! {
+            #[inline(always)]
+            fn [<$func>](a: Self::Register, b: Self::Register) -> Self::Register {
+                $intrinsic(a, b)
+            }
+            #[inline(always)]
+            fn [<$func _supported>]() -> bool {
+                false
+            }
+        }
+    };
+}
+
+/// Mask lanes are bytes whose low bit is the lane's truth value: comparisons
+/// store 0 or 1, and `Not` flips every bit.
+macro_rules! impl_select_scalar {
+    ($($bits: literal: $ty: ty),*) => {
+        $(paste! {
+            #[inline(always)]
+            fn [<select_ $bits>](
+                mask: Self::[<Mask $bits>],
+                if_true: Self::Register,
+                if_false: Self::Register,
+            ) -> Self::Register {
+                const LANES: usize = 8 / size_of::<$ty>();
+                let if_true: [$ty; LANES] = cast!(if_true);
+                let if_false: [$ty; LANES] = cast!(if_false);
+                let mut out = [0; LANES];
+
+                for i in 0..LANES {
+                    out[i] = if mask.0[i] & 1 != 0 { if_true[i] } else { if_false[i] };
+                }
+                cast!(out)
+            }
+            #[inline(always)]
+            fn [<select_ $bits _supported>]() -> bool {
+                false
+            }
+        })*
+    };
+}
+
+
+macro_rules! impl_mask_reduce_scalar {
+    ($($bits: literal),*) => {
+        $(paste! {
+            #[inline(always)]
+            fn [<mask_any_ $bits>](mask: Self::[<Mask $bits>]) -> bool {
+                mask.0.iter().any(|lane| lane & 1 != 0)
+            }
+            #[inline(always)]
+            fn [<mask_any_ $bits _supported>]() -> bool {
+                false
+            }
+            #[inline(always)]
+            fn [<mask_all_ $bits>](mask: Self::[<Mask $bits>]) -> bool {
+                mask.0.iter().all(|lane| lane & 1 != 0)
+            }
+            #[inline(always)]
+            fn [<mask_all_ $bits _supported>]() -> bool {
+                false
+            }
+        })*
+    };
+}
+
+macro_rules! impl_shift_scalar {
+    ($($ty: ty),*) => {
+        $(paste! {
+            #[inline(always)]
+            fn [<shl_ $ty>](a: Self::Register, n: u32) -> Self::Register {
+                const LANES: usize = 8 / size_of::<$ty>();
+                let a: [$ty; LANES] = cast!(a);
+                let mut out = [0; LANES];
+
+                for i in 0..LANES {
+                    out[i] = a[i] << n;
+                }
+                cast!(out)
+            }
+            #[inline(always)]
+            fn [<shl_ $ty _supported>]() -> bool {
+                false
+            }
+            #[inline(always)]
+            fn [<shr_ $ty>](a: Self::Register, n: u32) -> Self::Register {
+                const LANES: usize = 8 / size_of::<$ty>();
+                let a: [$ty; LANES] = cast!(a);
+                let mut out = [0; LANES];
+
+                for i in 0..LANES {
+                    out[i] = a[i] >> n;
+                }
+                cast!(out)
+            }
+            #[inline(always)]
+            fn [<shr_ $ty _supported>]() -> bool {
+                false
+            }
+        })*
+    };
+}
+macro_rules! impl_cmp_scalar {
+    ($func: ident, $intrinsic: path, $($ty: ty),*) => {
+        $(paste! {
+            #[inline(always)]
+            fn [<$func _ $ty>](a: Self::Register, b: Self::Register) -> <$ty as Scalar>::Mask<Self> {
+                const LANES: usize = 8 / size_of::<$ty>();
+                let a: [$ty; LANES] = cast!(a);
+                let b: [$ty; LANES] = cast!(b);
+                let mut out = [0u8; LANES];
+
+                for i in 0..LANES {
+                    out[i] = a[i].$intrinsic(&b[i]) as u8;
+                }
+                cast!(out)
+            }
+            #[inline(always)]
+            fn [<$func _ $ty _supported>]() -> bool {
+                false
+            }
+        })*
+    };
+}
+
+macro_rules! impl_reduce_scalar {
+    ($func: ident, $intrinsic: path, $($ty: ty),*) => {
+        $(paste! {
+            #[inline(always)]
+            fn [<$func _ $ty>](a: Self::Register) -> $ty {
+                const LANES: usize = 8 / size_of::<$ty>();
+                let a: [$ty; LANES] = cast!(a);
+                let mut out: $ty = a[0];
+
+                #[allow(clippy::reversed_empty_ranges)]
+                for i in 1..LANES {
+                    out = out.$intrinsic(a[i]);
+                }
+                out
+            }
+            #[inline(always)]
+            fn [<$func _ $ty _supported>]() -> bool {
+                false
+            }
+        })*
+    };
+}
+
+macro_rules! lanes {
+    ($($bits: literal),*) => {
+        $(paste! {
+            #[inline(always)]
+            fn [<lanes $bits>]() -> usize {
+                64 / $bits
+            }
+        })*
+    };
+}
+
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+#[repr(transparent)]
+pub struct ScalarMask<const LANES: usize>([u8; LANES]);
+
+impl<const LANES: usize> core::ops::Not for ScalarMask<LANES> {
+    type Output = Self;
+
+    fn not(self) -> Self::Output {
+        let mut out = [0; LANES];
+        for (i, o) in self.0.into_iter().zip(&mut out) {
+            *o = !i;
+        }
+        ScalarMask(out)
+    }
+}
+
+impl<const LANES: usize> core::ops::BitAnd for ScalarMask<LANES> {
+    type Output = Self;
+
+    fn bitand(self, rhs: Self) -> Self::Output {
+        let mut out = [0; LANES];
+        for ((lhs, rhs), o) in self.0.into_iter().zip(rhs.0).zip(&mut out) {
+            *o = lhs & rhs;
+        }
+        ScalarMask(out)
+    }
+}
+
+impl<const LANES: usize> core::ops::BitOr for ScalarMask<LANES> {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        let mut out = [0; LANES];
+        for ((lhs, rhs), o) in self.0.into_iter().zip(rhs.0).zip(&mut out) {
+            *o = lhs | rhs;
+        }
+        ScalarMask(out)
+    }
+}
+
+impl<const LANES: usize> core::ops::BitXor for ScalarMask<LANES> {
+    type Output = Self;
+
+    fn bitxor(self, rhs: Self) -> Self::Output {
+        let mut out = [0; LANES];
+        for ((lhs, rhs), o) in self.0.into_iter().zip(rhs.0).zip(&mut out) {
+            *o = lhs ^ rhs;
+        }
+        ScalarMask(out)
+    }
+}
+
+impl<const LANES: usize> MaskOps for ScalarMask<LANES> {}
+
+#[inline(always)]
+unsafe fn mask_store_as_bool<const LANES: usize>(out: *mut bool, mask: ScalarMask<LANES>) {
+    for (i, lane) in mask.0.into_iter().enumerate() {
+        // there is no `as bool` in Rust, `!= 0` is the canonical conversion rustc
+        // suggests
+        unsafe { write(out.add(i), lane & 1 != 0) };
+    }
+}
+
+impl Simd for Fallback {
+    type Register = u64;
+    type Mask8 = ScalarMask<8>;
+    type Mask16 = ScalarMask<4>;
+    type Mask32 = ScalarMask<2>;
+    type Mask64 = ScalarMask<1>;
+
+    lanes!(8, 16, 32, 64);
+
+    impl_binop_scalar!(add, wrapping_add, u8, i8, u16, i16, u32, i32, u64, i64);
+    impl_binop_scalar!(add, Add::add, f16, f32, f64);
+    impl_binop_scalar!(sub, wrapping_sub, u8, i8, u16, i16, u32, i32, u64, i64);
+    impl_binop_scalar!(sub, Sub::sub, f16, f32, f64);
+    impl_binop_scalar!(div, Div::div, f16, f32, f64);
+    impl_binop_scalar!(mul, wrapping_mul, u8, i8, u16, i16, u32, i32, u64, i64);
+    impl_binop_scalar!(mul, Mul::mul, f16, f32, f64);
+    impl_binop_scalar!(min, Ord::min, u8, i8, u16, i16, u32, i32, u64, i64);
+    impl_binop_scalar!(min, f16::min, f16);
+    impl_binop_scalar!(min, f32::min, f32);
+    impl_binop_scalar!(min, f64::min, f64);
+    impl_binop_scalar!(max, Ord::max, u8, i8, u16, i16, u32, i32, u64, i64);
+    impl_binop_scalar!(max, f16::max, f16);
+    impl_binop_scalar!(max, f32::max, f32);
+    impl_binop_scalar!(max, f64::max, f64);
+
+    impl_binop_scalar_full!(bitand, BitAnd::bitand);
+    impl_binop_scalar_full!(bitor, BitOr::bitor);
+    impl_binop_scalar_full!(bitxor, BitXor::bitxor);
+
+    impl_select_scalar!(8: u8, 16: u16, 32: u32, 64: u64);
+    impl_convert_scalar!(8, f32: i32, f64: i64);
+    impl_mask_reduce_scalar!(8, 16, 32, 64);
+
+    impl_shift_scalar!(u16, i16, u32, i32, u64, i64);
+
+    impl_unop_scalar!(recip, recip, f16, f32, f64);
+    impl_unop_scalar!(abs, wrapping_abs, i8, i16, i32, i64);
+    impl_unop_scalar!(abs, abs, f16, f32, f64);
+    impl_unop_scalar!(sqrt, sqrt, f16, f32, f64);
+    impl_unop_scalar!(floor, floor, f16, f32, f64);
+    impl_unop_scalar!(ceil, ceil, f16, f32, f64);
+    impl_unop_scalar!(trunc, trunc, f16, f32, f64);
+    impl_unop_scalar!(round_ties_even, round_ties_even_soft, f16, f32, f64);
+
+    impl_cmp_scalar!(equals, eq, u8, i8, u16, i16, f16, u32, i32, f32, u64, i64, f64);
+    impl_cmp_scalar!(
+        greater_than,
+        gt,
+        u8,
+        i8,
+        u16,
+        i16,
+        f16,
+        u32,
+        i32,
+        f32,
+        u64,
+        i64,
+        f64
+    );
+    impl_cmp_scalar!(
+        greater_than_or_equal,
+        ge,
+        u8,
+        i8,
+        u16,
+        i16,
+        f16,
+        u32,
+        i32,
+        f32,
+        u64,
+        i64,
+        f64
+    );
+    impl_cmp_scalar!(less_than, lt, u8, i8, u16, i16, f16, u32, i32, f32, u64, i64, f64);
+    impl_cmp_scalar!(
+        less_than_or_equal,
+        le,
+        u8,
+        i8,
+        u16,
+        i16,
+        f16,
+        u32,
+        i32,
+        f32,
+        u64,
+        i64,
+        f64
+    );
+
+    impl_reduce_scalar!(
+        reduce_add,
+        wrapping_add,
+        u8,
+        i8,
+        u16,
+        i16,
+        u32,
+        i32,
+        u64,
+        i64
+    );
+    impl_reduce_scalar!(reduce_add, add, f16, f32, f64);
+    impl_reduce_scalar!(reduce_min, min, u8, i8, u16, i16, u32, i32, u64, i64, f16, f32, f64);
+    impl_reduce_scalar!(reduce_max, max, u8, i8, u16, i16, u32, i32, u64, i64, f16, f32, f64);
+
+    unsafe fn vectorize<Op: WithSimd>(op: Op) -> Op::Output {
+        op.with_simd::<Self>()
+    }
+
+    #[inline(always)]
+    unsafe fn mask_store_as_bool_8(out: *mut bool, mask: Self::Mask8) {
+        unsafe { mask_store_as_bool(out, mask) };
+    }
+    #[inline(always)]
+    unsafe fn mask_store_as_bool_16(out: *mut bool, mask: Self::Mask16) {
+        unsafe { mask_store_as_bool(out, mask) };
+    }
+    #[inline(always)]
+    unsafe fn mask_store_as_bool_32(out: *mut bool, mask: Self::Mask32) {
+        unsafe { mask_store_as_bool(out, mask) };
+    }
+    #[inline(always)]
+    unsafe fn mask_store_as_bool_64(out: *mut bool, mask: Self::Mask64) {
+        unsafe { mask_store_as_bool(out, mask) };
+    }
+    #[inline(always)]
+    fn mask_from_bools_8(bools: &[bool]) -> Self::Mask8 {
+        let mask: [bool; 8] = bools.try_into().expect("Slice must be `lanes8` length");
+        cast!(mask)
+    }
+    #[inline(always)]
+    fn mask_from_bools_16(bools: &[bool]) -> Self::Mask16 {
+        let mask: [bool; 4] = bools.try_into().expect("Slice must be `lanes16` length");
+        cast!(mask)
+    }
+    #[inline(always)]
+    fn mask_from_bools_32(bools: &[bool]) -> Self::Mask32 {
+        let mask: [bool; 2] = bools.try_into().expect("Slice must be `lanes32` length");
+        cast!(mask)
+    }
+    #[inline(always)]
+    fn mask_from_bools_64(bools: &[bool]) -> Self::Mask64 {
+        let mask: [bool; 1] = bools.try_into().expect("Slice must be `lanes64` length");
+        cast!(mask)
+    }
+
+    #[inline(always)]
+    unsafe fn load<T: Scalar>(ptr: *const T) -> super::Vector<Self, T> {
+        Self::typed(unsafe { read(ptr as *const u64) })
+    }
+    #[inline(always)]
+    unsafe fn load_unaligned<T: Scalar>(ptr: *const T) -> super::Vector<Self, T> {
+        Self::typed(unsafe { read_unaligned(ptr as *const u64) })
+    }
+    #[inline(always)]
+    unsafe fn load_low<T: Scalar>(ptr: *const T) -> super::Vector<Self, T> {
+        let halves: [u32; 2] = [unsafe { read_unaligned(ptr as *const u32) }, 0];
+        Self::typed(cast!(halves))
+    }
+    #[inline(always)]
+    unsafe fn load_high<T: Scalar>(ptr: *const T) -> super::Vector<Self, T> {
+        let halves: [u32; 2] = [0, unsafe { read_unaligned((ptr as *const u32).add(1)) }];
+        Self::typed(cast!(halves))
+    }
+    #[inline(always)]
+    unsafe fn store<T: Scalar>(ptr: *mut T, value: super::Vector<Self, T>) {
+        unsafe { write(ptr as *mut u64, cast!(*value)) };
+    }
+    #[inline(always)]
+    unsafe fn store_unaligned<T: Scalar>(ptr: *mut T, value: super::Vector<Self, T>) {
+        unsafe { write_unaligned(ptr as *mut u64, cast!(*value)) };
+    }
+    #[inline(always)]
+    unsafe fn store_low<T: Scalar>(ptr: *mut T, value: super::Vector<Self, T>) {
+        let halves: [u32; 2] = cast!(*value);
+        unsafe { write_unaligned(ptr as *mut u32, halves[0]) };
+    }
+    #[inline(always)]
+    unsafe fn store_high<T: Scalar>(ptr: *mut T, value: super::Vector<Self, T>) {
+        let halves: [u32; 2] = cast!(*value);
+        unsafe { write_unaligned((ptr as *mut u32).add(1), halves[1]) };
+    }
+    #[inline(always)]
+    fn splat_i8(value: i8) -> Self::Register {
+        cast!([value; 8])
+    }
+    #[inline(always)]
+    fn splat_i16(value: i16) -> Self::Register {
+        cast!([value; 4])
+    }
+    #[inline(always)]
+    fn splat_i32(value: i32) -> Self::Register {
+        cast!([value; 2])
+    }
+    #[inline(always)]
+    fn splat_i64(value: i64) -> Self::Register {
+        cast!(value)
+    }
+    #[inline(always)]
+    fn mul_add_f16(a: Self::Register, b: Self::Register, c: Self::Register) -> Self::Register {
+        let a: [f16; 4] = cast!(a);
+        let b: [f16; 4] = cast!(b);
+        let c: [f16; 4] = cast!(c);
+        let mut out = [f16::default(); 4];
+
+        for i in 0..4 {
+            out[i] = a[i] * b[i] + c[i];
+        }
+        cast!(out)
+    }
+    #[inline(always)]
+    fn mul_add_f16_supported() -> bool {
+        false
+    }
+    #[inline(always)]
+    fn mul_add_f32(a: Self::Register, b: Self::Register, c: Self::Register) -> Self::Register {
+        let a: [f32; 2] = cast!(a);
+        let b: [f32; 2] = cast!(b);
+        let c: [f32; 2] = cast!(c);
+        let mut out = [f32::default(); 2];
+
+        for i in 0..2 {
+            out[i] = a[i].mul_add(b[i], c[i]);
+        }
+        cast!(out)
+    }
+    #[inline(always)]
+    fn mul_add_f32_supported() -> bool {
+        false
+    }
+    #[inline(always)]
+    fn mul_add_f64(a: Self::Register, b: Self::Register, c: Self::Register) -> Self::Register {
+        let a: [f64; 1] = cast!(a);
+        let b: [f64; 1] = cast!(b);
+        let c: [f64; 1] = cast!(c);
+        let mut out = [f64::default(); 1];
+
+        for i in 0..1 {
+            out[i] = a[i].mul_add(b[i], c[i]);
+        }
+        cast!(out)
+    }
+    #[inline(always)]
+    fn mul_add_f64_supported() -> bool {
+        false
+    }
+    impl_fma_scalar!(8, f32, f64);
+
+    fn bitnot(a: Self::Register) -> Self::Register {
+        !a
+    }
+
+    fn bitnot_supported() -> bool {
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Fallback;
+    use crate::{vstore_high, vstore_low, Mask, Scalar};
+
+    #[test]
+    fn mask_store_as_bool_normalizes_bitwise_mask_bytes() {
+        // `ScalarMask` stores boolean masks as raw `u8` bytes and its safe
+        // `Not` implementation applies bitwise-not to those bytes.
+        // `store_as_bool` must not bulk-copy raw mask bytes into bool storage,
+        // because after `!` true lanes become `0xfe`, which is not a valid
+        // `bool` representation.
+        let mask = !Mask::<Fallback, u8>::from_bools(&[true; 8]);
+        let mut out = [false; 8];
+
+        unsafe { mask.store_as_bool(out.as_mut_ptr()) };
+
+        assert_eq!(out, [false; 8]);
+    }
+
+    #[test]
+    fn vstore_low_accepts_unaligned_pointer() {
+        #[repr(align(4))]
+        struct Aligned([u8; 8]);
+
+        // `vstore_low` documents `write_unaligned`-style requirements, so this
+        // unaligned pointer is valid for the documented unsafe contract. This
+        // regresses the old `ptr::write` through `*mut u32`, which required
+        // 4-byte alignment.
+        let value = 0xabu8.splat::<Fallback>();
+        let mut bytes = Aligned([0; 8]);
+
+        unsafe { vstore_low::<Fallback, u8>(bytes.0.as_mut_ptr().add(1), value) };
+    }
+
+    #[test]
+    fn vstore_high_accepts_unaligned_pointer() {
+        #[repr(align(4))]
+        struct Aligned([u8; 9]);
+
+        // `vstore_high` has the same documented unaligned-pointer contract as
+        // `vstore_low`. This regresses the old aligned `ptr::write` through
+        // `*mut u32`. `ptr` addresses the whole vector, so the buffer needs
+        // room for 8 bytes after the offset.
+        let value = 0xabu8.splat::<Fallback>();
+        let mut bytes = Aligned([0; 9]);
+
+        unsafe { vstore_high::<Fallback, u8>(bytes.0.as_mut_ptr().add(1), value) };
+    }
+}

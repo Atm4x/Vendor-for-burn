@@ -1,0 +1,148 @@
+use std::marker::PhantomData;
+
+use cubecl::{
+    benchmark::{Benchmark, TimingMethod},
+    client::Client,
+    future,
+    prelude::*,
+    std::tensor::TensorHandle,
+    zspace::Shape,
+};
+use cubek_test_utils::{RunSamples, StridedLayout, TestInput};
+
+use crate::eval::benchmarks::problem::FftProblem;
+use crate::eval::benchmarks::strategy::FftStrategy;
+use crate::{FftMode, irfft_launch, rfft_launch};
+
+pub fn bench(
+    _strategy: &FftStrategy,
+    problem: &FftProblem,
+    num_samples: usize,
+) -> Result<RunSamples, String> {
+    let device = cubecl::test_device();
+    let client = device.client();
+
+    let bench = FftBench::<f32> {
+        shape: problem.shape.clone(),
+        mode: problem.mode,
+        device,
+        client,
+        samples: num_samples,
+        _e: PhantomData,
+    };
+
+    let durations = bench
+        .run(cubek_test_utils::timing_method(TimingMethod::System))
+        .map_err(|e| format!("benchmark failed: {e}"))?
+        .durations;
+
+    Ok(RunSamples::new(durations))
+}
+
+struct FftBench<E> {
+    shape: Vec<usize>,
+    mode: FftMode,
+    device: cubecl::Device,
+    client: Client,
+    samples: usize,
+    _e: PhantomData<E>,
+}
+
+#[derive(Clone)]
+struct FftInput {
+    signal: TensorHandle,
+    spectrum_re: TensorHandle,
+    spectrum_im: TensorHandle,
+}
+
+fn make_uniform(client: &Client, shape: Vec<usize>, dtype: ElemType, seed: u64) -> TensorHandle {
+    TestInput::builder(client.clone(), Shape::from(shape))
+        .layout(StridedLayout::RowMajor)
+        .dtype(dtype)
+        .uniform(seed, 0., 1.)
+        .generate_without_host_data()
+}
+
+fn empty_handle(client: &Client, shape: Vec<usize>, elem: impl Into<Type>) -> TensorHandle {
+    TensorHandle::empty(client, shape, elem)
+}
+
+impl<E: Float> Benchmark for FftBench<E> {
+    type Input = FftInput;
+    type Output = ();
+
+    fn prepare(&self) -> Self::Input {
+        let client = self.device.client();
+        let elem = E::elem_type_native();
+
+        let mut shape_out = self.shape.clone();
+        let dim = self.shape.len() - 1;
+        shape_out[dim] = self.shape[dim] / 2 + 1;
+
+        match self.mode {
+            FftMode::Forward => {
+                let signal = make_uniform(&client, self.shape.clone(), elem, 0);
+                let spectrum_re = empty_handle(&client, shape_out.clone(), elem);
+                let spectrum_im = empty_handle(&client, shape_out, elem);
+                FftInput {
+                    signal,
+                    spectrum_re,
+                    spectrum_im,
+                }
+            }
+            FftMode::Inverse => {
+                let signal = empty_handle(&client, self.shape.clone(), elem);
+                let spectrum_re = make_uniform(&client, shape_out.clone(), elem, 0);
+                let spectrum_im = make_uniform(&client, shape_out, elem, 1);
+                FftInput {
+                    signal,
+                    spectrum_re,
+                    spectrum_im,
+                }
+            }
+        }
+    }
+
+    fn execute(&self, input: Self::Input) -> Result<(), String> {
+        let dim = self.shape.len() - 1;
+        match self.mode {
+            FftMode::Forward => rfft_launch(
+                &self.client,
+                input.signal.binding(),
+                input.spectrum_re.binding(),
+                input.spectrum_im.binding(),
+                dim,
+                E::elem_type_native(),
+            )
+            .map_err(|err| format!("{err}"))?,
+            FftMode::Inverse => irfft_launch(
+                &self.client,
+                input.spectrum_re.binding(),
+                input.spectrum_im.binding(),
+                input.signal.binding(),
+                dim,
+                E::elem_type_native(),
+            )
+            .map_err(|err| format!("{err}"))?,
+        }
+        Ok(())
+    }
+
+    fn num_samples(&self) -> usize {
+        self.samples
+    }
+
+    fn name(&self) -> String {
+        format!(
+            "fft-{}-{:?}-{:?}",
+            E::elem_type_native(),
+            self.shape,
+            self.mode,
+        )
+        .to_lowercase()
+    }
+
+    fn sync(&self) {
+        future::block_on(self.client.sync()).unwrap()
+    }
+}

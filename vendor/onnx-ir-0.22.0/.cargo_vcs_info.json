@@ -1,0 +1,6 @@
+{
+  "git": {
+    "sha1": "96660512a3fa72cf21c4a77226659b37e95d9f64"
+  },
+  "path_in_vcs": "crates/onnx-ir"
+}

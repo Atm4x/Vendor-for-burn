@@ -1,0 +1,497 @@
+use super::prelude::*;
+
+impl NodeCodegen for onnx_ir::node::arithmetic::SubNode {
+    fn inputs(&self) -> &[Argument] {
+        &self.inputs
+    }
+
+    fn outputs(&self) -> &[Argument] {
+        &self.outputs
+    }
+
+    fn forward(&self, scope: &mut ScopeAtPosition<'_>) -> TokenStream {
+        let lhs_arg = self.inputs.first().unwrap();
+        let rhs_arg = self.inputs.get(1).unwrap();
+        let output = arg_to_ident(self.outputs.first().unwrap());
+
+        let lhs = scope.arg(lhs_arg);
+
+        let rhs = scope.arg(rhs_arg);
+
+        let function = match (&lhs_arg.ty, &rhs_arg.ty) {
+            (lhs_ty, rhs_ty) if lhs_ty.is_on_device() && rhs_ty.is_on_device() => {
+                let lhs_rank = lhs_ty.rank();
+                let rhs_rank = rhs_ty.rank();
+                let lhs_bc =
+                    broadcast_helpers::leading_broadcast(quote! { #lhs }, lhs_rank, rhs_rank);
+                let rhs_bc =
+                    broadcast_helpers::leading_broadcast(quote! { #rhs }, rhs_rank, lhs_rank);
+                quote! { #lhs_bc.sub(#rhs_bc) }
+            }
+            (lhs_ty, ArgType::ScalarNative(_)) if lhs_ty.is_on_device() => {
+                quote! { #lhs.sub_scalar(#rhs) }
+            }
+            (ArgType::ScalarNative(_), ArgType::ScalarNative(_)) => quote! { #lhs - #rhs },
+            (ArgType::ScalarNative(_), rhs_ty) if rhs_ty.is_on_device() => {
+                quote! { #lhs - #rhs }
+            }
+            (ArgType::Shape(lhs_len), ArgType::Shape(rhs_len)) => {
+                broadcast_helpers::shape_binary_elementwise(
+                    quote! { #lhs },
+                    *lhs_len,
+                    quote! { #rhs },
+                    *rhs_len,
+                    |a, b| quote! { (#a).saturating_sub(#b) },
+                )
+            }
+            (ArgType::Shape(_), rhs_ty) if rhs_ty.is_scalar() => {
+                let scalar_expr = scalar_as_i64(rhs_arg, rhs.clone());
+                quote! {
+                    {
+                        let mut result = #lhs;
+                        let scalar = #scalar_expr;
+                        for result_item in result.iter_mut() {
+                            *result_item = result_item.saturating_sub(scalar);
+                        }
+                        result
+                    }
+                }
+            }
+            (lhs_ty, ArgType::Shape(_)) if lhs_ty.is_scalar() => {
+                let scalar_expr = scalar_as_i64(lhs_arg, lhs.clone());
+                quote! {
+                    {
+                        let mut result = #rhs;
+                        let scalar = #scalar_expr;
+                        for result_item in result.iter_mut() {
+                            *result_item = scalar.saturating_sub(*result_item);
+                        }
+                        result
+                    }
+                }
+            }
+            (ArgType::Shape(_), rhs_ty) if rhs_ty.is_on_device() => {
+                let lhs_bc = broadcast_helpers::shape_operand_tensor(quote! { #lhs }, rhs_ty);
+                quote! { #lhs_bc.sub(#rhs) }
+            }
+            (lhs_ty, ArgType::Shape(_)) if lhs_ty.is_on_device() => {
+                let rhs_bc = broadcast_helpers::shape_operand_tensor(quote! { #rhs }, lhs_ty);
+                quote! { #lhs.sub(#rhs_bc) }
+            }
+            _ => unreachable!(
+                "sub: unsupported input types: {:?}, {:?}",
+                lhs_arg.ty, rhs_arg.ty
+            ),
+        };
+
+        quote! {
+            let #output = #function;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_helpers::*;
+    use burn::tensor::DType;
+    use insta::assert_snapshot;
+    use onnx_ir::node::arithmetic::SubNodeBuilder;
+
+    // --- on_device + on_device ---
+
+    #[test]
+    fn test_tensor_tensor_same_rank() {
+        let node = SubNodeBuilder::new("sub1")
+            .input_tensor("lhs", 2, DType::F32)
+            .input_tensor("rhs", 2, DType::F32)
+            .output_tensor("output", 2, DType::F32)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, lhs: Tensor<2>, rhs: Tensor<2>) -> Tensor<2> {
+            let output = lhs.sub(rhs);
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_tensor_tensor_broadcast_lhs_higher() {
+        let node = SubNodeBuilder::new("sub1")
+            .input_tensor("lhs", 3, DType::F32)
+            .input_tensor("rhs", 2, DType::F32)
+            .output_tensor("output", 3, DType::F32)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, lhs: Tensor<3>, rhs: Tensor<2>) -> Tensor<3> {
+            let output = lhs.sub((rhs).unsqueeze_dims(&[0isize]));
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_tensor_tensor_broadcast_rhs_higher() {
+        let node = SubNodeBuilder::new("sub1")
+            .input_tensor("lhs", 2, DType::F32)
+            .input_tensor("rhs", 3, DType::F32)
+            .output_tensor("output", 3, DType::F32)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, lhs: Tensor<2>, rhs: Tensor<3>) -> Tensor<3> {
+            let output = (lhs).unsqueeze_dims(&[0isize]).sub(rhs);
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_tensor_scalar_tensor() {
+        let node = SubNodeBuilder::new("sub1")
+            .input_tensor("lhs", 3, DType::F32)
+            .input_scalar_tensor("rhs", DType::F32)
+            .output_tensor("output", 3, DType::F32)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, lhs: Tensor<3>, rhs: Tensor<1>) -> Tensor<3> {
+            let output = lhs.sub((rhs).unsqueeze_dims(&[0isize, 1isize]));
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_scalar_tensor_tensor() {
+        let node = SubNodeBuilder::new("sub1")
+            .input_scalar_tensor("lhs", DType::F32)
+            .input_tensor("rhs", 3, DType::F32)
+            .output_tensor("output", 3, DType::F32)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, lhs: Tensor<1>, rhs: Tensor<3>) -> Tensor<3> {
+            let output = (lhs).unsqueeze_dims(&[0isize, 1isize]).sub(rhs);
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_scalar_tensor_scalar_tensor() {
+        let node = SubNodeBuilder::new("sub1")
+            .input_scalar_tensor("lhs", DType::F32)
+            .input_scalar_tensor("rhs", DType::F32)
+            .output_scalar_tensor("output", DType::F32)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, lhs: Tensor<1>, rhs: Tensor<1>) -> Tensor<1> {
+            let output = lhs.sub(rhs);
+            output
+        }
+        ");
+    }
+
+    // --- on_device + ScalarNative ---
+
+    #[test]
+    fn test_tensor_scalar_native() {
+        let node = SubNodeBuilder::new("sub1")
+            .input_tensor("lhs", 2, DType::F32)
+            .input_scalar("rhs", DType::F32)
+            .output_tensor("output", 2, DType::F32)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, lhs: Tensor<2>, rhs: f32) -> Tensor<2> {
+            let output = lhs.sub_scalar(rhs);
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_scalar_native_tensor() {
+        let node = SubNodeBuilder::new("sub1")
+            .input_scalar("lhs", DType::F32)
+            .input_tensor("rhs", 2, DType::F32)
+            .output_tensor("output", 2, DType::F32)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, lhs: f32, rhs: Tensor<2>) -> Tensor<2> {
+            let output = lhs - rhs;
+            output
+        }
+        ");
+    }
+
+    // --- ScalarNative + ScalarNative ---
+
+    #[test]
+    fn test_scalar_native_scalar_native() {
+        let node = SubNodeBuilder::new("sub1")
+            .input_scalar("lhs", DType::F32)
+            .input_scalar("rhs", DType::F32)
+            .output_scalar("output", DType::F32)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, lhs: f32, rhs: f32) -> f32 {
+            let output = lhs - rhs;
+            output
+        }
+        ");
+    }
+
+    // --- Shape + Shape ---
+
+    #[test]
+    fn test_shape_shape() {
+        let node = SubNodeBuilder::new("sub1")
+            .input_shape("lhs", 4)
+            .input_shape("rhs", 4)
+            .output_shape("output", 4)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, lhs: [i64; 4], rhs: [i64; 4]) -> [i64; 4] {
+            let output = {
+                let __lhs = lhs;
+                let __rhs = rhs;
+                core::array::from_fn::<
+                    i64,
+                    4usize,
+                    _,
+                >(|__i| (__lhs[__i]).saturating_sub(__rhs[__i]))
+            };
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_shape_shape_broadcast_lhs() {
+        let node = SubNodeBuilder::new("sub1")
+            .input_shape("lhs", 1)
+            .input_shape("rhs", 4)
+            .output_shape("output", 4)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, lhs: [i64; 1], rhs: [i64; 4]) -> [i64; 4] {
+            let output = {
+                let __lhs = lhs;
+                let __rhs = rhs;
+                core::array::from_fn::<
+                    i64,
+                    4usize,
+                    _,
+                >(|__i| (__lhs[0]).saturating_sub(__rhs[__i]))
+            };
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_shape_shape_broadcast_rhs() {
+        let node = SubNodeBuilder::new("sub1")
+            .input_shape("lhs", 4)
+            .input_shape("rhs", 1)
+            .output_shape("output", 4)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, lhs: [i64; 4], rhs: [i64; 1]) -> [i64; 4] {
+            let output = {
+                let __lhs = lhs;
+                let __rhs = rhs;
+                core::array::from_fn::<
+                    i64,
+                    4usize,
+                    _,
+                >(|__i| (__lhs[__i]).saturating_sub(__rhs[0]))
+            };
+            output
+        }
+        ");
+    }
+
+    // --- Shape + Scalar ---
+
+    #[test]
+    fn test_shape_scalar_native() {
+        let node = SubNodeBuilder::new("sub1")
+            .input_shape("lhs", 4)
+            .input_scalar("rhs", DType::I64)
+            .output_shape("output", 4)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, lhs: [i64; 4], rhs: i64) -> [i64; 4] {
+            let output = {
+                let mut result = lhs;
+                let scalar = rhs;
+                for result_item in result.iter_mut() {
+                    *result_item = result_item.saturating_sub(scalar);
+                }
+                result
+            };
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_shape_scalar_tensor() {
+        let node = SubNodeBuilder::new("sub1")
+            .input_shape("lhs", 4)
+            .input_scalar_tensor("rhs", DType::I64)
+            .output_shape("output", 4)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, lhs: [i64; 4], rhs: Tensor<1, Int>) -> [i64; 4] {
+            let output = {
+                let mut result = lhs;
+                let scalar = (rhs).into_scalar::<i64>();
+                for result_item in result.iter_mut() {
+                    *result_item = result_item.saturating_sub(scalar);
+                }
+                result
+            };
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_scalar_native_shape() {
+        let node = SubNodeBuilder::new("sub1")
+            .input_scalar("lhs", DType::I64)
+            .input_shape("rhs", 4)
+            .output_shape("output", 4)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, lhs: i64, rhs: [i64; 4]) -> [i64; 4] {
+            let output = {
+                let mut result = rhs;
+                let scalar = lhs;
+                for result_item in result.iter_mut() {
+                    *result_item = scalar.saturating_sub(*result_item);
+                }
+                result
+            };
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_scalar_tensor_shape() {
+        let node = SubNodeBuilder::new("sub1")
+            .input_scalar_tensor("lhs", DType::I64)
+            .input_shape("rhs", 4)
+            .output_shape("output", 4)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, lhs: Tensor<1, Int>, rhs: [i64; 4]) -> [i64; 4] {
+            let output = {
+                let mut result = rhs;
+                let scalar = (lhs).into_scalar::<i64>();
+                for result_item in result.iter_mut() {
+                    *result_item = scalar.saturating_sub(*result_item);
+                }
+                result
+            };
+            output
+        }
+        ");
+    }
+
+    // --- Shape + on_device ---
+
+    #[test]
+    fn test_shape_tensor() {
+        let node = SubNodeBuilder::new("sub1")
+            .input_shape("lhs", 4)
+            .input_tensor("rhs", 1, DType::I64)
+            .output_tensor("output", 1, DType::I64)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, lhs: [i64; 4], rhs: Tensor<1, Int>) -> Tensor<1, Int> {
+            let output = Tensor::<
+                1,
+                burn::tensor::Int,
+            >::from_data(
+                    burn::tensor::TensorData::from(&lhs as &[i64]),
+                    (&self.device, burn::tensor::DType::I64),
+                )
+                .sub(rhs);
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_tensor_shape() {
+        let node = SubNodeBuilder::new("sub1")
+            .input_tensor("lhs", 1, DType::I64)
+            .input_shape("rhs", 4)
+            .output_tensor("output", 1, DType::I64)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, lhs: Tensor<1, Int>, rhs: [i64; 4]) -> Tensor<1, Int> {
+            let output = lhs
+                .sub(
+                    Tensor::<
+                        1,
+                        burn::tensor::Int,
+                    >::from_data(
+                        burn::tensor::TensorData::from(&rhs as &[i64]),
+                        (&self.device, burn::tensor::DType::I64),
+                    ),
+                );
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_shape_tensor_rank3() {
+        let node = SubNodeBuilder::new("sub1")
+            .input_shape("lhs", 1)
+            .input_tensor("rhs", 3, DType::I64)
+            .output_tensor("output", 3, DType::I64)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, lhs: [i64; 1], rhs: Tensor<3, Int>) -> Tensor<3, Int> {
+            let output = (Tensor::<
+                1,
+                burn::tensor::Int,
+            >::from_data(
+                burn::tensor::TensorData::from(&lhs as &[i64]),
+                (&self.device, burn::tensor::DType::I64),
+            ))
+                .unsqueeze_dims(&[0isize, 1isize])
+                .sub(rhs);
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_tensor_rank3_shape() {
+        let node = SubNodeBuilder::new("sub1")
+            .input_tensor("lhs", 3, DType::I64)
+            .input_shape("rhs", 1)
+            .output_tensor("output", 3, DType::I64)
+            .build();
+        assert_snapshot!(codegen_forward_default(&node), @r"
+        pub fn forward(&self, lhs: Tensor<3, Int>, rhs: [i64; 1]) -> Tensor<3, Int> {
+            let output = lhs
+                .sub(
+                    (Tensor::<
+                        1,
+                        burn::tensor::Int,
+                    >::from_data(
+                        burn::tensor::TensorData::from(&rhs as &[i64]),
+                        (&self.device, burn::tensor::DType::I64),
+                    ))
+                        .unsqueeze_dims(&[0isize, 1isize]),
+                );
+            output
+        }
+        ");
+    }
+}

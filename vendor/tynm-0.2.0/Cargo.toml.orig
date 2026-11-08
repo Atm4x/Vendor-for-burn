@@ -1,0 +1,29 @@
+[package]
+name = "tynm"
+version = "0.2.0"
+authors = ["Azriel Hoh <azriel91@gmail.com>"]
+edition = "2024"
+description = "Returns type names in shorter form."
+repository = "https://github.com/azriel91/tynm"
+documentation = "https://docs.rs/tynm/"
+readme = "README.md"
+keywords = ["typename", "type", "name"]
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+nom = { version = "8.0.0", default-features = false, features = ["alloc"] }
+serde = { version = "1.0.219", optional = true, features = ["derive"] }
+
+[dev-dependencies]
+pretty_assertions = "1.4.1"
+serde_yaml = "0.9.34"
+
+[features]
+default = []
+info = []
+serde = ["dep:serde"]
+
+[badges]
+appveyor = { repository = "azriel91/tynm" }
+travis-ci = { repository = "azriel91/tynm" }
+codecov = { repository = "azriel91/tynm" }

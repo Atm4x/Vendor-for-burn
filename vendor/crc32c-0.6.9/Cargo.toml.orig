@@ -1,0 +1,32 @@
+[package]
+name = "crc32c"
+version = "0.6.9"
+authors = ["Zack Owens"]
+license = "MIT OR Apache-2.0"
+keywords = ["crc", "simd"]
+categories = ["algorithms"]
+repository = "https://github.com/zowens/crc32c"
+homepage = "https://github.com/zowens/crc32c"
+documentation = "http://docs.rs/crc32c"
+edition = "2018"
+description = "Safe implementation for hardware accelerated CRC32C instructions with software fallback"
+exclude = [
+    "benches/*",
+    "tests/*",
+]
+build = "build.rs"
+
+[dev-dependencies]
+rand = { version ="0.9", features=["alloc"] }
+criterion = "0.8"
+
+[build-dependencies]
+rustc_version = "0.4"
+
+[[bench]]
+name = "rand"
+path = "benches/rand.rs"
+harness = false
+
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"

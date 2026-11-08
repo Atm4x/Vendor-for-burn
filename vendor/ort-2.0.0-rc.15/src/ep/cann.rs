@@ -1,0 +1,184 @@
+use alloc::string::ToString;
+use core::fmt;
+
+use super::{ArenaExtendStrategy, ExecutionProvider, ExecutionProviderOptions};
+use crate::{AsPointer, error::Result, ortsys, session::builder::SessionBuilder};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PrecisionMode {
+	/// Convert to float32 first according to operator implementation
+	ForceFP32,
+	/// Convert to float16 when float16 and float32 are both supported
+	ForceFP16,
+	/// Convert to float16 when float32 is not supported
+	AllowFP32ToFP16,
+	/// Keep dtypes as is
+	MustKeepOrigin,
+	/// Allow mixed precision
+	AllowMixedPrecision
+}
+
+impl fmt::Display for PrecisionMode {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.write_str(match self {
+			PrecisionMode::ForceFP32 => "force_fp32",
+			PrecisionMode::ForceFP16 => "force_fp16",
+			PrecisionMode::AllowFP32ToFP16 => "allow_fp32_to_fp16",
+			PrecisionMode::MustKeepOrigin => "must_keep_origin_dtype",
+			PrecisionMode::AllowMixedPrecision => "allow_mix_precision"
+		})
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ImplementationMode {
+	/// Prefer high precision, potentially at the cost of some performance.
+	HighPrecision,
+	/// Prefer high performance, potentially with lower accuracy.
+	HighPerformance
+}
+
+impl fmt::Display for ImplementationMode {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.write_str(match self {
+			ImplementationMode::HighPrecision => "high_precision",
+			ImplementationMode::HighPerformance => "high_performance"
+		})
+	}
+}
+
+/// [CANN execution provider](https://onnxruntime.ai/docs/execution-providers/community-maintained/CANN-ExecutionProvider.html)
+/// for hardware acceleration using Huawei Ascend AI devices.
+#[derive(Default, Debug, Clone)]
+pub struct CANN(ExecutionProviderOptions);
+
+super::impl_ep!(arbitrary; CANN);
+
+impl CANN {
+	super::define_options! {
+		/// Configures which device the EP should use.
+		///
+		/// ```
+		/// # use ort::{ep, session::Session};
+		/// # fn main() -> ort::Result<()> {
+		/// let ep = ep::CANN::default().with_device_id(0).build();
+		/// # Ok(())
+		/// # }
+		/// ```
+		pub fn with_device_id(mut self, device_id: i32) -> Self = "device_id";
+
+		/// Configure the size limit of the device memory arena in bytes. This size limit is only for the execution
+		/// provider’s arena; the total device memory usage may be higher.
+		///
+		/// ```
+		/// # use ort::{ep, session::Session};
+		/// # fn main() -> ort::Result<()> {
+		/// let ep = ep::CANN::default().with_memory_limit(2 * 1024 * 1024 * 1024).build();
+		/// # Ok(())
+		/// # }
+		/// ```
+		pub fn with_memory_limit(mut self, limit: usize) -> Self = "npu_mem_limit";
+
+		/// Configure the strategy for extending the device's memory arena.
+		///
+		/// ```
+		/// # use ort::{ep::{self, ArenaExtendStrategy}, session::Session};
+		/// # fn main() -> ort::Result<()> {
+		/// let ep = ep::CANN::default()
+		/// 	.with_arena_extend_strategy(ArenaExtendStrategy::SameAsRequested)
+		/// 	.build();
+		/// # Ok(())
+		/// # }
+		/// ```
+		pub fn with_arena_extend_strategy(mut self, strategy: ArenaExtendStrategy) -> Self = "arena_extend_strategy";
+
+		/// Configure whether to use the graph inference engine to speed up performance. The recommended and default setting
+		/// is `true`. If `false`, it will fall back to the single-operator inference engine.
+		///
+		/// ```
+		/// # use ort::{ep, session::Session};
+		/// # fn main() -> ort::Result<()> {
+		/// let ep = ep::CANN::default().with_cann_graph(true).build();
+		/// # Ok(())
+		/// # }
+		/// ```
+		pub fn with_cann_graph(mut self, enable: bool) -> Self = "enable_cann_graph";
+
+		/// Configure whether to dump the subgraph into ONNX format for analysis of subgraph segmentation.
+		///
+		/// ```
+		/// # use ort::{ep, session::Session};
+		/// # fn main() -> ort::Result<()> {
+		/// let ep = ep::CANN::default().with_dump_graphs(true).build();
+		/// # Ok(())
+		/// # }
+		/// ```
+		pub fn with_dump_graphs(mut self, enable: bool) -> Self = "dump_graphs";
+
+		/// Configure whether to dump the offline model to an `.om` file.
+		///
+		/// ```
+		/// # use ort::{ep, session::Session};
+		/// # fn main() -> ort::Result<()> {
+		/// let ep = ep::CANN::default().with_dump_om_model(true).build();
+		/// # Ok(())
+		/// # }
+		/// ```
+		pub fn with_dump_om_model(mut self, enable: bool) -> Self = "dump_om_model";
+
+		/// Configure the precision mode; see [`PrecisionMode`].
+		///
+		/// ```
+		/// # use ort::{ep, session::Session};
+		/// # fn main() -> ort::Result<()> {
+		/// let ep = ep::CANN::default().with_precision_mode(ep::cann::PrecisionMode::ForceFP16).build();
+		/// # Ok(())
+		/// # }
+		/// ```
+		pub fn with_precision_mode(mut self, mode: PrecisionMode) -> Self = "precision_mode";
+
+		/// Configure the implementation mode for operators. Some CANN operators can have both high-precision and
+		/// high-performance implementations.
+		///
+		/// ```
+		/// # use ort::{ep, session::Session};
+		/// # fn main() -> ort::Result<()> {
+		/// let ep = ep::CANN::default()
+		/// 	.with_implementation_mode(ep::cann::ImplementationMode::HighPerformance)
+		/// 	.build();
+		/// # Ok(())
+		/// # }
+		/// ```
+		pub fn with_implementation_mode(mut self, mode: ImplementationMode) -> Self = "op_select_impl_mode";
+
+		/// Configure the list of operators which use the mode specified by
+		/// [`CANN::with_implementation_mode`].
+		///
+		/// ```
+		/// # use ort::{ep, session::Session};
+		/// # fn main() -> ort::Result<()> {
+		/// let ep = ep::CANN::default().with_implementation_mode_oplist("LayerNorm,Gelu").build();
+		/// # Ok(())
+		/// # }
+		/// ```
+		pub fn with_implementation_mode_oplist(mut self, list: impl ToString) -> Self = "optypelist_for_implmode";
+	}
+}
+
+impl ExecutionProvider for CANN {
+	const NAME: &'static str = "CANNExecutionProvider";
+
+	fn register(&self, session_builder: &mut SessionBuilder) -> Result<()> {
+		super::register_with_options_struct!(
+			self.0,
+			session_builder,
+			ort_sys::OrtCANNProviderOptions,
+			CreateCANNProviderOptions,
+			UpdateCANNProviderOptions,
+			ReleaseCANNProviderOptions,
+			SessionOptionsAppendExecutionProvider_CANN
+		)
+	}
+}

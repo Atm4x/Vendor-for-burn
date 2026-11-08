@@ -1,0 +1,20 @@
+[package]
+authors.workspace = true
+categories.workspace = true
+description = "proc-macros for macerator"
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+name = "macerator-macros"
+readme.workspace = true
+repository.workspace = true
+version = "0.3.2"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+darling = "0.24"
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "3", features = ["full"] }

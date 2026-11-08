@@ -1,0 +1,46 @@
+[package]
+name = "buildid"
+version = "1.1.0"
+edition = "2021"
+keywords = ["no_std", "build-id"]
+license = "MPL-2.0"
+description = "Examine the currently running executable to get its build-id or LC_UUID"
+repository = "https://github.com/jmesmon/buildid"
+documentation = "https://docs.rs/buildid"
+readme = "README.md"
+categories = ["no-std", "os"]
+include = ["/src/*.rs", "/README.md"]
+
+# TODO: restrict crate content with include/exclude
+# TODO: include readme for crates.io page
+
+[features]
+buildid-symbol-start-end = []
+buildid-section-inject = []
+buildid-custom-inject = []
+
+[dependencies]
+buildid-linker-symbols = { version = "1.0", optional = true, path = 'buildid-linker-symbols' }
+log = { version = "0.4", default-features = false }
+cfg-if = "1.0.0"
+
+# NOTE: we only need libc if we don't enable one of the overriding features
+[target.'cfg(all(unix, not(target_vendor = "apple")))'.dependencies]
+libc = { version = "0.2" }
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["libloaderapi", "winnt", "dbghelp"] }
+
+[dev-dependencies]
+env_logger = "0.11"
+hex = "0.4"
+tracing = { version = "0.1", features = ["log"] }
+
+[target.'cfg(all(target_os = "windows", target_env = "msvc"))'.dev-dependencies]
+find-msvc-tools = "0.1"
+
+[workspace]
+members = [
+	'buildid-tests-linker-symbols',
+	'buildid-wasm-stamp',
+]

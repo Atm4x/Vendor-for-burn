@@ -1,0 +1,18 @@
+[package]
+name = "wrapcenum-derive"
+version = "0.4.1"
+authors = ["Cldfire"]
+description = "Derive macro for nvml-wrapper, not for general use"
+readme = "README.md"
+repository = "https://github.com/Cldfire/wrapcenum-derive"
+license = "MIT/Apache-2.0"
+edition = "2018"
+
+[dependencies]
+syn = "2.0"
+quote = "1.0"
+darling = "0.20"
+proc-macro2 = "1.0"
+
+[lib]
+proc-macro = true

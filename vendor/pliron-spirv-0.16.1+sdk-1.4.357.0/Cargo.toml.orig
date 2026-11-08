@@ -1,0 +1,27 @@
+[package]
+edition = "2024"
+name = "pliron-spirv"
+rust-version.workspace = true
+version.workspace = true
+
+description = "Pliron dialect for SPIR-V"
+documentation = "https://docs.rs/pliron-spirv"
+keywords = ["spirv", "vulkan", "opengl", "opencl", "pliron"]
+license = "Apache-2.0"
+repository = "https://github.com/tracel-ai/tracel-rspirv"
+
+[lints]
+workspace = true
+
+[dependencies]
+derive-new = "0.7"
+derive_more = { version = "2", features = ["from", "into"] }
+itertools = "0.15"
+pliron = { workspace = true }
+thiserror = "2"
+
+[dependencies.tracel-rspirv]
+default-features = false
+features = ["pliron"]
+path = "../rspirv"
+version = "=0.16.1"

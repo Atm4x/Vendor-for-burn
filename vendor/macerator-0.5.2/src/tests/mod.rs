@@ -1,0 +1,323 @@
+use core::fmt::Debug;
+use std::{vec, vec::Vec};
+
+use bytemuck::Zeroable;
+use rand::{
+    distr::{uniform::SampleUniform, Uniform},
+    Rng,
+};
+
+use crate::{
+    assert_relative_eq, tests::approx::RelativeEq, vload_unaligned, vstore_unaligned, Scalar, Simd,
+    Vector,
+};
+
+/// Mirror of the needed parts from `approx`, since it doesn't support `f16`
+mod approx;
+mod arithmetic;
+mod bitwise;
+mod convert;
+
+mod fma;
+mod half;
+mod macro_tests;
+mod mask_reduce;
+mod ord;
+mod reduce;
+mod round;
+mod select;
+
+mod shift;
+mod unary;
+
+wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+const SIZE: usize = 128;
+fn random<T: SampleUniform>(lo: T, hi: T) -> Vec<T> {
+    let distribution = Uniform::new(lo, hi).unwrap();
+    rand::rng().sample_iter(&distribution).take(SIZE).collect()
+}
+
+fn random_of_size<T: SampleUniform>(lo: T, hi: T, size: usize) -> Vec<T> {
+    let distribution = Uniform::new(lo, hi).unwrap();
+    rand::rng().sample_iter(&distribution).take(size).collect()
+}
+
+fn assert_approx_eq<T: RelativeEq + Debug>(lhs: &[T], rhs: &[T]) {
+    for (a, b) in lhs.iter().zip(rhs) {
+        assert_relative_eq!(*a, *b);
+    }
+}
+
+fn assert_eq<T: PartialEq + Debug>(lhs: &[T], rhs: &[T]) {
+    assert_eq!(lhs, rhs);
+}
+
+macro_rules! testgen_binop {
+    ($test_fn: ident, $reference: expr, $($(#[$meta:meta])* $ty: ty),*) => {
+        $(::paste::paste! {
+            $(#[$meta])*
+            #[::wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
+            fn [<$test_fn _ $ty>]() {
+                use num_traits::NumCast;
+
+                let lhs = $crate::tests::random(NumCast::from(8).unwrap(), NumCast::from(16).unwrap());
+                let rhs = $crate::tests::random(NumCast::from(0).unwrap(), NumCast::from(8).unwrap());
+                let out_ref = lhs
+                    .iter()
+                    .zip(rhs.iter())
+                    .map(|(a, b)| $reference(a, b))
+                    .collect::<Vec<_>>();
+                #[cfg(x86)]
+                unsafe {
+                    use $crate::backend::x86::*;
+                    #[cfg(avx512_fp16)]
+                    if V4FP16::is_available() {
+                        let out = V4FP16::run_vectorized(|| [<$test_fn _impl>]::<V4FP16, $ty>(&lhs, &rhs));
+                        assert_eq!(out_ref, out);
+                    }
+                    #[cfg(avx512)]
+                    if V4::is_available() {
+                        let out = V4::run_vectorized(|| [<$test_fn _impl>]::<V4, $ty>(&lhs, &rhs));
+                        assert_eq!(out_ref, out);
+                    }
+                    if V3::is_available() {
+                        let out = V3::run_vectorized(|| [<$test_fn _impl>]::<V3, $ty>(&lhs, &rhs));
+                        assert_eq!(out_ref, out);
+                    }
+                    if V2::is_available() {
+                        let out = V2::run_vectorized(|| [<$test_fn _impl>]::<V2, $ty>(&lhs, &rhs));
+                        assert_eq!(out_ref, out);
+                    }
+                }
+                #[cfg(aarch64)]
+                unsafe {
+                    use $crate::backend::aarch64::*;
+                    #[cfg(feature = "fp16")]
+                    if NeonFP16::is_available() {
+                        let out = NeonFP16::run_vectorized(|| [<$test_fn _impl>]::<NeonFP16, $ty>(&lhs, &rhs));
+                        assert_eq!(out_ref, out);
+                    }
+                    if NeonFma::is_available() {
+                        let out = NeonFma::run_vectorized(|| [<$test_fn _impl>]::<NeonFma, $ty>(&lhs, &rhs));
+                        assert_eq!(out_ref, out);
+                    }
+                }
+                #[cfg(loong64)]
+                unsafe {
+                    use $crate::backend::loong64::*;
+                    if Lasx::is_available() {
+                        let out = Lasx::run_vectorized(|| [<$test_fn _impl>]::<Lasx, $ty>(&lhs, &rhs));
+                        assert_eq!(&out_ref, &out);
+                    }
+                    if Lsx::is_available() {
+                        let out = Lsx::run_vectorized(|| [<$test_fn _impl>]::<Lsx, $ty>(&lhs, &rhs));
+                        assert_eq!(&out_ref, &out);
+                    }
+                }
+                #[cfg(wasm32)]
+                unsafe {
+                    use crate::backend::wasm32;
+                    #[cfg(relaxed_simd)]
+                    if wasm32::Simd128Relaxed::is_available() {
+                        let out = wasm32::Simd128Relaxed::run_vectorized(|| [<$test_fn _impl>]::<wasm32::Simd128Relaxed, $ty>(&lhs, &rhs));
+                        assert_eq!(&out_ref, &out);
+                    }
+                    if wasm32::Simd128Fallback::is_available() {
+                        let out = wasm32::Simd128Fallback::run_vectorized(|| [<$test_fn _impl>]::<wasm32::Simd128Fallback, $ty>(&lhs, &rhs));
+                        assert_eq!(&out_ref, &out);
+                    }
+                }
+                let out = [<$test_fn _impl>]::<$crate::backend::scalar::Fallback, $ty>(&lhs, &rhs);
+                assert_eq!(out_ref, out);
+            }
+        })*
+    };
+}
+pub(crate) use testgen_binop;
+
+pub(crate) trait Binop<T: Scalar> {
+    fn call<S: Simd>(lhs: Vector<S, T>, rhs: Vector<S, T>) -> Vector<S, T>;
+}
+
+#[inline(always)]
+fn test_binop<S: Simd, T: Scalar, Op: Binop<T>>(lhs: &[T], rhs: &[T]) -> Vec<T> {
+    let lanes = T::lanes::<S>();
+    let mut output = vec![Zeroable::zeroed(); lhs.len()];
+    let lhs = lhs.chunks_exact(lanes);
+    let rhs = rhs.chunks_exact(lanes);
+    let out = output.chunks_exact_mut(lanes);
+    for ((lhs, rhs), out) in lhs.zip(rhs).zip(out) {
+        let lhs = unsafe { vload_unaligned(lhs.as_ptr()) };
+        let rhs = unsafe { vload_unaligned(rhs.as_ptr()) };
+        unsafe { vstore_unaligned(out.as_mut_ptr(), Op::call::<S>(lhs, rhs)) };
+    }
+    output
+}
+
+macro_rules! binop {
+    ($trait: ident, $impl: expr) => {
+        ::paste::paste! {
+            struct [<$trait Op>]<T>(::core::marker::PhantomData<T>);
+            impl<T: $trait> $crate::tests::Binop<T> for [<$trait Op>]<T> {
+                #[inline(always)]
+                fn call<S: Simd>(lhs: $crate::Vector<S, T>, rhs: $crate::Vector<S, T>) -> $crate::Vector<S, T> {
+                    $impl(lhs, rhs)
+                }
+            }
+        }
+    };
+}
+pub(crate) use binop;
+
+pub(crate) trait Unop<T: Scalar> {
+    fn call<S: Simd>(lhs: Vector<S, T>) -> Vector<S, T>;
+}
+
+#[inline(always)]
+fn test_unop<S: Simd, T: Scalar, Op: Unop<T>>(a: &[T]) -> Vec<T> {
+    let lanes = T::lanes::<S>();
+    let mut output = vec![Zeroable::zeroed(); a.len()];
+    let a = a.chunks_exact(lanes);
+    let out = output.chunks_exact_mut(lanes);
+    for (a, out) in a.zip(out) {
+        let a = unsafe { vload_unaligned(a.as_ptr()) };
+        unsafe { vstore_unaligned(out.as_mut_ptr(), Op::call::<S>(a)) };
+    }
+    output
+}
+
+macro_rules! unop {
+    ($trait: ident, $impl: expr) => {
+        ::paste::paste! {
+            struct [<$trait Op>]<T>(::core::marker::PhantomData<T>);
+            impl<T: $trait> Unop<T> for [<$trait Op>]<T> {
+                #[inline(always)]
+                fn call<S: Simd>(lhs: Vector<S, T>) -> Vector<S, T> {
+                    $impl(lhs)
+                }
+            }
+        }
+    };
+}
+pub(crate) use unop;
+
+/// Runs `$impl_fn` across all available runtime backends (and scalar fallback), passing outputs to `$check`.
+macro_rules! for_each_backend {
+    ($impl_fn: ident, $ty: ty, $a: expr, $check: expr) => {{
+        let a = $a;
+        let check = $check;
+        #[cfg(x86)]
+        unsafe {
+            use $crate::backend::x86::*;
+            #[cfg(avx512_fp16)]
+            if V4FP16::is_available() {
+                check(&V4FP16::run_vectorized(|| $impl_fn::<V4FP16, $ty>(a)));
+            }
+            #[cfg(avx512)]
+            if V4::is_available() {
+                check(&V4::run_vectorized(|| $impl_fn::<V4, $ty>(a)));
+            }
+            if V3::is_available() {
+                check(&V3::run_vectorized(|| $impl_fn::<V3, $ty>(a)));
+            }
+            if V2::is_available() {
+                check(&V2::run_vectorized(|| $impl_fn::<V2, $ty>(a)));
+            }
+        }
+        #[cfg(aarch64)]
+        unsafe {
+            use $crate::backend::aarch64::*;
+            #[cfg(feature = "fp16")]
+            if NeonFP16::is_available() {
+                check(&NeonFP16::run_vectorized(|| $impl_fn::<NeonFP16, $ty>(a)));
+            }
+            if NeonFma::is_available() {
+                check(&NeonFma::run_vectorized(|| $impl_fn::<NeonFma, $ty>(a)));
+            }
+        }
+        #[cfg(loong64)]
+        unsafe {
+            use $crate::backend::loong64::*;
+            if Lasx::is_available() {
+                check(&Lasx::run_vectorized(|| $impl_fn::<Lasx, $ty>(a)));
+            }
+            if Lsx::is_available() {
+                check(&Lsx::run_vectorized(|| $impl_fn::<Lsx, $ty>(a)));
+            }
+        }
+        #[cfg(wasm32)]
+        unsafe {
+            use $crate::backend::wasm32;
+            #[cfg(relaxed_simd)]
+            if wasm32::Simd128Relaxed::is_available() {
+                check(&wasm32::Simd128Relaxed::run_vectorized(|| {
+                    $impl_fn::<wasm32::Simd128Relaxed, $ty>(a)
+                }));
+            }
+            if wasm32::Simd128Fallback::is_available() {
+                check(&wasm32::Simd128Fallback::run_vectorized(|| {
+                    $impl_fn::<wasm32::Simd128Fallback, $ty>(a)
+                }));
+            }
+        }
+        check(&$impl_fn::<$crate::backend::scalar::Fallback, $ty>(a));
+    }};
+}
+pub(crate) use for_each_backend;
+
+macro_rules! testgen_unop {
+    ($test_fn: ident, $reference: expr, $lo: expr, $hi: expr, $assert: ident, $($(#[$meta:meta])* $ty: ty),*) => {
+        $(::paste::paste! {
+            $(#[$meta])*
+            #[::wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
+            fn [<$test_fn _ $ty>]() {
+                use num_traits::NumCast;
+
+                let a = $crate::tests::random::<$ty>(NumCast::from($lo).unwrap(), NumCast::from($hi).unwrap());
+                let out_ref = a.iter().map(|a| $ty::$reference(*a)).collect::<Vec<_>>();
+                $crate::tests::for_each_backend!(
+                    [<$test_fn _impl>], $ty, &a, |out: &[$ty]| $assert(&out_ref, out)
+                );
+            }
+        })*
+    };
+}
+pub(crate) use testgen_unop;
+
+/// Unary operator test generator using explicit input values instead of random ranges.
+macro_rules! testgen_unop_values {
+    ($test_fn: ident, $impl_fn: ident, $reference: expr, $values: expr, $assert: ident, $($(#[$meta:meta])* $ty: ty),*) => {
+        $(::paste::paste! {
+            $(#[$meta])*
+            #[::wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
+            fn [<$test_fn _ $ty>]() {
+                let values: Vec<$ty> = $values;
+                // Cycle inputs to fill complete SIMD vector lanes up to SIZE
+                let a: Vec<$ty> = values.iter().copied().cycle().take($crate::tests::SIZE).collect();
+                let out_ref = a.iter().map(|a| $ty::$reference(*a)).collect::<Vec<_>>();
+                $crate::tests::for_each_backend!(
+                    $impl_fn, $ty, &a, |out: &[$ty]| $assert(&a, &out_ref, out)
+                );
+            }
+        })*
+    };
+}
+pub(crate) use testgen_unop_values;
+
+/// With `lsx` enabled and `lasx` not, dispatch must pick the LSX backend. Only
+/// under Miri, where detection follows the target features rather than the
+/// host CPU.
+#[cfg(all(miri, loong64))]
+#[test]
+fn test_lsx_selected_without_lasx() {
+    use crate::{
+        backend::loong64::{Lasx, Lsx},
+        Arch,
+    };
+    assert_eq!(Lsx::is_available(), cfg!(target_feature = "lsx"));
+    assert_eq!(Lasx::is_available(), cfg!(target_feature = "lasx"));
+    if cfg!(target_feature = "lsx") && !cfg!(target_feature = "lasx") {
+        assert!(matches!(Arch::detect(), Arch::Lsx));
+    }
+}

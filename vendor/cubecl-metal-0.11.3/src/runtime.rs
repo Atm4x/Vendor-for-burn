@@ -1,0 +1,259 @@
+use crate::{MetalDevice, compute::MetalServer};
+use cubecl_common::device::{Device, DeviceService};
+use cubecl_core::{
+    device::{DeviceId, ServerUtilitiesHandle},
+    ir::{
+        AddressType, DeviceIdentity, DeviceProperties, ElemType, FloatKind, HardwareProperties,
+        IntKind, MemoryDeviceProperties, PhysicalDevice, RegistryEntryId, TargetProperties, Type,
+        UIntKind,
+        features::{AtomicUsage, Plane, TypeUsage},
+    },
+    zspace::{Shape, Strides, striding::has_pitched_row_major_strides},
+};
+use cubecl_cpp::{
+    metal::{arch::MetalArchitecture, supported_cmma_combinations_metal},
+    shared::register_wmma_features,
+};
+use cubecl_monitoring::{DeviceUtilization, UtilizationUnavailable, gpu_utilization::CardCounters};
+use cubecl_server::allocator::ContiguousMemoryLayoutPolicy;
+use cubecl_server::runtime::Runtime;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLDevice, MTLGPUFamily};
+
+/// Native Metal runtime for `CubeCL`.
+#[derive(Debug, Clone)]
+pub struct MetalRuntime;
+
+impl DeviceService for MetalServer {
+    fn init(device_id: DeviceId) -> Self {
+        let device = MetalDevice::from_id(device_id);
+        let metal_device = match device {
+            MetalDevice::DefaultDevice => {
+                crate::device::default_device().expect("No Metal device found")
+            }
+            MetalDevice::DiscreteGpu(idx) => {
+                let devices = crate::device::all_devices();
+                devices
+                    .into_iter()
+                    .filter(
+                        |d: &objc2::rc::Retained<ProtocolObject<dyn objc2_metal::MTLDevice>>| {
+                            !(**d).hasUnifiedMemory()
+                        },
+                    )
+                    .nth(idx)
+                    .expect("Discrete GPU not found")
+            }
+            MetalDevice::IntegratedGpu(idx) => {
+                let devices = crate::device::all_devices();
+                devices
+                    .into_iter()
+                    .filter(
+                        |d: &objc2::rc::Retained<ProtocolObject<dyn objc2_metal::MTLDevice>>| {
+                            (**d).hasUnifiedMemory()
+                        },
+                    )
+                    .nth(idx)
+                    .expect("Integrated GPU not found")
+            }
+            MetalDevice::Existing(id) => crate::device::get_existing_device(id)
+                .expect("Existing device not found. Use register_device() first."),
+        };
+
+        ensure_metal3(&metal_device);
+
+        use cubecl_common::profile::TimingMethod;
+
+        // Metal states no total, only the working set it recommends a device
+        // stay under before it starts paging, around two thirds of unified
+        // memory on Apple silicon. That is the budget `max_memory` asks for.
+        let mem_props = MemoryDeviceProperties::new((*metal_device).maxBufferLength() as u64, 256)
+            .with_max_memory((*metal_device).recommendedMaxWorkingSetSize());
+
+        let hardware_props = HardwareProperties {
+            load_width: 128,
+            vector_register_count: None,
+            plane_size_min: 32,
+            plane_size_max: 32,
+            // Metal allows 31 buffer bindings; one is reserved for the per-kernel info buffer.
+            max_bindings: 30,
+            max_shared_memory_size: (*metal_device).maxThreadgroupMemoryLength(),
+            max_cube_count: (u32::MAX, u32::MAX, u32::MAX),
+            max_units_per_cube: (*metal_device).maxThreadsPerThreadgroup().width as u32,
+            max_cube_dim: {
+                let size = (*metal_device).maxThreadsPerThreadgroup();
+                (size.width as u32, size.height as u32, size.depth as u32)
+            },
+            num_streaming_multiprocessors: None,
+            num_tensor_cores: None,
+            min_tensor_cores_dim: None,
+            num_cpu_cores: None,
+            last_level_cache_size: None,
+            max_vector_size: 4,
+            cube_mma_reserved_shared_memory: 0,
+        };
+
+        // Metal is the one backend where the display name *is* the fingerprint:
+        // the MSL is emitted from device-derived compilation options, so the
+        // device's own name is what keeps sources built for another GPU out.
+        // `MetalContext` builds the same `msl_{name}` namespace from the same
+        // string.
+        let device_name = metal_device.name().to_string();
+
+        let mut physical = PhysicalDevice::default();
+        physical.registry_entry_id = Some(RegistryEntryId::new(metal_device.registryID()));
+
+        let mut device_props = DeviceProperties::new(
+            Default::default(),
+            mem_props.clone(),
+            hardware_props,
+            TimingMethod::Device,
+            DeviceIdentity {
+                fingerprint: format!("msl_{device_name}"),
+                name: device_name,
+                physical: Some(physical),
+            },
+        );
+
+        register_metal_features(&mut device_props);
+
+        let logger = std::sync::Arc::new(cubecl_server::logging::ServerLogger::default());
+        let allocator = ContiguousMemoryLayoutPolicy::new(mem_props.alignment as usize);
+        // No graph capture on this backend: nothing updates the captures.
+        let (utilities, _captures) = cubecl_core::server::ServerUtilities::init(
+            cubecl_common::device::ServiceId::of::<Self>(device_id),
+            "metal",
+            device_props.clone(),
+            MetalRuntime::target_properties(),
+            logger,
+            allocator,
+        );
+        let utilities = std::sync::Arc::new(utilities);
+
+        let mem_config = cubecl_core::MemoryConfiguration::default();
+
+        MetalServer::new(metal_device, mem_props.clone(), mem_config, utilities)
+    }
+
+    fn utilities(&self) -> ServerUtilitiesHandle {
+        self.utilities.clone() as ServerUtilitiesHandle
+    }
+}
+
+impl Runtime for MetalRuntime {
+    type Server = MetalServer;
+    type Device = MetalDevice;
+
+    fn can_read_tensor(shape: &Shape, strides: &Strides) -> bool {
+        has_pitched_row_major_strides(shape, strides)
+    }
+
+    fn target_properties() -> TargetProperties {
+        TargetProperties {
+            mma: Default::default(),
+        }
+    }
+
+    fn enumerate_devices(type_id: u16) -> Vec<DeviceId> {
+        // type_id matches `device.rs`: 0=Default, 1=Discrete, 2=Integrated, where
+        // integrated == `hasUnifiedMemory()`. index_id is the nth device of that class,
+        // as resolved by `DeviceService::init`.
+        match type_id {
+            0 => vec![DeviceId {
+                type_id: 0,
+                index_id: 0,
+            }],
+            1 => crate::device::all_devices()
+                .into_iter()
+                .filter(|d| !(**d).hasUnifiedMemory())
+                .enumerate()
+                .map(|(idx, _)| DeviceId {
+                    type_id: 1,
+                    index_id: idx as u16,
+                })
+                .collect(),
+            2 => crate::device::all_devices()
+                .into_iter()
+                .filter(|d| (**d).hasUnifiedMemory())
+                .enumerate()
+                .map(|(idx, _)| DeviceId {
+                    type_id: 2,
+                    index_id: idx as u16,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn utilization(device: &Self::Device) -> Result<DeviceUtilization, UtilizationUnavailable> {
+        CardCounters::read(Self::client(device).properties().identity.physical.as_ref())
+    }
+}
+
+/// Register Metal-specific features including types, WMMA, and plane operations
+fn register_metal_features(props: &mut DeviceProperties) {
+    register_types(props);
+    register_wmma(props);
+
+    props.features.alignment = true;
+    // MSL's `threadgroup_barrier(mem_flags::mem_device)` orders device memory at device scope.
+    props.features.device_memory_scope = true;
+    props.features.plane.insert(Plane::Ops);
+    props.features.plane.insert(Plane::Sync);
+    props.features.plane.insert(Plane::NonUniformControlFlow);
+}
+
+/// Register supported data types for Metal
+fn register_types(props: &mut DeviceProperties) {
+    props.register_address_type(AddressType::U32);
+    props.register_address_type(AddressType::U64);
+
+    let types = [
+        ElemType::UInt(UIntKind::U8),
+        ElemType::UInt(UIntKind::U16),
+        ElemType::UInt(UIntKind::U32),
+        ElemType::UInt(UIntKind::U64),
+        ElemType::Int(IntKind::I8),
+        ElemType::Int(IntKind::I16),
+        ElemType::Int(IntKind::I32),
+        ElemType::Int(IntKind::I64),
+        ElemType::Float(FloatKind::F16),
+        ElemType::Float(FloatKind::BF16),
+        ElemType::Float(FloatKind::F32),
+        ElemType::Bool,
+    ];
+
+    for ty in types {
+        props.register_type_usage(ty, TypeUsage::all());
+    }
+    for ty in [FloatKind::E4M3, FloatKind::E5M2] {
+        props.register_type_usage(
+            ElemType::Float(ty),
+            TypeUsage::Conversion | TypeUsage::Buffer,
+        );
+    }
+
+    // Metal natively supports the full integer atomic set; float atomics are
+    // limited to add + load/store (no native float min/max).
+    for ty in [ElemType::Int(IntKind::I32), ElemType::UInt(UIntKind::U32)] {
+        props.register_atomic_type_usage(Type::atomic(ty), AtomicUsage::all());
+    }
+    props.register_atomic_type_usage(
+        Type::atomic(ElemType::Float(FloatKind::F32)),
+        AtomicUsage::Add | AtomicUsage::LoadStore,
+    );
+}
+
+/// Register WMMA (`simdgroup_matrix`) features for Metal.
+fn register_wmma(props: &mut DeviceProperties) {
+    let combinations = supported_cmma_combinations_metal(&MetalArchitecture::Metal3);
+    register_wmma_features(combinations, props);
+}
+
+fn ensure_metal3(device: &ProtocolObject<dyn MTLDevice>) {
+    if !device.supportsFamily(MTLGPUFamily::Metal3) {
+        let name = device.name().to_string();
+        panic!(
+            "CubeCL Metal backend requires Metal 3.0+. Device '{name}' does not support Metal 3."
+        );
+    }
+}

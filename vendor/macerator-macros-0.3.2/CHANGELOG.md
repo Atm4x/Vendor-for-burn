@@ -1,0 +1,74 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.3.2](https://github.com/wingertge/macerator/compare/macerator-macros-v0.3.1...macerator-macros-v0.3.2) - 2026-09-27
+
+### Fixed
+
+- *(macros)* accept where-bounds on the SIMD parameter ([#67](https://github.com/wingertge/macerator/pull/67))
+
+### Other
+
+- say when mul_add is fused, and update the README ([#66](https://github.com/wingertge/macerator/pull/66))
+
+## [0.3.1](https://github.com/wingertge/macerator/compare/macerator-macros-v0.3.0...macerator-macros-v0.3.1) - 2026-09-27
+
+### Fixed
+
+- *(macros)* keep dispatcher-only attributes off the with_simd body ([#55](https://github.com/wingertge/macerator/pull/55))
+
+## [0.3.0](https://github.com/wingertge/macerator/compare/macerator-macros-v0.2.0...macerator-macros-v0.3.0) - 2026-09-02
+
+### Fixed
+
+- [**breaking**] Make `run_vectorized` and `dispatch` unsafe to avoid unsoundness ([#41](https://github.com/wingertge/macerator/pull/41))
+
+### Other
+
+- Update dependencies of `macerator-macros` ([#43](https://github.com/wingertge/macerator/pull/43))
+
+## [0.2.0](https://github.com/wingertge/macerator/compare/macerator-macros-v0.1.5...macerator-macros-v0.2.0) - 2026-08-03
+
+### Fixed
+
+- [**breaking**] Add `#[inline(always)]` by default when usingthe macro ([#37](https://github.com/wingertge/macerator/pull/37))
+
+## [0.1.5](https://github.com/wingertge/macerator/compare/macerator-macros-v0.1.4...macerator-macros-v0.1.5) - 2026-04-20
+
+### Fixed
+
+- Separate relaxed ops from Simd128 and provide fallback option ([#28](https://github.com/wingertge/macerator/pull/28))
+
+## [0.1.4](https://github.com/wingertge/macerator/compare/macerator-macros-v0.1.3...macerator-macros-v0.1.4) - 2026-02-08
+
+### Fixed
+
+- Fix weird lifetime handling in macro to allow for reference params ([#17](https://github.com/wingertge/macerator/pull/17))
+
+### Other
+
+- Allow warnings on generated wrapper ([#19](https://github.com/wingertge/macerator/pull/19))
+
+## [0.1.3](https://github.com/wingertge/macerator/compare/macerator-macros-v0.1.2...macerator-macros-v0.1.3) - 2025-08-07
+
+### Other
+
+- Update README
+
+## [0.1.2](https://github.com/wingertge/macerator/compare/macerator-macros-v0.1.1...macerator-macros-v0.1.2) - 2025-05-19
+
+### Other
+
+- Update README.md ([#10](https://github.com/wingertge/macerator/pull/10))
+
+## [0.1.1](https://github.com/wingertge/macerator/compare/macerator-macros-v0.1.0...macerator-macros-v0.1.1) - 2025-03-14
+
+### Other
+
+- Add arithmetic test suite

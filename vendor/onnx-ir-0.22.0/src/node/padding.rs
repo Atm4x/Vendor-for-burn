@@ -1,0 +1,1037 @@
+//! # Padding Configuration Utilities
+//!
+//! Padding configuration types for 1D, 2D, and 3D operations.
+//!
+//! Provides `PaddingConfig1d`, `PaddingConfig2d`, `PaddingConfig3d` enums and helper
+//! functions to convert ONNX padding arrays.
+//!
+//! [`forward_time_same_blocker`] encodes what burn's `PaddingConfig::Same` can serve, which is
+//! burn knowledge in a crate that otherwise mirrors ONNX. That is deliberate: `NodeCodegen`
+//! returns no `Result`, so burn-onnx cannot reject anything without panicking, and rejecting
+//! here is the only way to give the user a `ProcessError` naming the node. Treat it as an
+//! exception forced by the missing error channel, not as licence to move more burn knowledge in.
+
+use std::fmt;
+
+use crate::ir::{ArgType, AttributeValue, RawNode};
+use crate::processor::ProcessError;
+
+/// ONNX auto_pad attribute value.
+///
+/// Specifies how padding should be computed automatically.
+/// When set to anything other than `NotSet`, the `pads` attribute is ignored.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum AutoPad {
+    /// Use explicit `pads` attribute (default).
+    #[default]
+    NotSet,
+    /// Pad so output_size = ceil(input_size / stride). Extra padding at end.
+    SameUpper,
+    /// Pad so output_size = ceil(input_size / stride). Extra padding at start.
+    SameLower,
+    /// No padding (equivalent to all-zero pads).
+    Valid,
+}
+
+impl AutoPad {
+    /// Parse an ONNX auto_pad string attribute.
+    pub fn parse(s: &str) -> Result<Self, ProcessError> {
+        match s {
+            "NOTSET" => Ok(AutoPad::NotSet),
+            "SAME_UPPER" => Ok(AutoPad::SameUpper),
+            "SAME_LOWER" => Ok(AutoPad::SameLower),
+            "VALID" => Ok(AutoPad::Valid),
+            _ => Err(ProcessError::InvalidAttribute {
+                name: "auto_pad".to_string(),
+                reason: format!("Unknown auto_pad value: {s}"),
+            }),
+        }
+    }
+}
+
+impl fmt::Display for AutoPad {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AutoPad::NotSet => write!(f, "NOTSET"),
+            AutoPad::SameUpper => write!(f, "SAME_UPPER"),
+            AutoPad::SameLower => write!(f, "SAME_LOWER"),
+            AutoPad::Valid => write!(f, "VALID"),
+        }
+    }
+}
+
+/// Spatial dimensions of a convolution or pooling input, when all of them are known.
+///
+/// Only the dimensions after N and C are inspected: a dynamic batch size does not stop the
+/// padding from being computed at import time.
+pub fn static_spatial_dims(ty: &ArgType) -> Option<Vec<usize>> {
+    ty.static_shape()?.get(2..)?.iter().copied().collect()
+}
+
+/// Why burn cannot defer a `SAME_UPPER`/`SAME_LOWER` padding to forward time.
+///
+/// Each variant names a property of burn's `calculate_same_padding`, verified against the pinned
+/// burn revision. `Display` renders the sentence that goes into the user-facing `ProcessError`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SameBlocker {
+    /// ONNX puts the extra pad of an odd total at the start, burn puts it at the end.
+    SameLower,
+    /// burn's forward-time padding takes no dilation, so the effective kernel would be wrong.
+    Dilated,
+    /// burn's 3D padding is symmetric-only, so an odd total has nowhere to go.
+    ThreeSpatialDims,
+}
+
+impl fmt::Display for SameBlocker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SameBlocker::SameLower => write!(
+                f,
+                "SAME_LOWER puts the extra pad at the start of the dimension, while padding \
+                 computed at forward time puts it at the end"
+            ),
+            SameBlocker::Dilated => {
+                write!(
+                    f,
+                    "padding computed at forward time does not account for dilation"
+                )
+            }
+            SameBlocker::ThreeSpatialDims => write!(
+                f,
+                "padding computed at forward time is symmetric-only over 3 spatial dimensions"
+            ),
+        }
+    }
+}
+
+/// Why burn cannot defer this `SAME_UPPER`/`SAME_LOWER` padding to forward time, if it cannot.
+///
+/// `PaddingConfig::Same` derives the pads from the real input size during `forward`, which is the
+/// only option left when the spatial dimensions are unknown at import time. It reproduces ONNX
+/// for `SAME_UPPER` over one or two spatial dimensions without dilation.
+///
+/// Other cases can coincide with ONNX without being listed as safe here: an even total makes
+/// SAME_LOWER and SAME_UPPER identical, and a stride-1 odd kernel is always symmetric even in 3D.
+/// This check stays conservative rather than reasoning about pad parity, so it rejects them.
+///
+/// The answer assumes the burn module routes padding through `calculate_padding_1d_pair` or
+/// `calculate_padding_2d_pairs`, which keep the two sides separate. Every module burn-onnx
+/// targets today does; `DeformConv2d` does not, and would need its own check.
+///
+/// onnx-ir turns a blocker into a `ProcessError`; burn-onnx codegen asserts there is none before
+/// emitting `Same`. Both consult this function so the rule is stated once, but each gathers its
+/// arguments separately, so every op reaching a `resolve_auto_pad_*` must also call
+/// `validate_auto_pad` for the two to agree.
+pub fn forward_time_same_blocker(
+    auto_pad: &AutoPad,
+    dilated: bool,
+    spatial_rank: usize,
+) -> Option<SameBlocker> {
+    if *auto_pad == AutoPad::SameLower {
+        Some(SameBlocker::SameLower)
+    } else if dilated {
+        Some(SameBlocker::Dilated)
+    } else if spatial_rank > 2 {
+        Some(SameBlocker::ThreeSpatialDims)
+    } else {
+        None
+    }
+}
+
+/// Reject a `SAME_UPPER`/`SAME_LOWER` auto_pad whose input spatial dimensions are unknown and
+/// that burn cannot resolve at forward time either.
+///
+/// Known spatial dimensions let the pads be computed during import, which covers every mode over
+/// one or two spatial dimensions. 3D still requires the resulting pads to come out symmetric;
+/// `PaddingConfig3d::to_tokens` in burn-onnx rejects the rest.
+pub(crate) fn validate_auto_pad(node: &RawNode) -> Result<(), ProcessError> {
+    let auto_pad = match node.attrs.get("auto_pad") {
+        None => return Ok(()),
+        Some(AttributeValue::String(value)) => AutoPad::parse(value)?,
+        Some(other) => {
+            return Err(ProcessError::InvalidAttribute {
+                name: "auto_pad".to_string(),
+                reason: format!("expected a string, got {other:?}"),
+            });
+        }
+    };
+
+    let input = &node.inputs[0].ty;
+    if !matches!(auto_pad, AutoPad::SameUpper | AutoPad::SameLower)
+        || static_spatial_dims(input).is_some()
+    {
+        return Ok(());
+    }
+
+    let dilated = match node.attrs.get("dilations") {
+        None => false,
+        Some(AttributeValue::Int64s(dilations)) => dilations.iter().any(|&d| d != 1),
+        Some(other) => {
+            return Err(ProcessError::InvalidAttribute {
+                name: "dilations".to_string(),
+                reason: format!("expected a list of ints, got {other:?}"),
+            });
+        }
+    };
+
+    match forward_time_same_blocker(&auto_pad, dilated, input.rank().saturating_sub(2)) {
+        None => Ok(()),
+        Some(blocker) => Err(ProcessError::InvalidAttribute {
+            name: "auto_pad".to_string(),
+            reason: format!(
+                "{auto_pad} needs the input spatial dimensions, but they are dynamic, and the \
+                 padding cannot be deferred to forward time either: {blocker}. Re-export the \
+                 model with a static input shape, or with explicit pads."
+            ),
+        }),
+    }
+}
+
+/// An integer list attribute of a ConvTranspose as `usize`s, each at least `min`.
+pub(crate) fn conv_transpose_ints(
+    name: &str,
+    values: &[i64],
+    min: i64,
+) -> Result<Vec<usize>, ProcessError> {
+    if values.iter().any(|&value| value < min) {
+        return Err(ProcessError::InvalidAttribute {
+            name: name.to_string(),
+            reason: format!("values must be at least {min}, got {values:?}"),
+        });
+    }
+    Ok(values.iter().map(|&value| value as usize).collect())
+}
+
+/// The spatial `output_shape` attribute of a ConvTranspose over `spatial_rank` axes.
+pub(crate) fn conv_transpose_output_shape(
+    output_shape: &[i64],
+    spatial_rank: usize,
+) -> Result<Vec<usize>, ProcessError> {
+    if output_shape.len() != spatial_rank {
+        return Err(ProcessError::InvalidAttribute {
+            name: "output_shape".to_string(),
+            reason: format!("expected {spatial_rank} spatial dimensions, got {output_shape:?}"),
+        });
+    }
+    conv_transpose_ints("output_shape", output_shape, 0)
+}
+
+/// Reject a ConvTranspose whose pads derive from the input size while that size is unknown.
+///
+/// `SAME_UPPER`/`SAME_LOWER` and `output_shape` both compute the pads from the input spatial
+/// dimensions. burn's conv-transpose has no padding mode that could resolve them at forward
+/// time, so those dimensions must be static and non-zero.
+pub(crate) fn validate_conv_transpose_pads(
+    node: &RawNode,
+    auto_pad: &AutoPad,
+    has_output_shape: bool,
+) -> Result<(), ProcessError> {
+    let derived = matches!(auto_pad, AutoPad::SameUpper | AutoPad::SameLower);
+    if !derived && !has_output_shape {
+        return Ok(());
+    }
+    let source = if has_output_shape {
+        "output_shape".to_string()
+    } else {
+        format!("auto_pad {auto_pad}")
+    };
+    match static_spatial_dims(&node.inputs[0].ty) {
+        Some(dims) if !dims.contains(&0) => Ok(()),
+        Some(dims) => Err(ProcessError::Custom(format!(
+            "ConvTranspose pads from {source} need non-empty input spatial dimensions, got {dims:?}"
+        ))),
+        None => Err(ProcessError::Custom(format!(
+            "ConvTranspose pads from {source} need the input spatial dimensions, but they are \
+             dynamic. Re-export the model with a static input shape, or with explicit pads."
+        ))),
+    }
+}
+
+/// Set a MaxPool or LpPool output type: the input's `[N, C]` followed by each spatial size.
+///
+/// A spatial size is known when its input size is known and the attributes give a valid
+/// window. SAME gives `ceil(input / stride)`. Otherwise the size is
+/// `floor((input + pads - (kernel - 1) * dilation - 1) / stride) + 1` (no pads for VALID), with
+/// ceil instead of floor under `ceil_mode`, which also drops a last window that would start in
+/// the end padding.
+pub(crate) fn pool_output_type(node: &mut RawNode) -> Result<(), ProcessError> {
+    let tensor = match &node.inputs[0].ty {
+        ArgType::Tensor(tensor) => tensor.clone(),
+        other => {
+            return Err(ProcessError::TypeMismatch {
+                expected: "Tensor".to_string(),
+                actual: format!("{other:?}"),
+            });
+        }
+    };
+    let ints = |name: &str| match node.attrs.get(name) {
+        Some(AttributeValue::Int64s(values)) => Some(values.clone()),
+        _ => None,
+    };
+    let kernel = ints("kernel_shape");
+    let strides = ints("strides");
+    let pads = ints("pads");
+    let dilations = ints("dilations");
+    // Processors disagree on other values (MaxPool reads `== 1`, LpPool `!= 0`).
+    let ceil_mode = match node.attrs.get("ceil_mode") {
+        None | Some(AttributeValue::Int64(0)) => Some(false),
+        Some(AttributeValue::Int64(1)) => Some(true),
+        _ => None,
+    };
+    let auto_pad = match node.attrs.get("auto_pad") {
+        Some(AttributeValue::String(value)) => AutoPad::parse(value)?,
+        _ => AutoPad::NotSet,
+    };
+
+    let spatial_rank = tensor.rank.saturating_sub(2);
+    let spatial_size = |axis: usize, input: usize| -> Option<usize> {
+        let at = |values: &Option<Vec<i64>>, index: usize, default: i64| match values {
+            Some(values) => values.get(index).copied(),
+            None => Some(default),
+        };
+        let input = input as i64;
+        let kernel = kernel.as_ref()?.get(axis).copied()?;
+        let stride = at(&strides, axis, 1)?;
+        let dilation = at(&dilations, axis, 1)?;
+        if kernel < 1 || stride < 1 || dilation < 1 {
+            return None;
+        }
+        // SAME pads make the span a multiple of the stride, so floor and ceil agree and
+        // `ceil_mode`, however a processor reads it, cannot change the size.
+        if matches!(auto_pad, AutoPad::SameUpper | AutoPad::SameLower) {
+            return usize::try_from((input + stride - 1) / stride).ok();
+        }
+        let (pad_begin, pad_end) = match auto_pad {
+            AutoPad::Valid => (0, 0),
+            _ => (at(&pads, axis, 0)?, at(&pads, axis + spatial_rank, 0)?),
+        };
+        let span = input + pad_begin + pad_end - ((kernel - 1) * dilation + 1);
+        let size = if ceil_mode? {
+            let size = (span + stride - 1).div_euclid(stride) + 1;
+            if (size - 1) * stride >= input + pad_begin {
+                size - 1
+            } else {
+                size
+            }
+        } else {
+            span.div_euclid(stride) + 1
+        };
+        usize::try_from(size).ok().filter(|&size| size > 0)
+    };
+
+    let static_shape = tensor.static_shape.as_ref().map(|shape| {
+        shape
+            .iter()
+            .enumerate()
+            .map(|(axis, &dim)| match axis {
+                0 | 1 => dim,
+                _ => dim.and_then(|input| spatial_size(axis - 2, input)),
+            })
+            .collect()
+    });
+
+    node.outputs[0].ty = ArgType::Tensor(crate::ir::TensorType {
+        dtype: tensor.dtype,
+        rank: tensor.rank,
+        static_shape,
+    });
+    Ok(())
+}
+
+/// The geometry of a ConvTranspose, one entry per spatial axis, as ONNX gives it.
+pub(crate) struct ConvTransposeDims<'a> {
+    pub kernel: &'a [usize],
+    pub stride: &'a [usize],
+    pub dilation: &'a [usize],
+    /// Symmetric explicit pads, used when neither `auto_pad` nor `output_shape` is set.
+    pub padding: &'a [usize],
+    pub output_padding: &'a [usize],
+    pub groups: usize,
+    pub auto_pad: &'a AutoPad,
+    pub output_shape: Option<&'a [usize]>,
+}
+
+/// Set a ConvTranspose's output type: `[N, W[1] * groups, spatial...]`, with each dimension
+/// known only when what it derives from is known.
+///
+/// An explicit `output_shape` fixes the spatial size, SAME makes it `input * stride`, and
+/// otherwise it is `stride * (input - 1) + output_padding + (kernel - 1) * dilation + 1` less
+/// the pads (none for VALID).
+pub(crate) fn conv_transpose_output_type(
+    node: &mut RawNode,
+    dims: ConvTransposeDims<'_>,
+) -> Result<(), ProcessError> {
+    let tensor = match &node.inputs[0].ty {
+        ArgType::Tensor(tensor) => tensor.clone(),
+        other => {
+            return Err(ProcessError::TypeMismatch {
+                expected: "Tensor".to_string(),
+                actual: format!("{other:?}"),
+            });
+        }
+    };
+    let input_dim = |axis: usize| {
+        tensor
+            .static_shape
+            .as_ref()
+            .and_then(|shape| shape.get(axis).copied().flatten())
+    };
+    let out_channels = known_weight_shape(&node.inputs[1])
+        .and_then(|shape| shape.get(1).map(|per_group| per_group * dims.groups));
+
+    let mut static_shape = vec![input_dim(0), out_channels];
+    for axis in 0..dims.kernel.len() {
+        let size = match dims.output_shape {
+            Some(shape) => Some(shape[axis]),
+            None => input_dim(axis + 2).map(|input| match dims.auto_pad {
+                AutoPad::SameUpper | AutoPad::SameLower => input * dims.stride[axis],
+                _ => {
+                    let pads = match dims.auto_pad {
+                        AutoPad::Valid => 0,
+                        _ => 2 * dims.padding[axis],
+                    };
+                    (dims.stride[axis] * input.saturating_sub(1)
+                        + dims.output_padding[axis]
+                        + (dims.kernel[axis] - 1) * dims.dilation[axis]
+                        + 1)
+                    .saturating_sub(pads)
+                }
+            }),
+        };
+        static_shape.push(size);
+    }
+
+    node.outputs[0].ty = ArgType::Tensor(crate::ir::TensorType {
+        dtype: tensor.dtype,
+        rank: tensor.rank,
+        static_shape: Some(static_shape),
+    });
+    Ok(())
+}
+
+/// Padding configuration for 1D operations such as convolution
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum PaddingConfig1d {
+    /// No padding (valid padding)
+    #[default]
+    Valid,
+    /// Explicit padding with values for left and right sides
+    /// Format: (left, right)
+    /// For symmetric padding, use the same value for both (e.g., `Explicit(1, 1)`).
+    Explicit(usize, usize),
+}
+
+impl fmt::Display for PaddingConfig1d {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PaddingConfig1d::Valid => write!(f, "Valid"),
+            PaddingConfig1d::Explicit(left, right) => write!(f, "Explicit({left}, {right})"),
+        }
+    }
+}
+
+impl PaddingConfig1d {
+    /// Returns true if this padding configuration is asymmetric (left != right)
+    pub fn is_asymmetric(&self) -> bool {
+        match self {
+            PaddingConfig1d::Explicit(left, right) => left != right,
+            _ => false,
+        }
+    }
+
+    /// Returns the padding values as (left, right) tuple
+    pub fn as_tuple(&self) -> (usize, usize) {
+        match self {
+            PaddingConfig1d::Valid => (0, 0),
+            PaddingConfig1d::Explicit(left, right) => (*left, *right),
+        }
+    }
+}
+/// Check that a per-spatial-dimension attribute has at least `expected` entries, the most the
+/// config reads, so a short array from a malformed model is an error rather than a panic.
+pub(crate) fn check_attr_len<T>(
+    name: &str,
+    values: &[T],
+    expected: usize,
+) -> Result<(), ProcessError> {
+    if values.len() < expected {
+        return Err(ProcessError::InvalidAttribute {
+            name: name.to_string(),
+            reason: format!("expected {expected} values, got {}", values.len()),
+        });
+    }
+    Ok(())
+}
+
+/// Calculate the padding configuration for a 1D operations such as Convolution and Pooling.
+///
+/// # Arguments
+///
+/// * `pads` - The padding values [left, right]
+///
+/// # Panics
+///
+/// * If the padding is negative
+///
+/// # Returns
+///
+/// * The padding configuration (Valid or Explicit)
+///
+/// # Remarks
+///
+/// This function is used when the padding is specified as a list of integers,
+/// and not used when the padding is specified as a string, e.g. "SAME_UPPER".
+pub(crate) fn padding_config_1d(pads: &[i64]) -> Result<PaddingConfig1d, ProcessError> {
+    check_attr_len("pads", pads, 2)?;
+    let [left, right] = [pads[0], pads[1]];
+
+    if left < 0 || right < 0 {
+        Err(ProcessError::InvalidAttribute {
+            name: "pads".to_string(),
+            reason: format!("negative pad values are not supported: {pads:?}"),
+        })
+    } else if left == 0 && right == 0 {
+        Ok(PaddingConfig1d::Valid)
+    } else {
+        Ok(PaddingConfig1d::Explicit(left as usize, right as usize))
+    }
+}
+
+/// Padding configuration for 2D operations such as convolution
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum PaddingConfig2d {
+    /// No padding (valid padding)
+    #[default]
+    Valid,
+    /// Explicit padding with values for each side
+    /// Format: (top, left, bottom, right)
+    /// For symmetric padding, use matching values (e.g., `Explicit(1, 1, 1, 1)`).
+    Explicit(usize, usize, usize, usize),
+}
+
+impl fmt::Display for PaddingConfig2d {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PaddingConfig2d::Valid => write!(f, "Valid"),
+            PaddingConfig2d::Explicit(top, left, bottom, right) => {
+                write!(f, "Explicit({top}, {left}, {bottom}, {right})")
+            }
+        }
+    }
+}
+
+impl PaddingConfig2d {
+    /// Returns true if this padding configuration is asymmetric (top != bottom or left != right)
+    pub fn is_asymmetric(&self) -> bool {
+        match self {
+            PaddingConfig2d::Explicit(top, left, bottom, right) => top != bottom || left != right,
+            _ => false,
+        }
+    }
+
+    /// Returns the padding values as (top, left, bottom, right) tuple
+    pub fn as_tuple(&self) -> (usize, usize, usize, usize) {
+        match self {
+            PaddingConfig2d::Valid => (0, 0, 0, 0),
+            PaddingConfig2d::Explicit(top, left, bottom, right) => (*top, *left, *bottom, *right),
+        }
+    }
+}
+
+/// Calculate the padding configuration for a 2D operations such as Convolution and Pooling.
+///
+/// # Arguments
+///
+/// * `pads` - The padding values [top, left, bottom, right] (ONNX format)
+///
+/// # Panics
+///
+/// * If the padding is negative
+///
+/// # Returns
+///
+/// * The padding configuration (Valid or Explicit)
+///
+/// # Remarks
+///
+/// This function is used when the padding is specified as a list of integers,
+/// and not used when the padding is specified as a string, e.g. "SAME_UPPER".
+pub(crate) fn padding_config_2d(pads: &[i64]) -> Result<PaddingConfig2d, ProcessError> {
+    check_attr_len("pads", pads, 4)?;
+    let [top, left, bottom, right] = [pads[0], pads[1], pads[2], pads[3]];
+
+    if left < 0 || right < 0 || top < 0 || bottom < 0 {
+        Err(ProcessError::InvalidAttribute {
+            name: "pads".to_string(),
+            reason: format!("negative pad values are not supported: {pads:?}"),
+        })
+    } else if left == 0 && right == 0 && top == 0 && bottom == 0 {
+        Ok(PaddingConfig2d::Valid)
+    } else {
+        Ok(PaddingConfig2d::Explicit(
+            top as usize,
+            left as usize,
+            bottom as usize,
+            right as usize,
+        ))
+    }
+}
+
+/// Padding configuration for 3D operations such as convolution
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum PaddingConfig3d {
+    /// No padding (valid padding)
+    #[default]
+    Valid,
+    /// Explicit padding with values for each side
+    /// Format: (front, top, left, back, bottom, right)
+    /// For symmetric padding, use matching values (e.g., `Explicit(1, 1, 1, 1, 1, 1)`).
+    Explicit(usize, usize, usize, usize, usize, usize),
+}
+
+impl fmt::Display for PaddingConfig3d {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PaddingConfig3d::Valid => write!(f, "Valid"),
+            PaddingConfig3d::Explicit(front, top, left, back, bottom, right) => {
+                write!(
+                    f,
+                    "Explicit({front}, {top}, {left}, {back}, {bottom}, {right})"
+                )
+            }
+        }
+    }
+}
+
+impl PaddingConfig3d {
+    /// Returns true if this padding configuration is asymmetric
+    pub fn is_asymmetric(&self) -> bool {
+        match self {
+            PaddingConfig3d::Explicit(front, top, left, back, bottom, right) => {
+                front != back || top != bottom || left != right
+            }
+            _ => false,
+        }
+    }
+
+    /// Returns the padding values as (front, top, left, back, bottom, right) tuple
+    pub fn as_tuple(&self) -> (usize, usize, usize, usize, usize, usize) {
+        match self {
+            PaddingConfig3d::Valid => (0, 0, 0, 0, 0, 0),
+            PaddingConfig3d::Explicit(front, top, left, back, bottom, right) => {
+                (*front, *top, *left, *back, *bottom, *right)
+            }
+        }
+    }
+}
+
+/// Calculate the padding configuration for a 3D operations such as Convolution and Pooling.
+///
+/// # Arguments
+///
+/// * `pads` - The padding values [front, top, left, back, bottom, right] (ONNX format)
+///
+/// # Panics
+///
+/// * If the padding is negative
+///
+/// # Returns
+///
+/// * The padding configuration (Valid or Explicit)
+///
+/// # Remarks
+///
+/// This function is used when the padding is specified as a list of integers,
+/// and not used when the padding is specified as a string, e.g. "SAME_UPPER".
+pub(crate) fn padding_config_3d(pads: &[i64]) -> Result<PaddingConfig3d, ProcessError> {
+    check_attr_len("pads", pads, 6)?;
+    let [front, top, left, back, bottom, right] =
+        [pads[0], pads[1], pads[2], pads[3], pads[4], pads[5]];
+
+    if left < 0 || right < 0 || top < 0 || bottom < 0 || front < 0 || back < 0 {
+        Err(ProcessError::InvalidAttribute {
+            name: "pads".to_string(),
+            reason: format!("negative pad values are not supported: {pads:?}"),
+        })
+    } else if left == 0 && right == 0 && top == 0 && bottom == 0 && front == 0 && back == 0 {
+        Ok(PaddingConfig3d::Valid)
+    } else {
+        Ok(PaddingConfig3d::Explicit(
+            front as usize,
+            top as usize,
+            left as usize,
+            back as usize,
+            bottom as usize,
+            right as usize,
+        ))
+    }
+}
+
+/// A conv weight's shape: from a fully known static shape, or from its constant value,
+/// which is only read (and copied) when the type does not carry the shape.
+pub(crate) fn known_weight_shape(weight: &crate::ir::Argument) -> Option<Vec<usize>> {
+    weight
+        .ty
+        .static_shape_known()
+        .or_else(|| weight.value().map(|data| data.shape().to_vec()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{DType, NodeType, TensorType};
+    use crate::node::test_utils::TestNodeBuilder;
+
+    /// Conv node whose input spatial dimensions are `spatial` (`None` = dynamic). The spatial
+    /// rank, which decides the 3D blocker, follows from how many are given. The node type is
+    /// always Conv2d even for other ranks; `validate_auto_pad` does not inspect it.
+    fn conv_node(auto_pad: &str, spatial: &[Option<usize>], dilations: Vec<i64>) -> RawNode {
+        let mut static_shape = vec![None, Some(3)];
+        static_shape.extend_from_slice(spatial);
+        let rank = static_shape.len();
+        TestNodeBuilder::new(NodeType::Conv2d, "test_conv")
+            .add_input(
+                "data",
+                ArgType::Tensor(TensorType {
+                    dtype: DType::F32,
+                    rank,
+                    static_shape: Some(static_shape),
+                }),
+            )
+            .output_tensor_f32("output", rank, None)
+            .attr_string("auto_pad", auto_pad)
+            .attr_ints("dilations", dilations)
+            .build()
+    }
+
+    #[test]
+    fn test_static_spatial_dims_ignores_dynamic_batch() {
+        let node = conv_node("SAME_UPPER", &[Some(7), Some(9)], vec![1, 1]);
+        assert_eq!(static_spatial_dims(&node.inputs[0].ty), Some(vec![7, 9]));
+    }
+
+    #[test]
+    fn test_static_spatial_dims_dynamic() {
+        let node = conv_node("SAME_UPPER", &[None, None], vec![1, 1]);
+        assert_eq!(static_spatial_dims(&node.inputs[0].ty), None);
+    }
+
+    #[test]
+    fn test_validate_auto_pad_accepts_static_spatial() {
+        // Over 1 or 2 spatial dimensions every mode is fine once the dimensions are known:
+        // the pads are computed during import.
+        for auto_pad in ["SAME_UPPER", "SAME_LOWER"] {
+            let node = conv_node(auto_pad, &[Some(7), Some(7)], vec![2, 2]);
+            assert!(validate_auto_pad(&node).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_validate_auto_pad_accepts_same_upper_dynamic() {
+        let node = conv_node("SAME_UPPER", &[None, None], vec![1, 1]);
+        assert!(validate_auto_pad(&node).is_ok());
+    }
+
+    #[test]
+    fn test_validate_auto_pad_rejects_same_lower_dynamic() {
+        let node = conv_node("SAME_LOWER", &[None, None], vec![1, 1]);
+        let err = validate_auto_pad(&node).unwrap_err().to_string();
+        assert!(err.contains(&SameBlocker::SameLower.to_string()), "{err}");
+    }
+
+    #[test]
+    fn test_validate_auto_pad_rejects_dilation_dynamic() {
+        let node = conv_node("SAME_UPPER", &[None, None], vec![2, 2]);
+        let err = validate_auto_pad(&node).unwrap_err().to_string();
+        assert!(err.contains(&SameBlocker::Dilated.to_string()), "{err}");
+    }
+
+    #[test]
+    fn test_validate_auto_pad_rejects_3d_dynamic() {
+        let node = conv_node("SAME_UPPER", &[None, None, None], vec![1, 1, 1]);
+        let err = validate_auto_pad(&node).unwrap_err().to_string();
+        assert!(
+            err.contains(&SameBlocker::ThreeSpatialDims.to_string()),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_forward_time_same_blocker_precedence() {
+        // SAME_LOWER is reported before dilation, and dilation before the 3D limit, so the
+        // message names the first thing the user has to change.
+        assert_eq!(
+            forward_time_same_blocker(&AutoPad::SameLower, true, 3),
+            Some(SameBlocker::SameLower)
+        );
+        assert_eq!(
+            forward_time_same_blocker(&AutoPad::SameUpper, true, 3),
+            Some(SameBlocker::Dilated)
+        );
+        assert_eq!(
+            forward_time_same_blocker(&AutoPad::SameUpper, false, 3),
+            Some(SameBlocker::ThreeSpatialDims)
+        );
+        assert_eq!(
+            forward_time_same_blocker(&AutoPad::SameUpper, false, 2),
+            None
+        );
+    }
+
+    #[test]
+    fn test_validate_auto_pad_rejects_wrong_attribute_types() {
+        let mut node = conv_node("SAME_UPPER", &[None, None], vec![1, 1]);
+        node.attrs
+            .insert("auto_pad".to_string(), AttributeValue::Int64(1));
+        let err = validate_auto_pad(&node).unwrap_err().to_string();
+        assert!(err.contains("expected a string"), "{err}");
+
+        let mut node = conv_node("SAME_UPPER", &[None, None], vec![1, 1]);
+        node.attrs
+            .insert("dilations".to_string(), AttributeValue::Int64(1));
+        let err = validate_auto_pad(&node).unwrap_err().to_string();
+        assert!(err.contains("expected a list of ints"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_auto_pad_ignores_other_modes() {
+        for auto_pad in ["NOTSET", "VALID"] {
+            let node = conv_node(auto_pad, &[None, None], vec![1, 1]);
+            assert!(validate_auto_pad(&node).is_ok());
+        }
+    }
+
+    // AutoPad tests
+    #[test]
+    fn test_auto_pad_parse() {
+        assert_eq!(AutoPad::parse("NOTSET").unwrap(), AutoPad::NotSet);
+        assert_eq!(AutoPad::parse("SAME_UPPER").unwrap(), AutoPad::SameUpper);
+        assert_eq!(AutoPad::parse("SAME_LOWER").unwrap(), AutoPad::SameLower);
+        assert_eq!(AutoPad::parse("VALID").unwrap(), AutoPad::Valid);
+        assert!(AutoPad::parse("INVALID").is_err());
+    }
+
+    #[test]
+    fn test_auto_pad_display() {
+        assert_eq!(AutoPad::NotSet.to_string(), "NOTSET");
+        assert_eq!(AutoPad::SameUpper.to_string(), "SAME_UPPER");
+        assert_eq!(AutoPad::SameLower.to_string(), "SAME_LOWER");
+        assert_eq!(AutoPad::Valid.to_string(), "VALID");
+    }
+
+    // 1D padding tests
+    #[test]
+    fn test_padding_config_1d_valid() {
+        let pads = vec![0, 0];
+        let config = padding_config_1d(&pads).unwrap();
+        assert!(matches!(config, PaddingConfig1d::Valid));
+    }
+
+    #[test]
+    fn test_padding_config_1d_explicit_symmetric() {
+        let pads = vec![2, 2];
+        let config = padding_config_1d(&pads).unwrap();
+        assert!(matches!(config, PaddingConfig1d::Explicit(2, 2)));
+        assert!(!config.is_asymmetric());
+        assert_eq!(config.as_tuple(), (2, 2));
+    }
+
+    #[test]
+    fn test_padding_config_1d_explicit_asymmetric() {
+        let pads = vec![1, 2];
+        let config = padding_config_1d(&pads).unwrap();
+        assert!(matches!(config, PaddingConfig1d::Explicit(1, 2)));
+        assert!(config.is_asymmetric());
+        assert_eq!(config.as_tuple(), (1, 2));
+    }
+
+    #[test]
+    fn test_padding_config_1d_negative() {
+        let pads = vec![-1, -1];
+        let err = padding_config_1d(&pads).unwrap_err();
+        assert!(err.to_string().contains("negative pad values"), "{err}");
+    }
+
+    // 2D padding tests
+    #[test]
+    fn test_padding_config_2d_valid() {
+        let pads = vec![0, 0, 0, 0];
+        let config = padding_config_2d(&pads).unwrap();
+        assert!(matches!(config, PaddingConfig2d::Valid));
+        assert!(!config.is_asymmetric());
+    }
+
+    #[test]
+    fn test_padding_config_2d_explicit_symmetric() {
+        let pads = vec![2, 2, 2, 2];
+        let config = padding_config_2d(&pads).unwrap();
+        assert!(matches!(config, PaddingConfig2d::Explicit(2, 2, 2, 2)));
+        assert!(!config.is_asymmetric());
+        assert_eq!(config.as_tuple(), (2, 2, 2, 2));
+    }
+
+    #[test]
+    fn test_padding_config_2d_explicit_asymmetric() {
+        // pads = [top, left, bottom, right]
+        let pads = vec![1, 2, 3, 4];
+        let config = padding_config_2d(&pads).unwrap();
+        assert!(matches!(config, PaddingConfig2d::Explicit(1, 2, 3, 4)));
+        assert!(config.is_asymmetric());
+        assert_eq!(config.as_tuple(), (1, 2, 3, 4));
+    }
+
+    #[test]
+    fn test_padding_config_2d_explicit_asymmetric_top_bottom() {
+        // top != bottom but left == right
+        let pads = vec![1, 2, 3, 2];
+        let config = padding_config_2d(&pads).unwrap();
+        assert!(matches!(config, PaddingConfig2d::Explicit(1, 2, 3, 2)));
+        assert!(config.is_asymmetric());
+    }
+
+    #[test]
+    fn test_padding_config_2d_explicit_asymmetric_left_right() {
+        // left != right but top == bottom
+        let pads = vec![2, 1, 2, 3];
+        let config = padding_config_2d(&pads).unwrap();
+        assert!(matches!(config, PaddingConfig2d::Explicit(2, 1, 2, 3)));
+        assert!(config.is_asymmetric());
+    }
+
+    #[test]
+    fn test_padding_config_2d_negative() {
+        let pads = vec![-1, -1, -1, -1];
+        let err = padding_config_2d(&pads).unwrap_err();
+        assert!(err.to_string().contains("negative pad values"), "{err}");
+    }
+
+    // 3D padding tests
+    #[test]
+    fn test_padding_config_3d_valid() {
+        let pads = vec![0, 0, 0, 0, 0, 0];
+        let config = padding_config_3d(&pads).unwrap();
+        assert!(matches!(config, PaddingConfig3d::Valid));
+        assert!(!config.is_asymmetric());
+    }
+
+    #[test]
+    fn test_padding_config_3d_explicit_symmetric() {
+        let pads = vec![2, 3, 1, 2, 3, 1];
+        let config = padding_config_3d(&pads).unwrap();
+        assert!(matches!(
+            config,
+            PaddingConfig3d::Explicit(2, 3, 1, 2, 3, 1)
+        ));
+        assert!(!config.is_asymmetric());
+        assert_eq!(config.as_tuple(), (2, 3, 1, 2, 3, 1));
+    }
+
+    #[test]
+    fn test_padding_config_3d_explicit_asymmetric() {
+        // pads = [front, top, left, back, bottom, right]
+        let pads = vec![1, 2, 3, 4, 5, 6];
+        let config = padding_config_3d(&pads).unwrap();
+        assert!(matches!(
+            config,
+            PaddingConfig3d::Explicit(1, 2, 3, 4, 5, 6)
+        ));
+        assert!(config.is_asymmetric());
+        assert_eq!(config.as_tuple(), (1, 2, 3, 4, 5, 6));
+    }
+
+    #[test]
+    fn test_padding_config_3d_explicit_asymmetric_partial() {
+        // Only front != back
+        let pads = vec![1, 3, 1, 2, 3, 1];
+        let config = padding_config_3d(&pads).unwrap();
+        assert!(matches!(
+            config,
+            PaddingConfig3d::Explicit(1, 3, 1, 2, 3, 1)
+        ));
+        assert!(config.is_asymmetric());
+    }
+
+    #[test]
+    fn test_padding_config_3d_negative() {
+        let pads = vec![-1, -1, -1, -1, -1, -1];
+        let err = padding_config_3d(&pads).unwrap_err();
+        assert!(err.to_string().contains("negative pad values"), "{err}");
+    }
+
+    /// Output static shape of a MaxPool with input `[None, 3, spatial...]` and the attributes
+    /// `attrs` adds.
+    fn pool_shape(
+        spatial: &[Option<usize>],
+        attrs: impl FnOnce(TestNodeBuilder) -> TestNodeBuilder,
+    ) -> Vec<Option<usize>> {
+        let mut static_shape = vec![None, Some(3)];
+        static_shape.extend_from_slice(spatial);
+        let rank = static_shape.len();
+        let builder = TestNodeBuilder::new(NodeType::MaxPool2d, "test_pool")
+            .add_input(
+                "data",
+                ArgType::Tensor(TensorType {
+                    dtype: DType::F32,
+                    rank,
+                    static_shape: Some(static_shape),
+                }),
+            )
+            .output_tensor_f32("output", rank, None);
+        let mut node = attrs(builder).build();
+        pool_output_type(&mut node).unwrap();
+        node.outputs[0].ty.static_shape().unwrap().clone()
+    }
+
+    #[test]
+    fn test_pool_output_type_asymmetric_pads_and_dilation() {
+        // H: 10 + 1 + 2 - 5 = 8, / 2 + 1 = 5. W: 10 - 3 = 7, / 1 + 1 = 8.
+        let shape = pool_shape(&[Some(10), Some(10)], |node| {
+            node.attr_ints("kernel_shape", vec![3, 3])
+                .attr_ints("strides", vec![2, 1])
+                .attr_ints("pads", vec![1, 0, 2, 0])
+                .attr_ints("dilations", vec![2, 1])
+        });
+        assert_eq!(shape, vec![None, Some(3), Some(5), Some(8)]);
+    }
+
+    #[test]
+    fn test_pool_output_type_ceil_mode_asymmetric_pads_drops_window() {
+        // 5 + 0 + 2 - 3 = 4, ceil(4 / 3) + 1 = 3, but the 3rd window starts at 6 >= 5.
+        let shape = pool_shape(&[Some(5)], |node| {
+            node.attr_ints("kernel_shape", vec![3])
+                .attr_ints("strides", vec![3])
+                .attr_ints("pads", vec![0, 2])
+                .attr_int("ceil_mode", 1)
+        });
+        assert_eq!(shape, vec![None, Some(3), Some(2)]);
+    }
+
+    #[test]
+    fn test_pool_output_type_valid_ignores_pads() {
+        let shape = pool_shape(&[Some(6), Some(6), Some(6)], |node| {
+            node.attr_ints("kernel_shape", vec![2, 2, 2])
+                .attr_ints("pads", vec![1, 1, 1, 1, 1, 1])
+                .attr_string("auto_pad", "VALID")
+        });
+        assert_eq!(shape, vec![None, Some(3), Some(5), Some(5), Some(5)]);
+    }
+
+    #[test]
+    fn test_pool_output_type_unknown_spatial_dims() {
+        // A dynamic input dim, and a kernel larger than the input, both leave the size unknown.
+        let shape = pool_shape(&[None, Some(2)], |node| {
+            node.attr_ints("kernel_shape", vec![3, 3])
+        });
+        assert_eq!(shape, vec![None, Some(3), None, None]);
+    }
+
+    #[test]
+    fn test_pool_output_type_unrecognized_ceil_mode() {
+        let shape = pool_shape(&[Some(7)], |node| {
+            node.attr_ints("kernel_shape", vec![2])
+                .attr_ints("strides", vec![2])
+                .attr_int("ceil_mode", 2)
+        });
+        assert_eq!(shape, vec![None, Some(3), None]);
+    }
+}

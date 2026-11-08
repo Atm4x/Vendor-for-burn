@@ -1,0 +1,184 @@
+//! # InstanceNormalization
+//!
+//! Applies instance normalization to the input as described in
+//! <https://arxiv.org/abs/1607.08022>.
+//!
+//! The operation normalizes each channel in each data instance independently:
+//! `y = scale * (x - mean) / sqrt(variance + epsilon) + B`, where mean and
+//! variance are computed per instance per channel.
+//!
+//! **ONNX Spec**: <https://onnx.ai/onnx/operators/onnx__InstanceNormalization.html>
+//!
+//! ## Type Constraints
+//! - T: tensor(float16), tensor(float), tensor(double), tensor(bfloat16)
+//!
+//! ## Opset Versions
+//! - **Opset 1-5**: Earlier versions with different epsilon handling
+//! - **Opset 6+**: Current version with epsilon=1e-5 default and standardized behavior
+//!
+//! ## Missing Test Coverage
+//! - TODO: No test for custom epsilon values (e.g., epsilon=1e-3) - Only default epsilon tested
+//! - TODO: No test for edge cases: zero-mean inputs, constant inputs, single channel
+//! - TODO: No test validating behavior with different batch sizes or spatial dimensions
+use derive_new::new;
+use onnx_ir_derive::NodeBuilder;
+
+use crate::ir::{Argument, Node, RawNode};
+use crate::processor::{
+    InputSpec, NodeProcessor, NodeSpec, OutputPreferences, OutputSpec, ProcessError,
+    lift_all_or_none, validate_group_not_split,
+};
+
+/// Configuration for InstanceNorm operations
+#[derive(Debug, Clone, new)]
+pub struct InstanceNormConfig {
+    /// Small constant added for numerical stability
+    pub epsilon: f64,
+}
+
+/// Node representation for InstanceNormalization operation
+#[derive(Debug, Clone, NodeBuilder)]
+pub struct InstanceNormalizationNode {
+    pub name: String,
+    pub inputs: Vec<Argument>,
+    pub outputs: Vec<Argument>,
+    pub config: InstanceNormConfig,
+}
+
+pub(crate) struct InstanceNormProcessor;
+
+impl NodeProcessor for InstanceNormProcessor {
+    type Config = InstanceNormConfig;
+
+    fn spec(&self) -> NodeSpec {
+        NodeSpec {
+            min_opset: 1,
+            max_opset: None,
+            inputs: InputSpec::Exact(3),
+            outputs: OutputSpec::Exact(1),
+        }
+    }
+
+    fn lift_constants(&self, node: &mut RawNode, _opset: usize) -> Result<(), ProcessError> {
+        // Scale (input 1) and bias (input 2) are lifted together or not at all: codegen
+        // takes the static path only when both are static, and otherwise references both
+        // by name, which a lifted input no longer has.
+        lift_all_or_none(node, &[1, 2])
+    }
+
+    fn infer_types(
+        &self,
+        node: &mut RawNode,
+        _opset: usize,
+        _output_preferences: &OutputPreferences,
+    ) -> Result<(), ProcessError> {
+        validate_group_not_split(node, &[1, 2])?;
+
+        // TODO: Validate input tensor dtype is floating-point type - Type constraint T: tensor(float16), tensor(float), tensor(double), tensor(bfloat16) not enforced - burn/crates/onnx-ir/src/node/instance_norm.rs:88
+        // TODO: Validate that scale and bias tensors are 1D and have size C matching the channel dimension of input - Shape mismatch could cause runtime errors - burn/crates/onnx-ir/src/node/instance_norm.rs:88
+        // TODO: Validate that input tensor is at least 3D (N x C x D1 ...) - Spec requires minimum rank of 3 - burn/crates/onnx-ir/src/node/instance_norm.rs:88
+
+        // Validate attributes before extracting config
+        // Output type is same as input
+        crate::processor::same_as_input(node);
+
+        Ok(())
+    }
+
+    fn extract_config(&self, node: &RawNode, _opset: usize) -> Result<Self::Config, ProcessError> {
+        let mut epsilon = 1e-5;
+
+        for (key, value) in node.attrs.iter() {
+            if key.as_str() == "epsilon" {
+                // TODO: Validate epsilon > 0 for numerical stability
+                epsilon = value.clone().into_f32()?
+            }
+        }
+
+        let config = InstanceNormConfig::new(epsilon as f64);
+        Ok(config)
+    }
+
+    fn build_node(&self, builder: RawNode, opset: usize) -> Result<Node, ProcessError> {
+        let config = self.extract_config(&builder, opset)?;
+
+        Ok(Node::InstanceNormalization(InstanceNormalizationNode {
+            name: builder.name,
+            inputs: builder.inputs,
+            outputs: builder.outputs,
+            config,
+        }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::NodeType;
+    use crate::node::test_utils::TestNodeBuilder;
+
+    fn create_test_node(epsilon: f32, num_features: usize) -> TestNodeBuilder {
+        let weight_data = vec![1.0; num_features]; // Not important for the test
+        let bias_data = vec![0.0; num_features]; // Not important for the test
+
+        TestNodeBuilder::new(NodeType::InstanceNormalization, "test_instancenorm")
+            .input_tensor_f32("X", 3, None)
+            .input_tensor_f32_data("scale", weight_data, vec![num_features])
+            .input_tensor_f32_data("bias", bias_data, vec![num_features])
+            .output_tensor_f32("output", 3, None)
+            .attr_float("epsilon", epsilon)
+    }
+
+    #[test]
+    fn test_instance_norm_config_basic() {
+        let node = create_test_node(1e-5, 64).build_with_graph_data(16);
+        let mut node = node;
+        let processor = InstanceNormProcessor;
+        let prefs = OutputPreferences::new();
+        let config = processor.extract_config(&node, 16).unwrap();
+        processor.infer_types(&mut node, 16, &prefs).unwrap();
+
+        assert!(f64::abs(config.epsilon - 1e-5) < 1e-6);
+    }
+
+    #[test]
+    fn test_instance_norm_lifts_scale_and_bias_together() {
+        let mut node = create_test_node(1e-5, 4).build_with_graph_data(16);
+        InstanceNormProcessor.lift_constants(&mut node, 16).unwrap();
+        assert!(node.inputs[1].is_static() && node.inputs[2].is_static());
+    }
+
+    #[test]
+    fn test_instance_norm_mixed_scale_and_bias_not_lifted() {
+        // A constant scale next to a runtime bias must stay named: codegen references
+        // both by name unless both are static.
+        let mut node = TestNodeBuilder::new(NodeType::InstanceNormalization, "test_norm")
+            .input_tensor_f32("X", 3, None)
+            .input_tensor_f32_data("scale", vec![1.0; 4], vec![4])
+            .input_tensor_f32("bias", 1, None)
+            .output_tensor_f32("output", 3, None)
+            .build_with_graph_data(16);
+        InstanceNormProcessor.lift_constants(&mut node, 16).unwrap();
+        assert!(node.inputs[1].is_constant());
+        assert_eq!(node.inputs[1].name, "scale");
+        assert!(node.inputs[2].is_dynamic());
+    }
+
+    #[test]
+    fn test_lifted_scale_with_runtime_bias_rejected() {
+        // A subgraph capturing an already-lifted outer scale alongside a body-input bias:
+        // the scale has no runtime name for codegen to reference.
+        let mut node = TestNodeBuilder::new(NodeType::InstanceNormalization, "test_norm")
+            .input_tensor_f32("X", 3, None)
+            .input_tensor_f32_data("scale", vec![1.0; 4], vec![4])
+            .input_tensor_f32("bias", 1, None)
+            .output_tensor_f32("output", 3, None)
+            .build_with_graph_data(16);
+        node.inputs[1].to_static().unwrap();
+
+        let err = InstanceNormProcessor
+            .infer_types(&mut node, 16, &OutputPreferences::new())
+            .expect_err("a lifted scale with a runtime bias must be rejected");
+        assert!(err.to_string().contains("input #1 is a build-time value"));
+    }
+}

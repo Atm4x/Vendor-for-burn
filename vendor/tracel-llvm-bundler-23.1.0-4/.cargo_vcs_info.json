@@ -1,0 +1,6 @@
+{
+  "git": {
+    "sha1": "7835ab2b080e1a13c40506f2f6b9d44de398c600"
+  },
+  "path_in_vcs": "crates/tracel-llvm-bundler"
+}

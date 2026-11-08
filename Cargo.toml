@@ -1,0 +1,68 @@
+
+[package]
+name = "neuromita-inference-vendor"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+
+[features]
+default = ["burn-flex"]
+
+burn-flex = ["burn/flex"]
+burn-cpu = ["burn/cpu"]
+burn-wgpu = ["burn/wgpu"]
+burn-cuda = ["burn/cuda"]
+
+onnx = ["dep:ort"]
+faiss-index = ["dep:faiss"]
+
+[dependencies]
+burn = { version = "=0.22.1", default-features = false, features = [
+    "std",
+    "store",
+    "pytorch",
+    "signal",
+    "cubecl",
+] }
+
+ort = { version = "=2.0.0-rc.15", optional = true, default-features = false, features = [
+    "std",
+    "load-dynamic",
+    "cuda",
+    "ndarray",
+] }
+
+faiss = { version = "0.13", optional = true }
+
+safetensors = "0.8"
+ndarray = "0.17"
+rubato = "5.0"
+rustfft = "6"
+realfft = "3.5"
+hound = "3.5"
+symphonia = "0.6"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "process",
+    "io-util",
+    "net",
+    "time",
+] }
+
+interprocess = { version = "2.4", features = ["tokio"] }
+libloading = "0.9"
+
+anyhow = "1"
+thiserror = "2"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[build-dependencies]
+burn-onnx = "=0.22.0"

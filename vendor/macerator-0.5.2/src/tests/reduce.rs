@@ -1,0 +1,476 @@
+use half::f16;
+use num_traits::{Bounded, Float, NumCast, Zero};
+
+use crate::{
+    assert_relative_eq,
+    tests::{approx::RelativeEq, assert_eq},
+    vload_unaligned, ReduceAdd, ReduceMax, ReduceMin, Scalar, Simd, Vector,
+};
+use core::fmt::Debug;
+use core::ops::Add;
+use std::vec::Vec;
+
+macro_rules! reduce_op {
+    ($trait: ident, $scalar_trait: path, $impl: expr, $impl_scalar: expr) => {
+        ::paste::paste! {
+            struct [<$trait Op>]<T>(::core::marker::PhantomData<T>);
+            impl<T: $trait + $scalar_trait> ReduceOp<T> for [<$trait Op>]<T> {
+                #[inline(always)]
+                fn call<S: Simd>(lhs: Vector<S, T>) -> T {
+                    $impl(lhs)
+                }
+                #[inline(always)]
+                fn call_scalar(lhs: T, rhs: T) -> T {
+                    $impl_scalar(lhs, rhs)
+                }
+            }
+        }
+    };
+}
+
+#[inline(always)]
+fn test_reduce_add_impl<S: Simd, T: ReduceAdd + Add + Zero + Debug>(a: &[T]) -> T {
+    reduce_op!(
+        ReduceAdd,
+        Add<Output = T>,
+        |a: Vector<S, T>| a.reduce_add(),
+        Add::add
+    );
+    test_reduce_op::<S, T, ReduceAddOp<T>>(a, Zero::zero())
+}
+
+#[inline(always)]
+fn test_reduce_min_ord_impl<S: Simd, T: ReduceMin + Ord + Bounded + Debug>(a: &[T]) -> T {
+    reduce_op!(ReduceMin, Ord, |a: Vector<S, T>| a.reduce_min(), Ord::min);
+    test_reduce_op::<S, T, ReduceMinOp<T>>(a, Bounded::max_value())
+}
+
+#[inline(always)]
+fn test_reduce_max_ord_impl<S: Simd, T: ReduceMax + Ord + Bounded + Debug>(a: &[T]) -> T {
+    reduce_op!(ReduceMax, Ord, |a: Vector<S, T>| a.reduce_max(), Ord::max);
+    test_reduce_op::<S, T, ReduceMaxOp<T>>(a, Bounded::min_value())
+}
+
+#[inline(always)]
+fn test_reduce_min_float_impl<S: Simd, T: ReduceMin + Float + Bounded + Debug>(a: &[T]) -> T {
+    reduce_op!(
+        ReduceMin,
+        Float,
+        |a: Vector<S, T>| a.reduce_min(),
+        Float::min
+    );
+    test_reduce_op::<S, T, ReduceMinOp<T>>(a, Bounded::max_value())
+}
+
+#[inline(always)]
+fn test_reduce_max_float_impl<S: Simd, T: ReduceMax + Float + Bounded + Debug>(a: &[T]) -> T {
+    reduce_op!(
+        ReduceMax,
+        Float,
+        |a: Vector<S, T>| a.reduce_max(),
+        Float::max
+    );
+    test_reduce_op::<S, T, ReduceMaxOp<T>>(a, Bounded::min_value())
+}
+
+pub(crate) trait ReduceOp<T: Scalar> {
+    fn call<S: Simd>(lhs: Vector<S, T>) -> T;
+    fn call_scalar(lhs: T, rhs: T) -> T;
+}
+
+#[inline(always)]
+fn test_reduce_op<S: Simd, T: Scalar + Debug, Op: ReduceOp<T>>(a: &[T], default: T) -> T {
+    let lanes = T::lanes::<S>();
+    let mut output = default;
+    let a = a.chunks_exact(lanes);
+    for a in a {
+        let a = unsafe { vload_unaligned(a.as_ptr()) };
+        let val = Op::call::<S>(a);
+        output = Op::call_scalar(output, val);
+    }
+    output
+}
+
+macro_rules! testgen_reduce {
+    ($test_fn: ident, $reference: expr, $default: expr, $lo: expr, $hi: expr, $size: expr, $assert: ident, $($(#[$meta:meta])* $ty: ty),*) => {
+        $(::paste::paste! {
+            $(#[$meta])*
+            #[::wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
+            fn [<$test_fn _ $ty>]() {
+                use num_traits::NumCast;
+
+                let a = $crate::tests::random_of_size::<$ty>(NumCast::from($lo).unwrap(), NumCast::from($hi).unwrap(), $size);
+                let out_ref: [$ty; 1] = [a.iter().copied().fold($default, |a: $ty, b: $ty| a.$reference(b))];
+                #[cfg(x86)]
+                unsafe {
+                    use $crate::backend::x86::*;
+                    #[cfg(avx512_fp16)]
+                    if V4FP16::is_available() {
+                        let out = V4FP16::run_vectorized(|| [<$test_fn _impl>]::<V4FP16, $ty>(&a));
+                        $assert(&out_ref, &[out]);
+                    }
+                    #[cfg(avx512)]
+                    if V4::is_available() {
+                        let out = V4::run_vectorized(|| [<$test_fn _impl>]::<V4, $ty>(&a));
+                        $assert(&out_ref, &[out]);
+                    }
+                    if V3::is_available() {
+                        let out = V3::run_vectorized(|| [<$test_fn _impl>]::<V3, $ty>(&a));
+                        $assert(&out_ref, &[out]);
+                    }
+                    if V2::is_available() {
+                        let out = V2::run_vectorized(|| [<$test_fn _impl>]::<V2, $ty>(&a));
+                        $assert(&out_ref, &[out]);
+                    }
+                }
+                #[cfg(aarch64)]
+                unsafe {
+                    use $crate::backend::aarch64::*;
+                    #[cfg(feature = "fp16")]
+                    if NeonFP16::is_available() {
+                        let out = NeonFP16::run_vectorized(|| [<$test_fn _impl>]::<NeonFP16, $ty>(&a));
+                        $assert(&out_ref, &[out]);
+                    }
+                    if NeonFma::is_available() {
+                        let out = NeonFma::run_vectorized(|| [<$test_fn _impl>]::<NeonFma, $ty>(&a));
+                        $assert(&out_ref, &[out]);
+                    }
+                }
+                #[cfg(loong64)]
+                unsafe {
+                    use $crate::backend::loong64::*;
+                    if Lasx::is_available() {
+                        let out = Lasx::run_vectorized(|| [<$test_fn _impl>]::<Lasx, $ty>(&a));
+                        $assert(&out_ref, &[out]);
+                    }
+                    if Lsx::is_available() {
+                        let out = Lsx::run_vectorized(|| [<$test_fn _impl>]::<Lsx, $ty>(&a));
+                        $assert(&out_ref, &[out]);
+                    }
+                }
+                #[cfg(wasm32)]
+                unsafe {
+                    use crate::backend::wasm32;
+                    #[cfg(relaxed_simd)]
+                    if wasm32::Simd128Relaxed::is_available() {
+                        let out = wasm32::Simd128Relaxed::run_vectorized(|| [<$test_fn _impl>]::<wasm32::Simd128Relaxed, $ty>(&a));
+                        $assert(&out_ref, &[out]);
+                    }
+                    if wasm32::Simd128Fallback::is_available() {
+                        let out = wasm32::Simd128Fallback::run_vectorized(|| [<$test_fn _impl>]::<wasm32::Simd128Fallback, $ty>(&a));
+                        $assert(&out_ref, &[out]);
+                    }
+                }
+                let out = [<$test_fn _impl>]::<$crate::backend::scalar::Fallback, $ty>(&a);
+                $assert(&out_ref, &[out]);
+            }
+        })*
+    };
+}
+
+// Skipping f16 because assertion library doesn't support it
+testgen_reduce!(
+    test_reduce_add,
+    add,
+    Zero::zero(),
+    1,
+    100,
+    128,
+    assert_approx_eq_sum,
+    #[cfg_attr(all(miri, any(x86_v3, x86_v4, aarch64)), ignore)]
+    f16,
+    #[cfg_attr(all(miri, aarch64), ignore)]
+    f32,
+    #[cfg_attr(all(miri, aarch64), ignore)]
+    f64
+);
+
+testgen_reduce!(
+    test_reduce_add,
+    wrapping_add,
+    Zero::zero(),
+    1,
+    100,
+    128,
+    assert_eq,
+    u16,
+    i16,
+    u32,
+    i32,
+    u64,
+    i64
+);
+
+testgen_reduce!(
+    test_reduce_add,
+    wrapping_add,
+    Zero::zero(),
+    0,
+    2,
+    64,
+    assert_eq,
+    u8,
+    i8
+);
+
+testgen_reduce!(
+    test_reduce_min_ord,
+    min,
+    Bounded::max_value(),
+    1,
+    100,
+    128,
+    assert_eq,
+    u8,
+    u16,
+    u32,
+    u64
+);
+
+testgen_reduce!(
+    test_reduce_min_ord,
+    min,
+    Bounded::max_value(),
+    -50,
+    50,
+    128,
+    assert_eq,
+    i8,
+    i16,
+    i32,
+    i64
+);
+
+testgen_reduce!(
+    test_reduce_min_float,
+    min,
+    Bounded::max_value(),
+    -50,
+    50,
+    128,
+    assert_eq,
+    #[cfg_attr(all(miri, any(x86_v3, x86_v4, aarch64)), ignore)]
+    f16,
+    #[cfg_attr(all(miri, aarch64), ignore)]
+    f32,
+    #[cfg_attr(all(miri, aarch64), ignore)]
+    f64
+);
+
+testgen_reduce!(
+    test_reduce_max_ord,
+    max,
+    Bounded::min_value(),
+    1,
+    100,
+    128,
+    assert_eq,
+    u8,
+    u16,
+    u32,
+    u64
+);
+
+testgen_reduce!(
+    test_reduce_max_ord,
+    max,
+    Bounded::min_value(),
+    -50,
+    50,
+    128,
+    assert_eq,
+    i8,
+    i16,
+    i32,
+    i64
+);
+
+testgen_reduce!(
+    test_reduce_max_float,
+    max,
+    Bounded::min_value(),
+    -50,
+    50,
+    128,
+    assert_eq,
+    #[cfg_attr(all(miri, any(x86_v3, x86_v4, aarch64)), ignore)]
+    f16,
+    #[cfg_attr(all(miri, aarch64), ignore)]
+    f32,
+    #[cfg_attr(all(miri, aarch64), ignore)]
+    f64
+);
+
+/// The tests above use small positive values, and `test_reduce_add_impl`
+/// combines the per-vector sums with `+`, which panics on overflow in debug
+/// builds. Reduce over the whole range of each integer type instead, combining
+/// with wrapping adds like the lanes do.
+mod full_range {
+    use super::*;
+    use num_traits::WrappingAdd;
+    use std::{vec, vec::Vec};
+
+    #[inline(always)]
+    fn test_reduce_add_impl<S: Simd, T: ReduceAdd + WrappingAdd + Zero + Debug>(a: &[T]) -> T {
+        reduce_op!(
+            ReduceAdd,
+            WrappingAdd,
+            |a: Vector<S, T>| a.reduce_add(),
+            |a: T, b: T| a.wrapping_add(&b)
+        );
+        test_reduce_op::<S, T, ReduceAddOp<T>>(a, Zero::zero())
+    }
+
+    macro_rules! testgen_full_range {
+        ($($ty: ident),*) => {
+            $(
+                testgen_reduce!(test_reduce_add, wrapping_add, Zero::zero(), $ty::MIN, $ty::MAX, 128, assert_eq, $ty);
+                testgen_reduce!(test_reduce_min_ord, min, Bounded::max_value(), $ty::MIN, $ty::MAX, 128, assert_eq, $ty);
+                testgen_reduce!(test_reduce_max_ord, max, Bounded::min_value(), $ty::MIN, $ty::MAX, 128, assert_eq, $ty);
+            )*
+        };
+    }
+
+    testgen_full_range!(u8, i8, u16, i16, u32, i32, u64, i64);
+
+    #[inline(always)]
+    fn test_reduce_extremes_impl<S: Simd, T>(a: &[T]) -> Vec<T>
+    where
+        T: ReduceAdd + ReduceMin + ReduceMax + WrappingAdd + Ord + Bounded + Zero + Debug,
+    {
+        vec![
+            test_reduce_add_impl::<S, T>(a),
+            test_reduce_min_ord_impl::<S, T>(a),
+            test_reduce_max_ord_impl::<S, T>(a),
+        ]
+    }
+
+    // `random_of_size` never returns its upper bound, so put `MAX` in the
+    // vectors explicitly.
+    macro_rules! testgen_extremes {
+        ($($ty: ident),*) => {
+            $(::paste::paste! {
+                #[::wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
+                fn [<test_reduce_extremes_ $ty>]() {
+                    let values = [$ty::MAX, $ty::MIN, 1, $ty::MAX - 1];
+                    let a: Vec<$ty> = (0..crate::tests::SIZE).map(|i| values[i % 4]).collect();
+                    let expected = vec![
+                        a.iter().fold(0, |sum: $ty, x| sum.wrapping_add(*x)),
+                        *a.iter().min().unwrap(),
+                        *a.iter().max().unwrap(),
+                    ];
+                    crate::tests::for_each_backend!(test_reduce_extremes_impl, $ty, &a, |out: &[$ty]| {
+                        assert_eq!(out, &expected[..])
+                    });
+                }
+            })*
+        };
+    }
+
+    testgen_extremes!(u8, i8, u16, i16, u32, i32, u64, i64);
+}
+
+fn assert_approx_eq_sum<T: RelativeEq<Epsilon = T> + Debug + NumCast + Copy>(lhs: &[T], rhs: &[T]) {
+    // No idea what the actual deviation is, f64 failed with an absolute difference
+    // of 1e-10
+    let epsilon = T::from(2.0.powf(-8.0)).unwrap();
+    // Higher max relative because instructions may use butterfly reduction, which
+    // can accumulate error to log2(lanes) times the normal error. 4x seems to work
+    // for the largest lane count.
+    let max_relative = T::from(T::default_max_relative().to_f64().unwrap() * 4.0).unwrap();
+    // f16 rounds every partial sum to 11 bits, and the backend and the
+    // reference add in different orders. Over 128 values the two sums drift
+    // apart by up to ~0.6%, more than 4x f16 epsilon (0.39%) allows. 2^-7 still
+    // fails if a whole element (~0.8% of the sum on average) goes missing.
+    let max_relative = if size_of::<T>() == 2 {
+        T::from(2.0.powf(-7.0)).unwrap()
+    } else {
+        max_relative
+    };
+    for (a, b) in lhs.iter().zip(rhs) {
+        assert_relative_eq!(*a, *b, epsilon = epsilon, max_relative = max_relative);
+    }
+}
+
+/// Reductions must leave their input vector untouched. The FP16 `reduce_add`
+/// used to overwrite the register holding its input, which only shows up when
+/// the reduction is inlined into a caller that keeps using the vector, so this
+/// only fails in optimized builds.
+#[cfg(all(aarch64, feature = "fp16"))]
+#[test]
+#[cfg_attr(miri, ignore)]
+fn test_reduce_keeps_input_neon_fp16() {
+    use crate::backend::aarch64::NeonFP16;
+    use std::{vec, vec::Vec};
+
+    #[inline(always)]
+    fn reduce_then_store<S: Simd>(a: &[f16], out: &mut [f16]) -> (f16, f16, f16) {
+        let v = unsafe { vload_unaligned::<S, f16>(a.as_ptr()) };
+        let reduced = (v.reduce_add(), v.reduce_min(), v.reduce_max());
+        unsafe { crate::vstore_unaligned(out.as_mut_ptr(), v) };
+        reduced
+    }
+
+    if !NeonFP16::is_available() {
+        return;
+    }
+    let a: Vec<f16> = (1..=8).map(|i| f16::from_f32(i as f32)).collect();
+    let mut out = vec![f16::ZERO; 8];
+    let reduced = unsafe {
+        NeonFP16::run_vectorized(|| {
+            reduce_then_store::<NeonFP16>(core::hint::black_box(&a), &mut out)
+        })
+    };
+    assert_eq!(out, a);
+    assert_eq!(reduced, (f16::from_f32(36.0), f16::ONE, f16::from_f32(8.0)));
+}
+
+/// Sums whose value doesn't depend on the order of the additions.
+#[inline(always)]
+fn test_reduce_add_specials_impl<S: Simd, T: ReduceAdd + Float>(_: &()) -> Vec<T> {
+    let lanes = T::lanes::<S>();
+    let cases: [&dyn Fn(usize) -> T; 4] = [
+        &|_| -T::zero(),
+        &|i| if i == lanes / 2 { T::nan() } else { T::one() },
+        &|i| if i == 0 { T::infinity() } else { T::one() },
+        &|i| match i {
+            0 => T::infinity(),
+            1 => T::neg_infinity(),
+            _ => T::one(),
+        },
+    ];
+    // A single lane can't hold both infinities, so that case has nothing to sum.
+    let cases = if lanes < 2 { &cases[..3] } else { &cases[..] };
+    cases
+        .iter()
+        .map(|case| {
+            let values: Vec<T> = (0..lanes).map(case).collect();
+            unsafe { vload_unaligned::<S, T>(values.as_ptr()) }.reduce_add()
+        })
+        .collect()
+}
+
+fn check_reduce_add_specials<T: Float + Debug>(sums: &[T]) {
+    assert!(
+        sums[0].is_zero() && sums[0].is_sign_negative(),
+        "-0 sum: {:?}",
+        sums[0]
+    );
+    assert!(sums[1].is_nan(), "NaN sum: {:?}", sums[1]);
+    assert_eq!(sums[2], T::infinity(), "inf sum");
+    if let Some(sum) = sums.get(3) {
+        assert!(sum.is_nan(), "inf - inf sum: {sum:?}");
+    }
+}
+
+#[::wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
+// Miri doesn't implement NEON's `faddv`.
+#[cfg_attr(all(miri, aarch64), ignore)]
+fn test_reduce_add_specials() {
+    crate::tests::for_each_backend!(test_reduce_add_specials_impl, f32, &(), |sums: &[f32]| {
+        check_reduce_add_specials(sums)
+    });
+    crate::tests::for_each_backend!(test_reduce_add_specials_impl, f64, &(), |sums: &[f64]| {
+        check_reduce_add_specials(sums)
+    });
+}

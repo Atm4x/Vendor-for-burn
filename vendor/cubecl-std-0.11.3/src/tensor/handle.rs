@@ -1,0 +1,202 @@
+use cubecl_core::zspace::metadata::Metadata;
+use cubecl_core::{calculate_cube_count_elemwise, server::MemoryLayout};
+use cubecl_core::{prelude::*, server::CopyDescriptor};
+use cubecl_core::{server, zspace::strides};
+use cubecl_core::{
+    tensor_vector_size_parallel,
+    zspace::{Shape, Strides},
+};
+use cubecl_runtime::server::Handle;
+
+/// Tensor representation containing a [server handle](Handle) as well as basic tensor metadata.,
+pub struct TensorHandle {
+    /// The buffer where the data are stored.
+    pub handle: server::Handle,
+    pub metadata: Box<Metadata>,
+    /// The type used as storage.
+    pub dtype: ElemType,
+}
+
+impl core::fmt::Debug for TensorHandle {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_fmt(format_args!(
+            "Tensor {{ shape: {:?}, strides: {:?}, dtype: {}}}",
+            self.shape(),
+            self.strides(),
+            self.dtype,
+        ))
+    }
+}
+
+impl Clone for TensorHandle {
+    fn clone(&self) -> Self {
+        Self {
+            handle: self.handle.clone(),
+            metadata: self.metadata.clone(),
+            dtype: self.dtype,
+        }
+    }
+}
+
+impl TensorHandle {
+    /// Create a new tensor.
+    pub fn new(
+        handle: server::Handle,
+        shape: impl Into<Shape>,
+        strides: impl Into<Strides>,
+        storage: impl Into<Type>,
+    ) -> Self {
+        Self {
+            handle,
+            metadata: Box::new(Metadata::new(shape, strides)),
+            dtype: storage.into().elem_type(),
+        }
+    }
+
+    /// A tensor over `metadata` as it is, tiling included: the constructor for a handle rebuilt
+    /// from another's metadata, where [`new`](Self::new) would rebuild an untiled one from the
+    /// shape and strides alone.
+    pub fn from_metadata(
+        handle: server::Handle,
+        metadata: Metadata,
+        storage: impl Into<Type>,
+    ) -> Self {
+        Self {
+            handle,
+            metadata: Box::new(metadata),
+            dtype: storage.into().elem_type(),
+        }
+    }
+
+    pub fn empty(client: &Client, shape: impl Into<Shape>, storage: impl Into<Type>) -> Self {
+        let storage = storage.into();
+        let shape: Shape = shape.into();
+        let elem_size = storage.elem_type().size();
+        let MemoryLayout {
+            memory: handle,
+            strides,
+        } = client.empty_tensor(shape.clone(), elem_size);
+
+        Self::new(handle, shape, strides, storage)
+    }
+
+    /// Create a new tensor with a contiguous memory layout.
+    pub fn new_contiguous(shape: impl Into<Shape>, handle: Handle, storage: ElemType) -> Self {
+        let shape = shape.into();
+        let strides = Self::contiguous_strides(&shape);
+
+        Self {
+            handle,
+            metadata: Box::new(Metadata::new(shape, strides)),
+            dtype: storage,
+        }
+    }
+
+    /// Check if the tensor is safe to mutate.
+    pub fn can_mut(&self) -> bool {
+        self.handle.can_mut()
+    }
+
+    pub fn binding(self) -> TensorBinding {
+        let Metadata {
+            shape,
+            strides,
+            tiling,
+        } = *self.metadata;
+        let mut binding = unsafe { TensorBinding::from_raw_parts(self.handle, strides, shape) };
+        // The metadata validated this tiling against this rank, and the binding
+        // carries the same dims, so it needs no second check.
+        binding.tiling = tiling;
+        binding
+    }
+
+    /// Return the reference to a tensor argument.
+    pub fn into_arg(self) -> TensorArg {
+        self.binding().into_tensor_arg()
+    }
+
+    pub fn into_copy_descriptor(self) -> CopyDescriptor {
+        CopyDescriptor {
+            handle: self.handle.binding(),
+            shape: self.metadata.shape,
+            strides: self.metadata.strides,
+            elem_size: self.dtype.size(),
+        }
+    }
+
+    pub fn required_address_type(&self) -> AddressType {
+        let len = self.handle.size() / self.dtype.size() as u64;
+        AddressType::from_len(len as usize)
+    }
+
+    pub fn shape(&self) -> &Shape {
+        self.metadata.shape()
+    }
+
+    pub fn strides(&self) -> &Strides {
+        self.metadata.strides()
+    }
+
+    fn contiguous_strides(shape: &[usize]) -> Strides {
+        let mut strides = strides![1; shape.len()];
+
+        let mut current = 1;
+        shape.iter().rev().enumerate().for_each(|(i, val)| {
+            strides[i] = current;
+            current *= val;
+        });
+        strides.reverse();
+        strides
+    }
+}
+impl TensorHandle {
+    pub fn zeros(client: &Client, shape: impl Into<Shape>, dtype: impl Into<Type>) -> Self {
+        let dtype = dtype.into();
+        let shape = shape.into();
+        let num_elements: usize = shape.iter().product();
+        let rank = shape.len();
+        let output = Self::empty(client, shape, dtype);
+        let dtype = dtype.elem_type();
+
+        let vector_size = tensor_vector_size_parallel(
+            client.io_optimized_vector_sizes(dtype.size()),
+            output.shape(),
+            output.strides(),
+            rank - 1,
+        );
+
+        let working_units = num_elements / vector_size as usize;
+        let cube_dim = CubeDim::new(client, working_units);
+        let cube_count = calculate_cube_count_elemwise(client, working_units, cube_dim);
+        let array_len = output.handle.size_in_used() as usize / dtype.size();
+
+        unsafe {
+            init::zeros_array::launch_unchecked(
+                client,
+                cube_count,
+                cube_dim,
+                output.required_address_type(),
+                vector_size,
+                BufferArg::from_raw_parts(output.handle.clone(), array_len),
+                dtype,
+            )
+        };
+
+        output
+    }
+}
+
+pub(crate) mod init {
+    use cubecl::prelude::*;
+    use cubecl_core::{self as cubecl};
+
+    #[cube(launch_unchecked, address_type = "dynamic")]
+    pub fn zeros_array<C: Numeric, N: Size>(
+        output: &mut [Vector<C, N>],
+        #[define(C)] _elem: ElemType,
+    ) {
+        if ABSOLUTE_POS < output.len() {
+            output[ABSOLUTE_POS] = Vector::cast_from(C::from_int(0));
+        }
+    }
+}

@@ -1,0 +1,717 @@
+#![allow(
+    unknown_lints,
+    unnecessary_transmutes, // for Rust nightly
+    renamed_and_removed_lints,
+    clippy::transmute_float_to_int,
+    unused_unsafe,
+    clippy::useless_transmute,
+    clippy::missing_transmute_annotations,
+    clippy::needless_range_loop,
+)]
+
+use bytemuck::{CheckedBitPattern, NoUninit, Pod, Zeroable};
+use core::ops::{BitAnd, BitOr, BitXor, Not};
+use core::{fmt::Debug, marker::PhantomData, ops::Deref};
+use half::{bf16, f16};
+use num_traits::{WrappingAdd, WrappingMul, WrappingSub};
+use paste::paste;
+
+mod arch;
+pub use arch::{Arch, AutoArch, WithSimd};
+
+moddef::moddef!(
+    pub(crate) mod {
+        x86 for cfg(x86),
+        aarch64 for cfg(aarch64),
+        wasm32 for cfg(wasm32),
+        loong64 for cfg(loong64),
+        scalar
+    }
+);
+
+use crate::{seal::Sealed, Scalar, VAdd, VBitAnd, VBitNot, VBitOr, VBitXor};
+
+pub trait VRegister: Copy + Pod + Debug + Send + Sync + Sealed {}
+
+// Integer lane arithmetic for ops a backend emulates with scalar code. SIMD
+// integer instructions wrap on overflow, so the emulation must wrap too instead
+// of panicking in debug builds.
+#[inline(always)]
+pub(crate) fn wrapping_add<T: WrappingAdd>(a: T, b: T) -> T {
+    a.wrapping_add(&b)
+}
+#[inline(always)]
+pub(crate) fn wrapping_sub<T: WrappingSub>(a: T, b: T) -> T {
+    a.wrapping_sub(&b)
+}
+#[inline(always)]
+pub(crate) fn wrapping_mul<T: WrappingMul>(a: T, b: T) -> T {
+    a.wrapping_mul(&b)
+}
+
+/// Rounding half to even for lanes without a rounding instruction. `std` has
+/// `round_ties_even`, but `core` and `num-traits` only round ties away from zero.
+pub(crate) trait RoundTiesEven {
+    fn round_ties_even_soft(self) -> Self;
+}
+
+impl<T: num_traits::Float> RoundTiesEven for T {
+    #[inline(always)]
+    fn round_ties_even_soft(self) -> Self {
+        let a = self.abs();
+        let r = a.round();
+        let two = T::one() + T::one();
+        // `round` sends a tie up; when that lands on an odd integer, the even
+        // neighbour is one below. Both subtractions are exact.
+        let rounded = if r - a == T::one() / two && (r / two).fract() != T::zero() {
+            r - T::one()
+        } else {
+            r
+        };
+        // Negating keeps the sign of zero: `-0.5` rounds to `-0.0`.
+        if self.is_sign_negative() {
+            -rounded
+        } else {
+            rounded
+        }
+    }
+}
+
+macro_rules! cast {
+    ($v: expr) => {
+        unsafe { core::mem::transmute($v) }
+    };
+}
+pub(crate) use cast;
+
+#[repr(C)]
+pub struct Vector<S: Simd, T: Scalar> {
+    inner: S::Register,
+    _ty: PhantomData<T>,
+}
+
+/// SAFETY: S::Register is `Send`, and no other data is stored
+unsafe impl<S: Simd, T: Scalar> Send for Vector<S, T> where S::Register: Send {}
+/// SAFETY: S::Register is `Sync`, and no other data is stored
+unsafe impl<S: Simd, T: Scalar> Sync for Vector<S, T> where S::Register: Sync {}
+
+#[repr(transparent)]
+pub struct Mask<S: Simd, T: Scalar>(pub(crate) T::Mask<S>);
+
+impl<S: Simd, T: Scalar> Clone for Vector<S, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<S: Simd, T: Scalar> Copy for Vector<S, T> {}
+impl<S: Simd, T: Scalar> Debug for Vector<S, T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("Vector").field(&self.inner).finish()
+    }
+}
+
+unsafe impl<S: Simd, T: Scalar> Pod for Vector<S, T> {}
+unsafe impl<S: Simd, T: Scalar> Zeroable for Vector<S, T> {}
+
+impl<S: Simd, T: Scalar> Deref for Vector<S, T> {
+    type Target = S::Register;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<S: Simd, T: Scalar> Not for Mask<S, T> {
+    type Output = Self;
+
+    fn not(self) -> Self::Output {
+        Self(self.0.not())
+    }
+}
+impl<S: Simd, T: Scalar> BitAnd for Mask<S, T> {
+    type Output = Self;
+
+    fn bitand(self, rhs: Self) -> Self::Output {
+        Self(self.0.bitand(rhs.0))
+    }
+}
+impl<S: Simd, T: Scalar> BitOr for Mask<S, T> {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0.bitor(rhs.0))
+    }
+}
+impl<S: Simd, T: Scalar> BitXor for Mask<S, T> {
+    type Output = Self;
+
+    fn bitxor(self, rhs: Self) -> Self::Output {
+        Self(self.0.bitxor(rhs.0))
+    }
+}
+
+impl<S: Simd, T: Scalar> Mask<S, T> {
+    pub fn and(self, rhs: Self) -> Self {
+        self.bitand(rhs)
+    }
+
+    pub fn or(self, rhs: Self) -> Self {
+        self.bitor(rhs)
+    }
+
+    /// Converts a slice of booleans to a mask. Slice length must be equal to
+    /// `lanes`.
+    pub fn from_bools(bools: &[bool]) -> Self {
+        T::mask_from_bools(bools)
+    }
+
+    /// Store a `Mask` as a set of booleans of `lanes` width, converting as
+    /// necessary.
+    ///
+    /// # SAFETY
+    /// `out` must be valid for `lanes` contiguous values.
+    pub unsafe fn store_as_bool(self, out: *mut bool) {
+        T::mask_store_as_bool(out, self);
+    }
+}
+
+impl<S: Simd, T: Scalar> Deref for Mask<S, T> {
+    type Target = T::Mask<S>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+macro_rules! declare_binop {
+    ($name: ident, $($ty: ty),*) => {
+        $(paste! {
+            fn [<$name _ $ty>](a: Self::Register, b: Self::Register) -> Self::Register;
+            fn [<$name _ $ty _supported>]() -> bool;
+        })*
+    };
+}
+
+macro_rules! declare_unop {
+    ($name: ident, $($ty: ty),*) => {
+        $(paste! {
+            fn [<$name _ $ty>](a: Self::Register) -> Self::Register;
+            fn [<$name _ $ty _supported>]() -> bool;
+        })*
+    };
+}
+
+macro_rules! declare_mask_reduce {
+    ($($bits: literal),*) => {
+        $(paste! {
+            fn [<mask_any_ $bits>](mask: Self::[<Mask $bits>]) -> bool;
+            fn [<mask_any_ $bits _supported>]() -> bool;
+            fn [<mask_all_ $bits>](mask: Self::[<Mask $bits>]) -> bool;
+            fn [<mask_all_ $bits _supported>]() -> bool;
+        })*
+    };
+}
+
+macro_rules! declare_shift {
+    ($name: ident, $($ty: ty),*) => {
+        $(paste! {
+            fn [<$name _ $ty>](a: Self::Register, n: u32) -> Self::Register;
+            fn [<$name _ $ty _supported>]() -> bool;
+        })*
+    };
+}
+macro_rules! declare_reduction {
+    ($name: ident, $($ty: ty),*) => {
+        $(paste! {
+            fn [<$name _ $ty>](a: Self::Register) -> $ty;
+            fn [<$name _ $ty _supported>]() -> bool;
+        })*
+    };
+}
+
+macro_rules! declare_cmp {
+    ($name: ident, $($ty: ty),*) => {
+        $(paste! {
+            fn [<$name _ $ty>](a: Self::Register, b: Self::Register) -> <$ty as Scalar>::Mask<Self>;
+            fn [<$name _ $ty _supported>]() -> bool;
+        })*
+    };
+}
+
+macro_rules! splat {
+    (float $($bits: literal),*) => {
+        $(paste!{
+            fn [<splat_i $bits>](value: [<i $bits>]) -> Self::Register;
+            splat!(transmute $bits -> [<u $bits>]);
+            splat!(transmute $bits -> [<f $bits>]);
+        })*
+    };
+    (transmute $bits: literal -> $ty: ident) => {
+        paste! {
+            fn [<splat_ $ty>](value: $ty) -> Self::Register {
+                Self::[<splat_i $bits>](unsafe { core::mem::transmute::<$ty, [<i $bits>]>(value) })
+            }
+        }
+    };
+}
+
+pub(crate) mod seal {
+    pub trait Sealed {}
+}
+
+pub trait MaskOps:
+    BitAnd<Output = Self>
+    + BitOr<Output = Self>
+    + BitXor<Output = Self>
+    + Not<Output = Self>
+    + Debug
+    + Copy
+    + Send
+    + Sync
+    + Zeroable
+    + NoUninit
+    + CheckedBitPattern
+    + 'static
+{
+}
+
+impl<S: Simd, T: VBitAnd + VBitOr + VBitXor + VBitNot> MaskOps for Vector<S, T> {}
+
+pub trait Simd: Sized + seal::Sealed + 'static {
+    type Register: VRegister;
+    type Mask8: MaskOps;
+    type Mask16: MaskOps;
+    type Mask32: MaskOps;
+    type Mask64: MaskOps;
+
+    fn lanes8() -> usize;
+    fn lanes16() -> usize;
+    fn lanes32() -> usize;
+    fn lanes64() -> usize;
+
+    fn typed<T: Scalar>(reg: Self::Register) -> Vector<Self, T> {
+        Vector {
+            inner: reg,
+            _ty: PhantomData,
+        }
+    }
+
+    /// Run a function on on this [`Simd`] arch.
+    ///
+    /// # Safety
+    /// Required features must be available.
+    unsafe fn vectorize<Op: WithSimd>(op: Op) -> Op::Output;
+
+    /// Store a `Mask8` as a set of booleans of `lanes8` width, converting as
+    /// necessary.
+    ///
+    /// # SAFETY
+    /// `out` must be valid for `lanes8` contiguous values.
+    unsafe fn mask_store_as_bool_8(out: *mut bool, mask: Self::Mask8);
+    /// Store a `Mask16` as a set of booleans of `lanes16` width, converting as
+    /// necessary.
+    ///
+    /// # SAFETY
+    /// `out` must be valid for `lanes16` contiguous values.
+    unsafe fn mask_store_as_bool_16(out: *mut bool, mask: Self::Mask16);
+    /// Store a `Mask32` as a set of booleans of `lanes32` width, converting as
+    /// necessary.
+    ///
+    /// # SAFETY
+    /// `out` must be valid for `lanes32` contiguous values.
+    unsafe fn mask_store_as_bool_32(out: *mut bool, mask: Self::Mask32);
+    /// Store a `Mask64` as a set of booleans of `lanes64` width, converting as
+    /// necessary.
+    ///
+    /// # SAFETY
+    /// `out` must be valid for `lanes64` contiguous values.
+    unsafe fn mask_store_as_bool_64(out: *mut bool, mask: Self::Mask64);
+
+    /// Converts a slice of booleans to a mask. Slice length must be equal to
+    /// `lanes8`.
+    fn mask_from_bools_8(bools: &[bool]) -> Self::Mask8;
+    /// Converts a slice of booleans to a mask. Slice length must be equal to
+    /// `lanes16`.
+    fn mask_from_bools_16(bools: &[bool]) -> Self::Mask16;
+    /// Converts a slice of booleans to a mask. Slice length must be equal to
+    /// `lanes32`.
+    fn mask_from_bools_32(bools: &[bool]) -> Self::Mask32;
+    /// Converts a slice of booleans to a mask. Slice length must be equal to
+    /// `lanes64`.
+    fn mask_from_bools_64(bools: &[bool]) -> Self::Mask64;
+
+    /// Load a vector from an aligned element pointer. Must be aligned to the
+    /// whole vector.
+    ///
+    /// # Safety
+    ///
+    /// Same safety requirements as [`read`](std::ptr::read), with the
+    /// additional requirement that the entire vector must be aligned and
+    /// valid, not just the element at `ptr`.
+    unsafe fn load<T: Scalar>(ptr: *const T) -> Vector<Self, T>;
+    /// Load a vector from an unaligned element pointer.
+    ///
+    /// # Safety
+    ///
+    /// Same safety requirements as
+    /// [`read_unaligned`](std::ptr::read_unaligned), with the additional
+    /// requirement that the entire vector must be valid, not just the
+    /// element at `ptr`.
+    unsafe fn load_unaligned<T: Scalar>(ptr: *const T) -> Vector<Self, T>;
+    /// Load the lower half of a vector from an unaligned element pointer. The
+    /// upper half of the result is zeroed.
+    ///
+    /// # Safety
+    ///
+    /// Same safety requirements as
+    /// [`read_unaligned`](std::ptr::read_unaligned), with the additional
+    /// requirement that the lower half of the vector must be valid, not just
+    /// the element at `ptr`.
+    unsafe fn load_low<T: Scalar>(ptr: *const T) -> Vector<Self, T>;
+    /// Load the upper half of a vector. `ptr` points to the start of the whole
+    /// vector, so the half is read from `ptr` plus half the vector width. The
+    /// lower half of the result is zeroed.
+    ///
+    /// # Safety
+    ///
+    /// Same safety requirements as
+    /// [`read_unaligned`](std::ptr::read_unaligned), with the additional
+    /// requirement that `ptr` points to the start of a whole vector in one
+    /// allocation and the upper half of that vector is valid. The lower half is
+    /// not accessed.
+    unsafe fn load_high<T: Scalar>(ptr: *const T) -> Vector<Self, T>;
+    /// Store a vector to an aligned element pointer. Must be
+    /// aligned to the whole vector.
+    ///
+    /// # Safety
+    ///
+    /// Same safety requirements as
+    /// [`write`](std::ptr::write), with the additional
+    /// requirement that the entire vector must be valid and aligned to the size
+    /// of the full vector, not just the element at `ptr`.
+    unsafe fn store<T: Scalar>(ptr: *mut T, value: Vector<Self, T>);
+    /// Store a vector to an unaligned element pointer.
+    ///
+    /// # Safety
+    ///
+    /// Same safety requirements as
+    /// [`write_unaligned`](std::ptr::write_unaligned), with the additional
+    /// requirement that the entire vector must be valid, not just
+    /// the element at `ptr`.
+    unsafe fn store_unaligned<T: Scalar>(ptr: *mut T, value: Vector<Self, T>);
+    /// Store the lower half of a vector to an unaligned element pointer.
+    ///
+    /// # Safety
+    ///
+    /// Same safety requirements as
+    /// [`write_unaligned`](std::ptr::write_unaligned), with the additional
+    /// requirement that the lower half of the vector must be valid, not just
+    /// the element at `ptr`.
+    unsafe fn store_low<T: Scalar>(ptr: *mut T, value: Vector<Self, T>);
+    /// Store the upper half of a vector. `ptr` points to the start of the whole
+    /// vector, so the half is written to `ptr` plus half the vector width.
+    ///
+    /// # Safety
+    ///
+    /// Same safety requirements as
+    /// [`write_unaligned`](std::ptr::write_unaligned), with the additional
+    /// requirement that `ptr` points to the start of a whole vector in one
+    /// allocation and the upper half of that vector is valid. The lower half is
+    /// not accessed.
+    unsafe fn store_high<T: Scalar>(ptr: *mut T, value: Vector<Self, T>);
+
+    fn splat_i8(value: i8) -> Self::Register;
+    splat!(transmute 8 -> u8);
+    splat!(transmute 16 -> bf16);
+    splat!(float 16, 32, 64);
+
+    fn add<T: VAdd>(a: Vector<Self, T>, b: Vector<Self, T>) -> Vector<Self, T> {
+        T::vadd::<Self>(a, b)
+    }
+
+    declare_binop!(add, i8, u8, i16, u16, f16, i32, u32, f32, i64, u64, f64);
+    declare_binop!(sub, i8, u8, i16, u16, f16, i32, u32, f32, i64, u64, f64);
+    declare_binop!(div, f16, f32, f64);
+    declare_binop!(mul, i8, u8, i16, u16, f16, i32, u32, f32, u64, i64, f64);
+    declare_binop!(min, u8, i8, u16, i16, f16, u32, i32, f32, u64, i64, f64);
+    declare_binop!(max, u8, i8, u16, i16, f16, u32, i32, f32, u64, i64, f64);
+
+    fn bitand(a: Self::Register, b: Self::Register) -> Self::Register;
+    fn bitand_supported() -> bool;
+    fn bitor(a: Self::Register, b: Self::Register) -> Self::Register;
+    fn bitor_supported() -> bool;
+    fn bitxor(a: Self::Register, b: Self::Register) -> Self::Register;
+    fn bitxor_supported() -> bool;
+    fn bitnot(a: Self::Register) -> Self::Register;
+    fn bitnot_supported() -> bool;
+
+    /// Lanes of `if_true` where `mask` is set, lanes of `if_false` elsewhere,
+    /// for lanes of 8, 16, 32, and 64 bits.
+    fn select_8(
+        mask: Self::Mask8,
+        if_true: Self::Register,
+        if_false: Self::Register,
+    ) -> Self::Register;
+    fn select_8_supported() -> bool;
+    fn select_16(
+        mask: Self::Mask16,
+        if_true: Self::Register,
+        if_false: Self::Register,
+    ) -> Self::Register;
+    fn select_16_supported() -> bool;
+    fn select_32(
+        mask: Self::Mask32,
+        if_true: Self::Register,
+        if_false: Self::Register,
+    ) -> Self::Register;
+    fn select_32_supported() -> bool;
+    fn select_64(
+        mask: Self::Mask64,
+        if_true: Self::Register,
+        if_false: Self::Register,
+    ) -> Self::Register;
+    fn select_64_supported() -> bool;
+
+    // Whether any lane, or every lane, of a mask is set.
+    declare_mask_reduce!(8, 16, 32, 64);
+
+    declare_cmp!(equals, i8, u8, i16, u16, f16, i32, u32, f32, i64, u64, f64);
+    declare_cmp!(less_than, i8, u8, i16, u16, f16, i32, u32, f32, i64, u64, f64);
+    declare_cmp!(
+        less_than_or_equal,
+        i8,
+        u8,
+        i16,
+        u16,
+        f16,
+        i32,
+        u32,
+        f32,
+        i64,
+        u64,
+        f64
+    );
+    declare_cmp!(
+        greater_than,
+        i8,
+        u8,
+        i16,
+        u16,
+        f16,
+        i32,
+        u32,
+        f32,
+        i64,
+        u64,
+        f64
+    );
+    declare_cmp!(
+        greater_than_or_equal,
+        i8,
+        u8,
+        i16,
+        u16,
+        f16,
+        i32,
+        u32,
+        f32,
+        i64,
+        u64,
+        f64
+    );
+
+    fn mul_add_f16(a: Self::Register, b: Self::Register, c: Self::Register) -> Self::Register;
+    fn mul_add_f16_supported() -> bool;
+    fn mul_add_f32(a: Self::Register, b: Self::Register, c: Self::Register) -> Self::Register;
+    fn mul_add_f32_supported() -> bool;
+    fn mul_add_f64(a: Self::Register, b: Self::Register, c: Self::Register) -> Self::Register;
+    fn mul_add_f64_supported() -> bool;
+
+    /// `a * b + c` with a single rounding.
+    fn fma_f32(a: Self::Register, b: Self::Register, c: Self::Register) -> Self::Register;
+    fn fma_f32_supported() -> bool;
+    fn fma_f64(a: Self::Register, b: Self::Register, c: Self::Register) -> Self::Register;
+    fn fma_f64_supported() -> bool;
+
+    declare_unop!(recip, f16, f32, f64);
+    declare_unop!(sqrt, f16, f32, f64);
+    declare_unop!(floor, f16, f32, f64);
+    declare_unop!(ceil, f16, f32, f64);
+    declare_unop!(trunc, f16, f32, f64);
+    declare_unop!(round_ties_even, f16, f32, f64);
+
+    // Conversions between f32 and i32 lanes and between f64 and i64 lanes, with
+    // the results of Rust's `as`: float to int saturates and maps NaN to 0.
+    declare_unop!(trunc_to_int, f32, f64);
+    declare_unop!(round_to_int, f32, f64);
+    declare_unop!(from_int, f32, f64);
+
+    // Shifts every lane by `n` bits. `n` must be less than the lane width:
+    // backends disagree about larger counts. Right shifts are logical for
+    // unsigned lanes and arithmetic for signed ones.
+    declare_shift!(shl, u16, i16, u32, i32, u64, i64);
+    declare_shift!(shr, u16, i16, u32, i32, u64, i64);
+    declare_unop!(abs, i8, i16, i32, i64, f16, f32, f64);
+
+    declare_reduction!(reduce_add, i8, i16, i32, i64, u8, u16, u32, u64, f16, f32, f64);
+    declare_reduction!(reduce_min, i8, i16, i32, i64, u8, u16, u32, u64, f16, f32, f64);
+    declare_reduction!(reduce_max, i8, i16, i32, i64, u8, u16, u32, u64, f16, f32, f64);
+}
+
+#[cfg(any(x86, loong64, wasm32))]
+macro_rules! impl_cmp_scalar {
+    ($func: ident, $intrinsic: path, $($ty: ty: $mask_ty: ty),*) => {
+        $(paste! {
+            #[inline(always)]
+            fn [<$func _ $ty>](a: Self::Register, b: Self::Register) -> <$ty as Scalar>::Mask<Self> {
+                const LANES: usize = WIDTH / (8 * size_of::<$ty>());
+                let a: [$ty; LANES] = cast!(a);
+                let b: [$ty; LANES] = cast!(b);
+                let mut out: [$mask_ty; LANES] = [0; LANES];
+
+                for i in 0..LANES {
+                    out[i] = if a[i].$intrinsic(&b[i]) { -1 } else { 0 };
+                }
+                cast!(out)
+            }
+            #[inline(always)]
+            fn [<$func _ $ty _supported>]() -> bool {
+                false
+            }
+        })*
+    };
+}
+
+#[cfg(any(x86, loong64, wasm32))]
+pub(crate) use impl_cmp_scalar;
+
+/// Corrects a float-to-int conversion to the result of Rust's `as`: lanes at
+/// or above 2^31 become `i32::MAX`, lanes below -2^31 `i32::MIN`, and NaN lanes
+/// 0, whatever the instruction produced for them.
+#[cfg(any(x86, loong64))]
+#[inline(always)]
+pub(crate) fn saturate_f32_i32<S: Simd>(x: S::Register, converted: S::Register) -> S::Register {
+    let too_high = S::greater_than_or_equal_f32(x, S::splat_f32(2147483648.0));
+    let too_low = S::less_than_f32(x, S::splat_f32(-2147483648.0));
+    let r = S::select_32(too_high, S::splat_i32(i32::MAX), converted);
+    let r = S::select_32(too_low, S::splat_i32(i32::MIN), r);
+    S::select_32(S::equals_f32(x, x), r, S::splat_i32(0))
+}
+
+/// As [`saturate_f32_i32`], for f64 and i64 lanes and the bounds ±2^63.
+#[cfg(any(x86, loong64))]
+#[inline(always)]
+pub(crate) fn saturate_f64_i64<S: Simd>(x: S::Register, converted: S::Register) -> S::Register {
+    let too_high = S::greater_than_or_equal_f64(x, S::splat_f64(9223372036854775808.0));
+    let too_low = S::less_than_f64(x, S::splat_f64(-9223372036854775808.0));
+    let r = S::select_64(too_high, S::splat_i64(i64::MAX), converted);
+    let r = S::select_64(too_low, S::splat_i64(i64::MIN), r);
+    S::select_64(S::equals_f64(x, x), r, S::splat_i64(0))
+}
+
+/// Float and integer conversion one lane at a time, for registers of `$bytes`
+/// bytes.
+macro_rules! impl_convert_scalar {
+    ($bytes: literal, $($ty: ty: $int: ty),*) => {
+        $(paste! {
+            #[inline(always)]
+            fn [<trunc_to_int_ $ty>](a: Self::Register) -> Self::Register {
+                const LANES: usize = $bytes / size_of::<$ty>();
+                let a: [$ty; LANES] = cast!(a);
+                let mut out = [0 as $int; LANES];
+                for i in 0..LANES {
+                    out[i] = a[i] as $int;
+                }
+                cast!(out)
+            }
+            #[inline(always)]
+            fn [<trunc_to_int_ $ty _supported>]() -> bool {
+                false
+            }
+            #[inline(always)]
+            fn [<round_to_int_ $ty>](a: Self::Register) -> Self::Register {
+                const LANES: usize = $bytes / size_of::<$ty>();
+                let a: [$ty; LANES] = cast!(a);
+                let mut out = [0 as $int; LANES];
+                for i in 0..LANES {
+                    out[i] = a[i].round_ties_even_soft() as $int;
+                }
+                cast!(out)
+            }
+            #[inline(always)]
+            fn [<round_to_int_ $ty _supported>]() -> bool {
+                false
+            }
+            #[inline(always)]
+            fn [<from_int_ $ty>](a: Self::Register) -> Self::Register {
+                const LANES: usize = $bytes / size_of::<$ty>();
+                let a: [$int; LANES] = cast!(a);
+                let mut out = [0 as $ty; LANES];
+                for i in 0..LANES {
+                    out[i] = a[i] as $ty;
+                }
+                cast!(out)
+            }
+            #[inline(always)]
+            fn [<from_int_ $ty _supported>]() -> bool {
+                false
+            }
+        })*
+    };
+}
+
+/// Fused multiply-add one lane at a time, for registers of `$bytes` bytes.
+/// `mul_add` rounds once in `std` and in `libm`.
+macro_rules! impl_fma_scalar {
+    ($bytes: literal, $($ty: ty),*) => {
+        $(paste! {
+            #[inline(always)]
+            fn [<fma_ $ty>](a: Self::Register, b: Self::Register, c: Self::Register) -> Self::Register {
+                const LANES: usize = $bytes / size_of::<$ty>();
+                let a: [$ty; LANES] = cast!(a);
+                let b: [$ty; LANES] = cast!(b);
+                let c: [$ty; LANES] = cast!(c);
+                let mut out = [0 as $ty; LANES];
+                for i in 0..LANES {
+                    out[i] = num_traits::Float::mul_add(a[i], b[i], c[i]);
+                }
+                cast!(out)
+            }
+            #[inline(always)]
+            fn [<fma_ $ty _supported>]() -> bool {
+                false
+            }
+        })*
+    };
+}
+pub(crate) use impl_convert_scalar;
+
+pub(crate) use impl_fma_scalar;
+/// Tests that type inference works properly
+#[cfg(test)]
+mod test_inference {
+    use core::ptr::null;
+
+    use crate::{
+        backend::{Simd, Vector},
+        vload, Scalar, VAdd,
+    };
+
+    #[allow(unused)]
+    fn simd_splat<S: Simd, T: Scalar>() -> Vector<S, T> {
+        let value = T::default();
+        value.splat()
+    }
+
+    #[allow(unused)]
+    fn load<S: Simd, T: Scalar>() -> Vector<S, T> {
+        unsafe { vload(null()) }
+    }
+
+    #[allow(unused)]
+    fn add<S: Simd, T: VAdd>() -> Vector<S, T> {
+        let a = T::default().splat();
+        let b = T::default().splat();
+        a + b
+    }
+}

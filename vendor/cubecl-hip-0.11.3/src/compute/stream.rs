@@ -1,0 +1,166 @@
+//! One backend stream, and everything that hangs off it.
+//!
+//! A stream owns its own memory: allocations are per stream, not per device,
+//! so a buffer resolves to the stream that created it and nowhere else. What
+//! it carries beside the driver handle is the state that has to move in step
+//! with the work queued on it — the deferred frees, the capture window, and
+//! the per-launch info buffers a capture may not allocate inside.
+
+use cubecl_core::{
+    MemoryConfiguration,
+    ir::MemoryDeviceProperties,
+    server::{BufferBinding, DeviceCaptures, Handle, ServerError},
+};
+use cubecl_server::storage::PINNED_MEMORY_ALIGNMENT;
+use cubecl_server::{
+    logging::ServerLogger,
+    memory_management::{
+        ErrorGraph, FailureId, MemoryAllocationMode, MemoryManagement, MemoryManagementOptions,
+        drop_queue::{self, FlushingPolicy, PendingDropQueue},
+    },
+    metadata_cache::{MetadataCachePolicy, MetadataInfoCache},
+    stream::{EventStreamBackend, StreamCapture, StreamMemory},
+};
+use std::sync::Arc;
+
+use crate::compute::status::checked;
+
+use crate::compute::{cpu::PinnedMemoryStorage, events::Fence, gpu::GpuStorage};
+
+#[derive(Debug)]
+pub struct Stream {
+    pub(crate) sys: cubecl_hip_sys::hipStream_t,
+    pub memory_management_gpu: MemoryManagement<GpuStorage>,
+    pub memory_management_cpu: MemoryManagement<PinnedMemoryStorage>,
+    pub drop_queue: drop_queue::PendingDropQueue<Fence>,
+    /// This stream's graph capture (see [`StreamCapture`]): its position in
+    /// the lifecycle, and the memory its recorded launches were given. Enforces
+    /// the ordered `graph_prepare` → `begin_capture` → `end_capture`
+    /// transitions and gates the deferral of fenced drop-queue flushes while a
+    /// capture is actively recording.
+    pub capturing: StreamCapture,
+    /// Reusable per-launch info buffers (kernel shapes/strides/scalars), keyed
+    /// by kernel and the exact info bytes. Admission and least-recently-used
+    /// eviction are decided by the cache's [`MetadataCachePolicy`]; the launch
+    /// path sets its [`CacheMode`] from the capture lifecycle, so during graph
+    /// capture every buffer is cached and none is evicted mid-capture. See
+    /// [`StreamCapture::cache_mode`].
+    pub info_cache: MetadataInfoCache<Handle>,
+}
+
+impl StreamMemory for Stream {
+    fn failure(&self, binding: &BufferBinding) -> Option<FailureId> {
+        self.memory_management_gpu
+            .failure(&binding.memory, binding.range())
+    }
+
+    fn taint(&mut self, binding: &BufferBinding, failure: FailureId, failures: &mut ErrorGraph) {
+        self.memory_management_gpu
+            .taint(&binding.memory, binding.range(), failure, failures)
+    }
+
+    fn written(&mut self, binding: &BufferBinding, failures: &mut ErrorGraph) {
+        self.memory_management_gpu
+            .written(&binding.memory, binding.range(), failures)
+    }
+}
+
+#[derive(new, Debug)]
+pub struct HipStreamBackend {
+    mem_props: MemoryDeviceProperties,
+    mem_config: MemoryConfiguration,
+    mem_alignment: usize,
+    is_integrated: bool,
+    logger: Arc<ServerLogger>,
+    /// The device's captures, which every stream this creates takes its capture state from.
+    captures: DeviceCaptures,
+}
+
+impl EventStreamBackend for HipStreamBackend {
+    type Stream = Stream;
+    type Event = Fence;
+
+    fn create_stream(&self) -> Result<Self::Stream, ServerError> {
+        // SAFETY: Calling HIP FFI to create a non-blocking stream. The stream handle is
+        // initialized by HIP on success (checked below) and stored for the lifetime of
+        // this `Stream`.
+        let stream = unsafe {
+            let mut stream: cubecl_hip_sys::hipStream_t = std::ptr::null_mut();
+            let stream_status = cubecl_hip_sys::hipStreamCreateWithFlags(
+                &mut stream,
+                cubecl_hip_sys::hipStreamNonBlocking,
+            );
+            checked("hipStreamCreateWithFlags", stream_status)?;
+            stream
+        };
+        let storage = GpuStorage::new(self.mem_alignment);
+
+        let memory_management_gpu = MemoryManagement::from_configuration(
+            storage,
+            &self.mem_props,
+            self.mem_config.clone(),
+            self.logger.clone(),
+            MemoryManagementOptions::new("Main GPU Memory"),
+        );
+        // We use the same page size and memory pools configuration for CPU pinned memory, since we
+        // expect the CPU to have at least the same amount of RAM as GPU memory.
+        // The host was never measured, so this pool states no capacity.
+        let memory_management_cpu = MemoryManagement::from_configuration(
+            PinnedMemoryStorage::new(stream),
+            &MemoryDeviceProperties::new(
+                self.mem_props.max_page_size,
+                PINNED_MEMORY_ALIGNMENT as u64,
+            ),
+            self.mem_config.clone(),
+            self.logger.clone(),
+            MemoryManagementOptions::new("Pinned CPU Memory").mode(MemoryAllocationMode::Auto),
+        );
+
+        Ok(Stream {
+            sys: stream,
+            memory_management_gpu,
+            memory_management_cpu,
+            capturing: StreamCapture::new(&self.captures),
+            info_cache: MetadataInfoCache::new(MetadataCachePolicy::default()),
+            drop_queue: PendingDropQueue::new(FlushingPolicy {
+                max_bytes_count: match self.is_integrated {
+                    // Integrated GPUs (APUs) share memory and IOMMU with the CPU.
+                    // Flushing more frequently prevents the GPU from reaching 100%
+                    // utilization, which avoids transient voltage droops and IOMMU
+                    // TLB invalidation races that cause GPU hangs on 0→100% transitions.
+                    //
+                    // 16 was found empirically to be a good balance between stability
+                    // and performance, 32 still exhibited intermittent hangs.
+                    //
+                    // In practice the performance difference is negligible since integrated
+                    // GPUs are typically thermally constrained anyway.
+                    true => 16,
+                    false => 64,
+                },
+                ..Default::default()
+            }),
+        })
+    }
+
+    fn flush(stream: &mut Self::Stream, _failures: &mut ErrorGraph) -> Self::Event {
+        Fence::new(stream.sys)
+    }
+
+    fn wait_event(stream: &mut Self::Stream, event: Self::Event) -> Result<(), ServerError> {
+        event.wait_async(stream.sys)
+    }
+
+    fn wait_event_sync(event: Self::Event) -> Result<(), ServerError> {
+        event.wait_sync()
+    }
+
+    fn handle_cursor(stream: &Self::Stream, binding: &BufferBinding) -> u64 {
+        // The slice cursor the sync logic compares against the origin stream's `last_synced`
+        // to decide whether to wait. A freed/reallocated slice falls back to `u64::MAX`,
+        // which conservatively forces a wait.
+        stream
+            .memory_management_gpu
+            .get_cursor(binding.memory.clone())
+            .unwrap_or(u64::MAX)
+    }
+}

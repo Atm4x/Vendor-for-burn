@@ -1,0 +1,614 @@
+//! Types for managing memory & device allocations.
+
+use alloc::{borrow::Cow, ffi::CString, sync::Arc};
+use core::{
+	ffi::{CStr, c_char, c_int, c_void},
+	hash::{Hash, Hasher},
+	marker::PhantomData,
+	mem,
+	ptr::{self, NonNull},
+	str::{self, FromStr}
+};
+
+use crate::{AsPointer, error::Result, ortsys, session::Session};
+
+/// A device allocator used to manage the allocation of [`Value`]s.
+///
+/// # Direct allocation
+/// [`Allocator`] can be used to directly allocate device memory. This can be useful if you have a
+/// postprocessing step that runs on the GPU.
+/// ```no_run
+/// # use ort::{memory::{Allocator, MemoryInfo, MemoryType, AllocationDevice, AllocatorType}, session::Session, value::Tensor};
+/// # fn main() -> ort::Result<()> {
+/// # let env = ort::test_util::test_env().clone();
+/// # let session = Session::builder(&env)?.commit_from_file("tests/data/upsample.onnx")?;
+/// let allocator = Allocator::new(
+/// 	&session,
+/// 	MemoryInfo::new(AllocationDevice::CUDA, 0, AllocatorType::Device, MemoryType::Default)?
+/// )?;
+///
+/// let mut tensor = Tensor::<f32>::new(&allocator, [1_usize, 3, 224, 224])?;
+/// // Here, `data_ptr` is a pointer to **device memory** inaccessible to the CPU; we'll need another crate, like
+/// // `cudarc`, to access it.
+/// let data_ptr = tensor.data_ptr_mut();
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Note that `ort` does not facilitate the transfer of data between host & device outside of session inputs &
+/// outputs; you'll need to use a separate crate for that, like [`cudarc`](https://crates.io/crates/cudarc) for CUDA.
+///
+/// # Pinned allocation
+/// Memory allocated on the host CPU is often *pageable* and may reside on the disk (swap memory). Transferring
+/// pageable memory to another device is slow because the device has to go through the CPU to access the
+/// memory. Many execution providers thus provide a "pinned" allocator type, which allocates *unpaged* CPU memory
+/// that the device is able to access directly, bypassing the CPU and allowing for faster host-to-device data
+/// transfer.
+///
+/// If you create a session with a device allocator that supports pinned memory, like CUDA or ROCm, you can create
+/// an allocator for that session, and use it to allocate tensors with faster pinned memory:
+/// ```no_run
+/// # use ort::{memory::{Allocator, MemoryInfo, MemoryType, AllocationDevice, AllocatorType}, session::Session, value::Tensor};
+/// # fn main() -> ort::Result<()> {
+/// # let env = ort::test_util::test_env().clone();
+/// # let session = Session::builder(&env)?.commit_from_file("tests/data/upsample.onnx")?;
+/// let allocator = Allocator::new(
+/// 	&session,
+/// 	MemoryInfo::new(AllocationDevice::CUDA_PINNED, 0, AllocatorType::Device, MemoryType::CPUInput)?
+/// )?;
+///
+/// // Create a tensor with our pinned allocator.
+/// let mut tensor = Tensor::<f32>::new(&allocator, [1_usize, 3, 224, 224])?;
+/// let data = tensor.extract_tensor_mut();
+/// // ...fill `data` with data...
+/// # Ok(())
+/// # }
+/// ```
+///
+/// [`Value`]: crate::value::Value
+#[derive(Debug)]
+pub struct Allocator {
+	ptr: NonNull<ort_sys::OrtAllocator>,
+	info: MemoryInfo<'static>,
+	pub(crate) handle: Arc<AllocatorHandle>
+}
+
+unsafe impl Send for Allocator {}
+// not all allocators appear to be Sync - specifically the CUDA allocator can sometimes crash when used on multiple
+// threads. CPU allocator doesn't seem to be affected though.
+
+/// Handle that tensors can hold onto so the underlying allocator stays alive until all tensors are freed.
+#[derive(Debug)]
+pub(crate) struct AllocatorHandle {
+	/// `None` for the default CPU allocator provided by `GetAllocatorWithDefaultOptions`, which must never be released.
+	pub(crate) _drop_ptr: Option<NonNull<ort_sys::OrtAllocator>>
+}
+
+// The handle is only used to release the allocator.
+unsafe impl Send for AllocatorHandle {}
+unsafe impl Sync for AllocatorHandle {}
+
+impl Drop for AllocatorHandle {
+	fn drop(&mut self) {
+		if let Some(ptr) = self._drop_ptr {
+			ortsys![unsafe ReleaseAllocator(ptr.as_ptr())];
+			crate::logging::drop!(Allocator, ptr);
+		}
+	}
+}
+
+impl Allocator {
+	pub(crate) unsafe fn from_raw(ptr: NonNull<ort_sys::OrtAllocator>, is_default: bool) -> Allocator {
+		let mut memory_info_ptr = ptr::null();
+		ortsys![unsafe AllocatorGetInfo(ptr.as_ptr(), &mut memory_info_ptr).expect("Failed to get memory info"); nonNull(memory_info_ptr)];
+
+		Allocator {
+			ptr,
+			info: MemoryInfo::from_raw(memory_info_ptr, false),
+			handle: Arc::new(AllocatorHandle {
+				_drop_ptr: (!is_default).then_some(ptr)
+			})
+		}
+	}
+
+	/// Allocates a block of memory, of size `size_of::<T>() * len` bytes, using this allocator.
+	/// The memory will be automatically freed when the returned `AllocatedBlock` goes out of scope.
+	///
+	/// Returns an error if the allocation fails.
+	///
+	/// # Example
+	/// ```
+	/// # use ort::memory::Allocator;
+	/// let allocator = Allocator::default();
+	/// let mut mem = allocator.alloc::<i32>(5).unwrap();
+	/// unsafe {
+	/// 	let ptr = mem.as_mut_ptr().cast::<i32>();
+	/// 	*ptr.add(3) = 42;
+	/// };
+	/// ```
+	pub fn alloc<T>(&self, len: usize) -> Result<AllocatedBlock<'_>> {
+		let mut ptr = ptr::null_mut();
+		ortsys![unsafe AllocatorAlloc(self.ptr.as_ptr(), (len * mem::size_of::<T>()) as _, &mut ptr)?; nonNull(ptr)];
+		crate::logging::create!(AllocatedBlock, ptr);
+		Ok(AllocatedBlock { ptr, allocator: self })
+	}
+
+	/// Frees an object allocated by this allocator, given the object's C pointer.
+	///
+	/// # Safety
+	/// The pointer **must** have been allocated using this exact allocator's [`alloc`](Allocator::alloc) function.
+	///
+	/// This function is meant to be used in situations where the lifetime restrictions of [`AllocatedBlock`] are hard
+	/// to work with.
+	///
+	/// ```
+	/// # use ort::memory::Allocator;
+	/// let allocator = Allocator::default();
+	/// let mut mem = allocator.alloc::<i32>(5).unwrap();
+	/// unsafe {
+	/// 	let ptr = mem.as_mut_ptr().cast::<i32>();
+	/// 	*ptr.add(3) = 42;
+	///
+	/// 	allocator.free(mem.into_raw());
+	/// };
+	/// ```
+	pub unsafe fn free<T>(&self, ptr: *mut T) {
+		ortsys![unsafe AllocatorFree(self.ptr.as_ptr(), ptr.cast()).expect("Failed to free")];
+	}
+
+	/// Returns the [`MemoryInfo`] describing this allocator.
+	pub fn memory_info<'a>(&'a self) -> &'a MemoryInfo<'a> {
+		&self.info
+	}
+
+	/// Creates a new [`Allocator`] for the given session, to allocate memory on the device described in the
+	/// [`MemoryInfo`].
+	pub fn new(session: &Session, memory_info: MemoryInfo<'_>) -> Result<Self> {
+		let mut ptr: *mut ort_sys::OrtAllocator = ptr::null_mut();
+		ortsys![unsafe CreateAllocator(session.ptr(), memory_info.ptr.as_ptr(), &mut ptr)?; nonNull(ptr)];
+		crate::logging::create!(Allocator, ptr);
+		Ok(Self {
+			ptr,
+			info: memory_info.to_owned(),
+			handle: Arc::new(AllocatorHandle { _drop_ptr: Some(ptr) })
+		})
+	}
+}
+
+impl Default for Allocator {
+	/// Returns the default CPU allocator; equivalent to `MemoryInfo::new(AllocationDevice::CPU, 0,
+	/// AllocatorType::Device, MemoryType::Default)`.
+	///
+	/// The allocator returned by this function is actually shared across all invocations (though this behavior is
+	/// transparent to the user).
+	fn default() -> Self {
+		let mut allocator_ptr: *mut ort_sys::OrtAllocator = ptr::null_mut();
+		ortsys![
+			unsafe GetAllocatorWithDefaultOptions(&mut allocator_ptr)
+				.expect("Failed to get default allocator");
+			nonNull(allocator_ptr)
+		];
+
+		let mut memory_info_ptr = ptr::null();
+		ortsys![unsafe AllocatorGetInfo(allocator_ptr.as_ptr(), &mut memory_info_ptr).expect("Failed to get memory info"); nonNull(memory_info_ptr)];
+
+		Self {
+			ptr: allocator_ptr,
+			info: MemoryInfo::from_raw(memory_info_ptr, false),
+			handle: Arc::new(AllocatorHandle { _drop_ptr: None })
+		}
+	}
+}
+
+impl AsPointer for Allocator {
+	type Sys = ort_sys::OrtAllocator;
+
+	fn ptr(&self) -> *const Self::Sys {
+		self.ptr.as_ptr()
+	}
+}
+
+/// A block of memory allocated by an [`Allocator`].
+pub struct AllocatedBlock<'a> {
+	ptr: NonNull<c_void>,
+	allocator: &'a Allocator
+}
+
+impl<'a> AllocatedBlock<'a> {
+	/// Returns a pointer to the allocated memory.
+	///
+	/// Note that, depending on the exact allocator used, this may not be a pointer to memory accessible by the CPU.
+	pub fn as_ptr(&self) -> *const c_void {
+		self.ptr.as_ptr()
+	}
+
+	/// Returns a mutable pointer to the allocated memory.
+	///
+	/// Note that, depending on the exact allocator used, this may not be a pointer to memory accessible by the CPU.
+	pub fn as_mut_ptr(&mut self) -> *mut c_void {
+		self.ptr.as_ptr()
+	}
+
+	/// Returns the [`Allocator`] that allocated this block of memory.
+	pub fn allocator(&self) -> &'a Allocator {
+		self.allocator
+	}
+
+	/// Consumes the [`AllocatedBlock`], returning the pointer to its data.
+	///
+	/// The pointer must be freed with [`Allocator::free`], using the allocator that initially created it. Not doing so
+	/// will cause a memory leak.
+	#[must_use = "the returned pointer must be freed with the allocator that created it"]
+	pub fn into_raw(self) -> *mut c_void {
+		let ptr = self.ptr;
+		mem::forget(self);
+		ptr.as_ptr()
+	}
+}
+
+impl Drop for AllocatedBlock<'_> {
+	fn drop(&mut self) {
+		unsafe { self.allocator.free(self.ptr.as_ptr()) };
+		crate::logging::drop!(AllocatedBlock, self.ptr);
+	}
+}
+
+/// Represents possible devices that have their own device allocator.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AllocationDevice<'s>(Cow<'s, CStr>);
+
+impl<'s> AllocationDevice<'s> {
+	pub const CPU: AllocationDevice<'static> = AllocationDevice(Cow::Borrowed(c"Cpu"));
+	pub const CUDA: AllocationDevice<'static> = AllocationDevice(Cow::Borrowed(c"Cuda"));
+	pub const CUDA_PINNED: AllocationDevice<'static> = AllocationDevice(Cow::Borrowed(c"CudaPinned"));
+	pub const CANN: AllocationDevice<'static> = AllocationDevice(Cow::Borrowed(c"Cann"));
+	pub const CANN_PINNED: AllocationDevice<'static> = AllocationDevice(Cow::Borrowed(c"CannPinned"));
+	pub const DIRECTML: AllocationDevice<'static> = AllocationDevice(Cow::Borrowed(c"DML"));
+	pub const HIP: AllocationDevice<'static> = AllocationDevice(Cow::Borrowed(c"Hip"));
+	pub const HIP_PINNED: AllocationDevice<'static> = AllocationDevice(Cow::Borrowed(c"HipPinned"));
+	pub const OPENVINO_CPU: AllocationDevice<'static> = AllocationDevice(Cow::Borrowed(c"OpenVINO_CPU"));
+	pub const OPENVINO_GPU: AllocationDevice<'static> = AllocationDevice(Cow::Borrowed(c"OpenVINO_GPU"));
+	pub const QNN_HTP_SHARED: AllocationDevice<'static> = AllocationDevice(Cow::Borrowed(c"QnnHtpShared"));
+	pub const WEBGPU_BUFFER: AllocationDevice<'static> = AllocationDevice(Cow::Borrowed(c"WebGPU_Buffer"));
+
+	pub fn new(name: &str) -> Self {
+		AllocationDevice(Cow::Owned(CString::from_str(name).expect("invalid device name")))
+	}
+
+	pub fn as_str(&self) -> &str {
+		// SAFETY: device names coming from C are all checked for ASCII; ::new() takes &str which is already valid UTF-8
+		unsafe { str::from_utf8_unchecked(self.0.as_ref().to_bytes()) }
+	}
+}
+
+impl PartialEq<str> for AllocationDevice<'_> {
+	fn eq(&self, other: &str) -> bool {
+		self.as_str() == other
+	}
+}
+
+/// Execution provider allocator type.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum AllocatorType {
+	/// Default device-specific allocator.
+	Device,
+	/// Arena allocator.
+	Arena,
+	/// Read-only allocator (for initializers)
+	ReadOnly
+}
+
+impl From<AllocatorType> for ort_sys::OrtAllocatorType {
+	fn from(val: AllocatorType) -> Self {
+		match val {
+			AllocatorType::Device => ort_sys::OrtAllocatorType::OrtDeviceAllocator,
+			AllocatorType::Arena => ort_sys::OrtAllocatorType::OrtArenaAllocator,
+			AllocatorType::ReadOnly => ort_sys::OrtAllocatorType::OrtReadOnlyAllocator
+		}
+	}
+}
+
+/// Memory types for allocated memory.
+#[derive(Default, Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum MemoryType {
+	/// Any CPU memory used by non-CPU execution provider.
+	CPUInput,
+	/// CPU-accessible memory output by a non-CPU execution provider, i.e. [`AllocationDevice::CUDA_PINNED`].
+	CPUOutput,
+	/// The default (typically device memory) allocator for an execution provider.
+	#[default]
+	Default
+}
+
+impl MemoryType {
+	/// Temporary CPU accessible memory allocated by non-CPU execution provider, i.e. `CUDA_PINNED`.
+	pub const CPU: MemoryType = MemoryType::CPUOutput;
+}
+
+impl From<MemoryType> for ort_sys::OrtMemType {
+	fn from(val: MemoryType) -> Self {
+		match val {
+			MemoryType::CPUInput => ort_sys::OrtMemType::OrtMemTypeCPUInput,
+			MemoryType::CPUOutput => ort_sys::OrtMemType::OrtMemTypeCPUOutput,
+			MemoryType::Default => ort_sys::OrtMemType::OrtMemTypeDefault
+		}
+	}
+}
+
+impl From<ort_sys::OrtMemType> for MemoryType {
+	fn from(value: ort_sys::OrtMemType) -> Self {
+		match value {
+			ort_sys::OrtMemType::OrtMemTypeCPUInput => MemoryType::CPUInput,
+			ort_sys::OrtMemType::OrtMemTypeCPUOutput => MemoryType::CPUOutput,
+			ort_sys::OrtMemType::OrtMemTypeDefault => MemoryType::Default
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(clippy::upper_case_acronyms)]
+pub enum DeviceType {
+	CPU,
+	GPU,
+	FPGA,
+	NPU
+}
+
+impl From<DeviceType> for ort_sys::OrtMemoryInfoDeviceType {
+	fn from(value: DeviceType) -> Self {
+		match value {
+			DeviceType::CPU => ort_sys::OrtMemoryInfoDeviceType::OrtMemoryInfoDeviceType_CPU,
+			DeviceType::GPU => ort_sys::OrtMemoryInfoDeviceType::OrtMemoryInfoDeviceType_GPU,
+			DeviceType::FPGA => ort_sys::OrtMemoryInfoDeviceType::OrtMemoryInfoDeviceType_FPGA,
+			DeviceType::NPU => ort_sys::OrtMemoryInfoDeviceType::OrtMemoryInfoDeviceType_NPU
+		}
+	}
+}
+
+impl From<ort_sys::OrtMemoryInfoDeviceType> for DeviceType {
+	fn from(value: ort_sys::OrtMemoryInfoDeviceType) -> Self {
+		match value {
+			ort_sys::OrtMemoryInfoDeviceType::OrtMemoryInfoDeviceType_CPU => DeviceType::CPU,
+			ort_sys::OrtMemoryInfoDeviceType::OrtMemoryInfoDeviceType_GPU => DeviceType::GPU,
+			ort_sys::OrtMemoryInfoDeviceType::OrtMemoryInfoDeviceType_FPGA => DeviceType::FPGA,
+			ort_sys::OrtMemoryInfoDeviceType::OrtMemoryInfoDeviceType_NPU => DeviceType::NPU
+		}
+	}
+}
+
+/// Describes allocation properties for value memory.
+///
+/// `MemoryInfo` is used in the creation of [`Session`]s, [`Allocator`]s, and [`Value`]s to describe on which
+/// device value data should reside, and how that data should be accessible with regard to the CPU (if a non-CPU device
+/// is requested).
+///
+/// [`Value`]: crate::value::Value
+#[derive(Debug)]
+pub struct MemoryInfo<'a> {
+	ptr: NonNull<ort_sys::OrtMemoryInfo>,
+	should_release: bool,
+	_p: PhantomData<&'a ()>
+}
+
+// SAFETY: `MemoryInfo` is read-only.
+unsafe impl Send for MemoryInfo<'_> {}
+unsafe impl Sync for MemoryInfo<'_> {}
+
+impl MemoryInfo<'static> {
+	/// Creates a [`MemoryInfo`], describing a memory location on a device allocator.
+	///
+	/// # Examples
+	/// `MemoryInfo` can be used to specify the device & memory type used by an [`Allocator`] to allocate tensors.
+	/// See [`Allocator`] for more information & potential applications.
+	/// ```no_run
+	/// # use ort::{memory::{Allocator, MemoryInfo, MemoryType, AllocationDevice, AllocatorType}, session::Session, value::Tensor};
+	/// # fn main() -> ort::Result<()> {
+	/// # let env = ort::test_util::test_env().clone();
+	/// # let session = Session::builder(&env)?.commit_from_file("tests/data/upsample.onnx")?;
+	/// let allocator = Allocator::new(
+	/// 	&session,
+	/// 	MemoryInfo::new(AllocationDevice::CUDA, 0, AllocatorType::Device, MemoryType::Default)?
+	/// )?;
+	///
+	/// let mut tensor = Tensor::<f32>::new(&allocator, [1_usize, 3, 224, 224])?;
+	/// # Ok(())
+	/// # }
+	/// ```
+	pub fn new(allocation_device: AllocationDevice, device_id: c_int, allocator_type: AllocatorType, memory_type: MemoryType) -> Result<Self> {
+		let mut ptr: *mut ort_sys::OrtMemoryInfo = ptr::null_mut();
+		ortsys![
+			unsafe CreateMemoryInfo(allocation_device.0.as_ptr().cast(), allocator_type.into(), device_id, memory_type.into(), &mut ptr)?;
+			nonNull(ptr)
+		];
+		crate::logging::create!(MemoryInfo, ptr);
+		Ok(Self {
+			ptr,
+			should_release: true,
+			_p: PhantomData
+		})
+	}
+}
+
+impl<'a> MemoryInfo<'a> {
+	/// SAFETY: value must be a tensor
+	pub(crate) unsafe fn from_tensor_value(value_ptr: NonNull<ort_sys::OrtValue>) -> Self {
+		let mut memory_info_ptr: *const ort_sys::OrtMemoryInfo = ptr::null_mut();
+		// infallible, and `memory_info_ptr` will never be null
+		ortsys![unsafe GetTensorMemoryInfo(value_ptr.as_ptr(), &mut memory_info_ptr).expect("infallible"); nonNull(memory_info_ptr)];
+		Self::from_raw(memory_info_ptr, false)
+	}
+
+	pub(crate) fn from_raw(ptr: NonNull<ort_sys::OrtMemoryInfo>, should_release: bool) -> Self {
+		MemoryInfo { ptr, should_release, _p: PhantomData }
+	}
+
+	// All getter functions are (at least currently) infallible - they simply just dereference the corresponding fields,
+	// and always return `nullptr` for the status; so none of these have to return `Result`s.
+	// https://github.com/microsoft/onnxruntime/blob/v1.31.0/onnxruntime/core/framework/allocator.cc#L338
+
+	/// Returns the [`MemoryType`] described by this struct.
+	/// ```
+	/// # use ort::memory::{MemoryInfo, MemoryType, AllocationDevice, AllocatorType};
+	/// # fn main() -> ort::Result<()> {
+	/// let mem = MemoryInfo::new(AllocationDevice::CPU, 0, AllocatorType::Device, MemoryType::Default)?;
+	/// assert_eq!(mem.memory_type(), MemoryType::Default);
+	/// # Ok(())
+	/// # }
+	/// ```
+	pub fn memory_type(&self) -> MemoryType {
+		let mut raw_type: ort_sys::OrtMemType = ort_sys::OrtMemType::OrtMemTypeDefault;
+		ortsys![unsafe MemoryInfoGetMemType(self.ptr.as_ptr(), &mut raw_type).expect("infallible")];
+		MemoryType::from(raw_type)
+	}
+
+	/// Returns the [`AllocatorType`] described by this struct.
+	/// ```
+	/// # use ort::memory::{MemoryInfo, MemoryType, AllocationDevice, AllocatorType};
+	/// # fn main() -> ort::Result<()> {
+	/// let mem = MemoryInfo::new(AllocationDevice::CPU, 0, AllocatorType::Device, MemoryType::Default)?;
+	/// assert_eq!(mem.allocator_type(), AllocatorType::Device);
+	/// # Ok(())
+	/// # }
+	/// ```
+	pub fn allocator_type(&self) -> AllocatorType {
+		let mut raw_type: ort_sys::OrtAllocatorType = ort_sys::OrtAllocatorType::OrtInvalidAllocator;
+		ortsys![unsafe MemoryInfoGetType(self.ptr.as_ptr(), &mut raw_type).expect("infallible")];
+		match raw_type {
+			ort_sys::OrtAllocatorType::OrtArenaAllocator => AllocatorType::Arena,
+			ort_sys::OrtAllocatorType::OrtDeviceAllocator => AllocatorType::Device,
+			ort_sys::OrtAllocatorType::OrtReadOnlyAllocator => AllocatorType::ReadOnly,
+			ort_sys::OrtAllocatorType::OrtInvalidAllocator => unreachable!("memory info has invalid allocator type")
+		}
+	}
+
+	/// Returns the [`AllocationDevice`] this struct was created with.
+	/// ```
+	/// # use ort::memory::{MemoryInfo, MemoryType, AllocationDevice, AllocatorType};
+	/// # fn main() -> ort::Result<()> {
+	/// let mem = MemoryInfo::new(AllocationDevice::CPU, 0, AllocatorType::Device, MemoryType::Default)?;
+	/// assert_eq!(mem.allocation_device(), AllocationDevice::CPU);
+	/// # Ok(())
+	/// # }
+	/// ```
+	pub fn allocation_device(&self) -> AllocationDevice<'_> {
+		let mut name_ptr: *const c_char = ptr::null_mut();
+		ortsys![unsafe MemoryInfoGetName(self.ptr.as_ptr(), &mut name_ptr).expect("infallible"); nonNull(name_ptr)];
+		let name = unsafe { CStr::from_ptr(name_ptr.as_ptr()) };
+		assert!(name.to_str().is_ok(), "invalid device name");
+		AllocationDevice(Cow::Borrowed(name))
+	}
+
+	/// Returns the ID of the [`AllocationDevice`] described by this struct.
+	/// ```
+	/// # use ort::memory::{MemoryInfo, MemoryType, AllocationDevice, AllocatorType};
+	/// # fn main() -> ort::Result<()> {
+	/// let mem = MemoryInfo::new(AllocationDevice::CPU, 0, AllocatorType::Device, MemoryType::Default)?;
+	/// assert_eq!(mem.device_id(), 0);
+	/// # Ok(())
+	/// # }
+	/// ```
+	pub fn device_id(&self) -> i32 {
+		let mut raw: ort_sys::c_int = 0;
+		ortsys![unsafe MemoryInfoGetId(self.ptr.as_ptr(), &mut raw).expect("infallible")];
+		raw as _
+	}
+
+	/// Returns the type of device (CPU/GPU) this memory is allocated on.
+	pub fn device_type(&self) -> DeviceType {
+		let mut raw: ort_sys::OrtMemoryInfoDeviceType = ort_sys::OrtMemoryInfoDeviceType::OrtMemoryInfoDeviceType_CPU;
+		ortsys![unsafe MemoryInfoGetDeviceType(self.ptr.as_ptr(), &mut raw)];
+		raw.into()
+	}
+
+	/// Returns `true` if this memory is accessible by the CPU; meaning that, if a value were allocated on this device,
+	/// it could be extracted to an `ndarray` or slice.
+	pub fn is_cpu_accessible(&self) -> bool {
+		// CUDA_PINNED used to be `DeviceType::CPU` pre-1.23, but now is `DeviceType::GPU`, so we have to use
+		// `MemoryInfoGetDeviceMemType` instead. But that returns `DEFAULT` (implying non-host accessible) for the CPU
+		// device, so we still need the old check too. I hate this library.
+		#[cfg(feature = "api-23")]
+		return self.device_type() == DeviceType::CPU
+			|| ortsys![unsafe MemoryInfoGetDeviceMemType(self.ptr.as_ptr())] == ort_sys::OrtDeviceMemoryType::OrtDeviceMemoryType_HOST_ACCESSIBLE;
+		#[cfg(not(feature = "api-23"))]
+		return self.device_type() == DeviceType::CPU;
+	}
+
+	pub fn to_owned(&self) -> MemoryInfo<'static> {
+		MemoryInfo::new(self.allocation_device(), self.device_id(), self.allocator_type(), self.memory_type()).expect("failed to clone memory info")
+	}
+}
+
+impl Default for MemoryInfo<'_> {
+	fn default() -> Self {
+		MemoryInfo::new(AllocationDevice::CPU, 0, AllocatorType::Device, MemoryType::Default).expect("failed to create default memory info")
+	}
+}
+
+impl Clone for MemoryInfo<'_> {
+	fn clone(&self) -> Self {
+		self.to_owned()
+	}
+}
+
+impl PartialEq<MemoryInfo<'_>> for MemoryInfo<'_> {
+	fn eq(&self, other: &MemoryInfo) -> bool {
+		let mut out = 0;
+		ortsys![unsafe CompareMemoryInfo(self.ptr.as_ptr(), other.ptr.as_ptr(), &mut out).expect("infallible")]; // implementation always returns ok status
+		out == 0
+	}
+}
+
+impl Hash for MemoryInfo<'_> {
+	fn hash<H: Hasher>(&self, state: &mut H) {
+		self.device_type().hash(state);
+		self.memory_type().hash(state);
+		self.allocator_type().hash(state);
+		self.allocation_device().hash(state);
+		self.device_id().hash(state);
+	}
+}
+
+impl AsPointer for MemoryInfo<'_> {
+	type Sys = ort_sys::OrtMemoryInfo;
+
+	fn ptr(&self) -> *const Self::Sys {
+		self.ptr.as_ptr()
+	}
+}
+
+impl Drop for MemoryInfo<'_> {
+	fn drop(&mut self) {
+		if self.should_release {
+			ortsys![unsafe ReleaseMemoryInfo(self.ptr.as_ptr())];
+			crate::logging::drop!(MemoryInfo, self.ptr);
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
+
+	#[test]
+	fn test_memory_info_eq() -> crate::Result<()> {
+		let a = MemoryInfo::new(AllocationDevice::CUDA, 1, AllocatorType::Device, MemoryType::Default)?;
+		let b = MemoryInfo::new(AllocationDevice::CUDA, 1, AllocatorType::Device, MemoryType::Default)?;
+		assert_eq!(a, b);
+		assert_eq!(a.to_owned(), a);
+		let c = MemoryInfo::new(AllocationDevice::CPU, 0, AllocatorType::Device, MemoryType::Default)?;
+		assert_ne!(a, c);
+		Ok(())
+	}
+
+	#[test]
+	#[cfg(feature = "cuda")]
+	fn test_cpu_accessible() -> crate::Result<()> {
+		let mem = MemoryInfo::new(AllocationDevice::CUDA_PINNED, 0, AllocatorType::Device, MemoryType::Default)?;
+		assert!(mem.is_cpu_accessible());
+		let mem = MemoryInfo::new(AllocationDevice::CUDA, 0, AllocatorType::Device, MemoryType::Default)?;
+		assert!(!mem.is_cpu_accessible());
+		let mem = MemoryInfo::new(AllocationDevice::CPU, 0, AllocatorType::Device, MemoryType::Default)?;
+		assert!(mem.is_cpu_accessible());
+		Ok(())
+	}
+}

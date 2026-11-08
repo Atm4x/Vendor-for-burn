@@ -1,0 +1,488 @@
+//! [`Value`]s are data containers used as inputs/outputs in ONNX Runtime graphs.
+//!
+//! The most common type of value is [`Tensor`]:
+//! ```
+//! # use ort::value::Tensor;
+//! # fn main() -> ort::Result<()> {
+//! // Create a tensor from a raw data vector
+//! let tensor = Tensor::from_array(([1usize, 2, 3], vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0].into_boxed_slice()))?;
+//!
+//! // Create a tensor from an `ndarray::Array`
+//! #[cfg(feature = "ndarray")]
+//! let tensor = Tensor::from_array(ndarray::Array4::<f32>::zeros((1, 16, 16, 3)))?;
+//! # 	Ok(())
+//! # }
+//! ```
+//!
+//! ONNX Runtime also supports [`Sequence`]s and [`Map`]s, though they are less commonly used.
+
+use alloc::{boxed::Box, format, sync::Arc};
+use core::{
+	any::Any,
+	fmt::{self, Debug},
+	marker::PhantomData,
+	mem::transmute,
+	ops::BitOr,
+	ptr::{self, NonNull}
+};
+
+mod impl_map;
+mod impl_sequence;
+mod impl_tensor;
+mod r#ref;
+mod ref_mut;
+pub(crate) mod r#type;
+
+pub use self::{
+	impl_map::{DynMap, DynMapRef, DynMapRefMut, DynMapValueType, Map, MapRef, MapRefMut, MapValueType, MapValueTypeMarker},
+	impl_sequence::{
+		DynSequence, DynSequenceRef, DynSequenceRefMut, DynSequenceValueType, Sequence, SequenceRef, SequenceRefMut, SequenceValueType, SequenceValueTypeMarker
+	},
+	impl_tensor::{
+		DefiniteTensorValueTypeMarker, DynTensor, DynTensorRef, DynTensorRefMut, DynTensorValueType, IntoShape, IntoTensorElementType, OwnedTensorArrayData,
+		PrimitiveTensorElementType, Shape, SymbolicDimensions, Tensor, TensorArrayData, TensorArrayDataMut, TensorArrayDataParts, TensorElementType, TensorRef,
+		TensorRefMut, TensorValueType, TensorValueTypeMarker, ToShape, Utf8Data
+	},
+	r#ref::{DynValueRef, ValueRef},
+	ref_mut::{AsValueMut, DynValueRefMut, ValueRefMut},
+	r#type::{Outlet, ValueType}
+};
+use crate::{
+	AsPointer,
+	error::{Error, ErrorCode, Result},
+	memory::{Allocator, AllocatorHandle, MemoryInfo},
+	ortsys,
+	session::SharedSessionInner
+};
+
+#[derive(Default, Debug)]
+pub(crate) struct ValueFlags(u8);
+
+impl ValueFlags {
+	pub const DROP: ValueFlags = ValueFlags(1 << 0);
+	pub const UPGRADABLE: ValueFlags = ValueFlags(1 << 1);
+
+	pub const fn drop(&self) -> bool {
+		self.0 & Self::DROP.0 != 0
+	}
+	pub const fn upgradable(&self) -> bool {
+		self.0 & Self::UPGRADABLE.0 != 0
+	}
+}
+
+impl BitOr for ValueFlags {
+	type Output = ValueFlags;
+	fn bitor(self, rhs: Self) -> Self::Output {
+		ValueFlags(self.0 | rhs.0)
+	}
+}
+
+#[derive(Debug)]
+pub(crate) struct ValueInner {
+	pub(crate) ptr: NonNull<ort_sys::OrtValue>,
+	pub(crate) dtype: ValueType,
+	pub(crate) flags: ValueFlags,
+	pub(crate) memory_info: Option<MemoryInfo<'static>>,
+	/// the value needs the allocator to stay alive so it can drop its memory. maps/sequences don't use their own
+	/// allocators, though, hence this is optional
+	pub(crate) _allocator_handle: Option<Arc<AllocatorHandle>>,
+	// additional things like element `Value` handles for `Sequence`s
+	_backing: Option<Box<dyn Any>>
+}
+
+impl ValueInner {
+	pub fn new(
+		ptr: NonNull<ort_sys::OrtValue>,
+		dtype: ValueType,
+		memory_info: Option<MemoryInfo<'static>>,
+		allocator_handle: Option<Arc<AllocatorHandle>>,
+		flags: ValueFlags,
+		backing: Option<Box<dyn Any>>
+	) -> Arc<Self> {
+		crate::logging::create!(Value, ptr);
+		Arc::new(Self {
+			ptr,
+			dtype,
+			memory_info,
+			flags,
+			_allocator_handle: allocator_handle,
+			_backing: backing
+		})
+	}
+
+	pub(crate) fn is_backed(&self) -> bool {
+		self._backing.is_some()
+	}
+}
+
+impl AsPointer for ValueInner {
+	type Sys = ort_sys::OrtValue;
+
+	fn ptr(&self) -> *const Self::Sys {
+		self.ptr.as_ptr()
+	}
+}
+
+impl Drop for ValueInner {
+	fn drop(&mut self) {
+		if self.flags.drop() {
+			ortsys![unsafe ReleaseValue(self.ptr_mut())];
+			crate::logging::drop!(Value, self.ptr());
+		}
+	}
+}
+
+/// A [`Value`] contains data for inputs/outputs in ONNX Runtime graphs. [`Value`]s can be a [`Tensor`], [`Sequence`]
+/// (aka array/vector), or [`Map`].
+///
+/// ## Creation
+/// Values can be created via methods like [`Tensor::from_array`], or as the output from running a [`Session`].
+///
+/// ```
+/// # use ort::{session::Session, value::Tensor};
+/// # fn main() -> ort::Result<()> {
+/// # 	let mut upsample = Session::builder(ort::test_util::test_env())?.commit_from_file("tests/data/upsample.onnx")?;
+/// // Create a Tensor value from a raw data vector
+/// let value = Tensor::from_array(([1usize, 1, 1, 3], vec![1.0_f32, 2.0, 3.0].into_boxed_slice()))?;
+///
+/// // Create a Tensor value from an `ndarray::Array`
+/// #[cfg(feature = "ndarray")]
+/// let value = Tensor::from_array(ndarray::Array4::<f32>::zeros((1, 16, 16, 3)))?;
+///
+/// // Get a DynValue from a session's output
+/// let value = &upsample.run(ort::inputs![value])?[0];
+/// # 	Ok(())
+/// # }
+/// ```
+///
+/// See [`Tensor::from_array`] for more details on what tensor values are accepted.
+///
+/// ## Usage
+/// You can access the data contained in a `Value` by using the relevant `extract` methods.
+/// You can also use [`DynValue::downcast`] to attempt to convert from a [`DynValue`] to a more strongly typed value.
+///
+/// For dynamic values, where the type is not known at compile time, see the `try_extract_*` methods:
+/// - [`Tensor::try_extract_tensor`], [`Tensor::try_extract_array`]
+/// - [`Sequence::try_extract_sequence`]
+/// - [`Map::try_extract_map`]
+///
+/// If the type was created from Rust (via a method like [`Tensor::from_array`] or via downcasting), you can directly
+/// extract the data using the infallible extract methods:
+/// - [`Tensor::extract_tensor`], [`Tensor::extract_array`]
+///
+/// [`Session`]: crate::session::Session
+#[derive(Debug)]
+pub struct Value<Type: ValueTypeMarker + ?Sized = DynValueTypeMarker> {
+	pub(crate) inner: Arc<ValueInner>,
+	pub(crate) _markers: PhantomData<Type>
+}
+
+/// A dynamic value, which could be a [`Tensor`], [`Sequence`], or [`Map`].
+///
+/// To attempt to convert a dynamic value to a strongly typed value, use [`DynValue::downcast`]. You can also attempt to
+/// extract data from dynamic values directly using `try_extract_*` methods; see [`Value`] for more information.
+pub type DynValue = Value<DynValueTypeMarker>;
+
+/// Marker trait used to determine what operations can and cannot be performed on a [`Value`] of a given type.
+///
+/// For example, [`Tensor::try_extract_tensor`] can only be used on [`Value`]s with the [`TensorValueTypeMarker`] (which
+/// inherits this trait), i.e. [`Tensor`]s, [`DynTensor`]s, and [`DynValue`]s.
+pub trait ValueTypeMarker {
+	#[doc(hidden)]
+	fn fmt(f: &mut fmt::Formatter) -> fmt::Result;
+
+	private_trait!();
+}
+
+pub(crate) struct ValueTypeFormatter<T: ?Sized>(PhantomData<T>);
+
+#[inline]
+pub(crate) fn format_value_type<T: ValueTypeMarker + ?Sized>() -> ValueTypeFormatter<T> {
+	ValueTypeFormatter(PhantomData)
+}
+
+impl<T: ValueTypeMarker + ?Sized> fmt::Display for ValueTypeFormatter<T> {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		<T as ValueTypeMarker>::fmt(f)
+	}
+}
+
+/// Represents a type that a [`DynValue`] can be downcast to.
+pub trait DowncastableTarget: ValueTypeMarker {
+	fn can_downcast(dtype: &ValueType) -> bool;
+
+	private_trait!();
+}
+
+// this implementation is used in case we want to extract `DynValue`s from a [`Sequence`]; see `try_extract_sequence`
+impl DowncastableTarget for DynValueTypeMarker {
+	fn can_downcast(_: &ValueType) -> bool {
+		true
+	}
+
+	private_impl!();
+}
+
+/// The dynamic type marker, used for values which can be of any type.
+#[derive(Debug)]
+pub struct DynValueTypeMarker;
+pub trait UnknownValueTypeMarker {
+	private_trait!();
+}
+impl ValueTypeMarker for DynValueTypeMarker {
+	fn fmt(f: &mut fmt::Formatter) -> fmt::Result {
+		f.write_str("DynValue")
+	}
+
+	private_impl!();
+}
+impl MapValueTypeMarker for DynValueTypeMarker {
+	private_impl!();
+}
+impl SequenceValueTypeMarker for DynValueTypeMarker {
+	private_impl!();
+}
+impl TensorValueTypeMarker for DynValueTypeMarker {
+	private_impl!();
+}
+impl UnknownValueTypeMarker for DynValueTypeMarker {
+	private_impl!();
+}
+
+unsafe impl<Type: ValueTypeMarker + ?Sized> Send for Value<Type> {}
+unsafe impl<Type: ValueTypeMarker + ?Sized> Sync for Value<Type> {}
+
+impl<Type: ValueTypeMarker + ?Sized> Value<Type> {
+	/// Returns the data type of this [`Value`].
+	pub fn dtype(&self) -> &ValueType {
+		&self.inner.dtype
+	}
+
+	/// Construct a [`Value`] from a C++ [`ort_sys::OrtValue`] pointer. Takes ownership of `ptr`.
+	///
+	/// If the value is a *tensor*, you must provide the allocator it was created with. Failure to do so will result in
+	/// a panic.
+	///
+	/// # Safety
+	///
+	/// - `ptr` must be a valid pointer to an [`ort_sys::OrtValue`].
+	/// - `session` must be `Some` for values returned from a session.
+	#[must_use]
+	pub unsafe fn from_ptr(ptr: NonNull<ort_sys::OrtValue>, allocator: Option<&Allocator>) -> Value<Type> {
+		let mut is_tensor = 0;
+		ortsys![unsafe IsTensor(ptr.as_ptr(), &mut is_tensor).expect("infallible")];
+		if is_tensor != 0 && allocator.is_none() {
+			panic!("tensor values require the allocator it was created with to be passed to `Value::from_ptr`");
+		}
+
+		let (memory_info, dtype) = if is_tensor != 0 {
+			unsafe { (Some(MemoryInfo::from_tensor_value(ptr)), ValueType::from_tensor_value(ptr)) }
+		} else {
+			let mut typeinfo_ptr = ptr::null_mut();
+			ortsys![unsafe GetTypeInfo(ptr.as_ptr(), &mut typeinfo_ptr).expect("infallible"); nonNull(typeinfo_ptr)];
+			(None, unsafe { ValueType::from_type_info(typeinfo_ptr) })
+		};
+
+		Value {
+			inner: ValueInner::new(ptr, dtype, memory_info, allocator.map(|a| a.handle.clone()), ValueFlags::DROP | ValueFlags::UPGRADABLE, None),
+			_markers: PhantomData
+		}
+	}
+
+	#[must_use]
+	#[inline]
+	pub(crate) unsafe fn from_session_output_ptr(ptr: NonNull<ort_sys::OrtValue>, session_inner: &SharedSessionInner) -> Value<Type> {
+		let mut is_tensor = 0;
+		ortsys![unsafe IsTensor(ptr.as_ptr(), &mut is_tensor).expect("infallible")];
+		if is_tensor != 0 {
+			let dtype = unsafe { ValueType::from_tensor_value(ptr) };
+			let memory_info = unsafe { MemoryInfo::from_tensor_value(ptr) };
+
+			// keep in mind CreateAllocator doesn't actually create an allocator, just a smart pointer to an allocator
+			// the session already created when it was committed. also, this cannot fail because the value is coming
+			// from a session output, so the session absolutely has an allocator that supports this `MemoryInfo`.
+			let allocator_handle = {
+				// not a fan of the repetition but we need it because Allocator::new only accepts Session, which
+				// run_async callback doesn't have access to
+				let mut ptr: *mut ort_sys::OrtAllocator = ptr::null_mut();
+				ortsys![unsafe CreateAllocator(session_inner.ptr(), memory_info.ptr(), &mut ptr).expect("infallible"); nonNull(ptr)];
+				crate::logging::create!(Allocator, ptr);
+				Arc::new(AllocatorHandle { _drop_ptr: Some(ptr) })
+			};
+
+			Value {
+				inner: ValueInner::new(ptr, dtype, Some(memory_info), Some(allocator_handle), ValueFlags::DROP | ValueFlags::UPGRADABLE, None),
+				_markers: PhantomData
+			}
+		} else {
+			let mut typeinfo_ptr = ptr::null_mut();
+			ortsys![unsafe GetTypeInfo(ptr.as_ptr(), &mut typeinfo_ptr).expect("infallible"); nonNull(typeinfo_ptr)];
+			let dtype = unsafe { ValueType::from_type_info(typeinfo_ptr) };
+			Value {
+				inner: ValueInner::new(ptr, dtype, None, Some(session_inner.allocator.handle.clone()), ValueFlags::DROP | ValueFlags::UPGRADABLE, None),
+				_markers: PhantomData
+			}
+		}
+	}
+
+	/// A variant of [`Value::from_ptr`] that does not release the value upon dropping. Used in operator kernel
+	/// contexts.
+	#[must_use]
+	pub(crate) unsafe fn from_ptr_nodrop(ptr: NonNull<ort_sys::OrtValue>, allocator: Option<&Allocator>) -> Value<Type> {
+		let mut is_tensor = 0;
+		ortsys![unsafe IsTensor(ptr.as_ptr(), &mut is_tensor).expect("infallible")];
+
+		let (memory_info, dtype) = if is_tensor != 0 {
+			unsafe { (Some(MemoryInfo::from_tensor_value(ptr)), ValueType::from_tensor_value(ptr)) }
+		} else {
+			let mut typeinfo_ptr = ptr::null_mut();
+			ortsys![unsafe GetTypeInfo(ptr.as_ptr(), &mut typeinfo_ptr).expect("infallible"); nonNull(typeinfo_ptr)];
+			(None, unsafe { ValueType::from_type_info(typeinfo_ptr) })
+		};
+
+		// allocator check for tensors not needed because, well, we don't drop!
+
+		Value {
+			inner: ValueInner::new(ptr, dtype, memory_info, allocator.map(|a| a.handle.clone()), ValueFlags::default(), None),
+			_markers: PhantomData
+		}
+	}
+
+	/// Create a view of this value's data.
+	pub fn view(&self) -> ValueRef<'_, Type> {
+		ValueRef::new(Value::clone_of(self))
+	}
+
+	/// Create a mutable view of this value's data.
+	pub fn view_mut(&mut self) -> ValueRefMut<'_, Type> {
+		ValueRefMut::new(Value::clone_of(self))
+	}
+
+	/// Converts this value into a type-erased [`DynValue`].
+	pub fn into_dyn(self) -> DynValue {
+		unsafe { self.transmute_type() }
+	}
+
+	/// Returns `true` if this value is a tensor, or `false` if it is another type (sequence, map).
+	///
+	/// ```
+	/// # use ort::value::Tensor;
+	/// # fn main() -> ort::Result<()> {
+	/// let tensor_value = Tensor::from_array(([3usize], vec![1.0_f32, 2.0, 3.0].into_boxed_slice()))?;
+	/// let dyn_value = tensor_value.into_dyn();
+	/// assert!(dyn_value.is_tensor());
+	/// # 	Ok(())
+	/// # }
+	/// ```
+	pub fn is_tensor(&self) -> bool {
+		let mut result = 0;
+		ortsys![unsafe IsTensor(self.ptr(), &mut result).expect("infallible")];
+		result == 1
+	}
+
+	#[inline(always)]
+	pub(crate) unsafe fn transmute_type<OtherType: ValueTypeMarker + ?Sized>(self) -> Value<OtherType> {
+		unsafe { transmute::<Value<Type>, Value<OtherType>>(self) }
+	}
+
+	#[inline(always)]
+	pub(crate) unsafe fn transmute_type_ref<OtherType: ValueTypeMarker + ?Sized>(&self) -> &Value<OtherType> {
+		unsafe { transmute::<&Value<Type>, &Value<OtherType>>(self) }
+	}
+
+	pub(crate) fn clone_of(value: &Self) -> Self {
+		Self {
+			inner: Arc::clone(&value.inner),
+			_markers: PhantomData
+		}
+	}
+}
+
+impl Value<DynValueTypeMarker> {
+	/// Attempts to downcast a dynamic value (like [`DynValue`] or [`DynTensor`]) to a more strongly typed variant,
+	/// like [`Tensor<T>`].
+	#[inline]
+	pub fn downcast<OtherType: ValueTypeMarker + DowncastableTarget + ?Sized>(self) -> Result<Value<OtherType>> {
+		let dt = self.dtype();
+		if OtherType::can_downcast(dt) {
+			Ok(unsafe { transmute::<Value<DynValueTypeMarker>, Value<OtherType>>(self) })
+		} else {
+			Err(Error::new_with_code(ErrorCode::InvalidArgument, format!("Cannot downcast {dt} to {}", format_value_type::<OtherType>())))
+		}
+	}
+}
+
+impl<Type: ValueTypeMarker + ?Sized> AsPointer for Value<Type> {
+	type Sys = ort_sys::OrtValue;
+
+	fn ptr(&self) -> *const Self::Sys {
+		self.inner.ptr()
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{DynTensorValueType, Map, Sequence, Tensor, TensorRef, TensorRefMut, TensorValueType};
+
+	#[test]
+	fn test_casting_tensor() -> crate::Result<()> {
+		let tensor: Tensor<i32> = Tensor::from_array((vec![5], vec![1, 2, 3, 4, 5]))?;
+
+		let dyn_tensor = tensor.into_dyn();
+		let mut tensor: Tensor<i32> = dyn_tensor.downcast()?;
+
+		{
+			let dyn_tensor_ref = tensor.view().into_dyn();
+			let tensor_ref: TensorRef<i32> = dyn_tensor_ref.downcast()?;
+			assert_eq!(tensor_ref.extract_tensor(), tensor.extract_tensor());
+		}
+		{
+			let dyn_tensor_ref = tensor.view().into_dyn();
+			let tensor_ref: TensorRef<i32> = dyn_tensor_ref.downcast()?;
+			assert_eq!(tensor_ref.extract_tensor(), tensor.extract_tensor());
+		}
+
+		// Ensure mutating a TensorRefMut mutates the original tensor.
+		{
+			let dyn_tensor_ref = tensor.view_mut().into_dyn();
+			let mut tensor_ref: TensorRefMut<i32> = dyn_tensor_ref.downcast()?;
+			let (_, data) = tensor_ref.extract_tensor_mut();
+			data[2] = 42;
+		}
+		{
+			let (_, data) = tensor.extract_tensor_mut();
+			assert_eq!(data[2], 42);
+		}
+
+		// chain a bunch of up/downcasts
+		{
+			let tensor = tensor
+				.into_dyn()
+				.downcast::<DynTensorValueType>()?
+				.into_dyn()
+				.downcast::<TensorValueType<i32>>()?
+				.upcast()
+				.into_dyn();
+			let tensor = tensor.view();
+			let tensor = tensor.downcast::<TensorValueType<i32>>()?;
+			let (_, data) = tensor.extract_tensor();
+			assert_eq!(data, [1, 2, 42, 4, 5]);
+		}
+
+		Ok(())
+	}
+
+	#[test]
+	fn test_sequence_map() -> crate::Result<()> {
+		let map_contents = [("meaning".to_owned(), 42.0), ("pi".to_owned(), core::f32::consts::PI)];
+		let value = Sequence::new([Map::<String, f32>::new(map_contents)?])?;
+
+		for map in value.extract_sequence() {
+			let map = map.extract_key_values().into_iter().collect::<std::collections::HashMap<_, _>>();
+			assert_eq!(map["meaning"], 42.0);
+			assert_eq!(map["pi"], core::f32::consts::PI);
+		}
+
+		Ok(())
+	}
+}
