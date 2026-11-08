@@ -7,12 +7,14 @@ on:
       - 'models/tts-with-rvc-rs/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'tools/restore_vendor_checksums.py'
       - '.github/workflows/rvc-parity.yml'
   pull_request:
     paths:
       - 'models/tts-with-rvc-rs/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'tools/restore_vendor_checksums.py'
       - '.github/workflows/rvc-parity.yml'
   workflow_dispatch:
 
@@ -26,6 +28,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.1
+      - name: Restore exact upstream vendor bytes before offline build
+        shell: bash
+        run: |
+          curl --fail --location --retry 3 \
+            https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate \
+            --output "$RUNNER_TEMP/zerocopy-0.8.63.crate"
+          python3 tools/restore_vendor_checksums.py --zerocopy-archive "$RUNNER_TEMP/zerocopy-0.8.63.crate"
       - name: Run Burn parity with vendored dependencies
         run: |
           cargo test -p tts-with-rvc-rs --locked --offline
