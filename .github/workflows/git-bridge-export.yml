@@ -27,7 +27,7 @@ jobs:
         run: |
           set -euo pipefail
           git update-ref refs/heads/main "${GITHUB_SHA}"
-          git bundle create "${RUNNER_TEMP}/repository.bundle" refs/heads/main
+          git bundle create "${RUNNER_TEMP}/repository.bundle" HEAD refs/heads/main
           git bundle verify "${RUNNER_TEMP}/repository.bundle"
           git bundle list-heads "${RUNNER_TEMP}/repository.bundle"
           (
