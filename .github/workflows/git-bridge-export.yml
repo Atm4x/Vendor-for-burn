@@ -1,0 +1,49 @@
+name: Git Bridge - Export Bundle
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/git-bridge-export.yml
+
+permissions:
+  contents: read
+
+jobs:
+  export-bundle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout complete main history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Create and verify self-contained Git bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          git update-ref refs/heads/main "${GITHUB_SHA}"
+          git bundle create "${RUNNER_TEMP}/repository.bundle" refs/heads/main
+          git bundle verify "${RUNNER_TEMP}/repository.bundle"
+          git bundle list-heads "${RUNNER_TEMP}/repository.bundle"
+          (
+            cd "${RUNNER_TEMP}"
+            sha256sum repository.bundle > repository.bundle.sha256
+            printf '%s\n' "${GITHUB_SHA}" > source-head.txt
+          )
+
+      - name: Upload Git Bridge artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vendor-for-burn-git-bundle
+          path: |
+            ${{ runner.temp }}/repository.bundle
+            ${{ runner.temp }}/repository.bundle.sha256
+            ${{ runner.temp }}/source-head.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
