@@ -133,3 +133,20 @@ fn native_checkpoint_text_encoder_matches_original_pytorch() {
     assert!(max_abs_error(&mean, &fixture.expected_skip_mean) < 1e-4);
     assert!(max_abs_error(&log_scale, &fixture.expected_skip_log_scale) < 1e-4);
 }
+
+#[test]
+fn decoder_first_stage_matches_original_pytorch() {
+    use tts_with_rvc_rs::{checkpoint::RvcCheckpoint, decoder::DecoderStageFixture};
+    let checkpoint = RvcCheckpoint::open(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/synthetic_decoder.pth")).unwrap();
+    let reference: DecoderStageFixture = serde_json::from_str(include_str!("fixtures/decoder_stage.json")).unwrap();
+    let device = Device::flex();
+    let stage = reference.load(&checkpoint, &device).unwrap();
+    assert_eq!(stage.residual_count(), 3);
+    let (input, source) = reference.tensors(&device);
+    let upsampled = stage.upsample_only(input.clone()).into_data().try_into_vec::<f32>().unwrap();
+    let up_error = max_abs_error(&upsampled, &reference.expected_upsampled);
+    assert!(up_error.is_finite() && up_error < 1e-4, "ConvTranspose1d error {up_error}");
+    let output = stage.forward(input, source).into_data().try_into_vec::<f32>().unwrap();
+    let error = max_abs_error(&output, &reference.expected_output);
+    assert!(error.is_finite() && error < 1e-4, "DecoderStage error {error}");
+}

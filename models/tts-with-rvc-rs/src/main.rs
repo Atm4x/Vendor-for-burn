@@ -15,11 +15,11 @@ fn run() -> Result<(), String> {
         }
         return Ok(());
     }
-    if !matches!(command.as_str(), "verify-text-front" | "verify-attention" | "verify-encoder-layer" | "verify-text-encoder" | "verify-flow" | "verify-text-encoder-pth") {
+    if !matches!(command.as_str(), "verify-text-front" | "verify-attention" | "verify-encoder-layer" | "verify-text-encoder" | "verify-flow" | "verify-text-encoder-pth" | "verify-decoder-stage") {
         return Err("usage: tts-with-rvc-rs verify-text-front|verify-attention|verify-encoder-layer|verify-text-encoder <fixture.json> [flex|cpu|cuda|wgpu]".into());
     }
     let path = args.next().ok_or("missing fixture or checkpoint path")?;
-    let flow_fixture_path = if command == "verify-flow" || command == "verify-text-encoder-pth" {
+    let flow_fixture_path = if command == "verify-flow" || command == "verify-text-encoder-pth" || command == "verify-decoder-stage" {
         Some(args.next().ok_or("missing flow fixture path")?)
     } else { None };
     let backend = args.next().unwrap_or_else(|| "flex".to_owned());
@@ -34,6 +34,23 @@ fn run() -> Result<(), String> {
         "wgpu" => Device::wgpu(Default::default()),
         other => return Err(format!("backend {other} is not compiled into this binary")),
     };
+    if command == "verify-decoder-stage" {
+        let reference_path = flow_fixture_path.as_ref().ok_or("missing decoder reference")?;
+        let checkpoint = tts_with_rvc_rs::checkpoint::RvcCheckpoint::open(&path)?;
+        let data = fs::read_to_string(reference_path).map_err(|error| error.to_string())?;
+        let reference: tts_with_rvc_rs::decoder::DecoderStageFixture = serde_json::from_str(&data).map_err(|error| error.to_string())?;
+        let stage = reference.load(&checkpoint, &device)?;
+        let (input, source) = reference.tensors(&device);
+        let upsampled = stage.upsample_only(input.clone()).into_data().try_into_vec::<f32>().map_err(|error| error.to_string())?;
+        let up_error = max_abs_error(&upsampled, &reference.expected_upsampled);
+        let result = stage.forward(input, source).into_data().try_into_vec::<f32>().map_err(|error| error.to_string())?;
+        let error = max_abs_error(&result, &reference.expected_output);
+        println!("backend={backend} stage={} resblocks={} max_abs_upsample={up_error:.9} max_abs_decoder_stage={error:.9}", reference.stage, stage.residual_count());
+        if !up_error.is_finite() || up_error > 1e-4 || !error.is_finite() || error > 1e-4 {
+            return Err("Torch/Burn NSF decoder stage parity exceeded tolerance".into());
+        }
+        return Ok(());
+    }
     if command == "verify-flow" {
         let flow_fixture_path = flow_fixture_path.as_ref().ok_or("missing flow reference")?;
         let checkpoint = tts_with_rvc_rs::checkpoint::RvcCheckpoint::open(&path)?;

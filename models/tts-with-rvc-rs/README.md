@@ -72,3 +72,16 @@ Compare a native checkpoint to an independently generated Torch reference with `
 These milestones do **not** constitute complete speech synthesis: NSF-HiFiGAN, HuBERT, F0 and retrieval remain unported, and GPU parity is not yet validated.
 
 The six-layer `TextEncoder` also supports direct checkpoint loading via `TextEncoder::load(&checkpoint, &device)` and can be checked with `verify-text-encoder-pth model.pth torch-reference.json flex`. The full model, attention and residual-flow weights are read natively from the same checkpoint without a conversion process. HuBERT/F0 input extraction and the NSF waveform decoder are not yet implemented.
+
+### Stage 7 — NSF decoder first upsampling stage
+
+`decoder::DecoderStage` executes the original `GeneratorNSF` stage order: `LeakyReLU(0.1)` → weight-normalized `ConvTranspose1d` → addition of the harmonic source via `noise_convs` → average of three `ResBlock1` branches. The branches each perform three paired dilated-weight-normalized Conv1d residual operations. This stage is loaded directly from `dec.ups`, `dec.noise_convs` and `dec.resblocks` tensors in `.pth` checkpoints. It does **not** yet synthesize harmonic excitation, run all four upsampling stages or produce final audio.
+
+The original Python class is used only to generate parity vectors for a synthetic checkpoint; users do not need Python at inference time. To validate a private RVC v2/F0 checkpoint locally:
+
+```text
+python models/tts-with-rvc-rs/tools/reference_decoder_stage.py --source-zip ORIGINAL_SOURCE.zip --checkpoint PRIVATE_MODEL.pth --fixture PRIVATE_STAGE_REFERENCE.json
+cargo run -p tts-with-rvc-rs --locked --offline -- verify-decoder-stage PRIVATE_MODEL.pth PRIVATE_STAGE_REFERENCE.json flex
+```
+
+This reference test is deterministic because it compares a separately provided harmonic-source tensor rather than the nondeterministic `SineGen` noise. A full synthesis test must also validate `SineGen`, all decoder stages and `conv_post`.

@@ -144,3 +144,5 @@ pub mod text_encoder;
 
 pub mod checkpoint;
 pub mod flow;
+
+pub mod decoder;
