@@ -15,11 +15,11 @@ fn run() -> Result<(), String> {
         }
         return Ok(());
     }
-    if !matches!(command.as_str(), "verify-text-front" | "verify-attention" | "verify-encoder-layer" | "verify-text-encoder" | "verify-flow" | "verify-text-encoder-pth" | "verify-decoder-stage" | "verify-nsf-decoder" | "verify-hubert-conv" | "verify-hubert-frontend" | "verify-hubert-transformer" | "verify-hubert-stack" | "verify-rmvpe-head") {
+    if !matches!(command.as_str(), "verify-text-front" | "verify-attention" | "verify-encoder-layer" | "verify-text-encoder" | "verify-flow" | "verify-text-encoder-pth" | "verify-decoder-stage" | "verify-nsf-decoder" | "verify-hubert-conv" | "verify-hubert-frontend" | "verify-hubert-transformer" | "verify-hubert-stack" | "verify-hubert-position" | "verify-hubert-encoder" | "verify-rmvpe-head") {
         return Err("usage: tts-with-rvc-rs verify-text-front|verify-attention|verify-encoder-layer|verify-text-encoder <fixture.json> [flex|cpu|cuda|wgpu]".into());
     }
     let path = args.next().ok_or("missing fixture or checkpoint path")?;
-    let flow_fixture_path = if command == "verify-flow" || command == "verify-text-encoder-pth" || command == "verify-decoder-stage" || command == "verify-nsf-decoder" || command == "verify-hubert-conv" || command == "verify-hubert-frontend" || command == "verify-hubert-transformer" || command == "verify-hubert-stack" || command == "verify-rmvpe-head" {
+    let flow_fixture_path = if command == "verify-flow" || command == "verify-text-encoder-pth" || command == "verify-decoder-stage" || command == "verify-nsf-decoder" || command == "verify-hubert-conv" || command == "verify-hubert-frontend" || command == "verify-hubert-transformer" || command == "verify-hubert-stack" || command == "verify-hubert-position" || command == "verify-hubert-encoder" || command == "verify-rmvpe-head" {
         Some(args.next().ok_or("missing flow fixture path")?)
     } else { None };
     let backend = args.next().unwrap_or_else(|| "flex".to_owned());
@@ -102,6 +102,40 @@ fn run() -> Result<(), String> {
         println!("backend={backend} max_abs_{command}={error:.9} max_abs_unmasked={unmasked_error:.9}");
         if !error.is_finite() || error > 1e-4 || !unmasked_error.is_finite() || unmasked_error > 1e-4 {
             return Err("HuBERT Transformer Torch/Burn parity exceeded tolerance".into());
+        }
+        return Ok(());
+    }
+    if command == "verify-hubert-position" || command == "verify-hubert-encoder" {
+        use burn::tensor::{Tensor, TensorData};
+        use tts_with_rvc_rs::{checkpoint::RvcCheckpoint, hubert_position::HubertEncoder};
+        let checkpoint = RvcCheckpoint::open_model(&path)?;
+        let fixture_path = flow_fixture_path.as_ref().ok_or("missing positional reference")?;
+        let fixture: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(fixture_path).map_err(|error| error.to_string())?,
+        ).map_err(|error| error.to_string())?;
+        let read = |field: &str| -> Result<Vec<f32>, String> {
+            serde_json::from_value(fixture[field].clone()).map_err(|error| error.to_string())
+        };
+        let shape: [usize; 3] = serde_json::from_value(fixture["shape"].clone()).map_err(|error| error.to_string())?;
+        let heads: usize = serde_json::from_value(fixture["heads"].clone()).map_err(|error| error.to_string())?;
+        let layers: usize = serde_json::from_value(fixture["layers"].clone()).map_err(|error| error.to_string())?;
+        let x = Tensor::from_data(TensorData::new(read("input")?, shape), &device);
+        let valid = Tensor::from_data(TensorData::new(read("valid")?, [shape[0], shape[1]]), &device);
+        let model = HubertEncoder::load(&checkpoint, layers, heads, &device)?;
+        let (actual, unmasked, expected, expected_unmasked) = if command == "verify-hubert-position" {
+            (model.position_only(x.clone(), Some(valid)), model.position_only(x, None),
+             read("expected_position")?, read("expected_position_unmasked")?)
+        } else {
+            (model.forward(x.clone(), Some(valid)), model.forward(x, None),
+             read("expected")?, read("expected_unmasked")?)
+        };
+        let actual = actual.into_data().try_into_vec::<f32>().map_err(|error| error.to_string())?;
+        let unmasked = unmasked.into_data().try_into_vec::<f32>().map_err(|error| error.to_string())?;
+        let error = max_abs_error(&actual, &expected);
+        let unmasked_error = max_abs_error(&unmasked, &expected_unmasked);
+        println!("backend={backend} max_abs_{command}={error:.9} max_abs_unmasked={unmasked_error:.9} layers={layers}");
+        if !error.is_finite() || !unmasked_error.is_finite() || error > 1e-4 || unmasked_error > 1e-4 {
+            return Err(format!("HuBERT positional/encoder parity exceeded tolerance: {error:.8}, {unmasked_error:.8}"));
         }
         return Ok(());
     }

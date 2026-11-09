@@ -51,6 +51,8 @@ jobs:
           cargo run -p tts-with-rvc-rs --locked --offline -- verify-hubert-frontend models/tts-with-rvc-rs/tests/fixtures/synthetic_hubert_frontend.pth models/tts-with-rvc-rs/tests/fixtures/hubert_frontend.json flex
           cargo run -p tts-with-rvc-rs --locked --offline -- verify-hubert-transformer models/tts-with-rvc-rs/tests/fixtures/synthetic_hubert_transformer.pth models/tts-with-rvc-rs/tests/fixtures/hubert_transformer.json flex
           cargo run -p tts-with-rvc-rs --locked --offline -- verify-hubert-stack models/tts-with-rvc-rs/tests/fixtures/synthetic_hubert_stack.pth models/tts-with-rvc-rs/tests/fixtures/hubert_stack.json flex
+          cargo run -p tts-with-rvc-rs --locked --offline -- verify-hubert-position models/tts-with-rvc-rs/tests/fixtures/synthetic_hubert_position.pth models/tts-with-rvc-rs/tests/fixtures/hubert_position.json flex
+          cargo run -p tts-with-rvc-rs --locked --offline -- verify-hubert-encoder models/tts-with-rvc-rs/tests/fixtures/synthetic_hubert_position.pth models/tts-with-rvc-rs/tests/fixtures/hubert_position.json flex
           cargo run -p tts-with-rvc-rs --locked --offline -- verify-rmvpe-head models/tts-with-rvc-rs/tests/fixtures/synthetic_rmvpe_head.pth models/tts-with-rvc-rs/tests/fixtures/rmvpe_head.json flex
       - name: Package native Linux parity runner
         shell: bash

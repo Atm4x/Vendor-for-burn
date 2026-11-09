@@ -142,3 +142,15 @@ cargo run -p tts-with-rvc-rs --locked --offline -- verify-hubert-transformer hub
 python models/tts-with-rvc-rs/tools/reference_hubert_stack.py --checkpoint hubert_base.pt --fixture PRIVATE_HUBERT_STACK.json
 cargo run -p tts-with-rvc-rs --locked --offline -- verify-hubert-stack hubert_base.pt PRIVATE_HUBERT_STACK.json flex
 ```
+
+## Stage 13 — HuBERT positional convolution + encoder integration
+
+`HubertPosition` rebuilds Fairseq's grouped positional Conv1d using kernel-axis (`dim=2`) weight normalization, removes the extra sample for even kernels, applies GELU and the outer encoder LayerNorm. When a valid-key mask is supplied, padded feature frames are zeroed **before** positional convolution. `HubertEncoder` composes this with the previously verified Transformer stack.
+
+```sh
+python models/tts-with-rvc-rs/tools/reference_hubert_position.py --checkpoint hubert_base.pt --fixture /tmp/hubert_position_private.json
+cargo run -p tts-with-rvc-rs --locked --offline -- verify-hubert-position hubert_base.pt /tmp/hubert_position_private.json flex
+cargo run -p tts-with-rvc-rs --locked --offline -- verify-hubert-encoder hubert_base.pt /tmp/hubert_position_private.json flex
+```
+
+The synthesis pipeline (HuBERT feature extractor input length handling, RMVPE F0, SineGen, FAISS, persistent worker) is still incomplete. Reference checkpoints, original user WAV and private fixtures must not be committed.

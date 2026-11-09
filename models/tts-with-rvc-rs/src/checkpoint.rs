@@ -92,4 +92,36 @@ impl RvcCheckpoint {
         }
         Ok(Tensor::from_data(TensorData::new(weights, [shape[0], shape[1], shape[2]]), device))
     }
+
+    pub fn weight_norm_conv1d_dim2(&self, prefix: &str, device: &Device) -> Result<Tensor<3>, String> {
+        let (shape, mut weights) = self.tensor_f32(&format!("{prefix}.weight_v"))?;
+        if shape.len() != 3 || shape.contains(&0) {
+            return Err(format!("{prefix}: expected nonempty rank-3 positional Conv1d, found {shape:?}"));
+        }
+        let (out_channels, input_per_group, kernel) = (shape[0], shape[1], shape[2]);
+        let (g_shape, gains) = self.tensor_f32(&format!("{prefix}.weight_g"))?;
+        if g_shape != [1, 1, kernel] && g_shape != [kernel] {
+            return Err(format!("{prefix}: expected kernel-axis weight_g [1,1,{kernel}], found {g_shape:?}"));
+        }
+        let mut squared_norms = vec![0.0f32; kernel];
+        for row in weights.chunks_exact(kernel) {
+            for (index, value) in row.iter().enumerate() {
+                squared_norms[index] += value * value;
+            }
+        }
+        let factors: Result<Vec<_>, String> = squared_norms.iter().zip(gains.iter()).map(|(&sq, &gain)| {
+            if !sq.is_finite() || sq <= 0.0 || !gain.is_finite() {
+                return Err(format!("{prefix}: invalid kernel-axis weight_norm values"));
+            }
+            Ok(gain / sq.sqrt())
+        }).collect();
+        let factors = factors?;
+        for row in weights.chunks_exact_mut(kernel) {
+            for (value, gain) in row.iter_mut().zip(factors.iter()) {
+                *value *= gain;
+            }
+        }
+        Ok(Tensor::from_data(TensorData::new(weights, [out_channels, input_per_group, kernel]), device))
+    }
+
 }

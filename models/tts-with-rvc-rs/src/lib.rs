@@ -151,3 +151,5 @@ pub mod rmvpe;
 pub mod hubert;
 
 pub mod hubert_transformer;
+
+pub mod hubert_position;

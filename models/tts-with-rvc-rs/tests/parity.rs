@@ -259,3 +259,31 @@ fn hubert_transformer_stack_matches_torch_with_padding() {
     assert!(max_abs_error(&actual_masked, &expected) < 1e-4);
     assert!(max_abs_error(&actual_unmasked, &expected_unmasked) < 1e-4);
 }
+
+#[test]
+fn hubert_positional_conv_and_three_layer_encoder_match_torch() {
+    use tts_with_rvc_rs::{checkpoint::RvcCheckpoint, hubert_position::HubertEncoder};
+    let checkpoint = RvcCheckpoint::open_model(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/synthetic_hubert_position.pth")).unwrap();
+    let fixture: serde_json::Value = serde_json::from_str(include_str!("fixtures/hubert_position.json")).unwrap();
+    let get = |name: &str| -> Vec<f32> { serde_json::from_value(fixture[name].clone()).unwrap() };
+    let shape: [usize; 3] = serde_json::from_value(fixture["shape"].clone()).unwrap();
+    let heads: usize = serde_json::from_value(fixture["heads"].clone()).unwrap();
+    let layers: usize = serde_json::from_value(fixture["layers"].clone()).unwrap();
+    let device = Device::flex();
+    let model = HubertEncoder::load(&checkpoint, layers, heads, &device).unwrap();
+    assert_eq!(model.layers(), 3);
+    let input = Tensor::from_data(TensorData::new(get("input"), shape), &device);
+    let valid = Tensor::from_data(TensorData::new(get("valid"), [shape[0], shape[1]]), &device);
+    let position = model.position_only(input.clone(), Some(valid.clone()))
+        .into_data().try_into_vec::<f32>().unwrap();
+    let position_unmasked = model.position_only(input.clone(), None)
+        .into_data().try_into_vec::<f32>().unwrap();
+    assert!(max_abs_error(&position, &get("expected_position")) < 1e-4);
+    assert!(max_abs_error(&position_unmasked, &get("expected_position_unmasked")) < 1e-4);
+    let encoded = model.forward(input.clone(), Some(valid))
+        .into_data().try_into_vec::<f32>().unwrap();
+    let encoded_unmasked = model.forward(input, None)
+        .into_data().try_into_vec::<f32>().unwrap();
+    assert!(max_abs_error(&encoded, &get("expected")) < 1e-4);
+    assert!(max_abs_error(&encoded_unmasked, &get("expected_unmasked")) < 1e-4);
+}
