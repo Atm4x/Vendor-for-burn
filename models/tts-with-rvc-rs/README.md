@@ -70,3 +70,5 @@ Check a checkpoint's native weight decoder with `tts-with-rvc-rs inspect-pth mod
 Compare a native checkpoint to an independently generated Torch reference with `tts-with-rvc-rs verify-flow model.pth flow-reference.json flex`. For generating tests, `tools/reference_flow.py` imports the original RVC classes from the supplied source ZIP. No private checkpoint, reference audio or index should be committed.
 
 These milestones do **not** constitute complete speech synthesis: NSF-HiFiGAN, HuBERT, F0 and retrieval remain unported, and GPU parity is not yet validated.
+
+The six-layer `TextEncoder` also supports direct checkpoint loading via `TextEncoder::load(&checkpoint, &device)` and can be checked with `verify-text-encoder-pth model.pth torch-reference.json flex`. The full model, attention and residual-flow weights are read natively from the same checkpoint without a conversion process. HuBERT/F0 input extraction and the NSF waveform decoder are not yet implemented.

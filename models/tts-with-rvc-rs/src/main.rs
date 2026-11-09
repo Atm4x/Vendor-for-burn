@@ -15,11 +15,11 @@ fn run() -> Result<(), String> {
         }
         return Ok(());
     }
-    if !matches!(command.as_str(), "verify-text-front" | "verify-attention" | "verify-encoder-layer" | "verify-text-encoder" | "verify-flow") {
+    if !matches!(command.as_str(), "verify-text-front" | "verify-attention" | "verify-encoder-layer" | "verify-text-encoder" | "verify-flow" | "verify-text-encoder-pth") {
         return Err("usage: tts-with-rvc-rs verify-text-front|verify-attention|verify-encoder-layer|verify-text-encoder <fixture.json> [flex|cpu|cuda|wgpu]".into());
     }
     let path = args.next().ok_or("missing fixture or checkpoint path")?;
-    let flow_fixture_path = if command == "verify-flow" {
+    let flow_fixture_path = if command == "verify-flow" || command == "verify-text-encoder-pth" {
         Some(args.next().ok_or("missing flow fixture path")?)
     } else { None };
     let backend = args.next().unwrap_or_else(|| "flex".to_owned());
@@ -34,7 +34,8 @@ fn run() -> Result<(), String> {
         "wgpu" => Device::wgpu(Default::default()),
         other => return Err(format!("backend {other} is not compiled into this binary")),
     };
-    if let Some(flow_fixture_path) = flow_fixture_path {
+    if command == "verify-flow" {
+        let flow_fixture_path = flow_fixture_path.as_ref().ok_or("missing flow reference")?;
         let checkpoint = tts_with_rvc_rs::checkpoint::RvcCheckpoint::open(&path)?;
         let data = fs::read_to_string(flow_fixture_path).map_err(|error| error.to_string())?;
         let fixture: tts_with_rvc_rs::flow::FlowFixture = serde_json::from_str(&data).map_err(|error| error.to_string())?;
@@ -50,6 +51,34 @@ fn run() -> Result<(), String> {
         if !error.is_finite() || error > 1e-4 || !reverse_error.is_finite() || reverse_error > 1e-4 {
             return Err("Torch/Burn ResidualCouplingBlock parity exceeded tolerance".into());
         }
+        return Ok(());
+    }
+    if command == "verify-text-encoder-pth" {
+        use burn::tensor::{Int, Tensor, TensorData};
+        let checkpoint = tts_with_rvc_rs::checkpoint::RvcCheckpoint::open(&path)?;
+        let reference_path = flow_fixture_path.as_ref().ok_or("missing TextEncoder reference")?;
+        let data = fs::read_to_string(reference_path).map_err(|error| error.to_string())?;
+        let fixture: TextEncoderFixture = serde_json::from_str(&data).map_err(|error| error.to_string())?;
+        let model = tts_with_rvc_rs::text_encoder::TextEncoder::load(&checkpoint, &device)?;
+        let (batch, time, channels) = (fixture.front.batch, fixture.front.time, fixture.front.in_channels);
+        let phone = Tensor::from_data(TensorData::new(fixture.front.phone.clone(), [batch, time, channels]), &device);
+        let pitch = Tensor::<2, Int>::from_data(TensorData::new(fixture.front.pitch.clone(), [batch, time]), &device);
+        let verify = |out: tts_with_rvc_rs::text_encoder::TextEncoderOutput, mean: &[f32], logs: &[f32], mask: &[f32]| -> Result<f32, String> {
+            let actual_mean = out.mean.into_data().try_into_vec::<f32>().map_err(|error| error.to_string())?;
+            let actual_logs = out.log_scale.into_data().try_into_vec::<f32>().map_err(|error| error.to_string())?;
+            let actual_mask = out.mask.into_data().try_into_vec::<f32>().map_err(|error| error.to_string())?;
+            let deviation = max_abs_error(&actual_mean, mean).max(max_abs_error(&actual_logs, logs));
+            let mask_error = max_abs_error(&actual_mask, mask);
+            if !deviation.is_finite() || deviation > 1e-4 || mask_error != 0.0 {
+                return Err(format!("native TextEncoder parity failed: deviation={deviation}, mask={mask_error}"));
+            }
+            Ok(deviation)
+        };
+        let forward = model.forward(phone.clone(), Some(pitch.clone()), &fixture.front.lengths, None);
+        let error = verify(forward, &fixture.expected_mean, &fixture.expected_log_scale, &fixture.expected_mask)?;
+        let skipped = model.forward(phone, Some(pitch), &fixture.front.lengths, Some(fixture.skip_head));
+        let skip_error = verify(skipped, &fixture.expected_skip_mean, &fixture.expected_skip_log_scale, &fixture.expected_skip_mask)?;
+        println!("backend={backend} max_abs_native_text_encoder={error:.9} max_abs_native_skip_head={skip_error:.9}");
         return Ok(());
     }
     let data = fs::read_to_string(&path).map_err(|e| e.to_string())?;

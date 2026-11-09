@@ -108,3 +108,28 @@ fn residual_coupling_flow_matches_original_pytorch_model() {
     let error = max_abs_error(&actual, &reference.expected_reverse);
     assert!(error <= 1e-4, "flow reverse max absolute deviation {error}");
 }
+
+#[test]
+fn native_checkpoint_text_encoder_matches_original_pytorch() {
+    use burn::tensor::Int;
+    use tts_with_rvc_rs::{checkpoint::RvcCheckpoint, text_encoder::{TextEncoder, TextEncoderFixture}};
+    let checkpoint = RvcCheckpoint::open(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/synthetic_text_encoder.pth")).unwrap();
+    let fixture: TextEncoderFixture = serde_json::from_str(include_str!("fixtures/text_encoder.json")).unwrap();
+    let device = Device::flex();
+    let model = TextEncoder::load(&checkpoint, &device).unwrap();
+    let (batch, time, channels) = (fixture.front.batch, fixture.front.time, fixture.front.in_channels);
+    let phone = Tensor::from_data(TensorData::new(fixture.front.phone.clone(), [batch, time, channels]), &device);
+    let pitch = burn::tensor::Tensor::<2, Int>::from_data(
+        TensorData::new(fixture.front.pitch.clone(), [batch, time]), &device,
+    );
+    let output = model.forward(phone.clone(), Some(pitch.clone()), &fixture.front.lengths, None);
+    let mean = output.mean.into_data().try_into_vec::<f32>().unwrap();
+    let log_scale = output.log_scale.into_data().try_into_vec::<f32>().unwrap();
+    assert!(max_abs_error(&mean, &fixture.expected_mean) < 1e-4);
+    assert!(max_abs_error(&log_scale, &fixture.expected_log_scale) < 1e-4);
+    let skipped = model.forward(phone, Some(pitch), &fixture.front.lengths, Some(fixture.skip_head));
+    let mean = skipped.mean.into_data().try_into_vec::<f32>().unwrap();
+    let log_scale = skipped.log_scale.into_data().try_into_vec::<f32>().unwrap();
+    assert!(max_abs_error(&mean, &fixture.expected_skip_mean) < 1e-4);
+    assert!(max_abs_error(&log_scale, &fixture.expected_skip_log_scale) < 1e-4);
+}
