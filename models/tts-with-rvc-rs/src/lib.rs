@@ -149,3 +149,5 @@ pub mod decoder;
 
 pub mod rmvpe;
 pub mod hubert;
+
+pub mod hubert_transformer;

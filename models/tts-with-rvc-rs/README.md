@@ -122,3 +122,14 @@ cargo run -p tts-with-rvc-rs --locked --offline -- verify-rmvpe-head rmvpe.pt pr
 `hubert::HubertFrontend` extends the first conv to all seven HuBERT Base feature extractor convolutions (kernels `10,3,3,3,3,2,2`, strides `5,2,2,2,2,2,2`), followed by the 512-channel post-feature LayerNorm and `post_extract_proj` to 768 channels. The frontend accepts 16-kHz mono PCM tensors `[batch, 1, samples]` and returns `[batch, frames, 768]` before the 12 Transformer layers. It is **not** equivalent to full HuBERT features until those Transformer layers are implemented. Synthetic CI uses a reduced channel count to keep test data small; private parity uses the full original 512/768-dimensional weights.
 
 Use `verify-hubert-frontend hubert_base.pt PRIVATE_FRONTEND_REFERENCE.json flex` to check the actual file on the CPU backend. The reference script computes the same seven conv stages, GroupNorm, LayerNorm and projection with PyTorch; it never commits the actual model.
+
+### Stage 11 — one HuBERT Transformer block
+
+`hubert_transformer::HubertTransformerLayer` restores one Fairseq HuBERT transformer layer directly from the `model` state dictionary: Q/K/V/out projections, 12-head scaled dot-product attention on Base, optional key padding mask, attention residual + LayerNorm, GELU/FC1/FC2 and final residual + LayerNorm (evaluation mode, dropout disabled). This is a **single encoder block**, not the full twelve-layer HuBERT model or positional convolution. It does not yet produce RVC content features from WAV end-to-end.
+
+The source generator `tools/reference_hubert_transformer.py` creates independent PyTorch numerical references with and without key padding. Real weight fixtures stay local.
+
+```text
+python models/tts-with-rvc-rs/tools/reference_hubert_transformer.py --checkpoint hubert_base.pt --fixture PRIVATE_TRANSFORMER_REFERENCE.json
+cargo run -p tts-with-rvc-rs --locked --offline -- verify-hubert-transformer hubert_base.pt PRIVATE_TRANSFORMER_REFERENCE.json flex
+```

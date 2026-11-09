@@ -15,11 +15,11 @@ fn run() -> Result<(), String> {
         }
         return Ok(());
     }
-    if !matches!(command.as_str(), "verify-text-front" | "verify-attention" | "verify-encoder-layer" | "verify-text-encoder" | "verify-flow" | "verify-text-encoder-pth" | "verify-decoder-stage" | "verify-nsf-decoder" | "verify-hubert-conv" | "verify-hubert-frontend" | "verify-rmvpe-head") {
+    if !matches!(command.as_str(), "verify-text-front" | "verify-attention" | "verify-encoder-layer" | "verify-text-encoder" | "verify-flow" | "verify-text-encoder-pth" | "verify-decoder-stage" | "verify-nsf-decoder" | "verify-hubert-conv" | "verify-hubert-frontend" | "verify-hubert-transformer" | "verify-rmvpe-head") {
         return Err("usage: tts-with-rvc-rs verify-text-front|verify-attention|verify-encoder-layer|verify-text-encoder <fixture.json> [flex|cpu|cuda|wgpu]".into());
     }
     let path = args.next().ok_or("missing fixture or checkpoint path")?;
-    let flow_fixture_path = if command == "verify-flow" || command == "verify-text-encoder-pth" || command == "verify-decoder-stage" || command == "verify-nsf-decoder" || command == "verify-hubert-conv" || command == "verify-hubert-frontend" || command == "verify-rmvpe-head" {
+    let flow_fixture_path = if command == "verify-flow" || command == "verify-text-encoder-pth" || command == "verify-decoder-stage" || command == "verify-nsf-decoder" || command == "verify-hubert-conv" || command == "verify-hubert-frontend" || command == "verify-hubert-transformer" || command == "verify-rmvpe-head" {
         Some(args.next().ok_or("missing flow fixture path")?)
     } else { None };
     let backend = args.next().unwrap_or_else(|| "flex".to_owned());
@@ -69,6 +69,34 @@ fn run() -> Result<(), String> {
         println!("backend={backend} max_abs_hubert_frontend={error:.9} tensor_count={}", checkpoint.tensor_count());
         if !error.is_finite() || error > 1e-4 {
             return Err("HuBERT frontend Torch/Burn parity exceeded tolerance".into());
+        }
+        return Ok(());
+    }
+    if command == "verify-hubert-transformer" {
+        use burn::tensor::{Tensor, TensorData};
+        let checkpoint = tts_with_rvc_rs::checkpoint::RvcCheckpoint::open_model(&path)?;
+        let reference_path = flow_fixture_path.as_ref().ok_or("missing transformer reference")?;
+        let fixture: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(reference_path).map_err(|e| e.to_string())?,
+        ).map_err(|e| e.to_string())?;
+        let input: Vec<f32> = serde_json::from_value(fixture["input"].clone()).map_err(|e| e.to_string())?;
+        let valid: Vec<f32> = serde_json::from_value(fixture["valid"].clone()).map_err(|e| e.to_string())?;
+        let expected: Vec<f32> = serde_json::from_value(fixture["expected"].clone()).map_err(|e| e.to_string())?;
+        let unmasked: Vec<f32> = serde_json::from_value(fixture["expected_unmasked"].clone()).map_err(|e| e.to_string())?;
+        let shape: [usize; 3] = serde_json::from_value(fixture["shape"].clone()).map_err(|e| e.to_string())?;
+        let heads: usize = serde_json::from_value(fixture["heads"].clone()).map_err(|e| e.to_string())?;
+        let layer = tts_with_rvc_rs::hubert_transformer::HubertTransformerLayer::load(&checkpoint, 0, heads, &device)?;
+        let input = Tensor::from_data(TensorData::new(input, shape), &device);
+        let valid = Tensor::from_data(TensorData::new(valid, [shape[0], shape[1]]), &device);
+        let actual = layer.forward(input.clone(), Some(valid)).into_data()
+            .try_into_vec::<f32>().map_err(|e| e.to_string())?;
+        let error = max_abs_error(&actual, &expected);
+        let actual = layer.forward(input, None).into_data()
+            .try_into_vec::<f32>().map_err(|e| e.to_string())?;
+        let unmasked_error = max_abs_error(&actual, &unmasked);
+        println!("backend={backend} max_abs_hubert_transformer={error:.9} max_abs_unmasked={unmasked_error:.9}");
+        if !error.is_finite() || error > 1e-4 || !unmasked_error.is_finite() || unmasked_error > 1e-4 {
+            return Err("HuBERT Transformer Torch/Burn parity exceeded tolerance".into());
         }
         return Ok(());
     }
