@@ -1,0 +1,29 @@
+name: Stage 23 source bundle importer
+on:
+  push:
+    branches: [bridge/stage23-source-20261109]
+    paths: ['.stage23-bridge/source.b64']
+permissions:
+  contents: write
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify and import Stage 23 original commits
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=57c2b8479b4795fc7d7ef23ec1c4efcb45c2e15a
+          HEAD=062ef0805739b94b989c5484d8d9f52a3c62761a
+          git fetch origin refs/heads/feat/rvc-burn-parity-stage1:refs/remotes/origin/feat/rvc-burn-parity-stage1
+          test "$(git rev-parse refs/remotes/origin/feat/rvc-burn-parity-stage1)" = "$BASE"
+          base64 -d .stage23-bridge/source.b64 > /tmp/stage23.bundle
+          echo "a56043fba4f1e054d45d6af031b566ff7d2a20d64a7a22247c06c2020995ae40  /tmp/stage23.bundle" | sha256sum -c
+          git bundle verify /tmp/stage23.bundle
+          git fetch /tmp/stage23.bundle refs/heads/feat/rvc-stage23-longform-batching:refs/heads/stage23-candidate
+          test "$(git rev-parse refs/heads/stage23-candidate)" = "$HEAD"
+          git merge-base --is-ancestor "$BASE" "$HEAD"
+          git push origin refs/heads/stage23-candidate:refs/heads/bridge/stage23-candidate-20261109
