@@ -1,6 +1,8 @@
 import argparse
 import json
 import math
+import os
+from zipfile import ZipFile, ZIP_STORED
 from pathlib import Path
 
 import torch
@@ -15,7 +17,7 @@ def flatten(tensor):
 def make_model(checkpoint):
     from tts_with_rvc.infer.lib.infer_pack.models import GeneratorNSF
     if checkpoint is None:
-        rates, kernels, dils = [2, 2], [3, 7, 11], [[1, 3, 5]] * 3
+        rates, kernels, dils = [2, 2], [3, 7], [[1, 3, 5]] * 2
         model = GeneratorNSF(4, '1', kernels, dils, rates, 8, [4, 4], 3, 40000, is_half=False)
         g = torch.randn(1, 3, 1) * 0.1
         x = torch.randn(1, 4, 4) * 0.1
@@ -75,6 +77,11 @@ def main():
                 name = name.replace('.parametrizations.weight.original1', '.weight_v')
                 state['dec.' + name] = value.detach().float()
             torch.save({'weight':state,'version':'v2'},a.synthetic_checkpoint)
+            normalized = a.synthetic_checkpoint.with_suffix('.normalized.pth')
+            with ZipFile(a.synthetic_checkpoint) as source, ZipFile(normalized, 'w', compression=ZIP_STORED) as dest:
+                for name in source.namelist():
+                    dest.writestr(name, source.read(name))
+            os.replace(normalized, a.synthetic_checkpoint)
     a.fixture.parent.mkdir(parents=True, exist_ok=True)
     a.fixture.write_text(json.dumps(fixture,indent=2),encoding='utf-8')
     print('channels',x.shape[1],'rates',rates,'waveform_samples',waveform.numel(),'mean_abs',waveform.abs().mean().item())

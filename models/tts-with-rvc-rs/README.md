@@ -96,3 +96,5 @@ This implements the waveform-decoder network **given the fully sampled harmonic 
 python models/tts-with-rvc-rs/tools/reference_nsf_decoder.py --source-zip ORIGINAL_SOURCE.zip --checkpoint PRIVATE_MODEL.pth --fixture PRIVATE_NSF_REFERENCE.json
 cargo run -p tts-with-rvc-rs --locked --offline -- verify-nsf-decoder PRIVATE_MODEL.pth PRIVATE_NSF_REFERENCE.json flex
 ```
+
+The small public two-stage fixture uses two residual kernels per stage to keep CI lightweight; the private `CrazyMita.pth` check uses the original four stages and all three kernels. For the synthetic fixture only, the Python reference generator rewrites PyTorch's ZIP envelope through the standard `zipfile` API without changing tensor contents, because the currently vendored `pytorch-reader` rejects that particular PyTorch 2.10 ZIP layout. This is a checkpoint parser compatibility limitation requiring its own follow-up; existing `CrazyMita.pth` loads directly.
