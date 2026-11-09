@@ -1,0 +1,29 @@
+name: Stage 25 SHA-preserving source importer
+on:
+  push:
+    branches: [bridge/stage25-source-20261109]
+    paths: ['.stage25-bridge/source.b64']
+permissions:
+  contents: write
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify source bundle and import original commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=7b8268e86986d199c538e2123e582b9fe87490f8
+          HEAD=8cc7d282e37a77ae8a31228247403617ad2fea27
+          git fetch origin refs/heads/feat/rvc-burn-parity-stage1:refs/remotes/origin/feat/rvc-burn-parity-stage1
+          test "$(git rev-parse refs/remotes/origin/feat/rvc-burn-parity-stage1)" = "$BASE"
+          base64 -d .stage25-bridge/source.b64 > /tmp/stage25.bundle
+          echo "1106d43d5e6f68d4a8c7774399b7f648167218f4baf0c13360e2c77fef138c77  /tmp/stage25.bundle" | sha256sum -c
+          git bundle verify /tmp/stage25.bundle
+          git fetch /tmp/stage25.bundle refs/heads/feat/rvc-stage23-longform-batching:refs/heads/stage25-candidate
+          test "$(git rev-parse refs/heads/stage25-candidate)" = "$HEAD"
+          git merge-base --is-ancestor "$BASE" "$HEAD"
+          git push origin refs/heads/stage25-candidate:refs/heads/bridge/stage25-candidate-20261109
