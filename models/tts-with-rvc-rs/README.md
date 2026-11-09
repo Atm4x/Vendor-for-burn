@@ -194,3 +194,7 @@ cargo run -p tts-with-rvc-rs --locked --offline -- verify-rmvpe-intermediate mod
 `RmvpeDecoder` loads the existing PyTorch U-Net decoder weights directly from a native `.pt` checkpoint and implements `ConvTranspose2d → BatchNorm2d → ReLU`, reverse-order encoder skip concatenation and residual blocks. Supported decoder strides are `[2, 2]` and `[1, 2]`, using the original PyTorch `output_padding`. The checked CPU parity path is independent of the final RMVPE mel and BiGRU stages.
 
 `reference_rmvpe_decoder.py` obtains Torch reference tensors by executing the unmodified source classes extracted from the original RVC archive. Synthetic test weights only are committed.
+
+### Full RMVPE U-Net and CNN (Stage 18)
+
+`RmvpeUnet` joins the pretrained five-level Encoder, four-level Intermediate, five-level Decoder and the output CNN into one resident Rust/Burn model. Input to `forward` is mel features already converted to NCHW `[batch,1,frames,frequency]`; `forward_gru_features` returns `[batch,frames,3*frequency]` for the forthcoming BiGRU. This is the full convolutional inference path, **not yet complete audio-to-F0** (mel preprocessing and BiGRU remain separate). The public fixture uses synthetic weights and the original Python class implementations.

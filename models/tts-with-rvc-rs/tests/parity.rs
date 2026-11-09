@@ -391,3 +391,30 @@ fn rmvpe_unet_decoder_matches_original_pytorch() {
         assert!(error.is_finite() && error < 1e-4, "RMVPE decoder stage {index} deviation {error}");
     }
 }
+
+#[test]
+fn complete_rmvpe_unet_and_cnn_match_original_pytorch() {
+    use tts_with_rvc_rs::{checkpoint::RvcCheckpoint, rmvpe_unet::RmvpeUnet};
+    let checkpoint = RvcCheckpoint::open_root(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/synthetic_rmvpe_unet.pth")).unwrap();
+    let fixture: serde_json::Value = serde_json::from_str(include_str!("fixtures/rmvpe_unet.json")).unwrap();
+    let input_shape: [usize; 4] = serde_json::from_value(fixture["input_shape"].clone()).unwrap();
+    let input: Vec<f32> = serde_json::from_value(fixture["input"].clone()).unwrap();
+    let output_shape: [usize; 4] = serde_json::from_value(fixture["output_shape"].clone()).unwrap();
+    let features_shape: [usize; 3] = serde_json::from_value(fixture["feature_shape"].clone()).unwrap();
+    let expected: Vec<f32> = serde_json::from_value(fixture["expected"].clone()).unwrap();
+    let expected_features: Vec<f32> = serde_json::from_value(fixture["expected_features"].clone()).unwrap();
+    let levels = fixture["encoder_levels"].as_u64().unwrap() as usize;
+    let middle = fixture["intermediate_levels"].as_u64().unwrap() as usize;
+    let device = Device::flex();
+    let model = RmvpeUnet::load(&checkpoint, levels, middle, &device).unwrap();
+    assert_eq!(model.encoder_levels(), 2);
+    let x = Tensor::from_data(TensorData::new(input, input_shape), &device);
+    let logits = model.forward(x.clone());
+    assert_eq!(logits.dims(), output_shape);
+    let logits = logits.into_data().try_into_vec::<f32>().unwrap();
+    let features = model.forward_gru_features(x);
+    assert_eq!(features.dims(), features_shape);
+    let features = features.into_data().try_into_vec::<f32>().unwrap();
+    assert!(max_abs_error(&logits, &expected) < 1e-4);
+    assert!(max_abs_error(&features, &expected_features) < 1e-4);
+}

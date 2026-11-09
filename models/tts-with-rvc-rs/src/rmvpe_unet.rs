@@ -311,3 +311,53 @@ impl RmvpeDecoder {
 
     pub fn stages(&self) -> usize { self.stages.len() }
 }
+
+pub struct RmvpeUnet {
+    encoder: Vec<RmvpeEncoderStage>,
+    intermediate: RmvpeIntermediate,
+    decoder: RmvpeDecoder,
+    cnn: Conv2d,
+}
+
+impl RmvpeUnet {
+    pub fn load(checkpoint: &RvcCheckpoint, encoder_levels: usize, intermediate_levels: usize, device: &Device) -> Result<Self, String> {
+        if !(1..=5).contains(&encoder_levels) {
+            return Err("RMVPE U-Net requires 1..=5 encoder/decoder levels".into());
+        }
+        let encoder: Vec<_> = (0..encoder_levels)
+            .map(|stage| RmvpeEncoderStage::load(checkpoint, stage, device))
+            .collect::<Result<_, _>>()?;
+        let intermediate = RmvpeIntermediate::load(checkpoint, intermediate_levels, device)?;
+        let decoder = RmvpeDecoder::load(checkpoint, encoder_levels, [2, 2], device)?;
+        let cnn = Conv2d::load(checkpoint, "cnn", 3, device)?;
+        let last_decoder_channels = decoder.stages.last().unwrap().blocks.last().unwrap().conv2.weight.dims()[0];
+        if cnn.weight.dims()[1] != last_decoder_channels || cnn.weight.dims()[0] != 3 {
+            return Err("RMVPE CNN head must project decoder features to three channels".into());
+        }
+        let last_encoder_channels = encoder.last().unwrap().blocks.last().unwrap().conv2.weight.dims()[0];
+        if intermediate.layers[0][0].conv1.weight.dims()[1] != last_encoder_channels ||
+           intermediate.layers.last().unwrap().last().unwrap().conv2.weight.dims()[0] != decoder.stages[0].upsample.weight.dims()[0] {
+            return Err("RMVPE U-Net channel mismatch between Encoder, Intermediate and Decoder".into());
+        }
+        Ok(Self { encoder, intermediate, decoder, cnn })
+    }
+
+    pub fn forward(&self, mut input: Tensor<4>) -> Tensor<4> {
+        let mut skips = Vec::with_capacity(self.encoder.len());
+        for stage in &self.encoder {
+            let output = stage.forward(input);
+            skips.push(output.skip);
+            input = output.pooled;
+        }
+        let middle = self.intermediate.forward(input);
+        self.cnn.forward(self.decoder.forward(middle, &skips))
+    }
+
+    pub fn forward_gru_features(&self, input: Tensor<4>) -> Tensor<3> {
+        let out = self.forward(input);
+        let [batch, channels, frames, frequency] = out.dims();
+        out.swap_dims(1, 2).reshape([batch, frames, channels * frequency])
+    }
+
+    pub fn encoder_levels(&self) -> usize { self.encoder.len() }
+}
