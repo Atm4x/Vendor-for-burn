@@ -15,11 +15,11 @@ fn run() -> Result<(), String> {
         }
         return Ok(());
     }
-    if !matches!(command.as_str(), "verify-text-front" | "verify-attention" | "verify-encoder-layer" | "verify-text-encoder" | "verify-flow" | "verify-text-encoder-pth" | "verify-decoder-stage" | "verify-nsf-decoder" | "verify-hubert-conv" | "verify-hubert-frontend" | "verify-hubert-transformer" | "verify-hubert-stack" | "verify-hubert-position" | "verify-hubert-encoder" | "verify-hubert-model" | "verify-rmvpe-head" | "verify-rmvpe-encoder" | "verify-rmvpe-intermediate" | "verify-rmvpe-decoder" | "verify-rmvpe-unet" | "verify-rmvpe-gru" | "verify-rmvpe-network" | "verify-rmvpe-mel" | "verify-rmvpe-audio") {
+    if !matches!(command.as_str(), "verify-text-front" | "verify-attention" | "verify-encoder-layer" | "verify-text-encoder" | "verify-flow" | "verify-text-encoder-pth" | "verify-decoder-stage" | "verify-nsf-decoder" | "verify-nsf-source" | "verify-nsf-from-f0" | "verify-hubert-conv" | "verify-hubert-frontend" | "verify-hubert-transformer" | "verify-hubert-stack" | "verify-hubert-position" | "verify-hubert-encoder" | "verify-hubert-model" | "verify-rmvpe-head" | "verify-rmvpe-encoder" | "verify-rmvpe-intermediate" | "verify-rmvpe-decoder" | "verify-rmvpe-unet" | "verify-rmvpe-gru" | "verify-rmvpe-network" | "verify-rmvpe-mel" | "verify-rmvpe-audio") {
         return Err("usage: tts-with-rvc-rs verify-text-front|verify-attention|verify-encoder-layer|verify-text-encoder <fixture.json> [flex|cpu|cuda|wgpu]".into());
     }
     let path = args.next().ok_or("missing fixture or checkpoint path")?;
-    let flow_fixture_path = if command == "verify-flow" || command == "verify-text-encoder-pth" || command == "verify-decoder-stage" || command == "verify-nsf-decoder" || command == "verify-hubert-conv" || command == "verify-hubert-frontend" || command == "verify-hubert-transformer" || command == "verify-hubert-stack" || command == "verify-hubert-position" || command == "verify-hubert-encoder" || command == "verify-hubert-model" || command == "verify-rmvpe-head" || command == "verify-rmvpe-encoder" || command == "verify-rmvpe-intermediate" || command == "verify-rmvpe-decoder" || command == "verify-rmvpe-unet" || command == "verify-rmvpe-gru" || command == "verify-rmvpe-network" || command == "verify-rmvpe-audio" {
+    let flow_fixture_path = if command == "verify-flow" || command == "verify-text-encoder-pth" || command == "verify-decoder-stage" || command == "verify-nsf-decoder" || command == "verify-nsf-source" || command == "verify-nsf-from-f0" || command == "verify-hubert-conv" || command == "verify-hubert-frontend" || command == "verify-hubert-transformer" || command == "verify-hubert-stack" || command == "verify-hubert-position" || command == "verify-hubert-encoder" || command == "verify-hubert-model" || command == "verify-rmvpe-head" || command == "verify-rmvpe-encoder" || command == "verify-rmvpe-intermediate" || command == "verify-rmvpe-decoder" || command == "verify-rmvpe-unet" || command == "verify-rmvpe-gru" || command == "verify-rmvpe-network" || command == "verify-rmvpe-audio" {
         Some(args.next().ok_or("missing flow fixture path")?)
     } else { None };
     let backend = args.next().unwrap_or_else(|| "flex".to_owned());
@@ -393,6 +393,34 @@ fn run() -> Result<(), String> {
         println!("backend={backend} max_abs_rmvpe_salience={error:.9} max_abs_f0={f0_error:.9} tensor_count={}", checkpoint.tensor_count());
         if !error.is_finite() || error > 1e-4 || !f0_error.is_finite() || f0_error > 1e-3 {
             return Err("RMVPE output head / F0 parity exceeded tolerance".into());
+        }
+        return Ok(());
+    }
+    if command == "verify-nsf-source" {
+        use tts_with_rvc_rs::{checkpoint::RvcCheckpoint, nsf_source::NsfSourceFixture};
+        let checkpoint = RvcCheckpoint::open(&path)?;
+        let fixture_path = flow_fixture_path.as_ref().ok_or("missing NSF source fixture")?;
+        let fixture: NsfSourceFixture = serde_json::from_str(
+            &fs::read_to_string(fixture_path).map_err(|error| error.to_string())?,
+        ).map_err(|error| error.to_string())?;
+        let (sines, voiced, noise, merged) = fixture.run(&checkpoint, &device)?;
+        println!("backend={backend} max_abs_nsf_sines={sines:.9} max_abs_nsf_uv={voiced:.9} max_abs_nsf_noise={noise:.9} max_abs_nsf_merged={merged:.9}");
+        if [sines, voiced, noise, merged].iter().any(|v| !v.is_finite() || *v > 1e-4) {
+            return Err("Torch/Burn NSF SineGen or SourceModule parity exceeded tolerance".into());
+        }
+        return Ok(());
+    }
+    if command == "verify-nsf-from-f0" {
+        use tts_with_rvc_rs::{checkpoint::RvcCheckpoint, nsf_source::NsfFromF0Fixture};
+        let checkpoint = RvcCheckpoint::open(&path)?;
+        let fixture_path = flow_fixture_path.as_ref().ok_or("missing NSF waveform fixture")?;
+        let fixture: NsfFromF0Fixture = serde_json::from_str(
+            &fs::read_to_string(fixture_path).map_err(|error| error.to_string())?,
+        ).map_err(|error| error.to_string())?;
+        let deviation = fixture.run(&checkpoint, &device)?;
+        println!("backend={backend} max_abs_nsf_from_f0={deviation:.9}");
+        if !deviation.is_finite() || deviation > 1e-4 {
+            return Err("Torch/Burn NSF F0→waveform parity exceeded tolerance".into());
         }
         return Ok(());
     }

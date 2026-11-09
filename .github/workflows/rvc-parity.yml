@@ -47,6 +47,8 @@ jobs:
           cargo run -p tts-with-rvc-rs --locked --offline -- verify-text-encoder-pth models/tts-with-rvc-rs/tests/fixtures/synthetic_text_encoder.pth models/tts-with-rvc-rs/tests/fixtures/text_encoder.json flex
           cargo run -p tts-with-rvc-rs --locked --offline -- verify-decoder-stage models/tts-with-rvc-rs/tests/fixtures/synthetic_decoder.pth models/tts-with-rvc-rs/tests/fixtures/decoder_stage.json flex
           cargo run -p tts-with-rvc-rs --locked --offline -- verify-nsf-decoder models/tts-with-rvc-rs/tests/fixtures/synthetic_nsf_decoder.pth models/tts-with-rvc-rs/tests/fixtures/nsf_decoder.json flex
+          cargo run -p tts-with-rvc-rs --locked --offline -- verify-nsf-source models/tts-with-rvc-rs/tests/fixtures/synthetic_nsf_decoder.pth models/tts-with-rvc-rs/tests/fixtures/nsf_source.json flex
+          cargo run -p tts-with-rvc-rs --locked --offline -- verify-nsf-from-f0 models/tts-with-rvc-rs/tests/fixtures/synthetic_nsf_decoder.pth models/tts-with-rvc-rs/tests/fixtures/nsf_f0_decoder.json flex
           cargo run -p tts-with-rvc-rs --locked --offline -- verify-hubert-conv models/tts-with-rvc-rs/tests/fixtures/synthetic_hubert_head.pth models/tts-with-rvc-rs/tests/fixtures/hubert_conv.json flex
           cargo run -p tts-with-rvc-rs --locked --offline -- verify-hubert-frontend models/tts-with-rvc-rs/tests/fixtures/synthetic_hubert_frontend.pth models/tts-with-rvc-rs/tests/fixtures/hubert_frontend.json flex
           cargo run -p tts-with-rvc-rs --locked --offline -- verify-hubert-transformer models/tts-with-rvc-rs/tests/fixtures/synthetic_hubert_transformer.pth models/tts-with-rvc-rs/tests/fixtures/hubert_transformer.json flex

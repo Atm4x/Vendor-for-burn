@@ -472,3 +472,31 @@ fn rmvpe_stft_mel_matches_original_pytorch_librosa() {
     assert!(mel.forward(&audio[..512]).is_err());
     assert!(mel.forward(&[f32::NAN; 1024]).is_err());
 }
+
+#[test]
+fn nsf_sine_generation_and_linear_source_match_original_torch() {
+    use tts_with_rvc_rs::{checkpoint::RvcCheckpoint, nsf_source::NsfSourceFixture};
+    let checkpoint = RvcCheckpoint::open(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/synthetic_nsf_decoder.pth")).unwrap();
+    let fixture: NsfSourceFixture = serde_json::from_str(include_str!("fixtures/nsf_source.json")).unwrap();
+    let (sine_error, voiced_error, noise_error, merged_error) = fixture.run(&checkpoint, &Device::flex()).unwrap();
+    assert!(sine_error.is_finite() && sine_error < 1e-4, "SineGen deviation {sine_error}");
+    assert_eq!(voiced_error, 0.0);
+    assert!(noise_error.is_finite() && noise_error < 1e-6, "SineGen noise deviation {noise_error}");
+    assert!(merged_error.is_finite() && merged_error < 1e-4, "NSF SourceModule deviation {merged_error}");
+}
+
+#[test]
+fn nsf_f0_to_waveform_matches_original_generator() {
+    use tts_with_rvc_rs::{checkpoint::RvcCheckpoint, nsf_source::NsfFromF0Fixture};
+    let checkpoint = RvcCheckpoint::open(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/synthetic_nsf_decoder.pth")).unwrap();
+    let fixture: NsfFromF0Fixture = serde_json::from_str(include_str!("fixtures/nsf_f0_decoder.json")).unwrap();
+    let error = fixture.run(&checkpoint, &Device::flex()).unwrap();
+    assert!(error.is_finite() && error < 1e-4, "NSF full F0→waveform deviation {error}");
+}
+
+#[test]
+fn unsupported_multiharmonic_nsf_fails_explicitly() {
+    use tts_with_rvc_rs::nsf_source::SineGen;
+    assert!(SineGen::new(40000, 2).is_err());
+    assert!(SineGen::new(0, 0).is_err());
+}

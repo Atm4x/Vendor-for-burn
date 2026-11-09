@@ -217,3 +217,19 @@ Both validate against the original PyTorch classes from the supplied RVC impleme
 `RmvpeAudioModel` composes log-mel with the already loaded neural model, pads the time axis to a multiple of 32 and trims the salience back to original frames. Its input must be finite, mono 16-kHz PCM samples; resampling 44.1-kHz WAV or other formats is a separate integration task.
 
 `verify-rmvpe-mel <reference.json> flex` validates numerical parity against the original PyTorch `MelSpectrogram` class and librosa basis. `verify-rmvpe-audio <rmvpe.pt> <private_reference.json> flex` verifies the full PCM-to-salience path for a private pretrained model. This model may remain loaded for repeated audio requests; a long-lived IPC worker is not yet implemented.
+
+### NSF Stage 21 — deterministic F0 → harmonic excitation → waveform
+
+`nsf_source::SineGen` reproduces the original RVC generator's per-frame phase accumulation, nearest-neighbor voiced-mask expansion, additive voiced/unvoiced noise, and the learned `dec.m_source.l_linear` + `tanh` source projection. `NsfWaveformDecoder::forward_from_f0` now connects that source to the existing four-stage convolutional generator. The weights remain loaded between forward calls, with no Python required for inference.
+
+**Determinism:** `forward_with_random` takes explicit initial phase and Gaussian noise tensors, permitting direct PyTorch/Burn parity tests and a reproducible native inference path. A production-grade per-device random generator and persistent process/IPC remain separate work. The supplied RVC model uses `harmonic_num=0`; this fork's original multi-harmonic code has an in-place broadcasting error, so the Rust interface explicitly rejects unsupported harmonic counts instead of silently diverging.
+
+`reference_nsf_source.py` executes the original unmodified `SineGen`, `SourceModuleHnNSF` and `GeneratorNSF.forward` on synthetic or private pretrained weights with the same random inputs. The public test fixtures use **synthetic** source and decoder weights. Private checkpoint/audio and fixture data must not be committed.
+
+```sh
+cargo test -p tts-with-rvc-rs --locked --offline
+cargo run -p tts-with-rvc-rs --locked --offline -- verify-nsf-source models/tts-with-rvc-rs/tests/fixtures/synthetic_nsf_decoder.pth models/tts-with-rvc-rs/tests/fixtures/nsf_source.json flex
+cargo run -p tts-with-rvc-rs --locked --offline -- verify-nsf-from-f0 models/tts-with-rvc-rs/tests/fixtures/synthetic_nsf_decoder.pth models/tts-with-rvc-rs/tests/fixtures/nsf_f0_decoder.json flex
+```
+
+This is **not** a complete WAV-to-WAV RVC deployment. FAISS retrieval, complete feature/F0 alignment, warmed resident process, native RNG policy, audio I/O and CUDA/WGPU validation remain pending.

@@ -159,3 +159,5 @@ pub mod hubert_position;
 pub mod hubert_model;
 
 pub mod rmvpe_unet;
+
+pub mod nsf_source;

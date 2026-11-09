@@ -2,6 +2,7 @@ use burn::tensor::{activation, module, ops::{ConvOptions, ConvTransposeOptions},
 use serde::Deserialize;
 
 use crate::checkpoint::RvcCheckpoint;
+use crate::nsf_source::SourceModuleHnNSF;
 
 struct Conv1d {
     weight: Tensor<3>,
@@ -238,6 +239,23 @@ impl NsfWaveformDecoder {
             x = stage.forward(x, harmonic_source.clone());
         }
         activation::tanh(self.post.forward(activation::leaky_relu(x, 0.01)))
+    }
+
+    pub fn forward_from_f0(
+        &self,
+        input: Tensor<3>,
+        f0: Tensor<2>,
+        condition: Option<Tensor<3>>,
+        source: &SourceModuleHnNSF,
+        initial_phases: Tensor<3>,
+        gaussian_noise: Tensor<3>,
+    ) -> Result<Tensor<3>, String> {
+        let [batch, _, frames] = input.dims();
+        if f0.dims() != [batch, frames] {
+            return Err("NSF decoder F0 shape must match input frames".into());
+        }
+        let (harmonic, _) = source.forward_with_random(f0, self.total_upsample, initial_phases, gaussian_noise)?;
+        Ok(self.forward(input, harmonic.permute([0, 2, 1]), condition))
     }
 
     pub fn stage_count(&self) -> usize { self.stages.len() }
