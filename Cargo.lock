@@ -6727,6 +6727,7 @@ dependencies = [
 name = "tts-with-rvc-rs"
 version = "0.1.0"
 dependencies = [
+ "rustfft",
  "burn",
  "half",
  "pytorch-reader",

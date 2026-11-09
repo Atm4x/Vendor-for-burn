@@ -61,6 +61,7 @@ jobs:
           cargo run -p tts-with-rvc-rs --locked --offline -- verify-rmvpe-unet models/tts-with-rvc-rs/tests/fixtures/synthetic_rmvpe_unet.pth models/tts-with-rvc-rs/tests/fixtures/rmvpe_unet.json flex
           cargo run -p tts-with-rvc-rs --locked --offline -- verify-rmvpe-gru models/tts-with-rvc-rs/tests/fixtures/synthetic_rmvpe_gru.pth models/tts-with-rvc-rs/tests/fixtures/rmvpe_gru.json flex
           cargo run -p tts-with-rvc-rs --locked --offline -- verify-rmvpe-network models/tts-with-rvc-rs/tests/fixtures/synthetic_rmvpe_gru.pth models/tts-with-rvc-rs/tests/fixtures/rmvpe_gru.json flex
+          cargo run -p tts-with-rvc-rs --locked --offline -- verify-rmvpe-mel models/tts-with-rvc-rs/tests/fixtures/rmvpe_mel.json flex
       - name: Package native Linux parity runner
         shell: bash
         run: |

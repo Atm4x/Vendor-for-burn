@@ -457,3 +457,18 @@ fn rmvpe_unet_bigru_and_salience_head_match_original_pytorch() {
     let f0 = salience_to_f0(&values, 0.03).unwrap();
     assert!(max_abs_error(&f0, &expected_f0) < 1e-3);
 }
+
+#[test]
+fn rmvpe_stft_mel_matches_original_pytorch_librosa() {
+    use tts_with_rvc_rs::rmvpe_mel::RmvpeMelSpectrogram;
+    let fixture: serde_json::Value = serde_json::from_str(include_str!("fixtures/rmvpe_mel.json")).unwrap();
+    let audio: Vec<f32> = serde_json::from_value(fixture["audio"].clone()).unwrap();
+    let shape: [usize; 3] = serde_json::from_value(fixture["mel_shape"].clone()).unwrap();
+    let expected: Vec<f32> = serde_json::from_value(fixture["expected_mel"].clone()).unwrap();
+    let mel = RmvpeMelSpectrogram::new();
+    let (actual, frames) = mel.forward(&audio).unwrap();
+    assert_eq!([1, 128, frames], shape);
+    assert!(max_abs_error(&actual, &expected) < 5e-4);
+    assert!(mel.forward(&audio[..512]).is_err());
+    assert!(mel.forward(&[f32::NAN; 1024]).is_err());
+}

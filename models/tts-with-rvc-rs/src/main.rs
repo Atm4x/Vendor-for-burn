@@ -15,11 +15,11 @@ fn run() -> Result<(), String> {
         }
         return Ok(());
     }
-    if !matches!(command.as_str(), "verify-text-front" | "verify-attention" | "verify-encoder-layer" | "verify-text-encoder" | "verify-flow" | "verify-text-encoder-pth" | "verify-decoder-stage" | "verify-nsf-decoder" | "verify-hubert-conv" | "verify-hubert-frontend" | "verify-hubert-transformer" | "verify-hubert-stack" | "verify-hubert-position" | "verify-hubert-encoder" | "verify-hubert-model" | "verify-rmvpe-head" | "verify-rmvpe-encoder" | "verify-rmvpe-intermediate" | "verify-rmvpe-decoder" | "verify-rmvpe-unet" | "verify-rmvpe-gru" | "verify-rmvpe-network") {
+    if !matches!(command.as_str(), "verify-text-front" | "verify-attention" | "verify-encoder-layer" | "verify-text-encoder" | "verify-flow" | "verify-text-encoder-pth" | "verify-decoder-stage" | "verify-nsf-decoder" | "verify-hubert-conv" | "verify-hubert-frontend" | "verify-hubert-transformer" | "verify-hubert-stack" | "verify-hubert-position" | "verify-hubert-encoder" | "verify-hubert-model" | "verify-rmvpe-head" | "verify-rmvpe-encoder" | "verify-rmvpe-intermediate" | "verify-rmvpe-decoder" | "verify-rmvpe-unet" | "verify-rmvpe-gru" | "verify-rmvpe-network" | "verify-rmvpe-mel" | "verify-rmvpe-audio") {
         return Err("usage: tts-with-rvc-rs verify-text-front|verify-attention|verify-encoder-layer|verify-text-encoder <fixture.json> [flex|cpu|cuda|wgpu]".into());
     }
     let path = args.next().ok_or("missing fixture or checkpoint path")?;
-    let flow_fixture_path = if command == "verify-flow" || command == "verify-text-encoder-pth" || command == "verify-decoder-stage" || command == "verify-nsf-decoder" || command == "verify-hubert-conv" || command == "verify-hubert-frontend" || command == "verify-hubert-transformer" || command == "verify-hubert-stack" || command == "verify-hubert-position" || command == "verify-hubert-encoder" || command == "verify-hubert-model" || command == "verify-rmvpe-head" || command == "verify-rmvpe-encoder" || command == "verify-rmvpe-intermediate" || command == "verify-rmvpe-decoder" || command == "verify-rmvpe-unet" || command == "verify-rmvpe-gru" || command == "verify-rmvpe-network" {
+    let flow_fixture_path = if command == "verify-flow" || command == "verify-text-encoder-pth" || command == "verify-decoder-stage" || command == "verify-nsf-decoder" || command == "verify-hubert-conv" || command == "verify-hubert-frontend" || command == "verify-hubert-transformer" || command == "verify-hubert-stack" || command == "verify-hubert-position" || command == "verify-hubert-encoder" || command == "verify-hubert-model" || command == "verify-rmvpe-head" || command == "verify-rmvpe-encoder" || command == "verify-rmvpe-intermediate" || command == "verify-rmvpe-decoder" || command == "verify-rmvpe-unet" || command == "verify-rmvpe-gru" || command == "verify-rmvpe-network" || command == "verify-rmvpe-audio" {
         Some(args.next().ok_or("missing flow fixture path")?)
     } else { None };
     let backend = args.next().unwrap_or_else(|| "flex".to_owned());
@@ -169,6 +169,37 @@ fn run() -> Result<(), String> {
         println!("backend={backend} max_abs_{command}={error:.9} max_abs_unmasked={unmasked_error:.9} layers={layers}");
         if !error.is_finite() || !unmasked_error.is_finite() || error > 1e-4 || unmasked_error > 1e-4 {
             return Err(format!("HuBERT positional/encoder parity exceeded tolerance: {error:.8}, {unmasked_error:.8}"));
+        }
+        return Ok(());
+    }
+    if command == "verify-rmvpe-mel" || command == "verify-rmvpe-audio" {
+        use tts_with_rvc_rs::rmvpe_mel::{RmvpeAudioModel, RmvpeMelSpectrogram};
+        let reference_path = if command == "verify-rmvpe-audio" {
+            flow_fixture_path.as_ref().ok_or("missing RMVPE audio reference")?
+        } else { &path };
+        let fixture: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(reference_path).map_err(|error| error.to_string())?,
+        ).map_err(|error| error.to_string())?;
+        let audio: Vec<f32> = serde_json::from_value(fixture["audio"].clone()).map_err(|error| error.to_string())?;
+        let shape: [usize; 3] = serde_json::from_value(fixture["mel_shape"].clone()).map_err(|error| error.to_string())?;
+        let expected_mel: Vec<f32> = serde_json::from_value(fixture["expected_mel"].clone()).map_err(|error| error.to_string())?;
+        let (actual_mel, frames) = RmvpeMelSpectrogram::new().forward(&audio)?;
+        if [1, 128, frames] != shape { return Err("RMVPE STFT/Mel shape mismatch".into()); }
+        let mel_error = max_abs_error(&actual_mel, &expected_mel);
+        println!("backend={backend} rmvpe_mel_frames={frames} max_abs_rmvpe_mel={mel_error:.9}");
+        if !mel_error.is_finite() || mel_error > 5e-4 { return Err("RMVPE STFT/Mel numerical parity exceeded tolerance".into()); }
+        if command == "verify-rmvpe-audio" {
+            let checkpoint = tts_with_rvc_rs::checkpoint::RvcCheckpoint::open_root(&path)?;
+            let network = RmvpeAudioModel::load(&checkpoint, &device)?;
+            let (salience, count) = network.forward_pcm(&audio, &device)?;
+            if count != frames { return Err("RMVPE full audio frame count mismatch".into()); }
+            let expected_shape: [usize; 3] = serde_json::from_value(fixture["expected_salience_shape"].clone()).map_err(|error| error.to_string())?;
+            if salience.dims() != expected_shape { return Err(format!("RMVPE audio salience shape mismatch: {:?}", salience.dims())); }
+            let expected: Vec<f32> = serde_json::from_value(fixture["expected_salience"].clone()).map_err(|error| error.to_string())?;
+            let values = salience.into_data().try_into_vec::<f32>().map_err(|error| error.to_string())?;
+            let error = max_abs_error(&values, &expected);
+            println!("backend={backend} max_abs_rmvpe_audio_salience={error:.9}");
+            if !error.is_finite() || error > 2e-3 { return Err("RMVPE PCM-to-salience numerical parity exceeded tolerance".into()); }
         }
         return Ok(());
     }

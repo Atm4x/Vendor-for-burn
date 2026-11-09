@@ -209,3 +209,11 @@ Offline parity checks use synthetic checkpoints only:
 - `verify-rmvpe-network <checkpoint.pth> <reference.json> flex`
 
 Both validate against the original PyTorch classes from the supplied RVC implementation. The full end-to-end audio path still requires STFT/Mel preprocessing and padding-to-32-frame integration. The initial GRU implementation uses explicit per-timestep tensor operations and is correctness-oriented; it has not been optimized for GPU inference throughput.
+
+### RMVPE Stage 20 — native Mel/STFT
+
+`RmvpeMelSpectrogram` performs a periodic Hann-window 1024-point FFT with reflected center padding, hop 160 and the librosa-compatible HTK/Slaney-normalized 128-bin mel filter at 16 kHz. It returns log-mel in `[mel_bins,frames]` order without Python. The native implementation uses the vendored `rustfft` crate. It currently supports only the original RMVPE inference configuration (no keyshift/speed variants).
+
+`RmvpeAudioModel` composes log-mel with the already loaded neural model, pads the time axis to a multiple of 32 and trims the salience back to original frames. Its input must be finite, mono 16-kHz PCM samples; resampling 44.1-kHz WAV or other formats is a separate integration task.
+
+`verify-rmvpe-mel <reference.json> flex` validates numerical parity against the original PyTorch `MelSpectrogram` class and librosa basis. `verify-rmvpe-audio <rmvpe.pt> <private_reference.json> flex` verifies the full PCM-to-salience path for a private pretrained model. This model may remain loaded for repeated audio requests; a long-lived IPC worker is not yet implemented.
