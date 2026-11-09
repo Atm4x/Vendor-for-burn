@@ -1,67 +1,15 @@
 use burn::tensor::Device;
 use std::{env, fs, process::ExitCode};
+mod user_cli;
+use user_cli::{WaveJob, process_wave_job};
 use tts_with_rvc_rs::{TextFrontFixture, attention::AttentionFixture, encoder::EncoderLayerFixture, text_encoder::TextEncoderFixture, max_abs_error};
-
-#[derive(serde::Deserialize)]
-struct WaveJob {
-    input: String,
-    output: String,
-    #[serde(default)]
-    index_rate: Option<f32>,
-    #[serde(default)]
-    pitch_shift_semitones: Option<f32>,
-    #[serde(default)]
-    rms_mix_rate: Option<f32>,
-}
-
-fn process_wave_job(
-    inferencer: &tts_with_rvc_rs::rvc_inference::RvcV2Inferencer,
-    job: &WaveJob,
-    options: &tts_with_rvc_rs::rvc_inference::InferenceOptions,
-    config: tts_with_rvc_rs::chunked::ChunkConfig,
-    tensor_batch_size: usize,
-) -> Result<(), String> {
-    use tts_with_rvc_rs::audio_io;
-    if job.input.is_empty() || job.output.is_empty() || job.input == job.output {
-        return Err("batch input and output paths must be nonempty and distinct".into());
-    }
-    let audio = audio_io::read_mono_wav(&job.input)?;
-    let pcm = audio_io::resample(&audio.samples, audio.sample_rate, 16_000)?;
-    let mut settings = options.clone();
-    if let Some(rate) = job.index_rate {
-        settings.index_rate = rate;
-    }
-    if let Some(shift) = job.pitch_shift_semitones {
-        settings.pitch_shift_semitones = shift;
-    }
-    eprintln!(
-        "RVC processing {} input_samples={} input_sr={}",
-        job.input,
-        audio.samples.len(),
-        audio.sample_rate
-    );
-    let mut converted = inferencer.infer_long_16khz_batched(&pcm, &settings, config, tensor_batch_size, |p| {
-        eprintln!(
-            "RVC chunks={}/{} output_samples={}",
-            p.chunk_index, p.chunk_count, p.output_samples
-        );
-    })?;
-    let mix = job.rms_mix_rate.unwrap_or(0.5);
-    let filtered = tts_with_rvc_rs::preprocess::highpass_48hz_zero_phase(&pcm)?;
-    audio_io::mix_rms_envelope(&filtered, 16_000, &mut converted, 40_000, mix)?;
-    audio_io::normalize_peak(&mut converted)?;
-    audio_io::write_mono_wav(&job.output, &converted, 40_000)?;
-    println!(
-        "RVC WAV→WAV complete: samples={} sr=40000 path={}",
-        converted.len(),
-        job.output
-    );
-    Ok(())
-}
 
 fn run() -> Result<(), String> {
     let mut args = env::args().skip(1);
     let command = args.next().ok_or("missing command")?;
+    if matches!(command.as_str(), "convert" | "convert-batch" | "doctor" | "help" | "--help" | "-h") {
+        return user_cli::run_named(&command, args);
+    }
     if command == "inspect-pth" {
         let path = args.next().ok_or("missing checkpoint path")?;
         let checkpoint = tts_with_rvc_rs::checkpoint::RvcCheckpoint::open(&path)?;
