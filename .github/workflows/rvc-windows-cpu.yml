@@ -1,0 +1,70 @@
+name: RVC Windows CPU executable
+
+on:
+  push:
+    branches: [feat/rvc-burn-parity-stage1]
+    paths:
+      - 'models/tts-with-rvc-rs/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'vendor/**'
+      - 'tools/restore_vendor_checksums.py'
+      - '.github/workflows/rvc-windows-cpu.yml'
+  pull_request:
+    paths:
+      - 'models/tts-with-rvc-rs/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'vendor/**'
+      - 'tools/restore_vendor_checksums.py'
+      - '.github/workflows/rvc-windows-cpu.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-msvc-cpu:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Restore vendored upstream source bytes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Vendor integrity validation failed' }
+      - name: Build release CPU executable
+        shell: pwsh
+        env:
+          CARGO_TERM_COLOR: always
+        run: |
+          cargo build --release --locked --offline -p tts-with-rvc-rs --bin tts-with-rvc-rs
+          if ($LASTEXITCODE -ne 0) { throw 'Windows release build failed' }
+      - name: CLI smoke test and package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & target/release/tts-with-rvc-rs.exe --help
+          if ($LASTEXITCODE -ne 0) { throw 'CLI help failed' }
+          & target/release/tts-with-rvc-rs.exe doctor
+          if ($LASTEXITCODE -ne 0) { throw 'CLI doctor failed' }
+          New-Item -ItemType Directory -Force -Path dist/rvc-windows-cpu | Out-Null
+          Copy-Item target/release/tts-with-rvc-rs.exe dist/rvc-windows-cpu/
+          Copy-Item models/tts-with-rvc-rs/WINDOWS_CLI.md dist/rvc-windows-cpu/README.md
+          Copy-Item models/tts-with-rvc-rs/convert-example.ps1 dist/rvc-windows-cpu/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rvc-windows-cpu-x64
+          path: dist/rvc-windows-cpu/
+          if-no-files-found: error
+          retention-days: 7

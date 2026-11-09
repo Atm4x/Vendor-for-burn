@@ -1,0 +1,39 @@
+name: Git Bridge - RVC source export
+# Refresh checkout for native NSF SineGen development (2026-11-09)
+on:
+  push:
+    branches:
+      - feat/rvc-burn-parity-stage1
+    paths:
+      - .github/workflows/git-bridge-rvc.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Export branch history
+        run: |
+          set -euo pipefail
+          git update-ref refs/heads/feat/rvc-burn-parity-stage1 "$GITHUB_SHA"
+          git bundle create "$RUNNER_TEMP/rvc.bundle" HEAD refs/heads/feat/rvc-burn-parity-stage1
+          git bundle verify "$RUNNER_TEMP/rvc.bundle"
+          cd "$RUNNER_TEMP"
+          sha256sum rvc.bundle > rvc.bundle.sha256
+          echo "$GITHUB_SHA" > rvc-head.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rvc-branch-source
+          path: |
+            ${{ runner.temp }}/rvc.bundle
+            ${{ runner.temp }}/rvc.bundle.sha256
+            ${{ runner.temp }}/rvc-head.txt
+          compression-level: 0
+          retention-days: 2

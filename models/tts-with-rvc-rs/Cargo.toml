@@ -1,0 +1,22 @@
+[package]
+name = "tts-with-rvc-rs"
+default-run = "tts-with-rvc-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+
+[features]
+default = ["flex"]
+flex = ["burn/flex", "dep:burn-flex"]
+cpu = ["burn/cpu"]
+cuda = ["burn/cuda"]
+wgpu = ["burn/wgpu"]
+
+[dependencies]
+burn = { version = "=0.22.1", default-features = false, features = ["std"] }
+burn-flex = { version = "=0.22.1", default-features = false, features = ["std", "simd", "rayon"], optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+pytorch-reader = "=0.22.1"
+half = "=2.7.1"
+rustfft = "=6.4.1"

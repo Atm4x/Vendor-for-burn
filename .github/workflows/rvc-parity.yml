@@ -1,0 +1,76 @@
+name: RVC Rust Burn parity
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'models/tts-with-rvc-rs/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'tools/restore_vendor_checksums.py'
+      - '.github/workflows/rvc-parity.yml'
+  pull_request:
+    paths:
+      - 'models/tts-with-rvc-rs/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'tools/restore_vendor_checksums.py'
+      - '.github/workflows/rvc-parity.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - name: Restore exact upstream vendor bytes before offline build
+        shell: bash
+        run: |
+          curl --fail --location --retry 3 \
+            https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate \
+            --output "$RUNNER_TEMP/zerocopy-0.8.63.crate"
+          python3 tools/restore_vendor_checksums.py --zerocopy-archive "$RUNNER_TEMP/zerocopy-0.8.63.crate"
+      - name: Run Burn parity with vendored dependencies
+        run: |
+          cargo test -p tts-with-rvc-rs --locked --offline
+          cargo run -p tts-with-rvc-rs --locked --offline -- verify-text-front models/tts-with-rvc-rs/tests/fixtures/text_front.json flex
+          cargo run -p tts-with-rvc-rs --locked --offline -- verify-attention models/tts-with-rvc-rs/tests/fixtures/relative_attention.json flex
+          cargo run -p tts-with-rvc-rs --locked --offline -- verify-encoder-layer models/tts-with-rvc-rs/tests/fixtures/encoder_layer.json flex
+          cargo run -p tts-with-rvc-rs --locked --offline -- verify-text-encoder models/tts-with-rvc-rs/tests/fixtures/text_encoder.json flex
+          cargo run -p tts-with-rvc-rs --locked --offline -- inspect-pth models/tts-with-rvc-rs/tests/fixtures/synthetic_checkpoint.pth enc_p.emb_pitch.weight
+          cargo run -p tts-with-rvc-rs --locked --offline -- verify-flow models/tts-with-rvc-rs/tests/fixtures/synthetic_flow.pth models/tts-with-rvc-rs/tests/fixtures/flow.json flex
+          cargo run -p tts-with-rvc-rs --locked --offline -- verify-text-encoder-pth models/tts-with-rvc-rs/tests/fixtures/synthetic_text_encoder.pth models/tts-with-rvc-rs/tests/fixtures/text_encoder.json flex
+          cargo run -p tts-with-rvc-rs --locked --offline -- verify-decoder-stage models/tts-with-rvc-rs/tests/fixtures/synthetic_decoder.pth models/tts-with-rvc-rs/tests/fixtures/decoder_stage.json flex
+          cargo run -p tts-with-rvc-rs --locked --offline -- verify-nsf-decoder models/tts-with-rvc-rs/tests/fixtures/synthetic_nsf_decoder.pth models/tts-with-rvc-rs/tests/fixtures/nsf_decoder.json flex
+          cargo run -p tts-with-rvc-rs --locked --offline -- verify-nsf-source models/tts-with-rvc-rs/tests/fixtures/synthetic_nsf_decoder.pth models/tts-with-rvc-rs/tests/fixtures/nsf_source.json flex
+          cargo run -p tts-with-rvc-rs --locked --offline -- verify-nsf-from-f0 models/tts-with-rvc-rs/tests/fixtures/synthetic_nsf_decoder.pth models/tts-with-rvc-rs/tests/fixtures/nsf_f0_decoder.json flex
+          cargo run -p tts-with-rvc-rs --locked --offline -- verify-hubert-conv models/tts-with-rvc-rs/tests/fixtures/synthetic_hubert_head.pth models/tts-with-rvc-rs/tests/fixtures/hubert_conv.json flex
+          cargo run -p tts-with-rvc-rs --locked --offline -- verify-hubert-frontend models/tts-with-rvc-rs/tests/fixtures/synthetic_hubert_frontend.pth models/tts-with-rvc-rs/tests/fixtures/hubert_frontend.json flex
+          cargo run -p tts-with-rvc-rs --locked --offline -- verify-hubert-transformer models/tts-with-rvc-rs/tests/fixtures/synthetic_hubert_transformer.pth models/tts-with-rvc-rs/tests/fixtures/hubert_transformer.json flex
+          cargo run -p tts-with-rvc-rs --locked --offline -- verify-hubert-stack models/tts-with-rvc-rs/tests/fixtures/synthetic_hubert_stack.pth models/tts-with-rvc-rs/tests/fixtures/hubert_stack.json flex
+          cargo run -p tts-with-rvc-rs --locked --offline -- verify-hubert-position models/tts-with-rvc-rs/tests/fixtures/synthetic_hubert_position.pth models/tts-with-rvc-rs/tests/fixtures/hubert_position.json flex
+          cargo run -p tts-with-rvc-rs --locked --offline -- verify-hubert-encoder models/tts-with-rvc-rs/tests/fixtures/synthetic_hubert_position.pth models/tts-with-rvc-rs/tests/fixtures/hubert_position.json flex
+          cargo run -p tts-with-rvc-rs --locked --offline -- verify-hubert-model models/tts-with-rvc-rs/tests/fixtures/synthetic_hubert_model.pth models/tts-with-rvc-rs/tests/fixtures/hubert_model.json flex
+          cargo run -p tts-with-rvc-rs --locked --offline -- verify-rmvpe-head models/tts-with-rvc-rs/tests/fixtures/synthetic_rmvpe_head.pth models/tts-with-rvc-rs/tests/fixtures/rmvpe_head.json flex
+          cargo run -p tts-with-rvc-rs --locked --offline -- verify-rmvpe-encoder models/tts-with-rvc-rs/tests/fixtures/synthetic_rmvpe_encoder.pth models/tts-with-rvc-rs/tests/fixtures/rmvpe_encoder.json flex
+          cargo run -p tts-with-rvc-rs --locked --offline -- verify-rmvpe-intermediate models/tts-with-rvc-rs/tests/fixtures/synthetic_rmvpe_intermediate.pth models/tts-with-rvc-rs/tests/fixtures/rmvpe_intermediate.json flex
+          cargo run -p tts-with-rvc-rs --locked --offline -- verify-rmvpe-decoder models/tts-with-rvc-rs/tests/fixtures/synthetic_rmvpe_decoder.pth models/tts-with-rvc-rs/tests/fixtures/rmvpe_decoder.json flex
+          cargo run -p tts-with-rvc-rs --locked --offline -- verify-rmvpe-unet models/tts-with-rvc-rs/tests/fixtures/synthetic_rmvpe_unet.pth models/tts-with-rvc-rs/tests/fixtures/rmvpe_unet.json flex
+          cargo run -p tts-with-rvc-rs --locked --offline -- verify-rmvpe-gru models/tts-with-rvc-rs/tests/fixtures/synthetic_rmvpe_gru.pth models/tts-with-rvc-rs/tests/fixtures/rmvpe_gru.json flex
+          cargo run -p tts-with-rvc-rs --locked --offline -- verify-rmvpe-network models/tts-with-rvc-rs/tests/fixtures/synthetic_rmvpe_gru.pth models/tts-with-rvc-rs/tests/fixtures/rmvpe_gru.json flex
+          cargo run -p tts-with-rvc-rs --locked --offline -- verify-rmvpe-mel models/tts-with-rvc-rs/tests/fixtures/rmvpe_mel.json flex
+      - name: Package native Linux parity runner
+        shell: bash
+        run: |
+          strip target/debug/tts-with-rvc-rs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rvc-burn-parity-linux
+          path: target/debug/tts-with-rvc-rs
+          if-no-files-found: error
+          retention-days: 3
