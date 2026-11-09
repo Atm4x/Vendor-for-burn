@@ -199,3 +199,19 @@ fn rmvpe_output_head_and_local_centroid_match_torch_numpy() {
     assert_eq!(salience_to_f0(&vec![0.0; 360], 0.03).unwrap(), vec![0.0]);
     assert!(salience_to_f0(&vec![f32::NAN; 360], 0.03).is_err());
 }
+
+#[test]
+fn seven_layer_hubert_frontend_matches_pytorch() {
+    use tts_with_rvc_rs::{checkpoint::RvcCheckpoint, hubert::HubertFrontend};
+    let checkpoint = RvcCheckpoint::open_model(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/synthetic_hubert_frontend.pth")).unwrap();
+    let fixture: serde_json::Value = serde_json::from_str(include_str!("fixtures/hubert_frontend.json")).unwrap();
+    let waveform: Vec<f32> = serde_json::from_value(fixture["waveform"].clone()).unwrap();
+    let shape: [usize; 3] = serde_json::from_value(fixture["shape"].clone()).unwrap();
+    let expected_shape: [usize; 3] = serde_json::from_value(fixture["expected_shape"].clone()).unwrap();
+    let expected: Vec<f32> = serde_json::from_value(fixture["expected"].clone()).unwrap();
+    let device = Device::flex();
+    let model = HubertFrontend::load(&checkpoint, &device).unwrap();
+    let actual = model.forward(Tensor::from_data(TensorData::new(waveform, shape), &device));
+    assert_eq!(actual.dims(), expected_shape);
+    assert!(max_abs_error(&actual.into_data().try_into_vec::<f32>().unwrap(), &expected) < 1e-4);
+}

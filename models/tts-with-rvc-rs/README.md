@@ -116,3 +116,9 @@ cargo run -p tts-with-rvc-rs --locked --offline -- verify-rmvpe-head rmvpe.pt pr
 ```
 
 `verify-rmvpe-head` uses GRU *output features* as input, not raw mel or WAV; `verify-hubert-conv` checks only the first conv/norm/activation, not the twelve-layer Transformer. Both models are incomplete and cannot perform audio feature extraction or pitch inference end-to-end yet.
+
+### Stage 10 — HuBERT convolutional frontend
+
+`hubert::HubertFrontend` extends the first conv to all seven HuBERT Base feature extractor convolutions (kernels `10,3,3,3,3,2,2`, strides `5,2,2,2,2,2,2`), followed by the 512-channel post-feature LayerNorm and `post_extract_proj` to 768 channels. The frontend accepts 16-kHz mono PCM tensors `[batch, 1, samples]` and returns `[batch, frames, 768]` before the 12 Transformer layers. It is **not** equivalent to full HuBERT features until those Transformer layers are implemented. Synthetic CI uses a reduced channel count to keep test data small; private parity uses the full original 512/768-dimensional weights.
+
+Use `verify-hubert-frontend hubert_base.pt PRIVATE_FRONTEND_REFERENCE.json flex` to check the actual file on the CPU backend. The reference script computes the same seven conv stages, GroupNorm, LayerNorm and projection with PyTorch; it never commits the actual model.
