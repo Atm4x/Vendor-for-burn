@@ -1,9 +1,16 @@
 use burn::tensor::{Device, Int, Tensor, TensorData};
 
 use crate::{
-    checkpoint::RvcCheckpoint, decoder::NsfWaveformDecoder, faiss_index::IvfFlatIndex,
-    flow::ResidualCouplingBlock, hubert_model::HubertFeatureModel, nsf_source::SourceModuleHnNSF,
-    rmvpe_mel::RmvpeAudioModel, text_encoder::TextEncoder,
+    checkpoint::RvcCheckpoint,
+    chunked::{ChunkConfig, ChunkProgress, infer_chunked_with_progress},
+    decoder::NsfWaveformDecoder,
+    faiss_index::IvfFlatIndex,
+    flow::ResidualCouplingBlock,
+    hubert_model::HubertFeatureModel,
+    nsf_source::SourceModuleHnNSF,
+    preprocess::highpass_48hz_zero_phase,
+    rmvpe_mel::RmvpeAudioModel,
+    text_encoder::TextEncoder,
 };
 
 const RVC_SAMPLE_RATE: usize = 40_000;
@@ -105,6 +112,28 @@ impl RvcV2Inferencer {
         })
     }
 
+    pub fn infer_long_16khz(
+        &self,
+        pcm: &[f32],
+        options: &InferenceOptions,
+        config: ChunkConfig,
+        progress: impl FnMut(ChunkProgress),
+    ) -> Result<Vec<f32>, String> {
+        let filtered = highpass_48hz_zero_phase(pcm)?;
+        infer_chunked_with_progress(
+            &filtered,
+            config,
+            |segment, chunk_index| {
+                let mut settings = options.clone();
+                settings.seed = options
+                    .seed
+                    .wrapping_add((chunk_index as u64).wrapping_mul(0x9e3779b97f4a7c15));
+                self.infer_16khz(segment, &settings)
+            },
+            progress,
+        )
+    }
+
     pub fn infer_16khz(&self, pcm: &[f32], options: &InferenceOptions) -> Result<Vec<f32>, String> {
         if pcm.len() < 3_200 || pcm.len() > 160_000 || pcm.iter().any(|x| !x.is_finite()) {
             return Err("RVC inference requires 0.2–10 seconds of finite 16-kHz mono PCM".into());
@@ -120,16 +149,10 @@ impl RvcV2Inferencer {
         {
             return Err("invalid RVC index, protection, pitch shift or noise settings".into());
         }
-        let mean = pcm.iter().map(|&x| x as f64).sum::<f64>() / pcm.len() as f64;
-        let variance =
-            pcm.iter().map(|&x| (x as f64 - mean).powi(2)).sum::<f64>() / pcm.len() as f64;
-        let denom = (variance + 1e-7).sqrt();
-        let normalized: Vec<f32> = pcm
-            .iter()
-            .map(|&x| ((x as f64 - mean) / denom) as f32)
-            .collect();
-        let waveform =
-            Tensor::from_data(TensorData::new(normalized, [1, 1, pcm.len()]), &self.device);
+        let waveform = Tensor::from_data(
+            TensorData::new(pcm.to_vec(), [1, 1, pcm.len()]),
+            &self.device,
+        );
         let content = self.hubert.forward(waveform, None);
         let [batch, content_time, channels] = content.dims();
         if batch != 1 || channels != CONTENT_CHANNELS {
@@ -150,28 +173,32 @@ impl RvcV2Inferencer {
             return Err("HuBERT/RMVPE returned no aligned frames".into());
         }
         f0.truncate(frames);
-        let original_features: Vec<f32> = raw
-            .chunks_exact(channels)
-            .take(frames.div_ceil(2))
-            .flat_map(|frame| (0..2).flat_map(move |_| frame.iter().copied()))
-            .take(frames * channels)
-            .collect();
-        let mut features = original_features.clone();
+        let mut retrieved = raw.clone();
         if options.index_rate > 0.0 {
             let index = self
                 .index
                 .as_ref()
                 .ok_or("FAISS retrieval requested but no index was loaded")?;
-            index.blend_features(&mut features, options.index_rate)?;
-            // Original RVC's protect mask only suppresses retrieval on unvoiced frames.
-            for (frame, f0_value) in f0.iter().enumerate() {
-                if *f0_value <= 0.0 {
-                    let start = frame * channels;
-                    for (value, original) in features[start..start + channels]
+            index.blend_features(&mut retrieved, options.index_rate)?;
+        }
+        let duplicate_frames = |source: &[f32]| -> Vec<f32> {
+            source
+                .chunks_exact(channels)
+                .flat_map(|frame| (0..2).flat_map(move |_| frame.iter().copied()))
+                .take(frames * channels)
+                .collect()
+        };
+        let mut features = duplicate_frames(&retrieved);
+        if options.index_rate > 0.0 && options.protect < 0.5 {
+            let original = duplicate_frames(&raw);
+            for (frame, &f0_value) in f0.iter().enumerate() {
+                if f0_value < 1.0 {
+                    let offset = frame * channels;
+                    for (value, unmodified) in features[offset..offset + channels]
                         .iter_mut()
-                        .zip(&original_features[start..start + channels])
+                        .zip(&original[offset..offset + channels])
                     {
-                        *value = *value * options.protect + *original * (1.0 - options.protect);
+                        *value = *value * options.protect + *unmodified * (1.0 - options.protect);
                     }
                 }
             }

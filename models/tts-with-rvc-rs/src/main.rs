@@ -2,6 +2,62 @@ use burn::tensor::Device;
 use std::{env, fs, process::ExitCode};
 use tts_with_rvc_rs::{TextFrontFixture, attention::AttentionFixture, encoder::EncoderLayerFixture, text_encoder::TextEncoderFixture, max_abs_error};
 
+#[derive(serde::Deserialize)]
+struct WaveJob {
+    input: String,
+    output: String,
+    #[serde(default)]
+    index_rate: Option<f32>,
+    #[serde(default)]
+    pitch_shift_semitones: Option<f32>,
+    #[serde(default)]
+    rms_mix_rate: Option<f32>,
+}
+
+fn process_wave_job(
+    inferencer: &tts_with_rvc_rs::rvc_inference::RvcV2Inferencer,
+    job: &WaveJob,
+    options: &tts_with_rvc_rs::rvc_inference::InferenceOptions,
+    config: tts_with_rvc_rs::chunked::ChunkConfig,
+) -> Result<(), String> {
+    use tts_with_rvc_rs::audio_io;
+    if job.input.is_empty() || job.output.is_empty() || job.input == job.output {
+        return Err("batch input and output paths must be nonempty and distinct".into());
+    }
+    let audio = audio_io::read_mono_wav(&job.input)?;
+    let pcm = audio_io::resample(&audio.samples, audio.sample_rate, 16_000)?;
+    let mut settings = options.clone();
+    if let Some(rate) = job.index_rate {
+        settings.index_rate = rate;
+    }
+    if let Some(shift) = job.pitch_shift_semitones {
+        settings.pitch_shift_semitones = shift;
+    }
+    eprintln!(
+        "RVC processing {} input_samples={} input_sr={}",
+        job.input,
+        audio.samples.len(),
+        audio.sample_rate
+    );
+    let mut converted = inferencer.infer_long_16khz(&pcm, &settings, config, |p| {
+        eprintln!(
+            "RVC chunks={}/{} output_samples={}",
+            p.chunk_index, p.chunk_count, p.output_samples
+        );
+    })?;
+    let mix = job.rms_mix_rate.unwrap_or(0.5);
+    let filtered = tts_with_rvc_rs::preprocess::highpass_48hz_zero_phase(&pcm)?;
+    audio_io::mix_rms_envelope(&filtered, 16_000, &mut converted, 40_000, mix)?;
+    audio_io::normalize_peak(&mut converted)?;
+    audio_io::write_mono_wav(&job.output, &converted, 40_000)?;
+    println!(
+        "RVC WAV→WAV complete: samples={} sr=40000 path={}",
+        converted.len(),
+        job.output
+    );
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let mut args = env::args().skip(1);
     let command = args.next().ok_or("missing command")?;
@@ -45,9 +101,94 @@ fn run() -> Result<(), String> {
             options.pitch_shift_semitones = shift.parse().map_err(|e| format!("invalid pitch shift: {e}"))?;
         }
 
-        let converted = inferencer.infer_16khz(&input, &options)?;
+        let filtered = tts_with_rvc_rs::preprocess::highpass_48hz_zero_phase(&input)?;
+        let converted = inferencer.infer_16khz(&filtered, &options)?;
         audio_io::write_mono_wav(&target, &converted, 40_000)?;
         println!("RVC WAV→WAV complete: samples={} sr=40000 path={target}", converted.len());
+        return Ok(());
+    }
+    if command == "infer-wav-full" || command == "infer-wav-batch" {
+        use tts_with_rvc_rs::{
+            chunked::ChunkConfig,
+            rvc_inference::{InferenceOptions, RvcV2Inferencer},
+        };
+        let voice = args.next().ok_or("missing RVC .pth")?;
+        let hubert = args.next().ok_or("missing HuBERT .pt")?;
+        let rmvpe = args.next().ok_or("missing RMVPE .pt")?;
+        let index = args.next().ok_or("missing RVC .index (use - to disable)")?;
+        let jobs = if command == "infer-wav-full" {
+            vec![WaveJob {
+                input: args.next().ok_or("missing input WAV")?,
+                output: args.next().ok_or("missing output WAV")?,
+                index_rate: None,
+                pitch_shift_semitones: None,
+                rms_mix_rate: None,
+            }]
+        } else {
+            let manifest = args.next().ok_or("missing batch JSON manifest")?;
+            let jobs: Vec<WaveJob> =
+                serde_json::from_slice(&fs::read(manifest).map_err(|e| e.to_string())?)
+                    .map_err(|e| format!("invalid RVC batch manifest: {e}"))?;
+            if jobs.is_empty() {
+                return Err("RVC batch manifest must have at least one job".into());
+            }
+            jobs
+        };
+        let mut options = InferenceOptions::default();
+        if index == "-" {
+            options.index_rate = 0.0;
+        }
+        if let Some(v) = args.next() {
+            options.index_rate = v.parse().map_err(|e| format!("invalid index rate: {e}"))?;
+        }
+        if let Some(v) = args.next() {
+            options.pitch_shift_semitones =
+                v.parse().map_err(|e| format!("invalid pitch shift: {e}"))?;
+        }
+        let mut config = ChunkConfig::default();
+        if let Some(v) = args.next() {
+            config.core_frames = v.parse().map_err(|e| format!("invalid core frames: {e}"))?;
+        }
+        if let Some(v) = args.next() {
+            config.overlap_frames = v
+                .parse()
+                .map_err(|e| format!("invalid overlap frames: {e}"))?;
+        }
+        if let Some(v) = args.next() {
+            config.context_frames = v
+                .parse()
+                .map_err(|e| format!("invalid context frames: {e}"))?;
+        }
+        if args.next().is_some() {
+            return Err("too many inference parameters".into());
+        }
+        config.validate()?;
+        let mut outputs = std::collections::HashSet::new();
+        let inputs: std::collections::HashSet<_> =
+            jobs.iter().map(|job| job.input.as_str()).collect();
+        for job in &jobs {
+            if job.input.is_empty()
+                || job.output.is_empty()
+                || inputs.contains(job.output.as_str())
+                || !outputs.insert(job.output.as_str())
+            {
+                return Err(
+                    "RVC batch contains an empty/duplicate output or overwrites an input".into(),
+                );
+            }
+        }
+        let device = Device::flex();
+        let inferencer = RvcV2Inferencer::load(
+            &voice,
+            &hubert,
+            &rmvpe,
+            (index != "-").then_some(index.as_str()),
+            device,
+        )?;
+        for (i, job) in jobs.iter().enumerate() {
+            eprintln!("RVC batch job {}/{}", i + 1, jobs.len());
+            process_wave_job(&inferencer, job, &options, config)?;
+        }
         return Ok(());
     }
     if command == "inspect-index" {

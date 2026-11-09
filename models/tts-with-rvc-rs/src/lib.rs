@@ -165,5 +165,7 @@ pub mod nsf_source;
 pub mod faiss_index;
 
 pub mod audio_io;
+pub mod chunked;
+pub mod preprocess;
 
 pub mod rvc_inference;

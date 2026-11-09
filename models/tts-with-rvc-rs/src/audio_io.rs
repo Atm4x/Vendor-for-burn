@@ -133,6 +133,89 @@ pub fn resample(input: &[f32], from_hz: u32, to_hz: u32) -> Result<Vec<f32>, Str
     Ok(output)
 }
 
+pub fn mix_rms_envelope(
+    input: &[f32],
+    input_rate: u32,
+    output: &mut [f32],
+    output_rate: u32,
+    mix: f32,
+) -> Result<(), String> {
+    if !mix.is_finite()
+        || !(0.0..=1.0).contains(&mix)
+        || input.is_empty()
+        || output.is_empty()
+        || input_rate < 2
+        || output_rate < 2
+    {
+        return Err("invalid RVC RMS envelope parameters".into());
+    }
+    if mix == 1.0 {
+        return Ok(());
+    }
+    let input_env = rms_frames(input, input_rate)?;
+    let output_env = rms_frames(output, output_rate)?;
+    let output_len = output.len();
+    for (i, sample) in output.iter_mut().enumerate() {
+        let reference = sample_linear(&input_env, i, output_len);
+        let generated = sample_linear(&output_env, i, output_len).max(1e-6);
+        let gain = reference.powf(1.0 - mix) * generated.powf(mix - 1.0);
+        *sample *= gain;
+        if !sample.is_finite() {
+            return Err("non-finite RVC RMS-adjusted waveform".into());
+        }
+    }
+    Ok(())
+}
+
+fn rms_frames(pcm: &[f32], sample_rate: u32) -> Result<Vec<f32>, String> {
+    let frame = sample_rate as usize;
+    let hop = frame / 2;
+    if frame == 0 || hop == 0 || pcm.iter().any(|x| !x.is_finite()) {
+        return Err("invalid PCM for RVC RMS".into());
+    }
+    let mut squared_prefix = Vec::with_capacity(pcm.len() + 1);
+    squared_prefix.push(0.0f64);
+    for &value in pcm {
+        squared_prefix.push(squared_prefix.last().unwrap() + (value as f64) * (value as f64));
+    }
+    let count = pcm.len() / hop + 1;
+    let mut values = Vec::with_capacity(count);
+    for i in 0..count {
+        let center = i * hop;
+        let start = center.saturating_sub(frame / 2);
+        let end = center.saturating_add(frame - frame / 2).min(pcm.len());
+        let power = (squared_prefix[end] - squared_prefix[start]).max(0.0) / frame as f64;
+        values.push(power.sqrt() as f32);
+    }
+    Ok(values)
+}
+
+fn sample_linear(values: &[f32], index: usize, output_len: usize) -> f32 {
+    if values.len() == 1 {
+        return values[0];
+    }
+    let position = ((index as f64 + 0.5) * values.len() as f64 / output_len as f64 - 0.5)
+        .clamp(0.0, (values.len() - 1) as f64);
+    let left = position.floor() as usize;
+    let right = (left + 1).min(values.len() - 1);
+    let fraction = (position - left as f64) as f32;
+    values[left] * (1.0 - fraction) + values[right] * fraction
+}
+
+pub fn normalize_peak(samples: &mut [f32]) -> Result<(), String> {
+    let peak = samples.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+    if !peak.is_finite() {
+        return Err("RVC output contains non-finite samples".into());
+    }
+    let normalization = peak / 0.99;
+    if normalization > 1.0 {
+        for value in samples {
+            *value /= normalization;
+        }
+    }
+    Ok(())
+}
+
 pub fn write_mono_wav(
     path: impl AsRef<Path>,
     samples: &[f32],
@@ -175,6 +258,23 @@ mod tests {
         let result = resample(&source, 44_100, 16_000).unwrap();
         assert_eq!(result.len(), 16_000);
         assert!(result[100..15_900].iter().all(|x| (x - 0.3).abs() < 1e-5));
+    }
+
+    #[test]
+    fn rms_envelope_and_peak_normalization() {
+        let input = vec![0.25f32; 32_000];
+        let mut output = vec![0.75f32; 80_000];
+        mix_rms_envelope(&input, 16_000, &mut output, 40_000, 0.0).unwrap();
+        for &sample in &output[10_000..70_000] {
+            assert!((sample - 0.25).abs() < 1e-4);
+        }
+        let mut same = vec![0.75f32; 80_000];
+        mix_rms_envelope(&input, 16_000, &mut same, 40_000, 1.0).unwrap();
+        assert!(same.iter().all(|&x| x == 0.75));
+        let mut clips = vec![-2.0f32, 1.0, 0.5];
+        normalize_peak(&mut clips).unwrap();
+        assert!((clips[0] + 0.99).abs() < 1e-6);
+        assert!((clips[1] - 0.495).abs() < 1e-6);
     }
 
     #[test]

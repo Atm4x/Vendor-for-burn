@@ -246,3 +246,31 @@ cargo run -p tts-with-rvc-rs --locked --offline -- infer-wav-segment voice.pth h
 ```
 
 The segment API accepts 0.2–10 s of 16-kHz PCM; the CLI limits segments to 0.2–9 s. No permanent process/IPC, overlap-add chunking, GPU testing, or reference comparison of the complete WAV-to-WAV pipeline is included. A real-checkpoint CPU smoke test succeeded using `CrazyMita.pth`, `hubert_base.pt`, `rmvpe.pt`, `CrazyMita.index`, and `MitaKind.wav`: 0.30 s input produced 11,200 finite samples (0.28 s at 40 kHz) with no clipping. This establishes integration, **not** quality or numerical waveform parity with PyTorch. The reference `.pth`, `.pt`, `.index`, `.wav` assets and the generated preview remain outside the repository.
+
+## Stage 23 — bounded long-form inference and file batching (experimental)
+
+The supplied `tts-with-rvc-main` Python implementation in `infer/vc/pipeline.py` was used to audit orchestration. Stage 23 corrects the retrieval order: HuBERT features are indexed at **50 Hz**, then duplicated to **100 Hz**, followed by unvoiced protection. The previous Stage 22 code indexed already-duplicated features. It also removes the non-reference per-segment mean/variance normalization and adds the original 48-Hz, fifth-order zero-phase Butterworth high-pass preprocessing. The high-pass is checked against `scipy.signal.butter` + `filtfilt` on a deterministic signal.
+
+The `chunked` module accepts arbitrary-length finite 16-kHz PCM and splits it into bounded inference windows with reflected left/right context, additional right frames to account for HuBERT's shorter convolutional output, deterministic per-window RNG seeds, per-window context trimming and normalized linear overlap-add. The output is exactly 40,000 / 16,000 times the PCM length, with neither silent gaps nor unchecked truncation permitted. The stitching algorithm has unit tests including multi-window audio, partial last windows, frame boundary coverage, crossfades and deliberately undersized model output. It is **not** yet numerically equivalent to the reference long-form inference: Python chooses cut points by minimum energy, computes F0 on the padded global signal, and then concatenates trimmed windows; the Rust version currently computes F0 inside each context window and crossfades the results.
+
+Multi-file `infer-wav-batch` loads the voice model, HuBERT, RMVPE and optional FAISS index **once**, then processes jobs sequentially without reloading them. This is model-resident **file batching**, not tensor microbatching, not parallel processing and not a long-lived IPC worker. The latter are separate performance milestones.
+
+```sh
+cargo run -p tts-with-rvc-rs --locked --offline -- infer-wav-full voice.pth hubert_base.pt rmvpe.pt voice.index input.wav output.wav [INDEX_RATE] [PITCH_SHIFT_SEMITONES] [CORE_FRAMES] [OVERLAP_FRAMES] [CONTEXT_FRAMES]
+cargo run -p tts-with-rvc-rs --locked --offline -- infer-wav-batch voice.pth hubert_base.pt rmvpe.pt voice.index jobs.json [INDEX_RATE] [PITCH_SHIFT_SEMITONES] [CORE_FRAMES] [OVERLAP_FRAMES] [CONTEXT_FRAMES]
+```
+
+Example `jobs.json`:
+
+```json
+[
+  {"input": "one.wav", "output": "one-rvc.wav"},
+  {"input": "two.wav", "output": "two-rvc.wav", "index_rate": 0.55, "pitch_shift_semitones": 2.0, "rms_mix_rate": 0.8}
+]
+```
+
+The frame parameters are at 100 frames/s; defaults are core=300 (3 s), overlap=12 (0.12 s), context=40 (0.40 s). A further fixed 4 frames of right padding are provided. Each model window is capped at 10 s. The output RMS mix defaults to 0.5, with 1.0 meaning keep the generated envelope. The output peak is normalized to at most 0.99 before int16 conversion, as in the Python reference. The standalone `infer-wav-segment` command remains available for regression checks.
+
+**Validation:** deterministic unit tests and the 27 existing PyTorch component parity tests pass. The full 0.25-second real-model long-form CPU smoke test did not finish before a 120-second timeout (approximately 1.05 GiB RSS); the new audio path and reconstructed seams have **not** yet passed a real-model acceptance test. The code should not be described as long-form reference parity or real-time capable. End-to-end parity, true tensor batching, streaming PCM output, global F0 alignment and GPU benchmarks remain open.
+
+Never add private `.pth`, `.pt`, `.index` or `.wav` assets to the repository.
