@@ -34,7 +34,7 @@ impl GruDirection {
         let hidden_size = self.hidden_size();
         assert_eq!(features, self.input_size(), "RMVPE GRU input features mismatch");
         assert!(time > 0, "RMVPE GRU requires a nonempty time dimension");
-        let mut hidden = Tensor::zeros([batch, hidden_size], input.device());
+        let mut hidden = Tensor::zeros([batch, hidden_size], &input.device());
         let input_weight = self.input_weight.clone().transpose();
         let hidden_weight = self.hidden_weight.clone().transpose();
         let input_bias = self.input_bias.clone().reshape([1, 3 * hidden_size]);
