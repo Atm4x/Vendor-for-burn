@@ -15,11 +15,11 @@ fn run() -> Result<(), String> {
         }
         return Ok(());
     }
-    if !matches!(command.as_str(), "verify-text-front" | "verify-attention" | "verify-encoder-layer" | "verify-text-encoder" | "verify-flow" | "verify-text-encoder-pth" | "verify-decoder-stage" | "verify-nsf-decoder" | "verify-hubert-conv" | "verify-hubert-frontend" | "verify-hubert-transformer" | "verify-hubert-stack" | "verify-hubert-position" | "verify-hubert-encoder" | "verify-rmvpe-head") {
+    if !matches!(command.as_str(), "verify-text-front" | "verify-attention" | "verify-encoder-layer" | "verify-text-encoder" | "verify-flow" | "verify-text-encoder-pth" | "verify-decoder-stage" | "verify-nsf-decoder" | "verify-hubert-conv" | "verify-hubert-frontend" | "verify-hubert-transformer" | "verify-hubert-stack" | "verify-hubert-position" | "verify-hubert-encoder" | "verify-hubert-model" | "verify-rmvpe-head") {
         return Err("usage: tts-with-rvc-rs verify-text-front|verify-attention|verify-encoder-layer|verify-text-encoder <fixture.json> [flex|cpu|cuda|wgpu]".into());
     }
     let path = args.next().ok_or("missing fixture or checkpoint path")?;
-    let flow_fixture_path = if command == "verify-flow" || command == "verify-text-encoder-pth" || command == "verify-decoder-stage" || command == "verify-nsf-decoder" || command == "verify-hubert-conv" || command == "verify-hubert-frontend" || command == "verify-hubert-transformer" || command == "verify-hubert-stack" || command == "verify-hubert-position" || command == "verify-hubert-encoder" || command == "verify-rmvpe-head" {
+    let flow_fixture_path = if command == "verify-flow" || command == "verify-text-encoder-pth" || command == "verify-decoder-stage" || command == "verify-nsf-decoder" || command == "verify-hubert-conv" || command == "verify-hubert-frontend" || command == "verify-hubert-transformer" || command == "verify-hubert-stack" || command == "verify-hubert-position" || command == "verify-hubert-encoder" || command == "verify-hubert-model" || command == "verify-rmvpe-head" {
         Some(args.next().ok_or("missing flow fixture path")?)
     } else { None };
     let backend = args.next().unwrap_or_else(|| "flex".to_owned());
@@ -102,6 +102,39 @@ fn run() -> Result<(), String> {
         println!("backend={backend} max_abs_{command}={error:.9} max_abs_unmasked={unmasked_error:.9}");
         if !error.is_finite() || error > 1e-4 || !unmasked_error.is_finite() || unmasked_error > 1e-4 {
             return Err("HuBERT Transformer Torch/Burn parity exceeded tolerance".into());
+        }
+        return Ok(());
+    }
+    if command == "verify-hubert-model" {
+        use burn::tensor::{Tensor, TensorData};
+        use tts_with_rvc_rs::{checkpoint::RvcCheckpoint, hubert_model::HubertFeatureModel};
+        let checkpoint = RvcCheckpoint::open_model(&path)?;
+        let reference_path = flow_fixture_path.as_ref().ok_or("missing HuBERT waveform reference")?;
+        let fixture: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(reference_path).map_err(|error| error.to_string())?,
+        ).map_err(|error| error.to_string())?;
+        let read = |field: &str| -> Result<Vec<f32>, String> {
+            serde_json::from_value(fixture[field].clone()).map_err(|error| error.to_string())
+        };
+        let input_shape: [usize; 3] = serde_json::from_value(fixture["input_shape"].clone()).map_err(|error| error.to_string())?;
+        let output_shape: [usize; 3] = serde_json::from_value(fixture["shape"].clone()).map_err(|error| error.to_string())?;
+        let heads: usize = serde_json::from_value(fixture["heads"].clone()).map_err(|error| error.to_string())?;
+        let layers: usize = serde_json::from_value(fixture["layers"].clone()).map_err(|error| error.to_string())?;
+        let waveform = Tensor::from_data(TensorData::new(read("waveform")?, input_shape), &device);
+        let valid = Tensor::from_data(TensorData::new(read("valid")?, [output_shape[0], output_shape[1]]), &device);
+        let model = HubertFeatureModel::load(&checkpoint, layers, heads, &device)?;
+        let result = model.forward(waveform.clone(), Some(valid));
+        let unmasked_result = model.forward(waveform, None);
+        if result.dims() != output_shape || unmasked_result.dims() != output_shape {
+            return Err("HuBERT complete waveform forward produced incorrect output shape".into());
+        }
+        let actual = result.into_data().try_into_vec::<f32>().map_err(|error| error.to_string())?;
+        let unmasked = unmasked_result.into_data().try_into_vec::<f32>().map_err(|error| error.to_string())?;
+        let error = max_abs_error(&actual, &read("expected")?);
+        let unmasked_error = max_abs_error(&unmasked, &read("expected_unmasked")?);
+        println!("backend={backend} max_abs_hubert_model={error:.9} max_abs_unmasked={unmasked_error:.9} layers={layers} frames={}", output_shape[1]);
+        if !error.is_finite() || !unmasked_error.is_finite() || error > 1e-4 || unmasked_error > 1e-4 {
+            return Err(format!("HuBERT waveform → features parity exceeded tolerance: {error:.8}, {unmasked_error:.8}"));
         }
         return Ok(());
     }

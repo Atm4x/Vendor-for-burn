@@ -287,3 +287,27 @@ fn hubert_positional_conv_and_three_layer_encoder_match_torch() {
     assert!(max_abs_error(&encoded, &get("expected")) < 1e-4);
     assert!(max_abs_error(&encoded_unmasked, &get("expected_unmasked")) < 1e-4);
 }
+
+#[test]
+fn hubert_waveform_to_content_matches_pytorch() {
+    use tts_with_rvc_rs::{checkpoint::RvcCheckpoint, hubert_model::HubertFeatureModel};
+    let checkpoint = RvcCheckpoint::open_model(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/synthetic_hubert_model.pth")).unwrap();
+    let fixture: serde_json::Value = serde_json::from_str(include_str!("fixtures/hubert_model.json")).unwrap();
+    let get = |field: &str| -> Vec<f32> { serde_json::from_value(fixture[field].clone()).unwrap() };
+    let input_shape: [usize; 3] = serde_json::from_value(fixture["input_shape"].clone()).unwrap();
+    let shape: [usize; 3] = serde_json::from_value(fixture["shape"].clone()).unwrap();
+    let layers: usize = serde_json::from_value(fixture["layers"].clone()).unwrap();
+    let heads: usize = serde_json::from_value(fixture["heads"].clone()).unwrap();
+    let device = Device::flex();
+    let model = HubertFeatureModel::load(&checkpoint, layers, heads, &device).unwrap();
+    assert_eq!(model.output_layers(), 3);
+    let waveform = Tensor::from_data(TensorData::new(get("waveform"), input_shape), &device);
+    let valid = Tensor::from_data(TensorData::new(get("valid"), [shape[0], shape[1]]), &device);
+    let masked = model.forward(waveform.clone(), Some(valid));
+    assert_eq!(masked.dims(), shape);
+    let unmasked = model.forward(waveform, None);
+    let masked = masked.into_data().try_into_vec::<f32>().unwrap();
+    let unmasked = unmasked.into_data().try_into_vec::<f32>().unwrap();
+    assert!(max_abs_error(&masked, &get("expected")) < 1e-4);
+    assert!(max_abs_error(&unmasked, &get("expected_unmasked")) < 1e-4);
+}

@@ -154,3 +154,14 @@ cargo run -p tts-with-rvc-rs --locked --offline -- verify-hubert-encoder hubert_
 ```
 
 The synthesis pipeline (HuBERT feature extractor input length handling, RMVPE F0, SineGen, FAISS, persistent worker) is still incomplete. Reference checkpoints, original user WAV and private fixtures must not be committed.
+
+## Stage 14 — HuBERT waveform → content embeddings
+
+`HubertFeatureModel` composes the native 7-layer CNN frontend, kernel-normalized positional convolution, encoder LayerNorm and configurable 9/12 Transformer layers in one inference-only Rust object. Accepts mono PCM **already sampled at 16 kHz**; no PyTorch process is needed to load the weights or execute these tensor layers. Frame validity masks must already be aligned to the CNN output length.
+
+```sh
+python models/tts-with-rvc-rs/tools/reference_hubert_model.py --checkpoint hubert_base.pt --fixture /tmp/hubert_model_private.json
+cargo run -p tts-with-rvc-rs --locked --offline -- verify-hubert-model hubert_base.pt /tmp/hubert_model_private.json flex
+```
+
+This validates an unquantized FP32 inference path on Burn CPU Flex. RVC feature upsampling, audio resampling, RMVPE, SineGen, FAISS, and long-lived worker are still separate and incomplete.
