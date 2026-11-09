@@ -85,3 +85,14 @@ cargo run -p tts-with-rvc-rs --locked --offline -- verify-decoder-stage PRIVATE_
 ```
 
 This reference test is deterministic because it compares a separately provided harmonic-source tensor rather than the nondeterministic `SineGen` noise. A full synthesis test must also validate `SineGen`, all decoder stages and `conv_post`.
+
+### Stage 8 — complete NSF waveform decoder (external harmonic source)
+
+`decoder::NsfWaveformDecoder` now composes all configured upsampling stages with `dec.conv_pre`, optional `dec.cond` (speaker embedding), the residual branches, and `dec.conv_post` followed by tanh. All weights load directly from the original RVC `.pth` checkpoint, without Python.
+
+This implements the waveform-decoder network **given the fully sampled harmonic source**. The `SineGen`/`SourceModuleHnNSF` pitch-to-harmonic path is **not yet included**. For deterministic parity, the Python fixture generator imports the original `GeneratorNSF` and substitutes only the stochastic harmonic source with the same supplied array as the Rust test. The convolutional generator itself is not rewritten on the Python reference side.
+
+```text
+python models/tts-with-rvc-rs/tools/reference_nsf_decoder.py --source-zip ORIGINAL_SOURCE.zip --checkpoint PRIVATE_MODEL.pth --fixture PRIVATE_NSF_REFERENCE.json
+cargo run -p tts-with-rvc-rs --locked --offline -- verify-nsf-decoder PRIVATE_MODEL.pth PRIVATE_NSF_REFERENCE.json flex
+```

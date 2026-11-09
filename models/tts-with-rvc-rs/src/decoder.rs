@@ -175,3 +175,99 @@ impl DecoderStageFixture {
         DecoderStage::load(checkpoint, self.stage, self.stride, self.future_stride, self.num_kernels, self.dilations, device)
     }
 }
+
+
+pub struct NsfWaveformDecoder {
+    pre: Conv1d,
+    condition: Option<Conv1d>,
+    stages: Vec<DecoderStage>,
+    post: Conv1d,
+    total_upsample: usize,
+}
+
+impl NsfWaveformDecoder {
+    pub fn load(
+        checkpoint: &RvcCheckpoint,
+        upsample_rates: &[usize],
+        kernels_per_stage: usize,
+        dilations: [usize; 3],
+        device: &Device,
+    ) -> Result<Self, String> {
+        if upsample_rates.is_empty() || upsample_rates.iter().any(|rate| *rate == 0) {
+            return Err("NSF decoder requires nonzero upsampling rates".into());
+        }
+        let pre = Conv1d::load(checkpoint, "dec.conv_pre", 1, 1, 3, device)?;
+        let condition = checkpoint.contains("dec.cond.weight")
+            .then(|| Conv1d::load(checkpoint, "dec.cond", 1, 1, 0, device))
+            .transpose()?;
+        let post = Conv1d::load(checkpoint, "dec.conv_post", 1, 1, 3, device)?;
+        let total_upsample = upsample_rates.iter().try_fold(1_usize, |product, rate| product.checked_mul(*rate))
+            .ok_or("NSF upsampling product overflows usize")?;
+        let mut stages = Vec::with_capacity(upsample_rates.len());
+        for (index, stride) in upsample_rates.iter().copied().enumerate() {
+            let future_stride = upsample_rates[index + 1..].iter().product();
+            stages.push(DecoderStage::load(checkpoint, index, stride, future_stride, kernels_per_stage, dilations, device)?);
+        }
+        let channel_count = pre.weight.dims()[0];
+        if stages[0].upsample.weight.dims()[0] != channel_count {
+            return Err("NSF conv_pre/upsample channels mismatch".into());
+        }
+        if post.weight.dims()[1] != stages.last().unwrap().upsample.bias.dims()[0]
+            || post.weight.dims()[0] != 1
+        {
+            return Err("NSF conv_post channels mismatch".into());
+        }
+        if let Some(cond) = &condition {
+            if cond.weight.dims()[0] != channel_count || cond.weight.dims()[2] != 1 {
+                return Err("NSF speaker conditioning channels mismatch".into());
+            }
+        }
+        Ok(Self { pre, condition, stages, post, total_upsample })
+    }
+
+    pub fn forward(&self, input: Tensor<3>, harmonic_source: Tensor<3>, g: Option<Tensor<3>>) -> Tensor<3> {
+        let [batch, _, time] = input.dims();
+        assert_eq!(harmonic_source.dims(), [batch, 1, time * self.total_upsample]);
+        let mut x = self.pre.forward(input);
+        match (&self.condition, g) {
+            (Some(conv), Some(condition)) => x = x + conv.forward(condition),
+            (None, None) => {},
+            _ => panic!("NSF decoder conditioning does not match checkpoint"),
+        }
+        for stage in &self.stages {
+            x = stage.forward(x, harmonic_source.clone());
+        }
+        activation::tanh(self.post.forward(activation::leaky_relu(x, 0.01)))
+    }
+
+    pub fn stage_count(&self) -> usize { self.stages.len() }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct NsfDecoderFixture {
+    pub upsample_rates: Vec<usize>,
+    pub kernels_per_stage: usize,
+    pub dilations: [usize; 3],
+    pub input_shape: [usize; 3],
+    pub source_shape: [usize; 3],
+    pub condition_shape: Option<[usize; 3]>,
+    pub input: Vec<f32>,
+    pub harmonic_source: Vec<f32>,
+    pub condition: Option<Vec<f32>>,
+    pub expected_waveform: Vec<f32>,
+}
+
+impl NsfDecoderFixture {
+    pub fn tensors(&self, device: &Device) -> (Tensor<3>, Tensor<3>, Option<Tensor<3>>) {
+        let input = Tensor::from_data(TensorData::new(self.input.clone(), self.input_shape), device);
+        let harmonic = Tensor::from_data(TensorData::new(self.harmonic_source.clone(), self.source_shape), device);
+        let condition = self.condition.as_ref().map(|values| {
+            Tensor::from_data(TensorData::new(values.clone(), self.condition_shape.expect("conditioning tensor missing shape")), device)
+        });
+        (input, harmonic, condition)
+    }
+
+    pub fn load(&self, checkpoint: &RvcCheckpoint, device: &Device) -> Result<NsfWaveformDecoder, String> {
+        NsfWaveformDecoder::load(checkpoint, &self.upsample_rates, self.kernels_per_stage, self.dilations, device)
+    }
+}

@@ -150,3 +150,17 @@ fn decoder_first_stage_matches_original_pytorch() {
     let error = max_abs_error(&output, &reference.expected_output);
     assert!(error.is_finite() && error < 1e-4, "DecoderStage error {error}");
 }
+
+#[test]
+fn complete_nsf_decoder_with_external_harmonic_matches_original_pytorch() {
+    use tts_with_rvc_rs::{checkpoint::RvcCheckpoint, decoder::NsfDecoderFixture};
+    let checkpoint = RvcCheckpoint::open(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/synthetic_nsf_decoder.pth")).unwrap();
+    let reference: NsfDecoderFixture = serde_json::from_str(include_str!("fixtures/nsf_decoder.json")).unwrap();
+    let device = Device::flex();
+    let decoder = reference.load(&checkpoint, &device).unwrap();
+    assert_eq!(decoder.stage_count(), reference.upsample_rates.len());
+    let (input, source, condition) = reference.tensors(&device);
+    let actual = decoder.forward(input, source, condition).into_data().try_into_vec::<f32>().unwrap();
+    let deviation = max_abs_error(&actual, &reference.expected_waveform);
+    assert!(deviation.is_finite() && deviation < 1e-4, "NSF decoder error {deviation}");
+}
