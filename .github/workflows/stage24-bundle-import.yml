@@ -1,0 +1,29 @@
+name: Stage 24 verified source import
+on:
+  push:
+    branches: [bridge/stage24-source-20261109]
+    paths: ['.stage24-bridge/source.b64']
+permissions:
+  contents: write
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify and import exact Stage 24 commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=062ef0805739b94b989c5484d8d9f52a3c62761a
+          HEAD=7b8268e86986d199c538e2123e582b9fe87490f8
+          git fetch origin refs/heads/feat/rvc-burn-parity-stage1:refs/remotes/origin/feat/rvc-burn-parity-stage1
+          test "$(git rev-parse refs/remotes/origin/feat/rvc-burn-parity-stage1)" = "$BASE"
+          base64 -d .stage24-bridge/source.b64 > /tmp/stage24.bundle
+          echo "5e3534a2d3e6d57d9765d4c0d1ba7a9ad8e1ec25a3f192def1f850ddeba8d2c8  /tmp/stage24.bundle" | sha256sum -c
+          git bundle verify /tmp/stage24.bundle
+          git fetch /tmp/stage24.bundle refs/heads/feat/rvc-stage23-longform-batching:refs/heads/stage24-candidate
+          test "$(git rev-parse refs/heads/stage24-candidate)" = "$HEAD"
+          git merge-base --is-ancestor "$BASE" "$HEAD"
+          git push origin refs/heads/stage24-candidate:refs/heads/bridge/stage24-candidate-20261109
