@@ -1,5 +1,6 @@
 [package]
 name = "tts-with-rvc-rs"
+default-run = "tts-with-rvc-rs"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.98"
