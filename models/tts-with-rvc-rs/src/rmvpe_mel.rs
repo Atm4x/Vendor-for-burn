@@ -100,6 +100,34 @@ impl RmvpeAudioModel {
         Ok(Self { mel: RmvpeMelSpectrogram::new(), network })
     }
 
+    pub fn forward_pcm_batch(&self, audios: &[Vec<f32>], device: &Device) -> Result<(Tensor<3>, usize), String> {
+        let first_len = audios.first().ok_or("RMVPE requires a nonempty batch")?.len();
+        if audios.iter().any(|audio| audio.len() != first_len) {
+            return Err("RMVPE tensor batches require equal audio lengths".into());
+        }
+        let frames = first_len / HOP_LENGTH + 1;
+        let padded = frames.div_ceil(32) * 32;
+        let mut features = Vec::with_capacity(audios.len() * MEL_BINS * padded);
+        for audio in audios {
+            let (mel, nframes) = self.mel.forward(audio)?;
+            if nframes != frames { return Err("RMVPE frame count mismatch".into()); }
+            for band in mel.chunks_exact(frames) {
+                features.extend_from_slice(band);
+                features.resize(features.len() + padded - frames, 0.0);
+            }
+        }
+        let batch = audios.len();
+        let mel = Tensor::from_data(TensorData::new(features, [batch, MEL_BINS, padded]), device);
+        let result = self.network.forward(mel);
+        Ok((result.slice([0..batch, 0..frames, 0..F0_BINS]), frames))
+    }
+
+    pub fn infer_f0_batch(&self, audios: &[Vec<f32>], device: &Device, threshold: f32) -> Result<Vec<Vec<f32>>, String> {
+        let (salience, frames) = self.forward_pcm_batch(audios, device)?;
+        let values = salience.into_data().try_into_vec::<f32>().map_err(|error| error.to_string())?;
+        values.chunks_exact(frames * F0_BINS).map(|frame| salience_to_f0(frame, threshold)).collect()
+    }
+
     pub fn forward_pcm(&self, audio_16k: &[f32], device: &Device) -> Result<(Tensor<3>, usize), String> {
         let (features, frames) = self.mel.forward(audio_16k)?;
         let mut mel = Tensor::from_data(TensorData::new(features, [1, MEL_BINS, frames]), device);

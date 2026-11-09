@@ -1,8 +1,22 @@
-# tts-with-rvc-rs — Stages 1–3: Torch/Burn numerical parity
+# tts-with-rvc-rs — Native RVC v2 inference on Burn
 
-Independent Rust model project. This stage implements the real RVC v2 `TextEncoder` input transform (`emb_phone`, `emb_pitch`, scale, LeakyReLU, transpose, padding mask) and the WaveNet fused tanh/sigmoid gate. Stage 2 adds RVC encoder relative multi-head self-attention (Q/K/V, score masking, shared-window relative keys and values, softmax, output projection) with CPU PyTorch fixtures. Stage 3 adds a complete evaluation-mode Encoder block (masked relative attention, residual LayerNorm, Conv1d-ReLU-Conv1d feedforward and residual LayerNorm). This is a transparent mathematical implementation using Burn tensor operations rather than a specialized fused GPU kernel; performance work remains. It does **not** implement the complete RVC network, HuBERT, RMVPE, FAISS index retrieval, audio inference, model loading, or a persistent worker yet.
+Rust-native RVC v2 (40 kHz) inference using Burn 0.22.1: checkpoint loading,
+HuBERT content features, RMVPE pitch extraction, FAISS IndexIVFFlat retrieval,
+TextEncoder, reverse Flow, and NSF-HiFiGAN waveform synthesis. The CLI supports
+mono WAV conversion of long inputs with overlap-add and true tensor batches for
+equal-length segments. The Python reference is used for numerical parity, not as
+an architectural or performance constraint. Model weights and audio are never
+included in this repository.
 
-The sources of mathematical behavior are the uploaded `tts-with-rvc` Python `infer_pack/models.py` (`TextEncoder.forward`, lines 62–71) and `infer_pack/commons.py` (`fused_add_tanh_sigmoid_multiply`, lines 108–114), and `infer_pack/attentions.py` (`MultiHeadAttention.attention` and its relative-position transforms).
+**Current validation:** component-level PyTorch reference fixtures, batch versus
+single-component checks, and local real-model WAV smoke tests. End-to-end
+PyTorch parity, perceptual audio quality, CUDA/WGPU numerical parity, and
+production-ready IPC are not yet established. Use release mode for CPU execution.
+
+## Historical stage notes
+
+The sections below record incremental development. Statements that a component
+was absent apply to the **specific earlier stage**, not the current codebase.
 
 ## Reproducible synthetic parity
 
@@ -274,3 +288,33 @@ The frame parameters are at 100 frames/s; defaults are core=300 (3 s), overlap=1
 **Validation:** deterministic unit tests and the 27 existing PyTorch component parity tests pass. The full 0.25-second real-model long-form CPU smoke test did not finish before a 120-second timeout (approximately 1.05 GiB RSS); the new audio path and reconstructed seams have **not** yet passed a real-model acceptance test. The code should not be described as long-form reference parity or real-time capable. End-to-end parity, true tensor batching, streaming PCM output, global F0 alignment and GPU benchmarks remain open.
 
 Never add private `.pth`, `.pt`, `.index` or `.wav` assets to the repository.
+
+
+## Stage 24 — tensor batched long-form inference
+
+`RvcV2Inferencer::infer_16khz_batch` executes multiple equal-length audio segments in
+one `[B, ...]` Burn tensor graph: HuBERT, RMVPE, RVC TextEncoder, inverse Flow and
+NSF-HiFiGAN. Each input retains its own speaker embedding, index blend, pitch,
+noise seed and pitch shift. Partial terminal chunks are processed separately, not
+padded into the same batch, so chunk boundaries do not change relative to the
+single-item inference. Long-form overlap-add and high-pass filtering remain intact.
+
+`infer-wav-full` and `infer-wav-batch` accept an optional final tensor batch size
+(default 2; `1..=32`). Example:
+
+```sh
+tts-with-rvc-rs infer-wav-full voice.pth hubert_base.pt rmvpe.pt voice.index input.wav output.wav 0.75 0 300 12 40 2
+```
+
+The optional numeric arguments are, in order: index rate, pitch shift (semitones),
+core frames, overlap frames, context frames, tensor batch size. Existing file
+batch manifests continue to reuse model weights across files, while tensor batches
+are formed **within** each file's chunk stream. `RVC_PROFILE=1` reports per-batch
+HuBERT/RMVPE/retrieval/encoder/flow/NSF timings on standard error.
+
+Use `--release` for CPU inference. Debug builds can be orders of magnitude slower,
+especially in the NSF decoder. Tensor batching improves computational parallelism
+but does not guarantee CPU speedups; benchmark with the actual backend and batch
+size. CUDA/WGPU parity, long audio quality, and complete PyTorch numerical parity
+remain independent acceptance criteria. Never commit private checkpoints, indices
+or audio recordings.

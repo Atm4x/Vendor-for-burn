@@ -500,3 +500,78 @@ fn unsupported_multiharmonic_nsf_fails_explicitly() {
     assert!(SineGen::new(40000, 2).is_err());
     assert!(SineGen::new(0, 0).is_err());
 }
+
+#[test]
+fn tensor_batch_hubert_matches_individual_waveforms() {
+    use tts_with_rvc_rs::{checkpoint::RvcCheckpoint, hubert_model::HubertFeatureModel};
+    let checkpoint = RvcCheckpoint::open_model(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/synthetic_hubert_model.pth")).unwrap();
+    let fixture: serde_json::Value = serde_json::from_str(include_str!("fixtures/hubert_model.json")).unwrap();
+    let shape: [usize; 3] = serde_json::from_value(fixture["input_shape"].clone()).unwrap();
+    let waveform: Vec<f32> = serde_json::from_value(fixture["waveform"].clone()).unwrap();
+    let device = Device::flex();
+    let model = HubertFeatureModel::load(&checkpoint, 3, 2, &device).unwrap();
+    let input = Tensor::from_data(TensorData::new(waveform, shape), &device);
+    let batched = model.forward(input.clone(), None).into_data().try_into_vec::<f32>().unwrap();
+    let mut individual = Vec::new();
+    for index in 0..shape[0] {
+        let sample = input.clone().slice([index..index + 1, 0..1, 0..shape[2]]);
+        individual.extend(model.forward(sample, None).into_data().try_into_vec::<f32>().unwrap());
+    }
+    assert!(max_abs_error(&batched, &individual) <= 1e-4);
+}
+
+#[test]
+fn tensor_batch_rmvpe_network_matches_individual_mels() {
+    use tts_with_rvc_rs::{checkpoint::RvcCheckpoint, rmvpe_gru::RmvpeNetwork};
+    let checkpoint = RvcCheckpoint::open_root(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/synthetic_rmvpe_gru.pth")).unwrap();
+    let fixture: serde_json::Value = serde_json::from_str(include_str!("fixtures/rmvpe_gru.json")).unwrap();
+    let shape: [usize; 3] = serde_json::from_value(fixture["mel_shape"].clone()).unwrap();
+    let waveform: Vec<f32> = serde_json::from_value(fixture["mel"].clone()).unwrap();
+    let device = Device::flex();
+    let model = RmvpeNetwork::load(&checkpoint, 2, 2, shape[1], &device).unwrap();
+    let input = Tensor::from_data(TensorData::new(waveform, shape), &device);
+    let second = input.clone() * 0.87;
+    let batch = Tensor::cat(vec![input.clone(), second.clone()], 0);
+    let batched = model.forward(batch).into_data().try_into_vec::<f32>().unwrap();
+    let mut individual = Vec::new();
+    individual.extend(model.forward(input).into_data().try_into_vec::<f32>().unwrap());
+    individual.extend(model.forward(second).into_data().try_into_vec::<f32>().unwrap());
+    assert!(max_abs_error(&batched, &individual) <= 2e-4);
+}
+
+#[test]
+fn tensor_batch_nsf_from_f0_matches_individual_waveforms() {
+    use tts_with_rvc_rs::{
+        checkpoint::RvcCheckpoint, decoder::NsfWaveformDecoder,
+        nsf_source::{NsfFromF0Fixture, SourceModuleHnNSF},
+    };
+    let checkpoint = RvcCheckpoint::open(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/synthetic_nsf_decoder.pth")).unwrap();
+    let fixture: NsfFromF0Fixture = serde_json::from_str(include_str!("fixtures/nsf_f0_decoder.json")).unwrap();
+    let device = Device::flex();
+    let decoder = NsfWaveformDecoder::load(
+        &checkpoint, &fixture.upsample_rates, fixture.kernels_per_stage, fixture.dilations, &device,
+    ).unwrap();
+    let source = SourceModuleHnNSF::load(&checkpoint, fixture.sample_rate, 0, &device).unwrap();
+    let [_, channels, frames] = fixture.input_shape;
+    let upsample = fixture.upsample_rates.iter().product::<usize>();
+    let input = Tensor::from_data(TensorData::new(fixture.input.clone(), [1, channels, frames]), &device);
+    let f0 = Tensor::from_data(TensorData::new(fixture.f0.clone(), [1, frames]), &device);
+    let noise = Tensor::from_data(TensorData::new(fixture.gaussian_noise.clone(), [1, frames * upsample, 1]), &device);
+    let phases = Tensor::from_data(TensorData::new(fixture.initial_phases, [1, 1, 1]), &device);
+    let condition = fixture.condition.as_ref().map(|values| Tensor::from_data(
+        TensorData::new(values.clone(), fixture.condition_shape.unwrap()), &device));
+    let single = decoder.forward_from_f0(input.clone(), f0.clone(), condition.clone(), &source,
+        phases.clone(), noise.clone()).unwrap();
+    let altered = decoder.forward_from_f0(input.clone() * 0.9, f0.clone() * 0.91,
+        condition.clone(), &source, phases.clone(), noise.clone()).unwrap();
+    let batched_condition = condition.map(|x| Tensor::cat(vec![x.clone(), x], 0));
+    let batched = decoder.forward_from_f0(
+        Tensor::cat(vec![input.clone(), input * 0.9], 0),
+        Tensor::cat(vec![f0.clone(), f0 * 0.91], 0), batched_condition, &source,
+        phases, Tensor::cat(vec![noise.clone(), noise], 0),
+    ).unwrap();
+    let expected = Tensor::cat(vec![single, altered], 0).into_data().try_into_vec::<f32>().unwrap();
+    let actual = batched.into_data().try_into_vec::<f32>().unwrap();
+    assert_eq!(actual.len(), expected.len());
+    assert!(max_abs_error(&actual, &expected) < 2e-4);
+}

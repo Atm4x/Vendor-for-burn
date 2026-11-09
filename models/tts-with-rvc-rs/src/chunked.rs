@@ -58,20 +58,37 @@ pub fn infer_chunked_with_progress(
     pcm: &[f32],
     config: ChunkConfig,
     mut infer: impl FnMut(&[f32], usize) -> Result<Vec<f32>, String>,
+    progress: impl FnMut(ChunkProgress),
+) -> Result<Vec<f32>, String> {
+    infer_chunked_batched_with_progress(
+        pcm,
+        config,
+        1,
+        |segments, indices| {
+            segments.iter().zip(indices).map(|(audio, &i)| infer(audio, i)).collect()
+        },
+        progress,
+    )
+}
+
+/// Execute equal-length model inputs as a single tensor batch; preserve chunk order.
+/// The final partial chunk is kept separate instead of padding its model input.
+pub fn infer_chunked_batched_with_progress(
+    pcm: &[f32],
+    config: ChunkConfig,
+    batch_size: usize,
+    mut infer: impl FnMut(&[Vec<f32>], &[usize]) -> Result<Vec<Vec<f32>>, String>,
     mut progress: impl FnMut(ChunkProgress),
 ) -> Result<Vec<f32>, String> {
     config.validate()?;
+    if batch_size == 0 || batch_size > 32 {
+        return Err("RVC tensor batch size must be in 1..=32".into());
+    }
     if pcm.is_empty() || pcm.iter().any(|x| !x.is_finite()) {
         return Err("RVC chunking requires nonempty finite 16-kHz PCM".into());
     }
-    let output_length = pcm
-        .len()
-        .checked_mul(OUTPUT_HZ)
-        .ok_or("RVC output length overflow")?
-        / INPUT_HZ;
-    if output_length == 0 {
-        return Err("RVC audio is shorter than one output sample".into());
-    }
+    let output_length = pcm.len().checked_mul(OUTPUT_HZ)
+        .ok_or("RVC output length overflow")? / INPUT_HZ;
     let total_frames = pcm.len().div_ceil(HOP);
     let step = config.core_frames - config.overlap_frames;
     let mut chunks = Vec::new();
@@ -79,70 +96,66 @@ pub fn infer_chunked_with_progress(
     loop {
         let end = (start + config.core_frames).min(total_frames);
         chunks.push((start, end));
-        if end == total_frames {
-            break;
-        }
+        if end == total_frames { break; }
         start += step;
     }
-
     let mut output = vec![0.0f32; output_length];
     let mut weight_sum = vec![0.0f32; output_length];
-    for (chunk_index, &(start, end)) in chunks.iter().enumerate() {
-        let left = config.context_frames * HOP;
-        let core = (end - start) * HOP;
-        let right = (config.context_frames + config.trailing_frames) * HOP;
-        let audio_start = start * HOP;
-        let mut segment = Vec::with_capacity(left + core + right);
-        let segment_start = audio_start as i64 - left as i64;
-        for position in 0..left + core + right {
-            let source = reflect_index(segment_start + position as i64, pcm.len());
-            segment.push(pcm[source]);
-        }
-        if segment.len() < 3_200 || segment.len() > INPUT_HZ * 10 {
-            return Err(format!(
-                "RVC chunk {chunk_index} has invalid model input size {}",
-                segment.len()
-            ));
-        }
-        let rendered = infer(&segment, chunk_index)
-            .map_err(|err| format!("RVC chunk {chunk_index}/{}: {err}", chunks.len()))?;
-        let out_start = start * OUTPUT_HOP;
-        let out_end = (end * OUTPUT_HOP).min(output_length);
-        let crop_start = config.context_frames * OUTPUT_HOP;
-        let crop_end = crop_start + out_end - out_start;
-        if rendered.len() < crop_end {
-            return Err(format!(
-                "RVC chunk {chunk_index} generated {} samples, requires {crop_end} including context",
-                rendered.len()
-            ));
-        }
-        let overlap = config.overlap_frames * OUTPUT_HOP;
-        for (offset, &sample) in rendered[crop_start..crop_end].iter().enumerate() {
-            if !sample.is_finite() {
-                return Err(format!(
-                    "RVC chunk {chunk_index} generated non-finite audio"
-                ));
+    let mut chunk_index = 0;
+    while chunk_index < chunks.len() {
+        let first_size = (chunks[chunk_index].1 - chunks[chunk_index].0) * HOP;
+        let mut audio_batch = Vec::new();
+        let mut indices = Vec::new();
+        while chunk_index + audio_batch.len() < chunks.len() && audio_batch.len() < batch_size {
+            let i = chunk_index + audio_batch.len();
+            let (start, end) = chunks[i];
+            if (end - start) * HOP != first_size { break; }
+            let left = config.context_frames * HOP;
+            let right = (config.context_frames + config.trailing_frames) * HOP;
+            let core = (end - start) * HOP;
+            let mut segment = Vec::with_capacity(left + core + right);
+            let segment_start = (start * HOP) as i64 - left as i64;
+            for position in 0..left + core + right {
+                segment.push(pcm[reflect_index(segment_start + position as i64, pcm.len())]);
             }
-            let absolute = out_start + offset;
-            let fade_in = if start > 0 && overlap > 0 {
-                ((absolute - out_start) as f32 / overlap as f32).min(1.0)
-            } else {
-                1.0
-            };
-            let fade_out = if end < total_frames && overlap > 0 {
-                ((out_end - absolute - 1) as f32 / overlap as f32).min(1.0)
-            } else {
-                1.0
-            };
-            let weight = fade_in.min(fade_out);
-            output[absolute] += sample * weight;
-            weight_sum[absolute] += weight;
+            if !(3_200..=INPUT_HZ * 10).contains(&segment.len()) {
+                return Err(format!("RVC chunk {i} has invalid model input size {}", segment.len()));
+            }
+            audio_batch.push(segment);
+            indices.push(i);
         }
-        progress(ChunkProgress {
-            chunk_index: chunk_index + 1,
-            chunk_count: chunks.len(),
-            output_samples: out_end,
-        });
+        let rendered_batch = infer(&audio_batch, &indices)
+            .map_err(|err| format!("RVC chunks {}..{}: {err}", chunk_index, chunk_index + audio_batch.len()))?;
+        if rendered_batch.len() != audio_batch.len() {
+            return Err(format!("RVC batch returned {} waveforms for {} inputs", rendered_batch.len(), audio_batch.len()));
+        }
+        for (relative, rendered) in rendered_batch.into_iter().enumerate() {
+            let i = chunk_index + relative;
+            let (start, end) = chunks[i];
+            let out_start = start * OUTPUT_HOP;
+            let out_end = (end * OUTPUT_HOP).min(output_length);
+            let crop_start = config.context_frames * OUTPUT_HOP;
+            let crop_end = crop_start + out_end - out_start;
+            if rendered.len() < crop_end {
+                return Err(format!("RVC chunk {i} generated {} samples, requires {crop_end} including context", rendered.len()));
+            }
+            let overlap = config.overlap_frames * OUTPUT_HOP;
+            for (offset, &sample) in rendered[crop_start..crop_end].iter().enumerate() {
+                if !sample.is_finite() { return Err(format!("RVC chunk {i} generated non-finite audio")); }
+                let absolute = out_start + offset;
+                let fade_in = if start > 0 && overlap > 0 {
+                    ((absolute - out_start) as f32 / overlap as f32).min(1.0)
+                } else { 1.0 };
+                let fade_out = if end < total_frames && overlap > 0 {
+                    ((out_end - absolute - 1) as f32 / overlap as f32).min(1.0)
+                } else { 1.0 };
+                let weight = fade_in.min(fade_out);
+                output[absolute] += sample * weight;
+                weight_sum[absolute] += weight;
+            }
+            progress(ChunkProgress { chunk_index: i + 1, chunk_count: chunks.len(), output_samples: out_end });
+        }
+        chunk_index += audio_batch.len();
     }
     for (sample, weight) in output.iter_mut().zip(weight_sum) {
         if weight <= 0.0 || !weight.is_finite() {
@@ -264,5 +277,37 @@ mod tests {
         assert!(out[36 * OUTPUT_HOP] > 0.4 && out[36 * OUTPUT_HOP] < 0.6);
         assert!((out[40 * OUTPUT_HOP] - 1.0).abs() < 1e-6);
         assert!(out.last().unwrap().is_finite());
+    }
+}
+
+#[cfg(test)]
+mod tensor_batch_tests {
+    use super::*;
+
+    #[test]
+    fn batched_chunking_matches_scalar_and_preserves_finite_boundaries() {
+        let pcm: Vec<f32> = (0..91_377).map(|i| (i as f32 * 0.001).sin()).collect();
+        let config = ChunkConfig { core_frames: 60, overlap_frames: 12, context_frames: 20, trailing_frames: 4 };
+        let render = |input: &[f32]| (0..input.len() * 5 / 2)
+            .map(|i| input[i * 2 / 5]).collect::<Vec<f32>>();
+        let expected = infer_chunked_with(&pcm, config, |input, _| Ok(render(input))).unwrap();
+        let mut batches = Vec::new();
+        let actual = infer_chunked_batched_with_progress(&pcm, config, 3, |inputs, ids| {
+            batches.push((inputs.len(), ids.to_vec()));
+            Ok(inputs.iter().map(|input| render(input)).collect())
+        }, |_|{}).unwrap();
+        assert_eq!(expected, actual);
+        assert!(batches.iter().any(|(len, _)| *len == 3));
+        assert!(batches.iter().all(|(len, ids)| *len == ids.len()));
+        assert_eq!(actual.len(), pcm.len() * 5 / 2);
+    }
+
+    #[test]
+    fn batch_rejects_missing_outputs_and_oversized_batch() {
+        let pcm = vec![0.1; 18_000];
+        let cfg = ChunkConfig { core_frames: 30, overlap_frames: 4, context_frames: 12, trailing_frames: 4 };
+        assert!(infer_chunked_batched_with_progress(&pcm, cfg, 0, |_, _| Ok(vec![]), |_| {}).is_err());
+        assert!(infer_chunked_batched_with_progress(&pcm, cfg, 33, |_, _| Ok(vec![]), |_| {}).is_err());
+        assert!(infer_chunked_batched_with_progress(&pcm, cfg, 2, |_, _| Ok(vec![]), |_| {}).is_err());
     }
 }

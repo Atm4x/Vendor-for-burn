@@ -19,6 +19,7 @@ fn process_wave_job(
     job: &WaveJob,
     options: &tts_with_rvc_rs::rvc_inference::InferenceOptions,
     config: tts_with_rvc_rs::chunked::ChunkConfig,
+    tensor_batch_size: usize,
 ) -> Result<(), String> {
     use tts_with_rvc_rs::audio_io;
     if job.input.is_empty() || job.output.is_empty() || job.input == job.output {
@@ -39,7 +40,7 @@ fn process_wave_job(
         audio.samples.len(),
         audio.sample_rate
     );
-    let mut converted = inferencer.infer_long_16khz(&pcm, &settings, config, |p| {
+    let mut converted = inferencer.infer_long_16khz_batched(&pcm, &settings, config, tensor_batch_size, |p| {
         eprintln!(
             "RVC chunks={}/{} output_samples={}",
             p.chunk_index, p.chunk_count, p.output_samples
@@ -159,6 +160,11 @@ fn run() -> Result<(), String> {
                 .parse()
                 .map_err(|e| format!("invalid context frames: {e}"))?;
         }
+        let tensor_batch_size: usize = args.next().map(|value| value.parse().map_err(|e| format!("invalid tensor batch size: {e}")))
+            .transpose()?.unwrap_or(2);
+        if !(1..=32).contains(&tensor_batch_size) {
+            return Err("tensor batch size must be 1..=32".into());
+        }
         if args.next().is_some() {
             return Err("too many inference parameters".into());
         }
@@ -187,7 +193,7 @@ fn run() -> Result<(), String> {
         )?;
         for (i, job) in jobs.iter().enumerate() {
             eprintln!("RVC batch job {}/{}", i + 1, jobs.len());
-            process_wave_job(&inferencer, job, &options, config)?;
+            process_wave_job(&inferencer, job, &options, config, tensor_batch_size)?;
         }
         return Ok(());
     }
