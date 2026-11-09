@@ -79,7 +79,7 @@ impl SineGen {
             .reshape([batch, samples, 1]);
         let noise_amplitude = voiced.clone() * self.noise_std
             + (1.0 - voiced.clone()) * (self.sine_amp / 3.0);
-        let noise = gaussian_noise * noise_amplitude;
+        let noise: Tensor<3> = gaussian_noise * noise_amplitude;
         let waves = sine * voiced.clone() + noise.clone();
         Ok(SineOutput { waves, voiced, noise })
     }
