@@ -1,8 +1,15 @@
 use burn::tensor::{activation, module, ops::{ConvOptions, ConvTransposeOptions}, Device, Tensor, TensorData};
 use serde::Deserialize;
+use rayon::prelude::*;
 
 use crate::checkpoint::RvcCheckpoint;
 use crate::nsf_source::SourceModuleHnNSF;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResidualExecution {
+    Sequential,
+    Parallel,
+}
 
 struct Conv1d {
     weight: Tensor<3>,
@@ -136,13 +143,33 @@ impl DecoderStage {
     }
 
     pub fn forward(&self, input: Tensor<3>, harmonic_source: Tensor<3>) -> Tensor<3> {
+        self.forward_with_execution(input, harmonic_source, ResidualExecution::Parallel)
+    }
+
+    fn forward_with_execution(
+        &self,
+        input: Tensor<3>,
+        harmonic_source: Tensor<3>,
+        execution: ResidualExecution,
+    ) -> Tensor<3> {
         let upsampled = self.upsample_only(input);
         let source = self.noise.forward(harmonic_source);
         assert_eq!(upsampled.dims(), source.dims(), "harmonic source must align with upsampled features");
-        let mut result = Tensor::<3>::zeros(upsampled.dims(), &upsampled.device());
         let prepared = upsampled + source;
-        for block in &self.residual {
-            result = result + block.forward(prepared.clone());
+        let mut result = Tensor::<3>::zeros(prepared.dims(), &prepared.device());
+        match execution {
+            ResidualExecution::Sequential => {
+                for block in &self.residual {
+                    result = result + block.forward(prepared.clone());
+                }
+            }
+            ResidualExecution::Parallel => {
+                let branches: Vec<Tensor<3>> = self.residual.par_iter()
+                    .map(|block| block.forward(prepared.clone())).collect();
+                for branch in branches {
+                    result = result + branch;
+                }
+            }
         }
         result / self.residual.len() as f32
     }
@@ -227,6 +254,16 @@ impl NsfWaveformDecoder {
     }
 
     pub fn forward(&self, input: Tensor<3>, harmonic_source: Tensor<3>, g: Option<Tensor<3>>) -> Tensor<3> {
+        self.forward_with_execution(input, harmonic_source, g, ResidualExecution::Parallel)
+    }
+
+    pub fn forward_with_execution(
+        &self,
+        input: Tensor<3>,
+        harmonic_source: Tensor<3>,
+        g: Option<Tensor<3>>,
+        execution: ResidualExecution,
+    ) -> Tensor<3> {
         let [batch, _, time] = input.dims();
         assert_eq!(harmonic_source.dims(), [batch, 1, time * self.total_upsample]);
         let mut x = self.pre.forward(input);
@@ -236,7 +273,7 @@ impl NsfWaveformDecoder {
             _ => panic!("NSF decoder conditioning does not match checkpoint"),
         }
         for stage in &self.stages {
-            x = stage.forward(x, harmonic_source.clone());
+            x = stage.forward_with_execution(x, harmonic_source.clone(), execution);
         }
         activation::tanh(self.post.forward(activation::leaky_relu(x, 0.01)))
     }
@@ -250,12 +287,27 @@ impl NsfWaveformDecoder {
         initial_phases: Tensor<3>,
         gaussian_noise: Tensor<3>,
     ) -> Result<Tensor<3>, String> {
+        self.forward_from_f0_with_execution(
+            input, f0, condition, source, initial_phases, gaussian_noise, ResidualExecution::Parallel,
+        )
+    }
+
+    pub fn forward_from_f0_with_execution(
+        &self,
+        input: Tensor<3>,
+        f0: Tensor<2>,
+        condition: Option<Tensor<3>>,
+        source: &SourceModuleHnNSF,
+        initial_phases: Tensor<3>,
+        gaussian_noise: Tensor<3>,
+        execution: ResidualExecution,
+    ) -> Result<Tensor<3>, String> {
         let [batch, _, frames] = input.dims();
         if f0.dims() != [batch, frames] {
             return Err("NSF decoder F0 shape must match input frames".into());
         }
         let (harmonic, _) = source.forward_with_random(f0, self.total_upsample, initial_phases, gaussian_noise)?;
-        Ok(self.forward(input, harmonic.permute([0, 2, 1]), condition))
+        Ok(self.forward_with_execution(input, harmonic.permute([0, 2, 1]), condition, execution))
     }
 
     pub fn stage_count(&self) -> usize { self.stages.len() }

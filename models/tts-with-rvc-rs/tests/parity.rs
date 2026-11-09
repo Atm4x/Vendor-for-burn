@@ -152,6 +152,27 @@ fn decoder_first_stage_matches_original_pytorch() {
 }
 
 #[test]
+fn nsf_residual_execution_modes_are_bitwise_equal() {
+    use tts_with_rvc_rs::{
+        checkpoint::RvcCheckpoint,
+        decoder::{NsfDecoderFixture, ResidualExecution},
+    };
+    let checkpoint = RvcCheckpoint::open(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/synthetic_nsf_decoder.pth")).unwrap();
+    let fixture: NsfDecoderFixture = serde_json::from_str(include_str!("fixtures/nsf_decoder.json")).unwrap();
+    let device = Device::flex();
+    let decoder = fixture.load(&checkpoint, &device).unwrap();
+    let (input, source, condition) = fixture.tensors(&device);
+    let sequential = decoder.forward_with_execution(
+        input.clone(), source.clone(), condition.clone(), ResidualExecution::Sequential,
+    ).into_data().try_into_vec::<f32>().unwrap();
+    let parallel = decoder.forward_with_execution(
+        input, source, condition, ResidualExecution::Parallel,
+    ).into_data().try_into_vec::<f32>().unwrap();
+    assert_eq!(sequential, parallel);
+    assert!(max_abs_error(&parallel, &fixture.expected_waveform) < 1e-4);
+}
+
+#[test]
 fn complete_nsf_decoder_with_external_harmonic_matches_original_pytorch() {
     use tts_with_rvc_rs::{checkpoint::RvcCheckpoint, decoder::NsfDecoderFixture};
     let checkpoint = RvcCheckpoint::open(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/synthetic_nsf_decoder.pth")).unwrap();
