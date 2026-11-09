@@ -236,3 +236,26 @@ fn hubert_transformer_layer_matches_pytorch_with_and_without_padding() {
     assert!(max_abs_error(&actual_masked, &expected) < 1e-4);
     assert!(max_abs_error(&actual_unmasked, &expected_unmasked) < 1e-4);
 }
+
+#[test]
+fn hubert_transformer_stack_matches_torch_with_padding() {
+    use tts_with_rvc_rs::{checkpoint::RvcCheckpoint, hubert_transformer::HubertTransformerStack};
+    let checkpoint = RvcCheckpoint::open_model(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/synthetic_hubert_stack.pth")).unwrap();
+    let fixture: serde_json::Value = serde_json::from_str(include_str!("fixtures/hubert_stack.json")).unwrap();
+    let input: Vec<f32> = serde_json::from_value(fixture["input"].clone()).unwrap();
+    let valid: Vec<f32> = serde_json::from_value(fixture["valid"].clone()).unwrap();
+    let expected: Vec<f32> = serde_json::from_value(fixture["expected"].clone()).unwrap();
+    let expected_unmasked: Vec<f32> = serde_json::from_value(fixture["expected_unmasked"].clone()).unwrap();
+    let shape: [usize; 3] = serde_json::from_value(fixture["shape"].clone()).unwrap();
+    let heads: usize = serde_json::from_value(fixture["heads"].clone()).unwrap();
+    let layers: usize = serde_json::from_value(fixture["layers"].clone()).unwrap();
+    let device = Device::flex();
+    let model = HubertTransformerStack::load(&checkpoint, layers, heads, &device).unwrap();
+    assert_eq!(model.len(), 3);
+    let x = Tensor::from_data(TensorData::new(input, shape), &device);
+    let mask = Tensor::from_data(TensorData::new(valid, [shape[0], shape[1]]), &device);
+    let actual_masked = model.forward(x.clone(), Some(mask)).into_data().try_into_vec::<f32>().unwrap();
+    let actual_unmasked = model.forward(x, None).into_data().try_into_vec::<f32>().unwrap();
+    assert!(max_abs_error(&actual_masked, &expected) < 1e-4);
+    assert!(max_abs_error(&actual_unmasked, &expected_unmasked) < 1e-4);
+}

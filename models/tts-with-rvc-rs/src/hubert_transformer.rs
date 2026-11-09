@@ -128,3 +128,33 @@ impl HubertTransformerLayer {
         self.final_norm.forward(after_attention + self.fc2.forward(hidden))
     }
 }
+
+/// Ordered HuBERT Transformer blocks; positional convolution and outer encoder
+/// normalization are separate stages and are not applied by this object.
+pub struct HubertTransformerStack {
+    layers: Vec<HubertTransformerLayer>,
+}
+
+impl HubertTransformerStack {
+    pub fn load(checkpoint: &RvcCheckpoint, layer_count: usize, heads: usize, device: &Device) -> Result<Self, String> {
+        if layer_count == 0 {
+            return Err("HuBERT Transformer requires at least one layer".into());
+        }
+        let mut layers = Vec::with_capacity(layer_count);
+        for index in 0..layer_count {
+            layers.push(HubertTransformerLayer::load(checkpoint, index, heads, device)?);
+        }
+        Ok(Self { layers })
+    }
+
+    pub fn len(&self) -> usize {
+        self.layers.len()
+    }
+
+    pub fn forward(&self, mut input: Tensor<3>, valid_keys: Option<Tensor<2>>) -> Tensor<3> {
+        for layer in &self.layers {
+            input = layer.forward(input, valid_keys.clone());
+        }
+        input
+    }
+}

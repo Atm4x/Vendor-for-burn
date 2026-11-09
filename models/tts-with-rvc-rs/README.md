@@ -133,3 +133,12 @@ The source generator `tools/reference_hubert_transformer.py` creates independent
 python models/tts-with-rvc-rs/tools/reference_hubert_transformer.py --checkpoint hubert_base.pt --fixture PRIVATE_TRANSFORMER_REFERENCE.json
 cargo run -p tts-with-rvc-rs --locked --offline -- verify-hubert-transformer hubert_base.pt PRIVATE_TRANSFORMER_REFERENCE.json flex
 ```
+
+### Stage 12 — all twelve HuBERT Transformer blocks
+
+`HubertTransformerStack` composes the verified Fairseq attention+FFN layer class with separate `.pth` weights from each of the twelve original layers. The stack retains weights in memory, uses evaluation-mode operations and supports key padding masks. The synthetic fixture exercises three layers; the private HuBERT Base fixture checks all twelve. This boundary starts **after positional convolution and outer encoder normalization**; it is not a complete HuBERT forward pass until those surrounding operations are integrated.
+
+```text
+python models/tts-with-rvc-rs/tools/reference_hubert_stack.py --checkpoint hubert_base.pt --fixture PRIVATE_HUBERT_STACK.json
+cargo run -p tts-with-rvc-rs --locked --offline -- verify-hubert-stack hubert_base.pt PRIVATE_HUBERT_STACK.json flex
+```

@@ -8,8 +8,8 @@ import torch.nn.functional as F
 from reference_feature_heads import normalize_zip, read_hubert
 
 
-def reference_layer(weights, x, valid, heads):
-    root = 'encoder.layers.0.'
+def reference_layer(weights, x, valid, heads, index=0):
+    root = f'encoder.layers.{index}.'
 
     def linear(name, value):
         return F.linear(value, weights[root + name + '.weight'].float(),
