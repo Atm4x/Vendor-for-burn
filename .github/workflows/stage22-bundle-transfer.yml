@@ -1,0 +1,30 @@
+name: Stage22 source bundle transfer
+on:
+  push:
+    branches: [bridge/stage22-source-20261109]
+  workflow_dispatch:
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Export working refs
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin '+refs/heads/main:refs/heads/main' '+refs/heads/feat/rvc-burn-parity-stage1:refs/heads/feat/rvc-burn-parity-stage1'
+          git bundle create vendor-for-burn-stage22.bundle refs/heads/main refs/heads/feat/rvc-burn-parity-stage1
+          git bundle verify vendor-for-burn-stage22.bundle
+          sha256sum vendor-for-burn-stage22.bundle > vendor-for-burn-stage22.bundle.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stage22-source-bundle
+          path: |
+            vendor-for-burn-stage22.bundle
+            vendor-for-burn-stage22.bundle.sha256
+          retention-days: 3
