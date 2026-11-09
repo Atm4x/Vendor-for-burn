@@ -15,11 +15,11 @@ fn run() -> Result<(), String> {
         }
         return Ok(());
     }
-    if !matches!(command.as_str(), "verify-text-front" | "verify-attention" | "verify-encoder-layer" | "verify-text-encoder" | "verify-flow" | "verify-text-encoder-pth" | "verify-decoder-stage" | "verify-nsf-decoder" | "verify-hubert-conv" | "verify-hubert-frontend" | "verify-hubert-transformer" | "verify-hubert-stack" | "verify-hubert-position" | "verify-hubert-encoder" | "verify-hubert-model" | "verify-rmvpe-head" | "verify-rmvpe-encoder" | "verify-rmvpe-intermediate" | "verify-rmvpe-decoder" | "verify-rmvpe-unet") {
+    if !matches!(command.as_str(), "verify-text-front" | "verify-attention" | "verify-encoder-layer" | "verify-text-encoder" | "verify-flow" | "verify-text-encoder-pth" | "verify-decoder-stage" | "verify-nsf-decoder" | "verify-hubert-conv" | "verify-hubert-frontend" | "verify-hubert-transformer" | "verify-hubert-stack" | "verify-hubert-position" | "verify-hubert-encoder" | "verify-hubert-model" | "verify-rmvpe-head" | "verify-rmvpe-encoder" | "verify-rmvpe-intermediate" | "verify-rmvpe-decoder" | "verify-rmvpe-unet" | "verify-rmvpe-gru" | "verify-rmvpe-network") {
         return Err("usage: tts-with-rvc-rs verify-text-front|verify-attention|verify-encoder-layer|verify-text-encoder <fixture.json> [flex|cpu|cuda|wgpu]".into());
     }
     let path = args.next().ok_or("missing fixture or checkpoint path")?;
-    let flow_fixture_path = if command == "verify-flow" || command == "verify-text-encoder-pth" || command == "verify-decoder-stage" || command == "verify-nsf-decoder" || command == "verify-hubert-conv" || command == "verify-hubert-frontend" || command == "verify-hubert-transformer" || command == "verify-hubert-stack" || command == "verify-hubert-position" || command == "verify-hubert-encoder" || command == "verify-hubert-model" || command == "verify-rmvpe-head" || command == "verify-rmvpe-encoder" || command == "verify-rmvpe-intermediate" || command == "verify-rmvpe-decoder" || command == "verify-rmvpe-unet" {
+    let flow_fixture_path = if command == "verify-flow" || command == "verify-text-encoder-pth" || command == "verify-decoder-stage" || command == "verify-nsf-decoder" || command == "verify-hubert-conv" || command == "verify-hubert-frontend" || command == "verify-hubert-transformer" || command == "verify-hubert-stack" || command == "verify-hubert-position" || command == "verify-hubert-encoder" || command == "verify-hubert-model" || command == "verify-rmvpe-head" || command == "verify-rmvpe-encoder" || command == "verify-rmvpe-intermediate" || command == "verify-rmvpe-decoder" || command == "verify-rmvpe-unet" || command == "verify-rmvpe-gru" || command == "verify-rmvpe-network" {
         Some(args.next().ok_or("missing flow fixture path")?)
     } else { None };
     let backend = args.next().unwrap_or_else(|| "flex".to_owned());
@@ -169,6 +169,51 @@ fn run() -> Result<(), String> {
         println!("backend={backend} max_abs_{command}={error:.9} max_abs_unmasked={unmasked_error:.9} layers={layers}");
         if !error.is_finite() || !unmasked_error.is_finite() || error > 1e-4 || unmasked_error > 1e-4 {
             return Err(format!("HuBERT positional/encoder parity exceeded tolerance: {error:.8}, {unmasked_error:.8}"));
+        }
+        return Ok(());
+    }
+    if command == "verify-rmvpe-gru" || command == "verify-rmvpe-network" {
+        use burn::tensor::{Tensor, TensorData};
+        use tts_with_rvc_rs::{checkpoint::RvcCheckpoint, rmvpe::salience_to_f0, rmvpe::RmvpeHead, rmvpe_gru::{RmvpeBiGru, RmvpeNetwork}};
+        let checkpoint = RvcCheckpoint::open_root(&path)?;
+        let reference_path = flow_fixture_path.as_ref().ok_or("missing RMVPE GRU reference")?;
+        let fixture: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(reference_path).map_err(|error| error.to_string())?,
+        ).map_err(|error| error.to_string())?;
+        let read = |name: &str| -> Result<Vec<f32>, String> {
+            serde_json::from_value(fixture[name].clone()).map_err(|error| error.to_string())
+        };
+        let (actual, expected, expected_f0) = if command == "verify-rmvpe-gru" {
+            let shape: [usize; 3] = serde_json::from_value(fixture["gru_input_shape"].clone()).map_err(|error| error.to_string())?;
+            let expected_shape: [usize; 3] = serde_json::from_value(fixture["gru_output_shape"].clone()).map_err(|error| error.to_string())?;
+            let gru = RmvpeBiGru::load(&checkpoint, &device)?;
+            let input = Tensor::from_data(TensorData::new(read("gru_input")?, shape), &device);
+            let encoded = gru.forward(input);
+            if encoded.dims() != expected_shape { return Err("RMVPE GRU output shape mismatch".into()); }
+            let encoded = encoded.into_data().try_into_vec::<f32>().map_err(|error| error.to_string())?;
+            let gru_error = max_abs_error(&encoded, &read("expected_gru")?);
+            if !gru_error.is_finite() || gru_error > 1e-4 { return Err(format!("RMVPE bidirectional GRU error {gru_error}")); }
+            println!("backend={backend} rmvpe_gru_input={} hidden={} max_abs_gru={gru_error:.9}", gru.input_size(), gru.hidden_size());
+            let head = RmvpeHead::load(&checkpoint, &device)?;
+            let output = head.forward(Tensor::from_data(TensorData::new(encoded, expected_shape), &device));
+            (output.into_data().try_into_vec::<f32>().map_err(|error| error.to_string())?, read("expected_salience")?, read("expected_f0")?)
+        } else {
+            let shape: [usize; 3] = serde_json::from_value(fixture["mel_shape"].clone()).map_err(|error| error.to_string())?;
+            let levels: usize = serde_json::from_value(fixture["unet_levels"].clone()).map_err(|error| error.to_string())?;
+            let middle: usize = serde_json::from_value(fixture["middle_levels"].clone()).map_err(|error| error.to_string())?;
+            let model = RmvpeNetwork::load(&checkpoint, levels, middle, shape[1], &device)?;
+            let input = Tensor::from_data(TensorData::new(read("mel")?, shape), &device);
+            let output = model.forward(input);
+            let expected_shape: [usize; 3] = serde_json::from_value(fixture["expected_full_shape"].clone()).map_err(|error| error.to_string())?;
+            if output.dims() != expected_shape { return Err(format!("RMVPE network output shape mismatch {:?}", output.dims())); }
+            (output.into_data().try_into_vec::<f32>().map_err(|error| error.to_string())?, read("expected_full")?, read("expected_full_f0")?)
+        };
+        let error = max_abs_error(&actual, &expected);
+        let f0 = salience_to_f0(&actual, 0.03)?;
+        let f0_error = max_abs_error(&f0, &expected_f0);
+        println!("backend={backend} max_abs_{command}={error:.9} max_abs_f0={f0_error:.9}");
+        if !error.is_finite() || error > 1e-4 || !f0_error.is_finite() || f0_error > 1e-3 {
+            return Err(format!("RMVPE GRU/network parity exceeded tolerance: {error}, {f0_error}"));
         }
         return Ok(());
     }

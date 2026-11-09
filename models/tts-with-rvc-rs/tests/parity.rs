@@ -418,3 +418,42 @@ fn complete_rmvpe_unet_and_cnn_match_original_pytorch() {
     assert!(max_abs_error(&logits, &expected) < 1e-4);
     assert!(max_abs_error(&features, &expected_features) < 1e-4);
 }
+
+#[test]
+fn rmvpe_bidirectional_gru_matches_original_pytorch() {
+    use tts_with_rvc_rs::{checkpoint::RvcCheckpoint, rmvpe_gru::RmvpeBiGru};
+    let checkpoint = RvcCheckpoint::open_root(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/synthetic_rmvpe_gru.pth")).unwrap();
+    let fixture: serde_json::Value = serde_json::from_str(include_str!("fixtures/rmvpe_gru.json")).unwrap();
+    let shape: [usize; 3] = serde_json::from_value(fixture["gru_input_shape"].clone()).unwrap();
+    let output_shape: [usize; 3] = serde_json::from_value(fixture["gru_output_shape"].clone()).unwrap();
+    let input: Vec<f32> = serde_json::from_value(fixture["gru_input"].clone()).unwrap();
+    let expected: Vec<f32> = serde_json::from_value(fixture["expected_gru"].clone()).unwrap();
+    let device = Device::flex();
+    let gru = RmvpeBiGru::load(&checkpoint, &device).unwrap();
+    assert_eq!(gru.input_size(), shape[2]);
+    assert_eq!(gru.hidden_size(), 256);
+    let actual = gru.forward(Tensor::from_data(TensorData::new(input, shape), &device));
+    assert_eq!(actual.dims(), output_shape);
+    let values = actual.into_data().try_into_vec::<f32>().unwrap();
+    assert!(max_abs_error(&values, &expected) < 1e-4);
+}
+
+#[test]
+fn rmvpe_unet_bigru_and_salience_head_match_original_pytorch() {
+    use tts_with_rvc_rs::{checkpoint::RvcCheckpoint, rmvpe::salience_to_f0, rmvpe_gru::RmvpeNetwork};
+    let checkpoint = RvcCheckpoint::open_root(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/synthetic_rmvpe_gru.pth")).unwrap();
+    let fixture: serde_json::Value = serde_json::from_str(include_str!("fixtures/rmvpe_gru.json")).unwrap();
+    let shape: [usize; 3] = serde_json::from_value(fixture["mel_shape"].clone()).unwrap();
+    let expected_shape: [usize; 3] = serde_json::from_value(fixture["expected_full_shape"].clone()).unwrap();
+    let input: Vec<f32> = serde_json::from_value(fixture["mel"].clone()).unwrap();
+    let expected: Vec<f32> = serde_json::from_value(fixture["expected_full"].clone()).unwrap();
+    let expected_f0: Vec<f32> = serde_json::from_value(fixture["expected_full_f0"].clone()).unwrap();
+    let device = Device::flex();
+    let model = RmvpeNetwork::load(&checkpoint, 2, 2, shape[1], &device).unwrap();
+    let actual = model.forward(Tensor::from_data(TensorData::new(input, shape), &device));
+    assert_eq!(actual.dims(), expected_shape);
+    let values = actual.into_data().try_into_vec::<f32>().unwrap();
+    assert!(max_abs_error(&values, &expected) < 1e-4);
+    let f0 = salience_to_f0(&values, 0.03).unwrap();
+    assert!(max_abs_error(&f0, &expected_f0) < 1e-3);
+}

@@ -198,3 +198,14 @@ cargo run -p tts-with-rvc-rs --locked --offline -- verify-rmvpe-intermediate mod
 ### Full RMVPE U-Net and CNN (Stage 18)
 
 `RmvpeUnet` joins the pretrained five-level Encoder, four-level Intermediate, five-level Decoder and the output CNN into one resident Rust/Burn model. Input to `forward` is mel features already converted to NCHW `[batch,1,frames,frequency]`; `forward_gru_features` returns `[batch,frames,3*frequency]` for the forthcoming BiGRU. This is the full convolutional inference path, **not yet complete audio-to-F0** (mel preprocessing and BiGRU remain separate). The public fixture uses synthetic weights and the original Python class implementations.
+
+### RMVPE Stage 19 — bidirectional GRU and full neural head
+
+`RmvpeBiGru` loads both directions of the original PyTorch GRU checkpoint (`fc.0.gru.*`) with reset/update/new gate ordering. `RmvpeNetwork` composes the previously verified U-Net/CNN, BiGRU and 360-class sigmoid head; its input is precomputed log-Mel `[batch, mel_bins, padded_frames]`. The model remains loaded across repeated `forward` calls.
+
+Offline parity checks use synthetic checkpoints only:
+
+- `verify-rmvpe-gru <checkpoint.pth> <reference.json> flex`
+- `verify-rmvpe-network <checkpoint.pth> <reference.json> flex`
+
+Both validate against the original PyTorch classes from the supplied RVC implementation. The full end-to-end audio path still requires STFT/Mel preprocessing and padding-to-32-frame integration. The initial GRU implementation uses explicit per-timestep tensor operations and is correctness-oriented; it has not been optimized for GPU inference throughput.
