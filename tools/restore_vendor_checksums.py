@@ -32,8 +32,11 @@ def restore_vendor(root: Path, lockfile: Path, zerocopy_archive: Path):
             checked += 1
             if digest(original) == expected:
                 continue
-            crlf = original.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
-            if digest(crlf) == expected:
+            lf = original.replace(b"\r\n", b"\n")
+            crlf = lf.replace(b"\n", b"\r\n")
+            if digest(lf) == expected:
+                data = lf
+            elif digest(crlf) == expected:
                 data = crlf
             elif path.relative_to(root).as_posix() == "zerocopy-0.8.63/win-cargo.bat":
                 data = original_batch_file
