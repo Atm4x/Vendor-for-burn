@@ -25,8 +25,8 @@ fn run() -> Result<(), String> {
         let target = args.next().ok_or("missing output WAV")?;
         let start: f64 = args.next().ok_or("missing segment start seconds")?.parse().map_err(|e| format!("invalid start: {e}"))?;
         let duration: f64 = args.next().ok_or("missing segment duration seconds")?.parse().map_err(|e| format!("invalid duration: {e}"))?;
-        if !start.is_finite() || !duration.is_finite() || start < 0.0 || duration < 0.04 || duration > 9.0 {
-            return Err("start and duration must be finite, duration in [0.04, 9.0] seconds".into());
+        if !start.is_finite() || !duration.is_finite() || start < 0.0 || duration < 0.2 || duration > 9.0 {
+            return Err("start and duration must be finite, duration in [0.2, 9.0] seconds".into());
         }
         let wave = audio_io::read_mono_wav(&source)?;
         let begin = (start * wave.sample_rate as f64) as usize;
