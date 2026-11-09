@@ -1,0 +1,30 @@
+name: Stage 22 bundle importer
+on:
+  push:
+    branches: [bridge/stage22-source-20261109]
+    paths: ['.stage22-bridge/source.b64']
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify and import Stage 22 commits
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=e019d962aee01251c0d9b30d01d26315302f7850
+          HEAD=57c2b8479b4795fc7d7ef23ec1c4efcb45c2e15a
+          git fetch origin refs/heads/feat/rvc-burn-parity-stage1:refs/remotes/origin/feat/rvc-burn-parity-stage1
+          test "$(git rev-parse refs/remotes/origin/feat/rvc-burn-parity-stage1)" = "$BASE"
+          base64 -d .stage22-bridge/source.b64 > /tmp/stage22.bundle
+          echo "473d5183baf710e3389fcd330665947208672470fa88caa42ace3ecaae55f006  /tmp/stage22.bundle" | sha256sum -c
+          git bundle verify /tmp/stage22.bundle
+          git fetch /tmp/stage22.bundle refs/heads/stage22-local:refs/heads/stage22-candidate
+          test "$(git rev-parse refs/heads/stage22-candidate)" = "$HEAD"
+          git merge-base --is-ancestor "$BASE" "$HEAD"
+          git push origin refs/heads/stage22-candidate:refs/heads/bridge/stage22-candidate-20261109
