@@ -15,6 +15,52 @@ fn run() -> Result<(), String> {
         }
         return Ok(());
     }
+    if command == "infer-wav-segment" {
+        use tts_with_rvc_rs::{audio_io, rvc_inference::{InferenceOptions, RvcV2Inferencer}};
+        let voice = args.next().ok_or("missing RVC .pth")?;
+        let hubert = args.next().ok_or("missing HuBERT .pt")?;
+        let rmvpe = args.next().ok_or("missing RMVPE .pt")?;
+        let index = args.next().ok_or("missing RVC .index (use - to disable)")?;
+        let source = args.next().ok_or("missing input WAV")?;
+        let target = args.next().ok_or("missing output WAV")?;
+        let start: f64 = args.next().ok_or("missing segment start seconds")?.parse().map_err(|e| format!("invalid start: {e}"))?;
+        let duration: f64 = args.next().ok_or("missing segment duration seconds")?.parse().map_err(|e| format!("invalid duration: {e}"))?;
+        if !start.is_finite() || !duration.is_finite() || start < 0.0 || duration < 0.04 || duration > 9.0 {
+            return Err("start and duration must be finite, duration in [0.04, 9.0] seconds".into());
+        }
+        let wave = audio_io::read_mono_wav(&source)?;
+        let begin = (start * wave.sample_rate as f64) as usize;
+        let end = (((start + duration) * wave.sample_rate as f64) as usize).min(wave.samples.len());
+        if begin >= end { return Err("specified WAV segment is outside the file".into()); }
+        let input = audio_io::resample(&wave.samples[begin..end], wave.sample_rate, 16_000)?;
+        let device = Device::flex();
+        let inferencer = RvcV2Inferencer::load(&voice, &hubert, &rmvpe,
+            (index != "-").then_some(index.as_str()), device)?;
+        let mut options = InferenceOptions::default();
+        if index == "-" { options.index_rate = 0.0; }
+        if let Some(rate) = args.next() {
+            options.index_rate = rate.parse().map_err(|e| format!("invalid index rate: {e}"))?;
+        }
+        if let Some(shift) = args.next() {
+            options.pitch_shift_semitones = shift.parse().map_err(|e| format!("invalid pitch shift: {e}"))?;
+        }
+
+        let converted = inferencer.infer_16khz(&input, &options)?;
+        audio_io::write_mono_wav(&target, &converted, 40_000)?;
+        println!("RVC WAV→WAV complete: samples={} sr=40000 path={target}", converted.len());
+        return Ok(());
+    }
+    if command == "inspect-index" {
+        let path = args.next().ok_or("missing FAISS .index path")?;
+        let index = tts_with_rvc_rs::faiss_index::IvfFlatIndex::open(&path)?;
+        println!("faiss=IndexIVFFlat metric=L2 dimension={} vectors={} nlist={} nprobe={}",
+            index.dimension(), index.len(), index.nlist(), index.nprobe());
+        if let Some(sample) = index.reconstruct(0) {
+            let result = index.search(sample, 8)?;
+            println!("probe_id=0 nearest={:?}", result);
+        }
+        return Ok(());
+    }
     if !matches!(command.as_str(), "verify-text-front" | "verify-attention" | "verify-encoder-layer" | "verify-text-encoder" | "verify-flow" | "verify-text-encoder-pth" | "verify-decoder-stage" | "verify-nsf-decoder" | "verify-nsf-source" | "verify-nsf-from-f0" | "verify-hubert-conv" | "verify-hubert-frontend" | "verify-hubert-transformer" | "verify-hubert-stack" | "verify-hubert-position" | "verify-hubert-encoder" | "verify-hubert-model" | "verify-rmvpe-head" | "verify-rmvpe-encoder" | "verify-rmvpe-intermediate" | "verify-rmvpe-decoder" | "verify-rmvpe-unet" | "verify-rmvpe-gru" | "verify-rmvpe-network" | "verify-rmvpe-mel" | "verify-rmvpe-audio") {
         return Err("usage: tts-with-rvc-rs verify-text-front|verify-attention|verify-encoder-layer|verify-text-encoder <fixture.json> [flex|cpu|cuda|wgpu]".into());
     }

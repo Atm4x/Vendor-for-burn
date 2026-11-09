@@ -233,3 +233,16 @@ cargo run -p tts-with-rvc-rs --locked --offline -- verify-nsf-from-f0 models/tts
 ```
 
 This is **not** a complete WAV-to-WAV RVC deployment. FAISS retrieval, complete feature/F0 alignment, warmed resident process, native RNG policy, audio I/O and CUDA/WGPU validation remain pending.
+
+## Stage 22 — native IVF retrieval and experimental WAV inference
+
+`faiss_index::IvfFlatIndex` reads the original FAISS `IwFl` / `IxF2` / `ilar` IndexIVFFlat format directly, without Python or a native FAISS dependency. Its supported subset is L2, trained, dense IDs, `NoMap`, and `full` inverted lists. The loader checks all dimensions, IDs, list lengths, and EOF. IVF search uses the stored `nprobe`, defaults to the checkpoint's value, and returns squared L2 distances. `blend_features` reconstructs the eight selected feature vectors and applies RVC's inverse-square-distance weights mixed by `index_rate`.
+
+The new modules `audio_io` and `rvc_inference` add an initial 40-kHz RVC-v2/F0 inference assembly: mono WAV reading / 16-kHz resampling, HuBERT content, RMVPE F0, native `.index` retrieval, optional unvoiced-protection blending, content-frame upsampling, pitch quantization, TextEncoder, reverse flow, and NSF decoder. The model parts are loaded once and retained in `RvcV2Inferencer`. The experimental single-segment CLI is:
+
+```text
+cargo run -p tts-with-rvc-rs --locked --offline -- inspect-index /path/to/CrazyMita.index
+cargo run -p tts-with-rvc-rs --locked --offline -- infer-wav-segment voice.pth hubert_base.pt rmvpe.pt voice.index input.wav output.wav START_SECONDS DURATION_SECONDS [INDEX_RATE] [PITCH_SHIFT_SEMITONES]
+```
+
+The segment API accepts 0.2–10 s of 16-kHz PCM (CLI currently enforces 0.04–9 s, but segments under 0.2 s will fail at inference). No permanent process/IPC, overlap-add chunking, GPU testing, or reference comparison of the entire WAV-to-WAV pipeline is included. An initial local debug-mode attempt on the real checkpoints reached HuBERT forward but did not finish before the execution timeout. The end-to-end CLI is **experimental and unverified**; the module's compilation and unit tests do not establish usable audio quality or PyTorch waveform parity. The reference `.pth`, `.pt`, `.index`, and `.wav` assets must remain outside the repository.
