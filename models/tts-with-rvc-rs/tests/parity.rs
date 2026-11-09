@@ -311,3 +311,32 @@ fn hubert_waveform_to_content_matches_pytorch() {
     assert!(max_abs_error(&masked, &get("expected")) < 1e-4);
     assert!(max_abs_error(&unmasked, &get("expected_unmasked")) < 1e-4);
 }
+
+#[test]
+fn rmvpe_first_two_unet_encoder_stages_match_original_pytorch() {
+    use tts_with_rvc_rs::{checkpoint::RvcCheckpoint, rmvpe_unet::RmvpeEncoderStage};
+    let checkpoint = RvcCheckpoint::open_root(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/synthetic_rmvpe_encoder.pth")).unwrap();
+    let fixture: serde_json::Value = serde_json::from_str(include_str!("fixtures/rmvpe_encoder.json")).unwrap();
+    let shape: [usize; 4] = serde_json::from_value(fixture["input_shape"].clone()).unwrap();
+    let input: Vec<f32> = serde_json::from_value(fixture["input"].clone()).unwrap();
+    let device = Device::flex();
+    let mut current = Tensor::from_data(TensorData::new(input, shape), &device);
+    let stages = fixture["stages"].as_array().unwrap();
+    assert_eq!(stages.len(), 2);
+    for (index, expected) in stages.iter().enumerate() {
+        let model = RmvpeEncoderStage::load(&checkpoint, index, &device).unwrap();
+        assert_eq!(model.blocks(), 2);
+        let result = model.forward(current);
+        let expected_skip: Vec<f32> = serde_json::from_value(expected["skip"].clone()).unwrap();
+        let expected_pool: Vec<f32> = serde_json::from_value(expected["pooled"].clone()).unwrap();
+        let shape_skip: [usize; 4] = serde_json::from_value(expected["skip_shape"].clone()).unwrap();
+        let shape_pool: [usize; 4] = serde_json::from_value(expected["pooled_shape"].clone()).unwrap();
+        assert_eq!(result.skip.dims(), shape_skip);
+        assert_eq!(result.pooled.dims(), shape_pool);
+        let error_skip = max_abs_error(&result.skip.into_data().try_into_vec::<f32>().unwrap(), &expected_skip);
+        let error_pool = max_abs_error(&result.pooled.clone().into_data().try_into_vec::<f32>().unwrap(), &expected_pool);
+        assert!(error_skip.is_finite() && error_skip < 1e-4, "RMVPE stage {index} skip parity {error_skip}");
+        assert!(error_pool.is_finite() && error_pool < 1e-4, "RMVPE stage {index} pooled parity {error_pool}");
+        current = result.pooled;
+    }
+}

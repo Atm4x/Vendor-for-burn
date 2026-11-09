@@ -165,3 +165,15 @@ cargo run -p tts-with-rvc-rs --locked --offline -- verify-hubert-model hubert_ba
 ```
 
 This validates an unquantized FP32 inference path on Burn CPU Flex. RVC feature upsampling, audio resampling, RMVPE, SineGen, FAISS, and long-lived worker are still separate and incomplete.
+
+## Stage 15 — first two RMVPE U-Net encoder levels
+
+`rmvpe_unet::RmvpeEncoderStage` implements the original RMVPE evaluation-mode input BatchNorm2d, `ConvBlockRes` (Conv2d → BatchNorm2d → ReLU twice plus identity or 1×1 shortcut), and AvgPool2d(2×2). It loads FP16 weights directly from the original root `rmvpe.pt` via `RvcCheckpoint::open_root`, including running statistics. Stage 0 applies the original outer BatchNorm, and subsequent stages use only their own residual blocks. The implementation supports each of the five encoder levels, but this stage checks **only the first two** on CPU. It is not a complete RMVPE network or F0 estimator.
+
+Reference fixtures are produced from the exact Python `Encoder`, `ResEncoderBlock`, and `ConvBlockRes` classes in the uploaded original source ZIP. Synthetic test weights are committed; private RMVPE weights and corresponding numerical references are not. The test script is development-only, not an inference dependency.
+
+```sh
+python models/tts-with-rvc-rs/tools/reference_rmvpe_encoder.py --source-zip ORIGINAL_SOURCE.zip --synthetic-checkpoint models/tts-with-rvc-rs/tests/fixtures/synthetic_rmvpe_encoder.pth --fixture models/tts-with-rvc-rs/tests/fixtures/rmvpe_encoder.json --stages 2
+cargo test -p tts-with-rvc-rs --locked --offline
+cargo run -p tts-with-rvc-rs --locked --offline -- verify-rmvpe-encoder models/tts-with-rvc-rs/tests/fixtures/synthetic_rmvpe_encoder.pth models/tts-with-rvc-rs/tests/fixtures/rmvpe_encoder.json flex
+```
