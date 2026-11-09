@@ -340,3 +340,26 @@ fn rmvpe_first_two_unet_encoder_stages_match_original_pytorch() {
         current = result.pooled;
     }
 }
+
+#[test]
+fn rmvpe_intermediate_residual_groups_match_original_pytorch() {
+    use tts_with_rvc_rs::{checkpoint::RvcCheckpoint, rmvpe_unet::RmvpeIntermediate};
+    let checkpoint = RvcCheckpoint::open_root(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/synthetic_rmvpe_intermediate.pth")).unwrap();
+    let fixture: serde_json::Value = serde_json::from_str(include_str!("fixtures/rmvpe_intermediate.json")).unwrap();
+    let shape: [usize; 4] = serde_json::from_value(fixture["input_shape"].clone()).unwrap();
+    let input: Vec<f32> = serde_json::from_value(fixture["input"].clone()).unwrap();
+    let levels = fixture["levels"].as_array().unwrap();
+    assert_eq!(levels.len(), 2);
+    let device = Device::flex();
+    let model = RmvpeIntermediate::load(&checkpoint, levels.len(), &device).unwrap();
+    assert_eq!(model.levels(), 2);
+    let tensors = model.forward_with_levels(Tensor::from_data(TensorData::new(input, shape), &device));
+    for (index, (tensor, expected)) in tensors.into_iter().zip(levels).enumerate() {
+        let expected_shape: [usize; 4] = serde_json::from_value(expected["shape"].clone()).unwrap();
+        let expected_output: Vec<f32> = serde_json::from_value(expected["output"].clone()).unwrap();
+        assert_eq!(tensor.dims(), expected_shape);
+        let actual = tensor.into_data().try_into_vec::<f32>().unwrap();
+        let error = max_abs_error(&actual, &expected_output);
+        assert!(error.is_finite() && error < 1e-4, "RMVPE Intermediate level {index} deviation {error}");
+    }
+}

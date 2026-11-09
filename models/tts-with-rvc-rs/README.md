@@ -177,3 +177,14 @@ python models/tts-with-rvc-rs/tools/reference_rmvpe_encoder.py --source-zip ORIG
 cargo test -p tts-with-rvc-rs --locked --offline
 cargo run -p tts-with-rvc-rs --locked --offline -- verify-rmvpe-encoder models/tts-with-rvc-rs/tests/fixtures/synthetic_rmvpe_encoder.pth models/tts-with-rvc-rs/tests/fixtures/rmvpe_encoder.json flex
 ```
+
+## Stage 16 — RMVPE U-Net Intermediate
+
+The `RmvpeIntermediate` type reuses the tested `ConvBlockRes` implementation for the four original groups of 4 residual blocks each, with the first group changing channels `256 → 512` and the other groups keeping 512. It loads the original `unet.intermediate.layers.*` weights natively from `.pt` without Python, and retains all tensors in the Rust object. The production `forward` does not retain intermediate outputs, while `forward_with_levels` is provided for parity diagnostics.
+
+The committed synthetic fixture tests a reduced two-group / two-block model. An independent private test can use the full original four-group weights with the pooled output of the complete RMVPE U-Net Encoder. This still leaves the transposed-convolution decoder, CNN 3-channel projection, BiGRU, mel extraction and audio/F0 integration unfinished.
+
+```sh
+python models/tts-with-rvc-rs/tools/reference_rmvpe_intermediate.py --source-zip ORIGINAL_SOURCE.zip --synthetic-checkpoint models/tts-with-rvc-rs/tests/fixtures/synthetic_rmvpe_intermediate.pth --fixture models/tts-with-rvc-rs/tests/fixtures/rmvpe_intermediate.json
+cargo run -p tts-with-rvc-rs --locked --offline -- verify-rmvpe-intermediate models/tts-with-rvc-rs/tests/fixtures/synthetic_rmvpe_intermediate.pth models/tts-with-rvc-rs/tests/fixtures/rmvpe_intermediate.json flex
+```

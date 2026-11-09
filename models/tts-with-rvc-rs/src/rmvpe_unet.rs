@@ -122,15 +122,7 @@ impl RmvpeEncoderStage {
             Some(BatchNorm2d::load(checkpoint, "unet.encoder.bn", device)?)
         } else { None };
         let prefix = format!("unet.encoder.layers.{stage}.conv");
-        let mut blocks = Vec::new();
-        for index in 0..32 {
-            let name = format!("{prefix}.{index}");
-            if !checkpoint.contains(&format!("{name}.conv.0.weight")) { break; }
-            blocks.push(ConvBlockRes::load(checkpoint, &name, device)?);
-        }
-        if blocks.is_empty() || checkpoint.contains(&format!("{prefix}.{}.conv.0.weight", blocks.len())) {
-            return Err(format!("RMVPE encoder stage {stage} is empty or has too many blocks"));
-        }
+        let blocks = load_blocks(checkpoint, &prefix, device)?;
         Ok(Self { input_norm, blocks, pool: [2, 2] })
     }
 
@@ -142,4 +134,67 @@ impl RmvpeEncoderStage {
     }
 
     pub fn blocks(&self) -> usize { self.blocks.len() }
+}
+
+fn load_blocks(checkpoint: &RvcCheckpoint, prefix: &str, device: &Device) -> Result<Vec<ConvBlockRes>, String> {
+    let mut blocks = Vec::new();
+    for index in 0..32 {
+        let name = format!("{prefix}.{index}");
+        if !checkpoint.contains(&format!("{name}.conv.0.weight")) { break; }
+        let block = ConvBlockRes::load(checkpoint, &name, device)?;
+        if let Some(previous) = blocks.last() {
+            let previous: &ConvBlockRes = previous;
+            if previous.conv2.weight.dims()[0] != block.conv1.weight.dims()[1] {
+                return Err(format!("{name}: input channels differ from previous residual block output"));
+            }
+        }
+        blocks.push(block);
+    }
+    if blocks.is_empty() || checkpoint.contains(&format!("{prefix}.{}.conv.0.weight", blocks.len())) {
+        return Err(format!("{prefix}: no blocks found or excessive block count"));
+    }
+    Ok(blocks)
+}
+
+pub struct RmvpeIntermediate {
+    layers: Vec<Vec<ConvBlockRes>>,
+}
+
+impl RmvpeIntermediate {
+    pub fn load(checkpoint: &RvcCheckpoint, levels: usize, device: &Device) -> Result<Self, String> {
+        if !(1..=4).contains(&levels) {
+            return Err("RMVPE U-Net Intermediate must have 1..=4 levels".into());
+        }
+        let mut layers = Vec::with_capacity(levels);
+        for level in 0..levels {
+            let prefix = format!("unet.intermediate.layers.{level}.conv");
+            let blocks = load_blocks(checkpoint, &prefix, device)?;
+            if let Some(previous) = layers.last() {
+                let previous: &Vec<ConvBlockRes> = previous;
+                if previous.last().unwrap().conv2.weight.dims()[0] != blocks[0].conv1.weight.dims()[1] {
+                    return Err(format!("RMVPE Intermediate level {level}: channel discontinuity"));
+                }
+            }
+            layers.push(blocks);
+        }
+        Ok(Self { layers })
+    }
+
+    pub fn forward(&self, mut input: Tensor<4>) -> Tensor<4> {
+        for layer in &self.layers {
+            for block in layer { input = block.forward(input); }
+        }
+        input
+    }
+
+    pub fn forward_with_levels(&self, mut input: Tensor<4>) -> Vec<Tensor<4>> {
+        let mut trace = Vec::with_capacity(self.layers.len());
+        for layer in &self.layers {
+            for block in layer { input = block.forward(input); }
+            trace.push(input.clone());
+        }
+        trace
+    }
+
+    pub fn levels(&self) -> usize { self.layers.len() }
 }

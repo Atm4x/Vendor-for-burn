@@ -15,11 +15,11 @@ fn run() -> Result<(), String> {
         }
         return Ok(());
     }
-    if !matches!(command.as_str(), "verify-text-front" | "verify-attention" | "verify-encoder-layer" | "verify-text-encoder" | "verify-flow" | "verify-text-encoder-pth" | "verify-decoder-stage" | "verify-nsf-decoder" | "verify-hubert-conv" | "verify-hubert-frontend" | "verify-hubert-transformer" | "verify-hubert-stack" | "verify-hubert-position" | "verify-hubert-encoder" | "verify-hubert-model" | "verify-rmvpe-head" | "verify-rmvpe-encoder") {
+    if !matches!(command.as_str(), "verify-text-front" | "verify-attention" | "verify-encoder-layer" | "verify-text-encoder" | "verify-flow" | "verify-text-encoder-pth" | "verify-decoder-stage" | "verify-nsf-decoder" | "verify-hubert-conv" | "verify-hubert-frontend" | "verify-hubert-transformer" | "verify-hubert-stack" | "verify-hubert-position" | "verify-hubert-encoder" | "verify-hubert-model" | "verify-rmvpe-head" | "verify-rmvpe-encoder" | "verify-rmvpe-intermediate") {
         return Err("usage: tts-with-rvc-rs verify-text-front|verify-attention|verify-encoder-layer|verify-text-encoder <fixture.json> [flex|cpu|cuda|wgpu]".into());
     }
     let path = args.next().ok_or("missing fixture or checkpoint path")?;
-    let flow_fixture_path = if command == "verify-flow" || command == "verify-text-encoder-pth" || command == "verify-decoder-stage" || command == "verify-nsf-decoder" || command == "verify-hubert-conv" || command == "verify-hubert-frontend" || command == "verify-hubert-transformer" || command == "verify-hubert-stack" || command == "verify-hubert-position" || command == "verify-hubert-encoder" || command == "verify-hubert-model" || command == "verify-rmvpe-head" || command == "verify-rmvpe-encoder" {
+    let flow_fixture_path = if command == "verify-flow" || command == "verify-text-encoder-pth" || command == "verify-decoder-stage" || command == "verify-nsf-decoder" || command == "verify-hubert-conv" || command == "verify-hubert-frontend" || command == "verify-hubert-transformer" || command == "verify-hubert-stack" || command == "verify-hubert-position" || command == "verify-hubert-encoder" || command == "verify-hubert-model" || command == "verify-rmvpe-head" || command == "verify-rmvpe-encoder" || command == "verify-rmvpe-intermediate" {
         Some(args.next().ok_or("missing flow fixture path")?)
     } else { None };
     let backend = args.next().unwrap_or_else(|| "flex".to_owned());
@@ -170,6 +170,33 @@ fn run() -> Result<(), String> {
         if !error.is_finite() || !unmasked_error.is_finite() || error > 1e-4 || unmasked_error > 1e-4 {
             return Err(format!("HuBERT positional/encoder parity exceeded tolerance: {error:.8}, {unmasked_error:.8}"));
         }
+        return Ok(());
+    }
+    if command == "verify-rmvpe-intermediate" {
+        use burn::tensor::{Tensor, TensorData};
+        use tts_with_rvc_rs::{checkpoint::RvcCheckpoint, rmvpe_unet::RmvpeIntermediate};
+        let checkpoint = RvcCheckpoint::open_root(&path)?;
+        let fixture_path = flow_fixture_path.as_ref().ok_or("missing RMVPE Intermediate reference")?;
+        let fixture: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(fixture_path).map_err(|error| error.to_string())?,
+        ).map_err(|error| error.to_string())?;
+        let shape: [usize; 4] = serde_json::from_value(fixture["input_shape"].clone()).map_err(|e| e.to_string())?;
+        let input: Vec<f32> = serde_json::from_value(fixture["input"].clone()).map_err(|e| e.to_string())?;
+        let expected = fixture["levels"].as_array().ok_or("missing RMVPE Intermediate levels")?;
+        let model = RmvpeIntermediate::load(&checkpoint, expected.len(), &device)?;
+        let values = model.forward_with_levels(Tensor::from_data(TensorData::new(input, shape), &device));
+        let mut maximum = 0.0_f32;
+        for (level, (tensor, reference)) in values.into_iter().zip(expected).enumerate() {
+            let output_shape: [usize; 4] = serde_json::from_value(reference["shape"].clone()).map_err(|e| e.to_string())?;
+            if tensor.dims() != output_shape { return Err(format!("RMVPE Intermediate level {level}: shape mismatch")); }
+            let reference_output: Vec<f32> = serde_json::from_value(reference["output"].clone()).map_err(|e| e.to_string())?;
+            let actual = tensor.into_data().try_into_vec::<f32>().map_err(|e| e.to_string())?;
+            let error = max_abs_error(&actual, &reference_output);
+            maximum = maximum.max(error);
+            println!("backend={backend} rmvpe_intermediate_level={level} max_abs={error:.9}");
+            if !error.is_finite() || error > 1e-4 { return Err(format!("RMVPE Intermediate level {level}: Torch/Burn parity exceeded tolerance")); }
+        }
+        println!("backend={backend} rmvpe_intermediate_levels={} max_abs_rmvpe_intermediate={maximum:.9}", model.levels());
         return Ok(());
     }
     if command == "verify-rmvpe-encoder" {
