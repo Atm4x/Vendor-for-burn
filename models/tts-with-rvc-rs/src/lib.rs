@@ -146,3 +146,6 @@ pub mod checkpoint;
 pub mod flow;
 
 pub mod decoder;
+
+pub mod rmvpe;
+pub mod hubert;

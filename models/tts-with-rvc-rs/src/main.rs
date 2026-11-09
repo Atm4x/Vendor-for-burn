@@ -15,11 +15,11 @@ fn run() -> Result<(), String> {
         }
         return Ok(());
     }
-    if !matches!(command.as_str(), "verify-text-front" | "verify-attention" | "verify-encoder-layer" | "verify-text-encoder" | "verify-flow" | "verify-text-encoder-pth" | "verify-decoder-stage" | "verify-nsf-decoder") {
+    if !matches!(command.as_str(), "verify-text-front" | "verify-attention" | "verify-encoder-layer" | "verify-text-encoder" | "verify-flow" | "verify-text-encoder-pth" | "verify-decoder-stage" | "verify-nsf-decoder" | "verify-hubert-conv" | "verify-rmvpe-head") {
         return Err("usage: tts-with-rvc-rs verify-text-front|verify-attention|verify-encoder-layer|verify-text-encoder <fixture.json> [flex|cpu|cuda|wgpu]".into());
     }
     let path = args.next().ok_or("missing fixture or checkpoint path")?;
-    let flow_fixture_path = if command == "verify-flow" || command == "verify-text-encoder-pth" || command == "verify-decoder-stage" || command == "verify-nsf-decoder" {
+    let flow_fixture_path = if command == "verify-flow" || command == "verify-text-encoder-pth" || command == "verify-decoder-stage" || command == "verify-nsf-decoder" || command == "verify-hubert-conv" || command == "verify-rmvpe-head" {
         Some(args.next().ok_or("missing flow fixture path")?)
     } else { None };
     let backend = args.next().unwrap_or_else(|| "flex".to_owned());
@@ -34,6 +34,43 @@ fn run() -> Result<(), String> {
         "wgpu" => Device::wgpu(Default::default()),
         other => return Err(format!("backend {other} is not compiled into this binary")),
     };
+    if command == "verify-hubert-conv" {
+        use burn::tensor::{Tensor, TensorData};
+        let checkpoint = tts_with_rvc_rs::checkpoint::RvcCheckpoint::open_model(&path)?;
+        let fixture_path = flow_fixture_path.as_ref().ok_or("missing HuBERT reference")?;
+        let fixture: serde_json::Value = serde_json::from_str(&fs::read_to_string(fixture_path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        let input: Vec<f32> = serde_json::from_value(fixture["waveform"].clone()).map_err(|e| e.to_string())?;
+        let shape: [usize; 3] = serde_json::from_value(fixture["shape"].clone()).map_err(|e| e.to_string())?;
+        let expected: Vec<f32> = serde_json::from_value(fixture["expected"].clone()).map_err(|e| e.to_string())?;
+        let model = tts_with_rvc_rs::hubert::HubertFirstConv::load(&checkpoint, &device)?;
+        let actual = model.forward(Tensor::from_data(TensorData::new(input, shape), &device))
+            .into_data().try_into_vec::<f32>().map_err(|e| e.to_string())?;
+        let error = max_abs_error(&actual, &expected);
+        println!("backend={backend} max_abs_hubert_conv={error:.9} tensor_count={}", checkpoint.tensor_count());
+        if !error.is_finite() || error > 1e-4 { return Err("HuBERT Conv1d/GroupNorm/GELU parity exceeded tolerance".into()); }
+        return Ok(());
+    }
+    if command == "verify-rmvpe-head" {
+        use burn::tensor::{Tensor, TensorData};
+        let checkpoint = tts_with_rvc_rs::checkpoint::RvcCheckpoint::open_root(&path)?;
+        let fixture_path = flow_fixture_path.as_ref().ok_or("missing RMVPE reference")?;
+        let fixture: serde_json::Value = serde_json::from_str(&fs::read_to_string(fixture_path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        let input: Vec<f32> = serde_json::from_value(fixture["features"].clone()).map_err(|e| e.to_string())?;
+        let shape: [usize; 3] = serde_json::from_value(fixture["shape"].clone()).map_err(|e| e.to_string())?;
+        let expected: Vec<f32> = serde_json::from_value(fixture["expected_salience"].clone()).map_err(|e| e.to_string())?;
+        let expected_f0: Vec<f32> = serde_json::from_value(fixture["expected_f0"].clone()).map_err(|e| e.to_string())?;
+        let model = tts_with_rvc_rs::rmvpe::RmvpeHead::load(&checkpoint, &device)?;
+        let actual = model.forward(Tensor::from_data(TensorData::new(input, shape), &device))
+            .into_data().try_into_vec::<f32>().map_err(|e| e.to_string())?;
+        let error = max_abs_error(&actual, &expected);
+        let f0 = tts_with_rvc_rs::rmvpe::salience_to_f0(&actual, 0.03)?;
+        let f0_error = max_abs_error(&f0, &expected_f0);
+        println!("backend={backend} max_abs_rmvpe_salience={error:.9} max_abs_f0={f0_error:.9} tensor_count={}", checkpoint.tensor_count());
+        if !error.is_finite() || error > 1e-4 || !f0_error.is_finite() || f0_error > 1e-3 {
+            return Err("RMVPE output head / F0 parity exceeded tolerance".into());
+        }
+        return Ok(());
+    }
     if command == "verify-nsf-decoder" {
         let reference_path = flow_fixture_path.as_ref().ok_or("missing NSF decoder reference")?;
         let checkpoint = tts_with_rvc_rs::checkpoint::RvcCheckpoint::open(&path)?;

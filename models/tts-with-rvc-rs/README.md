@@ -98,3 +98,21 @@ cargo run -p tts-with-rvc-rs --locked --offline -- verify-nsf-decoder PRIVATE_MO
 ```
 
 The small public two-stage fixture uses two residual kernels per stage to keep CI lightweight; the private `CrazyMita.pth` check uses the original four stages and all three kernels. For the synthetic fixture only, the Python reference generator rewrites PyTorch's ZIP envelope through the standard `zipfile` API without changing tensor contents, because the currently vendored `pytorch-reader` rejects that particular PyTorch 2.10 ZIP layout. This is a checkpoint parser compatibility limitation requiring its own follow-up; existing `CrazyMita.pth` loads directly.
+
+### Stage 9 — HuBERT and RMVPE checkpoints (initial mathematical slices)
+
+Two independently testable preprocessing/inference components were added, without declaring the full models complete:
+
+- `hubert::HubertFirstConv`: 16 kHz HuBERT Base's first convolution `(512, 1, 10), stride 5`, per-channel `GroupNorm(512, eps=1e-5)` and exact GELU. Loads directly from the `model` dictionary of a Fairseq checkpoint using `pytorch-reader`. Full seven-layer convolutional feature extraction, Transformer and output alignment remain unimplemented.
+- `rmvpe::RmvpeHead`: the last bidirectional-GRU output projection `512 -> 360`, sigmoid probability and local nine-bin weighted-centroid conversion to F0. Loads the two weights from the root `rmvpe.pt` state dictionary. The Mel, U-Net and BiGRU forward paths remain unimplemented.
+
+The source-derived reference generator `tools/reference_feature_heads.py` reads PyTorch checkpoint weights in safe mode and emits isolated numerical fixtures. For `hubert_base.pt`, the Fairseq `Dictionary` pickle global is allowlisted through a passive stub only for development-time reading; no pickle is executed by the final Rust inference code. The real model files and references must not be committed.
+
+Standalone parity commands for these slices:
+
+```text
+cargo run -p tts-with-rvc-rs --locked --offline -- verify-hubert-conv hubert_base.pt private-hubert-conv.json flex
+cargo run -p tts-with-rvc-rs --locked --offline -- verify-rmvpe-head rmvpe.pt private-rmvpe-head.json flex
+```
+
+`verify-rmvpe-head` uses GRU *output features* as input, not raw mel or WAV; `verify-hubert-conv` checks only the first conv/norm/activation, not the twelve-layer Transformer. Both models are incomplete and cannot perform audio feature extraction or pitch inference end-to-end yet.

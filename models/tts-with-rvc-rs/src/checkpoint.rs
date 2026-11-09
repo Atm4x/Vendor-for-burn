@@ -17,6 +17,24 @@ impl RvcCheckpoint {
         Ok(Self { reader })
     }
 
+    pub fn open_root(path: impl AsRef<Path>) -> Result<Self, String> {
+        Self::from_reader(PytorchReader::new(path).map_err(|error| format!("checkpoint: {error}"))?)
+    }
+
+    pub fn open_model(path: impl AsRef<Path>) -> Result<Self, String> {
+        Self::from_reader(
+            PytorchReader::with_top_level_key(path, "model")
+                .map_err(|error| format!("model checkpoint: {error}"))?,
+        )
+    }
+
+    fn from_reader(reader: PytorchReader) -> Result<Self, String> {
+        if reader.is_empty() {
+            return Err("checkpoint contains no tensors".into());
+        }
+        Ok(Self { reader })
+    }
+
     pub fn tensor_count(&self) -> usize {
         self.reader.len()
     }
