@@ -188,3 +188,9 @@ The committed synthetic fixture tests a reduced two-group / two-block model. An 
 python models/tts-with-rvc-rs/tools/reference_rmvpe_intermediate.py --source-zip ORIGINAL_SOURCE.zip --synthetic-checkpoint models/tts-with-rvc-rs/tests/fixtures/synthetic_rmvpe_intermediate.pth --fixture models/tts-with-rvc-rs/tests/fixtures/rmvpe_intermediate.json
 cargo run -p tts-with-rvc-rs --locked --offline -- verify-rmvpe-intermediate models/tts-with-rvc-rs/tests/fixtures/synthetic_rmvpe_intermediate.pth models/tts-with-rvc-rs/tests/fixtures/rmvpe_intermediate.json flex
 ```
+
+### RMVPE U-Net Decoder parity (Stage 17)
+
+`RmvpeDecoder` loads the existing PyTorch U-Net decoder weights directly from a native `.pt` checkpoint and implements `ConvTranspose2d → BatchNorm2d → ReLU`, reverse-order encoder skip concatenation and residual blocks. Supported decoder strides are `[2, 2]` and `[1, 2]`, using the original PyTorch `output_padding`. The checked CPU parity path is independent of the final RMVPE mel and BiGRU stages.
+
+`reference_rmvpe_decoder.py` obtains Torch reference tensors by executing the unmodified source classes extracted from the original RVC archive. Synthetic test weights only are committed.

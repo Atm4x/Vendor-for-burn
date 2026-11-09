@@ -198,3 +198,116 @@ impl RmvpeIntermediate {
 
     pub fn levels(&self) -> usize { self.layers.len() }
 }
+
+struct TransposedConv2d {
+    weight: Tensor<4>,
+    norm: BatchNorm2d,
+    stride: [usize; 2],
+    padding_out: [usize; 2],
+}
+
+impl TransposedConv2d {
+    fn load(checkpoint: &RvcCheckpoint, prefix: &str, stride: [usize; 2], device: &Device) -> Result<Self, String> {
+        if stride != [2, 2] && stride != [1, 2] {
+            return Err(format!("{prefix}: unsupported decoder stride {stride:?}"));
+        }
+        let weight = checkpoint.tensor::<4>(&format!("{prefix}.0.weight"), device)?;
+        let dims = weight.dims();
+        if dims[0] == 0 || dims[1] == 0 || dims[2] != 3 || dims[3] != 3 {
+            return Err(format!("{prefix}: unexpected ConvTranspose2d weight dimensions {dims:?}"));
+        }
+        let norm = BatchNorm2d::load(checkpoint, &format!("{prefix}.1"), device)?;
+        if norm.weight.dims()[0] != dims[1] {
+            return Err(format!("{prefix}: ConvTranspose2d / BatchNorm2d output channels differ"));
+        }
+        Ok(Self {
+            weight, norm, stride,
+            padding_out: if stride == [1, 2] { [0, 1] } else { [1, 1] },
+        })
+    }
+
+    fn forward(&self, input: Tensor<4>) -> Tensor<4> {
+        let value = module::conv_transpose2d(
+            input, self.weight.clone(), None,
+            burn::tensor::ops::ConvTransposeOptions::new(
+                self.stride, [1, 1], self.padding_out, [1, 1], 1,
+            ),
+        );
+        activation::relu(self.norm.forward(value))
+    }
+}
+
+pub struct RmvpeDecoderStage {
+    upsample: TransposedConv2d,
+    blocks: Vec<ConvBlockRes>,
+}
+
+impl RmvpeDecoderStage {
+    pub fn load(checkpoint: &RvcCheckpoint, stage: usize, stride: [usize; 2], device: &Device) -> Result<Self, String> {
+        if stage >= 5 {
+            return Err("RMVPE U-Net contains only five decoder stages".into());
+        }
+        let prefix = format!("unet.decoder.layers.{stage}");
+        let upsample = TransposedConv2d::load(checkpoint, &format!("{prefix}.conv1"), stride, device)?;
+        let blocks = load_blocks(checkpoint, &format!("{prefix}.conv2"), device)?;
+        let output_channels = upsample.weight.dims()[1];
+        if blocks[0].conv1.weight.dims()[1] != 2 * output_channels ||
+            blocks[0].conv2.weight.dims()[0] != output_channels {
+            return Err(format!("{prefix}: first residual block must reduce 2C skip features to C"));
+        }
+        Ok(Self { upsample, blocks })
+    }
+
+    pub fn forward(&self, input: Tensor<4>, skip: Tensor<4>) -> Tensor<4> {
+        let upsampled = self.upsample.forward(input);
+        let dims = upsampled.dims();
+        let skip_dims = skip.dims();
+        assert_eq!(dims, skip_dims, "RMVPE U-Net decoder skip must match upsampled shape");
+        let mut result = Tensor::cat(vec![upsampled, skip], 1);
+        for block in &self.blocks {
+            result = block.forward(result);
+        }
+        result
+    }
+
+    pub fn blocks(&self) -> usize { self.blocks.len() }
+}
+
+pub struct RmvpeDecoder {
+    stages: Vec<RmvpeDecoderStage>,
+}
+
+impl RmvpeDecoder {
+    pub fn load(checkpoint: &RvcCheckpoint, stages: usize, stride: [usize; 2], device: &Device) -> Result<Self, String> {
+        if !(1..=5).contains(&stages) {
+            return Err("RMVPE Decoder requires between one and five stages".into());
+        }
+        let mut blocks: Vec<RmvpeDecoderStage> = Vec::with_capacity(stages);
+        for stage in 0..stages {
+            let block = RmvpeDecoderStage::load(checkpoint, stage, stride, device)?;
+            if let Some(previous) = blocks.last() {
+                if previous.blocks.last().unwrap().conv2.weight.dims()[0] != block.upsample.weight.dims()[0] {
+                    return Err(format!("RMVPE Decoder stage {stage}: input channel discontinuity"));
+                }
+            }
+            blocks.push(block);
+        }
+        Ok(Self { stages: blocks })
+    }
+
+    pub fn forward(&self, input: Tensor<4>, encoder_skips: &[Tensor<4>]) -> Tensor<4> {
+        self.forward_with_levels(input, encoder_skips).pop().expect("nonempty decoder")
+    }
+
+    pub fn forward_with_levels(&self, mut input: Tensor<4>, encoder_skips: &[Tensor<4>]) -> Vec<Tensor<4>> {
+        assert_eq!(self.stages.len(), encoder_skips.len(), "decoder stages and encoder skips must match");
+        let mut outputs = Vec::with_capacity(self.stages.len());
+        for (stage, skip) in self.stages.iter().zip(encoder_skips.iter().rev()) {
+            input = stage.forward(input, skip.clone());
+            outputs.push(input.clone());
+        }
+        outputs
+    }
+
+    pub fn stages(&self) -> usize { self.stages.len() }
+}

@@ -363,3 +363,31 @@ fn rmvpe_intermediate_residual_groups_match_original_pytorch() {
         assert!(error.is_finite() && error < 1e-4, "RMVPE Intermediate level {index} deviation {error}");
     }
 }
+
+#[test]
+fn rmvpe_unet_decoder_matches_original_pytorch() {
+    use tts_with_rvc_rs::{checkpoint::RvcCheckpoint, rmvpe_unet::RmvpeDecoder};
+    let checkpoint = RvcCheckpoint::open_root(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/synthetic_rmvpe_decoder.pth")).unwrap();
+    let fixture: serde_json::Value = serde_json::from_str(include_str!("fixtures/rmvpe_decoder.json")).unwrap();
+    let device = Device::flex();
+    let input_shape: [usize; 4] = serde_json::from_value(fixture["input_shape"].clone()).unwrap();
+    let input: Vec<f32> = serde_json::from_value(fixture["input"].clone()).unwrap();
+    let skips: Vec<Tensor<4>> = fixture["skips"].as_array().unwrap().iter().map(|s| {
+        let shape: [usize; 4] = serde_json::from_value(s["shape"].clone()).unwrap();
+        let values: Vec<f32> = serde_json::from_value(s["values"].clone()).unwrap();
+        Tensor::from_data(TensorData::new(values, shape), &device)
+    }).collect();
+    let levels = fixture["levels"].as_array().unwrap();
+    assert_eq!(levels.len(), 2);
+    let decoder = RmvpeDecoder::load(&checkpoint, levels.len(), [2, 2], &device).unwrap();
+    assert_eq!(decoder.stages(), 2);
+    let outputs = decoder.forward_with_levels(Tensor::from_data(TensorData::new(input, input_shape), &device), &skips);
+    for (index, (actual, expected)) in outputs.into_iter().zip(levels).enumerate() {
+        let expected_shape: [usize; 4] = serde_json::from_value(expected["shape"].clone()).unwrap();
+        let expected_values: Vec<f32> = serde_json::from_value(expected["output"].clone()).unwrap();
+        assert_eq!(actual.dims(), expected_shape);
+        let actual_values = actual.into_data().try_into_vec::<f32>().unwrap();
+        let error = max_abs_error(&actual_values, &expected_values);
+        assert!(error.is_finite() && error < 1e-4, "RMVPE decoder stage {index} deviation {error}");
+    }
+}
