@@ -1,12 +1,17 @@
+#[cfg(feature = "cpu")]
 use burn::tensor::{Device, Tensor, TensorData};
+#[cfg(feature = "cpu")]
 use std::{hint::black_box, time::Instant};
+#[cfg(feature = "cpu")]
 use tts_with_rvc_rs::{checkpoint::RvcCheckpoint, decoder::NsfDecoderFixture};
 
+#[cfg(feature = "cpu")]
 fn median(mut xs: Vec<f64>) -> f64 {
     xs.sort_by(f64::total_cmp);
     xs[xs.len() / 2]
 }
 
+#[cfg(feature = "cpu")]
 fn main() {
     let fixture: NsfDecoderFixture =
         serde_json::from_str(include_str!("../../tests/fixtures/nsf_decoder.json")).unwrap();
@@ -72,4 +77,10 @@ fn main() {
             median(samples)
         );
     }
+}
+
+#[cfg(not(feature = "cpu"))]
+fn main() {
+    eprintln!("Stage43 CPU benchmark requires --no-default-features --features cpu");
+    std::process::exit(2);
 }
