@@ -83,3 +83,31 @@ powershell -ExecutionPolicy Bypass -File .\Run-NSF-Graph.ps1 -Iterations 20 -War
 4. Измерить окупаемость capture в числе повторных forward, VRAM overhead и рост memory pool.
 5. В отдельном опыте варьировать CUDA stream policy (`single` против `per-thread`) и ограничение `max_streams` на одинаковом NSF-графе. Это архитектурно ближе к анализу многопоточной конструкции Stage 44, чем перенос CPU batch-count.
 6. Только после этих проверок рекомендовать CUDA Graph для production — поверх доказанного Stage49 Prepacked и отдельно от вариантов Packed/QuadInterior.
+
+## 7. Дополнительный cross-backend эксперимент: native stream policy
+
+Исходный CubeCL предоставляет переносимый `StreamPolicy` и настройки `[streaming]` в `cubecl.toml`, подхватываемые при первом создании runtime:
+
+- `policy = "per-thread", max_streams = 128`: стандартный CUDA путь с отдельными логическими потоками отправки для разных CPU threads;
+- `policy = "single", max_streams = 1`: единый CUDA stream для операций всех CPU threads.
+
+Это **не batch=32**: настройка определяет распределение команд и стоимость межпоточных GPU-зависимостей, а не число задач в CPU scheduler. Для проверки CUDA добавлен второй runner `Run-NSF-Streams.ps1` (в том же Windows artifact). Он использует существующий Stage49 Prepacked NSF, сравнивает `Parallel` и `Sequential` с обеими stream-политиками, пересоздаёт устройство в отдельном процессе на каждую комбинацию, проверяет полные FP32-выходы и разворачивает порядок комбинаций во втором проходе. Каждому процессу выдаётся свой каталог с отдельным `cubecl.toml`.
+
+**Локальный предварительный CPU-тест** с `CUBECL_CPU_MAX_TASKS=32`, 5 CPU, 64 кадра, 10 измерений после 4 прогревов, три независимых процесса для каждой комбинации:
+
+| Stream policy | Residuals | Времена трёх запусков, мс | Медиана, мс |
+|---|---|---|---:|
+| `per-thread` | Parallel | 30,06 / 37,57 / 38,88 | 37,57 |
+| `single` | Parallel | 15,98 / 37,09 / 16,34 | 16,34 |
+| `per-thread` | Sequential | 16,01 / 16,26 / 16,15 | 16,15 |
+| `single` | Sequential | 16,04 / 16,25 / 16,01 | 16,04 |
+
+Число выходных элементов и контрольные суммы для всех 12 прогонов совпали, повторная численная ошибка внутри каждого прогона — ноль. Это **не** полная побитовая cross-process проверка, поскольку данный smoke не экспортировал FP32-файлы. Результаты сильно варьируют (один `single + Parallel` запуск занял 37 мс), поэтому нельзя заявить устойчивое 2,3× ускорение только от stream policy; это обоснование для A/B на GPU.
+
+Windows запуск второго теста:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Run-NSF-Streams.ps1 -Iterations 20 -Warmup 5 -Frames "64,256,1024"
+```
+
+Архив: `NSF_CUDA_STREAMS_STAGE51_RESULTS.zip`. Он отвечает на вопрос о влиянии **CUDA-native** распределения stream-зависимостей, тогда как `Run-NSF-Graph.ps1` измеряет сокращение CPU-side запусков через CUDA Graph. Оба опыта сохраняют неизменный математический NSF.
