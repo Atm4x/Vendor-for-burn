@@ -1,0 +1,46 @@
+name: RVC experiment Git Bridge export
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - experiment/conv-kernel-rnd-stage33-20261110
+    paths:
+      - .github/workflows/rvc-experiment-git-bridge.yml
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout full experiment history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Export verified Git refs
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main:refs/heads/main feat/rvc-burn-parity-stage1:refs/heads/feat/rvc-burn-parity-stage1
+          git update-ref refs/heads/experiment/conv-kernel-rnd-stage33-20261110 "$GITHUB_SHA"
+          git bundle create "$RUNNER_TEMP/rvc-experiment.bundle" refs/heads/main refs/heads/feat/rvc-burn-parity-stage1 refs/heads/experiment/conv-kernel-rnd-stage33-20261110
+          git bundle verify "$RUNNER_TEMP/rvc-experiment.bundle"
+          git bundle list-heads "$RUNNER_TEMP/rvc-experiment.bundle"
+          cd "$RUNNER_TEMP"
+          sha256sum rvc-experiment.bundle > rvc-experiment.bundle.sha256
+          printf '%s\n' "$GITHUB_SHA" > source-head.txt
+      - name: Publish Git Bridge artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rvc-experiment-git-bridge
+          path: |
+            ${{ runner.temp }}/rvc-experiment.bundle
+            ${{ runner.temp }}/rvc-experiment.bundle.sha256
+            ${{ runner.temp }}/source-head.txt
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 3
