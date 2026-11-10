@@ -18,7 +18,7 @@ $arguments = @(
     "--frames", $Frames,
     "--iterations", [string]$Iterations,
     "--warmup", [string]$Warmup,
-    "--checkpoint", $fixture
+    "--checkpoint", "synthetic_nsf_decoder.pth"
 )
 
 Write-Host "Running NSF CUDA scheduling A/B: $Frames frames; $Iterations iterations; $Warmup warmup"
