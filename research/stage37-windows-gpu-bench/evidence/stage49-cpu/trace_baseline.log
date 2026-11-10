@@ -1,0 +1,42 @@
+CUBECL_NSF_BEGIN frames=64
+CUBECL_ALIGN shape=[1, 64, 4] strides=Strides { dims: [256, 1, 64] } materialize=true
+CUBECL_ALIGN shape=[8, 7, 4] strides=Strides { dims: [28, 1, 7] } materialize=true
+CUBECL_ALIGN shape=[8, 4, 1, 4] strides=Strides { dims: [16, 1, 1, 4] } materialize=true
+CUBECL_ALIGN shape=[1, 64, 1, 8] strides=Strides { dims: [512, 1, 1, 64] } materialize=true
+CUBECL_ALIGN shape=[1, 256, 1] strides=Strides { dims: [256, 1, 256] } materialize=true
+CUBECL_ALIGN shape=[4, 4, 1] strides=Strides { dims: [4, 1, 4] } materialize=true
+CUBECL_ALIGN shape=[1, 128, 4] strides=Strides { dims: [512, 1, 128] } materialize=true
+CUBECL_ALIGN shape=[4, 3, 4] strides=Strides { dims: [12, 1, 3] } materialize=true
+CUBECL_ALIGN shape=[4, 3, 4] strides=Strides { dims: [12, 1, 3] } materialize=true
+CUBECL_ALIGN shape=[4, 3, 4] strides=Strides { dims: [12, 1, 3] } materialize=true
+CUBECL_ALIGN shape=[4, 3, 4] strides=Strides { dims: [12, 1, 3] } materialize=true
+CUBECL_ALIGN shape=[4, 3, 4] strides=Strides { dims: [12, 1, 3] } materialize=true
+CUBECL_ALIGN shape=[4, 3, 4] strides=Strides { dims: [12, 1, 3] } materialize=true
+CUBECL_ALIGN shape=[1, 128, 4] strides=Strides { dims: [512, 1, 128] } materialize=true
+CUBECL_ALIGN shape=[4, 7, 4] strides=Strides { dims: [28, 1, 7] } materialize=true
+CUBECL_ALIGN shape=[4, 7, 4] strides=Strides { dims: [28, 1, 7] } materialize=true
+CUBECL_ALIGN shape=[4, 7, 4] strides=Strides { dims: [28, 1, 7] } materialize=true
+CUBECL_ALIGN shape=[4, 7, 4] strides=Strides { dims: [28, 1, 7] } materialize=true
+CUBECL_ALIGN shape=[4, 7, 4] strides=Strides { dims: [28, 1, 7] } materialize=true
+CUBECL_ALIGN shape=[4, 7, 4] strides=Strides { dims: [28, 1, 7] } materialize=true
+CUBECL_ALIGN shape=[4, 4, 1, 2] strides=Strides { dims: [8, 1, 1, 4] } materialize=true
+CUBECL_ALIGN shape=[1, 128, 1, 4] strides=Strides { dims: [512, 1, 1, 128] } materialize=true
+CUBECL_ALIGN shape=[1, 256, 1] strides=Strides { dims: [256, 1, 256] } materialize=true
+CUBECL_ALIGN shape=[1, 256, 2] strides=Strides { dims: [512, 1, 256] } materialize=true
+CUBECL_ALIGN shape=[2, 3, 2] strides=Strides { dims: [6, 1, 3] } materialize=true
+CUBECL_ALIGN shape=[2, 3, 2] strides=Strides { dims: [6, 1, 3] } materialize=true
+CUBECL_ALIGN shape=[2, 3, 2] strides=Strides { dims: [6, 1, 3] } materialize=true
+CUBECL_ALIGN shape=[2, 3, 2] strides=Strides { dims: [6, 1, 3] } materialize=true
+CUBECL_ALIGN shape=[2, 3, 2] strides=Strides { dims: [6, 1, 3] } materialize=true
+CUBECL_ALIGN shape=[2, 3, 2] strides=Strides { dims: [6, 1, 3] } materialize=true
+CUBECL_ALIGN shape=[1, 256, 2] strides=Strides { dims: [512, 1, 256] } materialize=true
+CUBECL_ALIGN shape=[2, 7, 2] strides=Strides { dims: [14, 1, 7] } materialize=true
+CUBECL_ALIGN shape=[2, 7, 2] strides=Strides { dims: [14, 1, 7] } materialize=true
+CUBECL_ALIGN shape=[2, 7, 2] strides=Strides { dims: [14, 1, 7] } materialize=true
+CUBECL_ALIGN shape=[2, 7, 2] strides=Strides { dims: [14, 1, 7] } materialize=true
+CUBECL_ALIGN shape=[2, 7, 2] strides=Strides { dims: [14, 1, 7] } materialize=true
+CUBECL_ALIGN shape=[2, 7, 2] strides=Strides { dims: [14, 1, 7] } materialize=true
+CUBECL_ALIGN shape=[1, 256, 2] strides=Strides { dims: [512, 1, 256] } materialize=true
+CUBECL_ALIGN shape=[1, 7, 2] strides=Strides { dims: [14, 1, 7] } materialize=true
+CUBECL_ALIGN shape=[1, 1, 256] strides=Strides { dims: [256, 1, 1] } materialize=true
+CUBECL_NSF_END frames=64

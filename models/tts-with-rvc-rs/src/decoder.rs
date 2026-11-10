@@ -13,6 +13,24 @@ pub enum ResidualExecution {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+fn prepack_conv1d_weight(weight: Tensor<3>, device: &Device) -> Tensor<3> {
+    let [out_channels, in_channels, kernel] = weight.dims();
+    let original = weight.into_data().try_into_vec::<f32>().expect("conv weight must be FP32");
+    let mut packed = vec![0.0f32; original.len()];
+    for out in 0..out_channels {
+        for channel in 0..in_channels {
+            for k in 0..kernel {
+                packed[(out * kernel + k) * in_channels + channel] =
+                    original[(out * in_channels + channel) * kernel + k];
+            }
+        }
+    }
+    Tensor::from_data(
+        TensorData::new(packed, [out_channels, kernel, in_channels]),
+        device,
+    ).swap_dims(1, 2)
+}
+
 pub enum ResidualAggregation {
     ZeroSeeded,
     FirstBranch,
@@ -52,6 +70,11 @@ impl Conv1d {
             checkpoint.weight_norm_conv1d(prefix, device)?
         } else {
             checkpoint.tensor::<3>(&format!("{prefix}.weight"), device)?
+        };
+        let weight = if std::env::var_os("RVC_CONV_WEIGHT_PREPACK").is_some() {
+            prepack_conv1d_weight(weight, device)
+        } else {
+            weight
         };
         let bias = checkpoint.contains(&format!("{prefix}.bias"))
             .then(|| checkpoint.tensor::<1>(&format!("{prefix}.bias"), device))
