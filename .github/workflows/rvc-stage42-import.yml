@@ -1,0 +1,37 @@
+name: Import verified Stage42 NSF Git bundle
+
+on:
+  push:
+    branches:
+      - bridge/rvc-stage39-import-20261110
+    paths:
+      - bridge/stage42.bundle.b64
+
+permissions:
+  contents: write
+
+jobs:
+  import-candidate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify and import exact Stage42 NSF commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=2244962b2f10d00ee38230a72a5c5d5a9caaf25d
+          HEAD=7eff8849bede8897ede60fb7178384e6eda18394
+          FILE="$RUNNER_TEMP/stage42.bundle"
+          base64 --decode bridge/stage42.bundle.b64 > "$FILE"
+          echo "8746a04f2e789ae45c74188a66b865771a5069635bf6a4d9ca70c3cad01720b0  $FILE" | sha256sum --check
+          git fetch origin experiment/conv-kernel-rnd-stage33-20261110
+          git cat-file -e "$BASE^{commit}"
+          git bundle verify "$FILE"
+          git fetch "$FILE" refs/heads/experiment/nsf-stage42-pipeline:refs/heads/bridge/rvc-stage42-candidate-20261110
+          test "$(git rev-parse refs/heads/bridge/rvc-stage42-candidate-20261110)" = "$HEAD"
+          git merge-base --is-ancestor "$BASE" "$HEAD"
+          git fsck --connectivity-only --no-reflogs
+          git push origin refs/heads/bridge/rvc-stage42-candidate-20261110:refs/heads/bridge/rvc-stage42-candidate-20261110
