@@ -1,0 +1,36 @@
+name: Import Stage39 vendored checksum fix
+
+on:
+  push:
+    branches:
+      - bridge/rvc-stage39-import-20261110
+    paths:
+      - bridge/stage39b.bundle.b64
+
+permissions:
+  contents: write
+
+jobs:
+  import-candidate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify and import checksum fix commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=2e728f5519f15cf6184a2aed1bf8b619016f303f
+          HEAD=004c759369526fb9a27c58826b6fd558722fca35
+          FILE="$RUNNER_TEMP/stage39b.bundle"
+          base64 --decode bridge/stage39b.bundle.b64 > "$FILE"
+          echo "930e2d16088608f304ba0dcb240acfb9484d113aab607bb63d951e8ce6aede9c  $FILE" | sha256sum --check
+          git cat-file -e "$BASE^{commit}"
+          git bundle verify "$FILE"
+          git fetch "$FILE" refs/heads/experiment/conv-kernel-rnd-stage33-20261110:refs/heads/bridge/rvc-stage39b-candidate-20261110
+          test "$(git rev-parse refs/heads/bridge/rvc-stage39b-candidate-20261110)" = "$HEAD"
+          git merge-base --is-ancestor "$BASE" "$HEAD"
+          git fsck --no-reflogs --full
+          git push origin refs/heads/bridge/rvc-stage39b-candidate-20261110:refs/heads/bridge/rvc-stage39b-candidate-20261110
