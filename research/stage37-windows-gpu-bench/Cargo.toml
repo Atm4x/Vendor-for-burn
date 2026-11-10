@@ -33,3 +33,8 @@ required-features = ["cpu"]
 name = "bench_conv_stride_stage46"
 path = "src/bin/bench_conv_stride_stage46.rs"
 required-features = ["cpu"]
+
+[[bin]]
+name = "bench_conv_pipeline_stage47"
+path = "src/bin/bench_conv_pipeline_stage47.rs"
+required-features = ["cpu"]
