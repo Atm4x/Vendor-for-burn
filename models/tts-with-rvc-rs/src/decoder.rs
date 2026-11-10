@@ -53,6 +53,20 @@ pub struct NsfProfileStep {
     pub milliseconds: f64,
 }
 
+fn prepack_conv1d_weight_for_temporal(weight: Tensor<3>, device: &Device) -> Tensor<3> {
+    let [cout, cin, kernel] = weight.dims();
+    let original = weight.into_data().try_into_vec::<f32>().expect("Conv1d weight must be FP32");
+    let mut packed = vec![0.0f32; original.len()];
+    for oc in 0..cout {
+        for ci in 0..cin {
+            for k in 0..kernel {
+                packed[(k * cin + ci) * cout + oc] = original[(oc * cin + ci) * kernel + k];
+            }
+        }
+    }
+    Tensor::from_data(TensorData::new(packed, [kernel, cin, cout]), device).swap_dims(0, 2)
+}
+
 struct Conv1d {
     weight: Tensor<3>,
     bias: Option<Tensor<1>>,
@@ -71,7 +85,10 @@ impl Conv1d {
         } else {
             checkpoint.tensor::<3>(&format!("{prefix}.weight"), device)?
         };
-        let weight = if std::env::var_os("RVC_CONV_WEIGHT_PREPACK").is_some() {
+        let kernel_mode = std::env::var("RVC_NSF_CONV_KERNEL").unwrap_or_default();
+        let weight = if matches!(kernel_mode.as_str(), "packed" | "quad" | "quad_interior") {
+            prepack_conv1d_weight_for_temporal(weight, device)
+        } else if std::env::var_os("RVC_CONV_WEIGHT_PREPACK").is_some() {
             prepack_conv1d_weight(weight, device)
         } else {
             weight
