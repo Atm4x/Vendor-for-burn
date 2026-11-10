@@ -22,6 +22,15 @@ function Save-CommandOutput([string]$Command, [string[]]$Arguments, [string]$Des
     return $LASTEXITCODE -eq 0
 }
 
+function Invoke-LoggedNative([string]$Executable, [string]$Arguments, [string]$LogPrefix) {
+    $stdout = "$LogPrefix.stdout.log"
+    $stderr = "$LogPrefix.stderr.log"
+    $process = Start-Process -FilePath $Executable -ArgumentList $Arguments -WorkingDirectory $PSScriptRoot -NoNewWindow -Wait -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+    if (Test-Path $stdout) { Get-Content $stdout | ForEach-Object { Write-Host $_ } }
+    if (Test-Path $stderr) { Get-Content $stderr | ForEach-Object { Write-Host $_ } }
+    return $process.ExitCode
+}
+
 Write-Host 'Collecting device and runtime diagnostics...'
 $null = Save-CommandOutput -Command 'nvidia-smi' -Arguments @('-q') -Destination (Join-Path $reportDir 'nvidia-smi.txt')
 $null = Save-CommandOutput -Command 'nvcc' -Arguments @('--version') -Destination (Join-Path $reportDir 'nvcc.txt')
@@ -44,9 +53,10 @@ foreach ($name in $backends) {
     }
     Write-Host "Running CubeCL $name ..."
     $report = Join-Path $reportDir "$name.json"
-    & $exePath --backend $name --iterations $Iterations --warmup $Warmup --json $report 2>&1 |
-        Tee-Object -FilePath (Join-Path $reportDir "$name.log")
-    if ($LASTEXITCODE -ne 0) {
+    $tensorDir = Join-Path $reportDir "cubecl-$name-tensors"
+    $benchmarkArgs = "--backend $name --iterations $Iterations --warmup $Warmup --json `"$report`" --parity-dir `"$tensorDir`""
+    $exitCode = Invoke-LoggedNative -Executable $exePath -Arguments $benchmarkArgs -LogPrefix (Join-Path $reportDir $name)
+    if ($exitCode -ne 0) {
         Write-Warning "CubeCL $name failed. Raw log preserved; no speedup claimed."
     }
 }
@@ -67,9 +77,11 @@ if (-not $SkipTorch) {
         }
         & $python.Source @pyArgs -c 'import torch; print(torch.__version__)' 2>$null
         if ($LASTEXITCODE -eq 0) {
-            & $python.Source @pyArgs .\torch_cudnn_bench.py --warmup $Warmup --iterations $Iterations --report (Join-Path $reportDir 'pytorch.json') 2>&1 |
-                Tee-Object -FilePath (Join-Path $reportDir 'pytorch.log')
-            if ($LASTEXITCODE -ne 0) { Write-Warning 'PyTorch benchmark failed; see reports/pytorch.log.' }
+            $torchReport = Join-Path $reportDir 'pytorch.json'
+            $torchTensorDir = Join-Path $reportDir 'pytorch-tensors'
+            $pythonArgs = ((@($pyArgs) + @('.\torch_cudnn_bench.py', '--warmup', "$Warmup", '--iterations', "$Iterations", '--report', "`"$torchReport`"", '--tf32', 'disable', '--parity-dir', "`"$torchTensorDir`"")) -join ' ')
+            $exitCode = Invoke-LoggedNative -Executable $python.Source -Arguments $pythonArgs -LogPrefix (Join-Path $reportDir 'pytorch')
+            if ($exitCode -ne 0) { Write-Warning 'PyTorch benchmark failed; see reports/pytorch.stderr.log.' }
         } else {
             Write-Warning 'PyTorch is not installed. Use -InstallTorchCu128 explicitly to install a CUDA-enabled wheel.'
         }
@@ -78,7 +90,12 @@ if (-not $SkipTorch) {
             $torchReport = Join-Path $reportDir 'pytorch.json'
             if ((Test-Path $cubeReport) -and (Test-Path $torchReport)) {
                 & $python.Source @pyArgs .\merge_reports.py --cubecl $cubeReport --torch $torchReport --out (Join-Path $reportDir "$name-vs-pytorch.json")
-                if ($LASTEXITCODE -ne 0) { Write-Warning "Parity check failed for $name; inspect output JSON." }
+                if ($LASTEXITCODE -ne 0) { Write-Warning "Probe parity check failed for $name; inspect output JSON." }
+                $cubeTensorDir = Join-Path $reportDir "cubecl-$name-tensors"
+                if ((Test-Path $cubeTensorDir) -and (Test-Path (Join-Path $reportDir 'pytorch-tensors'))) {
+                    & $python.Source @pyArgs .\compare_tensor_dumps.py --cubecl-dir $cubeTensorDir --torch-dir (Join-Path $reportDir 'pytorch-tensors') --out (Join-Path $reportDir "$name-full-tensor-parity.json")
+                    if ($LASTEXITCODE -ne 0) { Write-Warning "Full tensor parity failed for $name; inspect the report." }
+                }
             }
         }
     } else {

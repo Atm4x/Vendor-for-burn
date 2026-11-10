@@ -10,6 +10,8 @@ def main():
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--report", type=Path, default=Path("torch-cudnn.json"))
+    parser.add_argument("--tf32", choices=("allow", "disable"), default="disable")
+    parser.add_argument("--parity-dir", type=Path)
     args = parser.parse_args()
     if not (1 <= args.iterations <= 1000 and 0 <= args.warmup <= 100):
         parser.error("Invalid number of repetitions")
@@ -21,6 +23,8 @@ def main():
         torch.cuda.init()
     torch.backends.cudnn.enabled = True
     torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.allow_tf32 = args.tf32 == "allow"
+    torch.backends.cuda.matmul.allow_tf32 = args.tf32 == "allow"
     report = {
         "backend": "pytorch-" + device,
         "status": "pass",
@@ -28,6 +32,7 @@ def main():
         "cuda_wheel_version": torch.version.cuda,
         "cudnn_version": torch.backends.cudnn.version() if device == "cuda" else None,
         "cudnn_enabled": bool(torch.backends.cudnn.enabled),
+        "tf32_allowed": bool(torch.backends.cudnn.allow_tf32),
         "device": torch.cuda.get_device_name(0) if device == "cuda" else "CPU",
         "semantics": "PyTorch conv1d + synchronous CPU readback; warmed median (same as CubeCL)",
         "results": [],
@@ -53,6 +58,10 @@ def main():
             elapsed = (time.perf_counter() - start) * 1000.0
             if i >= args.warmup:
                 measurements.append(elapsed)
+        if args.parity_dir:
+            args.parity_dir.mkdir(parents=True, exist_ok=True)
+            filename = name.lower().replace(" ", "_") + "_pytorch.f32le"
+            result.reshape(-1).to(torch.float32).numpy().astype("<f4", copy=False).tofile(args.parity_dir / filename)
         flat = result.reshape(-1).to(torch.float64)
         probes = [flat[0].item(), flat[flat.numel() // 2].item(), flat[-1].item()]
         report["results"].append({

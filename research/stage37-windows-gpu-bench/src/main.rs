@@ -1,11 +1,16 @@
 use cubecl::{prelude::*, std::tensor::TensorHandle, zspace::Shape};
 use cubecl_server::runtime::Runtime;
 use cubek_convolution::kernels::forward::{
-    launch_pack_conv1d_weights, launch_prepacked_temporal_pair,
+    launch_pack_conv1d_weights, launch_prepacked_temporal_pair, launch_prepacked_temporal_quad,
 };
 use cubek_convolution::{ConvolutionArgs, DirectTensors, launch_direct};
 use serde::Serialize;
-use std::{fs, hint::black_box, path::PathBuf, time::Instant};
+use std::{
+    fs,
+    hint::black_box,
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 #[derive(Serialize)]
 struct CaseResult {
@@ -18,6 +23,9 @@ struct CaseResult {
     pack_ms: f64,
     direct_ms: f64,
     packed_ms: f64,
+    quad_ms: f64,
+    speedup_pair_over_quad: f64,
+    max_abs_error_quad: f32,
     speedup_direct_over_packed: f64,
     max_abs_error: f32,
     max_normalized_error: f32,
@@ -61,6 +69,7 @@ fn run_case(
     d: usize,
     warmup: usize,
     iterations: usize,
+    parity_dir: Option<&Path>,
 ) -> Result<CaseResult, String> {
     let pad = (k - 1) * d / 2;
     let input: Vec<f32> = (0..length * cin)
@@ -104,10 +113,16 @@ fn run_case(
     };
     let mut direct = Vec::new();
     let mut packed = Vec::new();
+    let mut quad = Vec::new();
     let mut direct_out = Vec::new();
     let mut packed_out = Vec::new();
+    let mut quad_out = Vec::new();
     for repeat in 0..(warmup + iterations) {
-        for variant in if repeat % 2 == 0 { [0, 1] } else { [1, 0] } {
+        for variant in if repeat % 2 == 0 {
+            [0, 1, 2]
+        } else {
+            [2, 1, 0]
+        } {
             let out = TensorHandle::empty(
                 client,
                 Shape::new([1, length, cout]),
@@ -127,7 +142,7 @@ fn run_case(
             if variant == 0 {
                 launch_direct::<1>(client, tensors, opts.clone(), 1, f32::elem_type_native())
                     .map_err(|e| format!("direct failed: {e:?}"))?;
-            } else {
+            } else if variant == 1 {
                 launch_prepacked_temporal_pair(
                     client,
                     tensors,
@@ -136,6 +151,15 @@ fn run_case(
                     f32::elem_type_native(),
                 )
                 .map_err(|e| format!("packed failed: {e:?}"))?;
+            } else {
+                launch_prepacked_temporal_quad(
+                    client,
+                    tensors,
+                    opts.clone(),
+                    1,
+                    f32::elem_type_native(),
+                )
+                .map_err(|e| format!("quad failed: {e:?}"))?;
             }
             let values = read(client, out);
             black_box(&values);
@@ -143,20 +167,24 @@ fn run_case(
             if repeat >= warmup {
                 if variant == 0 {
                     direct.push(elapsed);
-                } else {
+                } else if variant == 1 {
                     packed.push(elapsed);
+                } else {
+                    quad.push(elapsed);
                 }
             }
             if repeat == warmup {
                 if variant == 0 {
                     direct_out = values;
-                } else {
+                } else if variant == 1 {
                     packed_out = values;
+                } else {
+                    quad_out = values;
                 }
             }
         }
     }
-    if direct_out.len() != packed_out.len() {
+    if direct_out.len() != packed_out.len() || direct_out.len() != quad_out.len() {
         return Err("output sizes differ".into());
     }
     let mut max_abs_error = 0.0f32;
@@ -166,9 +194,35 @@ fn run_case(
         max_abs_error = max_abs_error.max(diff);
         max_normalized_error = max_normalized_error.max(diff / (1.0 + a.abs()));
     }
+    let max_abs_error_quad = direct_out
+        .iter()
+        .zip(&quad_out)
+        .map(|(a, b)| (*a - *b).abs())
+        .fold(0.0_f32, f32::max);
+    if let Some(dir) = parity_dir {
+        fs::create_dir_all(dir).map_err(|e| format!("parity directory: {e}"))?;
+        let tag = name.to_ascii_lowercase().replace(' ', "_");
+        for (variant, values) in [
+            ("direct", &direct_out),
+            ("packed", &packed_out),
+            ("quad", &quad_out),
+        ] {
+            let mut bytes = Vec::with_capacity(values.len() * 4);
+            for value in values {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            fs::write(dir.join(format!("{tag}_{variant}.f32le")), bytes)
+                .map_err(|e| format!("write parity tensor: {e}"))?;
+        }
+    }
     let direct_ms = median(&mut direct);
     let packed_ms = median(&mut packed);
-    let passed = max_normalized_error <= 0.0002 && direct_ms.is_finite() && packed_ms.is_finite();
+    let quad_ms = median(&mut quad);
+    let passed = max_normalized_error <= 0.0002
+        && max_abs_error_quad <= 0.0002
+        && direct_ms.is_finite()
+        && packed_ms.is_finite()
+        && quad_ms.is_finite();
     let direct_probe = [
         direct_out[0],
         direct_out[direct_out.len() / 2],
@@ -185,6 +239,9 @@ fn run_case(
         pack_ms,
         direct_ms,
         packed_ms,
+        quad_ms,
+        speedup_pair_over_quad: packed_ms / quad_ms,
+        max_abs_error_quad,
         speedup_direct_over_packed: direct_ms / packed_ms,
         max_abs_error,
         max_normalized_error,
@@ -195,7 +252,13 @@ fn run_case(
     })
 }
 
-fn run(client: &Client, backend: &str, warmup: usize, iterations: usize) -> Report {
+fn run(
+    client: &Client,
+    backend: &str,
+    warmup: usize,
+    iterations: usize,
+    parity_dir: Option<&Path>,
+) -> Report {
     let specs = [
         ("NSF K3", 256, 256, 240, 3, 1),
         ("NSF K11 D5", 128, 128, 2400, 11, 5),
@@ -204,11 +267,16 @@ fn run(client: &Client, backend: &str, warmup: usize, iterations: usize) -> Repo
     let mut results = Vec::new();
     for (name, cin, cout, len, k, d) in specs {
         eprintln!("[{backend}] benchmarking {name}");
-        match run_case(client, name, cin, cout, len, k, d, warmup, iterations) {
+        match run_case(
+            client, name, cin, cout, len, k, d, warmup, iterations, parity_dir,
+        ) {
             Ok(result) => {
                 eprintln!(
-                    "[{backend}] {name}: direct {:.3} ms, packed {:.3} ms, error {:.6}",
-                    result.direct_ms, result.packed_ms, result.max_abs_error
+                    "[{backend}] {name}: direct {:.3} ms, packed {:.3} ms, quad {:.3} ms, error {:.6}",
+                    result.direct_ms,
+                    result.packed_ms,
+                    result.quad_ms,
+                    result.max_abs_error.max(result.max_abs_error_quad)
                 );
                 results.push(result);
             }
@@ -248,6 +316,7 @@ fn main() {
     let mut iterations = 10usize;
     let mut warmup = 3usize;
     let mut json = None::<PathBuf>;
+    let mut parity_dir = None::<PathBuf>;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "-h" | "--help" => {
@@ -270,6 +339,9 @@ fn main() {
                     .expect("warmup")
             }
             "--json" => json = Some(args.next().expect("--json filename").into()),
+            "--parity-dir" => {
+                parity_dir = Some(args.next().expect("--parity-dir directory").into())
+            }
             _ => {
                 eprintln!("Unknown option: {flag}");
                 usage();
@@ -290,7 +362,7 @@ fn main() {
                 std::process::exit(3);
             }
             let client = WgpuRuntime::<WgslCompiler>::client(&Default::default());
-            run(&client, &backend, warmup, iterations)
+            run(&client, &backend, warmup, iterations, parity_dir.as_deref())
         }
         #[cfg(feature = "cuda")]
         "cuda" => {
@@ -300,7 +372,7 @@ fn main() {
                 std::process::exit(3);
             }
             let client = CudaRuntime::client(&Default::default());
-            run(&client, &backend, warmup, iterations)
+            run(&client, &backend, warmup, iterations, parity_dir.as_deref())
         }
         _ => {
             eprintln!("Backend '{backend}' was not compiled in or is unknown");
