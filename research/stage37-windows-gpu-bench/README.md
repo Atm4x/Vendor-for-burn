@@ -45,3 +45,15 @@ The fourth GPU variant, `quad_interior`, uses the same four-position tile and pr
 New fields: `quad_interior_ms`, `speedup_quad_over_interior`, and `max_abs_error_quad_interior`. The full-tensor comparator checks four variants against PyTorch strict FP32. Keep `-Warmup 5 -Iterations 20` (or longer) and compare against the same benchmark executable; identical CUDA and WGPU performance is not expected.
 
 See [STAGE39_GPU_RESULTS_AND_INTERIOR_RND.md](STAGE39_GPU_RESULTS_AND_INTERIOR_RND.md).
+
+### Stage 40: LLVM CPU JIT A/B
+
+The same deterministic NSF synthetic tensors can now be measured via CubeCL CPU JIT (`cubecl-cpu` feature) using a compatible local Tracel LLVM 23.1.0-4 installation:
+
+```bash
+cargo build --release --locked --offline --no-default-features --features cpu
+./target/release/rvc-cubecl-gpu-bench --backend cpu --warmup 8 --iterations 30 --json cpu.json
+./target/release/rvc-cubecl-gpu-bench --backend cpu --sync-only --warmup 8 --iterations 30 --json cpu-sync.json
+```
+
+`--sync-only` reuses output buffers and times launch + synchronization, with complete output parity checked separately. It is not hardware-kernel-only timing. Use `--case 'NSF K11'` to select an individual shape. Experimental variants now include `PairInterior` and `QuadLinear`; see `STAGE40_CPU_JIT_RND_REPORT.md` for CPU evidence and rejected candidates. GPU runtime timing for these Stage 40 candidates is **not** available yet.

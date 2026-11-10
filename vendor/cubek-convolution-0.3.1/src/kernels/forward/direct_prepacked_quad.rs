@@ -31,6 +31,7 @@ fn prepacked_temporal_quad_kernel<E: Numeric, NOut: Size>(
     padding: i32,
     #[define(E)] _dtype: ElemType,
     #[comptime] fast_interior: bool,
+    #[comptime] linear_indexing: bool,
 ) {
     let out_vector = output.vector_size();
     let cout_group = weight.shape(3) as u32;
@@ -80,12 +81,33 @@ fn prepacked_temporal_quad_kernel<E: Numeric, NOut: Size>(
             let x3 = batch_base + i3 * input.stride(1) + channel_base;
             let weight_base =
                 g as usize * weight.stride(0) + k as usize * weight.stride(1) + local_oc as usize;
-            for ci in 0..cin_group {
-                let w = weight[(weight_base + ci as usize * weight.stride(2)) / out_vector];
-                sum0 += w * Vector::new(input[x0 + ci as usize]);
-                sum1 += w * Vector::new(input[x1 + ci as usize]);
-                sum2 += w * Vector::new(input[x2 + ci as usize]);
-                sum3 += w * Vector::new(input[x3 + ci as usize]);
+            if linear_indexing {
+                let mut w_index = weight_base / out_vector;
+                let w_step = weight.stride(2) / out_vector;
+                let mut x_index0 = x0;
+                let mut x_index1 = x1;
+                let mut x_index2 = x2;
+                let mut x_index3 = x3;
+                for _ in 0..cin_group {
+                    let w = weight[w_index];
+                    sum0 += w * Vector::new(input[x_index0]);
+                    sum1 += w * Vector::new(input[x_index1]);
+                    sum2 += w * Vector::new(input[x_index2]);
+                    sum3 += w * Vector::new(input[x_index3]);
+                    w_index += w_step;
+                    x_index0 += 1;
+                    x_index1 += 1;
+                    x_index2 += 1;
+                    x_index3 += 1;
+                }
+            } else {
+                for ci in 0..cin_group {
+                    let w = weight[(weight_base + ci as usize * weight.stride(2)) / out_vector];
+                    sum0 += w * Vector::new(input[x0 + ci as usize]);
+                    sum1 += w * Vector::new(input[x1 + ci as usize]);
+                    sum2 += w * Vector::new(input[x2 + ci as usize]);
+                    sum3 += w * Vector::new(input[x3 + ci as usize]);
+                }
             }
         }
     } else {
@@ -167,7 +189,7 @@ pub fn launch_prepacked_temporal_quad(
     groups: usize,
     dtype: ElemType,
 ) -> Result<(), ConvSetupError> {
-    launch_quad_impl(client, tensors, args, groups, dtype, false)
+    launch_quad_impl(client, tensors, args, groups, dtype, false, false)
 }
 
 pub fn launch_prepacked_temporal_quad_interior(
@@ -177,7 +199,17 @@ pub fn launch_prepacked_temporal_quad_interior(
     groups: usize,
     dtype: ElemType,
 ) -> Result<(), ConvSetupError> {
-    launch_quad_impl(client, tensors, args, groups, dtype, true)
+    launch_quad_impl(client, tensors, args, groups, dtype, true, false)
+}
+
+pub fn launch_prepacked_temporal_quad_linear(
+    client: &Client,
+    tensors: DirectTensors,
+    args: ConvolutionArgs<1>,
+    groups: usize,
+    dtype: ElemType,
+) -> Result<(), ConvSetupError> {
+    launch_quad_impl(client, tensors, args, groups, dtype, true, true)
 }
 
 fn launch_quad_impl(
@@ -187,6 +219,7 @@ fn launch_quad_impl(
     groups: usize,
     dtype: ElemType,
     fast_interior: bool,
+    linear_indexing: bool,
 ) -> Result<(), ConvSetupError> {
     let DirectTensors {
         input,
@@ -243,6 +276,7 @@ fn launch_quad_impl(
             args.padding[0] as i32,
             dtype,
             fast_interior,
+            linear_indexing,
         );
     }
     Ok(())

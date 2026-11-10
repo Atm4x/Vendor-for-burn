@@ -1,8 +1,9 @@
 use cubecl::{prelude::*, std::tensor::TensorHandle, zspace::Shape};
 use cubecl_server::runtime::Runtime;
 use cubek_convolution::kernels::forward::{
-    launch_pack_conv1d_weights, launch_prepacked_temporal_pair, launch_prepacked_temporal_quad,
-    launch_prepacked_temporal_quad_interior,
+    launch_pack_conv1d_weights, launch_prepacked_temporal_pair,
+    launch_prepacked_temporal_pair_interior, launch_prepacked_temporal_quad,
+    launch_prepacked_temporal_quad_interior, launch_prepacked_temporal_quad_linear,
 };
 use cubek_convolution::{ConvolutionArgs, DirectTensors, launch_direct};
 use serde::Serialize;
@@ -26,6 +27,11 @@ struct CaseResult {
     packed_ms: f64,
     quad_ms: f64,
     quad_interior_ms: f64,
+    quad_linear_ms: f64,
+    pair_interior_ms: f64,
+    max_abs_error_pair_interior: f32,
+    speedup_interior_over_linear: f64,
+    max_abs_error_quad_linear: f32,
     speedup_quad_over_interior: f64,
     max_abs_error_quad_interior: f32,
     speedup_pair_over_quad: f64,
@@ -74,6 +80,7 @@ fn run_case(
     warmup: usize,
     iterations: usize,
     parity_dir: Option<&Path>,
+    sync_only: bool,
 ) -> Result<CaseResult, String> {
     let pad = (k - 1) * d / 2;
     let input: Vec<f32> = (0..length * cin)
@@ -119,21 +126,42 @@ fn run_case(
     let mut packed = Vec::new();
     let mut quad = Vec::new();
     let mut quad_interior = Vec::new();
+    let mut quad_linear = Vec::new();
+    let mut pair_interior = Vec::new();
     let mut direct_out = Vec::new();
     let mut packed_out = Vec::new();
     let mut quad_out = Vec::new();
     let mut quad_interior_out = Vec::new();
+    let mut quad_linear_out = Vec::new();
+    let mut pair_interior_out = Vec::new();
+    let resident = if sync_only {
+        (0..6)
+            .map(|_| {
+                TensorHandle::empty(
+                    client,
+                    Shape::new([1, length, cout]),
+                    f32::elem_type_native(),
+                )
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     for repeat in 0..(warmup + iterations) {
         for variant in if repeat % 2 == 0 {
-            [0, 1, 2, 3]
+            [0, 1, 2, 3, 4, 5]
         } else {
-            [3, 2, 1, 0]
+            [5, 4, 3, 2, 1, 0]
         } {
-            let out = TensorHandle::empty(
-                client,
-                Shape::new([1, length, cout]),
-                f32::elem_type_native(),
-            );
+            let out = if sync_only {
+                resident[variant].clone()
+            } else {
+                TensorHandle::empty(
+                    client,
+                    Shape::new([1, length, cout]),
+                    f32::elem_type_native(),
+                )
+            };
             let begin = Instant::now();
             let tensors = DirectTensors {
                 input: x.clone().binding(),
@@ -166,7 +194,7 @@ fn run_case(
                     f32::elem_type_native(),
                 )
                 .map_err(|e| format!("quad failed: {e:?}"))?;
-            } else {
+            } else if variant == 3 {
                 launch_prepacked_temporal_quad_interior(
                     client,
                     tensors,
@@ -175,9 +203,34 @@ fn run_case(
                     f32::elem_type_native(),
                 )
                 .map_err(|e| format!("quad interior failed: {e:?}"))?;
+            } else if variant == 4 {
+                launch_prepacked_temporal_quad_linear(
+                    client,
+                    tensors,
+                    opts.clone(),
+                    1,
+                    f32::elem_type_native(),
+                )
+                .map_err(|e| format!("quad linear failed: {e:?}"))?;
+            } else {
+                launch_prepacked_temporal_pair_interior(
+                    client,
+                    tensors,
+                    opts.clone(),
+                    1,
+                    f32::elem_type_native(),
+                )
+                .map_err(|e| format!("pair interior failed: {e:?}"))?;
             }
-            let values = read(client, out);
-            black_box(&values);
+            let values = if sync_only {
+                futures_lite::future::block_on(client.sync())
+                    .map_err(|e| format!("CPU/GPU synchronization failed: {e:?}"))?;
+                Vec::new()
+            } else {
+                let values = read(client, out);
+                black_box(&values);
+                values
+            };
             let elapsed = begin.elapsed().as_secs_f64() * 1000.0;
             if repeat >= warmup {
                 if variant == 0 {
@@ -186,26 +239,44 @@ fn run_case(
                     packed.push(elapsed);
                 } else if variant == 2 {
                     quad.push(elapsed);
-                } else {
+                } else if variant == 3 {
                     quad_interior.push(elapsed);
+                } else if variant == 4 {
+                    quad_linear.push(elapsed);
+                } else {
+                    pair_interior.push(elapsed);
                 }
             }
-            if repeat == warmup {
+            if repeat == warmup && !sync_only {
                 if variant == 0 {
                     direct_out = values;
                 } else if variant == 1 {
                     packed_out = values;
                 } else if variant == 2 {
                     quad_out = values;
-                } else {
+                } else if variant == 3 {
                     quad_interior_out = values;
+                } else if variant == 4 {
+                    quad_linear_out = values;
+                } else {
+                    pair_interior_out = values;
                 }
             }
         }
     }
+    if sync_only {
+        direct_out = read(client, resident[0].clone());
+        packed_out = read(client, resident[1].clone());
+        quad_out = read(client, resident[2].clone());
+        quad_interior_out = read(client, resident[3].clone());
+        quad_linear_out = read(client, resident[4].clone());
+        pair_interior_out = read(client, resident[5].clone());
+    }
     if direct_out.len() != packed_out.len()
         || direct_out.len() != quad_out.len()
         || direct_out.len() != quad_interior_out.len()
+        || direct_out.len() != quad_linear_out.len()
+        || direct_out.len() != pair_interior_out.len()
     {
         return Err("output sizes differ".into());
     }
@@ -226,6 +297,16 @@ fn run_case(
         .zip(&quad_interior_out)
         .map(|(a, b)| (*a - *b).abs())
         .fold(0.0_f32, f32::max);
+    let max_abs_error_quad_linear = direct_out
+        .iter()
+        .zip(&quad_linear_out)
+        .map(|(a, b)| (*a - *b).abs())
+        .fold(0.0_f32, f32::max);
+    let max_abs_error_pair_interior = direct_out
+        .iter()
+        .zip(&pair_interior_out)
+        .map(|(a, b)| (*a - *b).abs())
+        .fold(0.0_f32, f32::max);
     if let Some(dir) = parity_dir {
         fs::create_dir_all(dir).map_err(|e| format!("parity directory: {e}"))?;
         let tag = name.to_ascii_lowercase().replace(' ', "_");
@@ -234,6 +315,8 @@ fn run_case(
             ("packed", &packed_out),
             ("quad", &quad_out),
             ("quad_interior", &quad_interior_out),
+            ("quad_linear", &quad_linear_out),
+            ("pair_interior", &pair_interior_out),
         ] {
             let mut bytes = Vec::with_capacity(values.len() * 4);
             for value in values {
@@ -247,9 +330,15 @@ fn run_case(
     let packed_ms = median(&mut packed);
     let quad_ms = median(&mut quad);
     let quad_interior_ms = median(&mut quad_interior);
+    let quad_linear_ms = median(&mut quad_linear);
+    let pair_interior_ms = median(&mut pair_interior);
     let passed = max_normalized_error <= 0.0002
         && max_abs_error_quad <= 0.0002
         && max_abs_error_quad_interior <= 0.0002
+        && max_abs_error_quad_linear <= 0.0002
+        && max_abs_error_pair_interior <= 0.0002
+        && pair_interior_ms.is_finite()
+        && quad_linear_ms.is_finite()
         && quad_interior_ms.is_finite()
         && direct_ms.is_finite()
         && packed_ms.is_finite()
@@ -272,6 +361,11 @@ fn run_case(
         packed_ms,
         quad_ms,
         quad_interior_ms,
+        quad_linear_ms,
+        pair_interior_ms,
+        max_abs_error_pair_interior,
+        speedup_interior_over_linear: quad_interior_ms / quad_linear_ms,
+        max_abs_error_quad_linear,
         speedup_quad_over_interior: quad_ms / quad_interior_ms,
         max_abs_error_quad_interior,
         speedup_pair_over_quad: packed_ms / quad_ms,
@@ -292,6 +386,8 @@ fn run(
     warmup: usize,
     iterations: usize,
     parity_dir: Option<&Path>,
+    case_filter: Option<&str>,
+    sync_only: bool,
 ) -> Report {
     let specs = [
         ("NSF K3", 256, 256, 240, 3, 1),
@@ -300,21 +396,28 @@ fn run(
     ];
     let mut results = Vec::new();
     for (name, cin, cout, len, k, d) in specs {
+        if case_filter.is_some_and(|selected| selected != name) {
+            continue;
+        }
         eprintln!("[{backend}] benchmarking {name}");
         match run_case(
-            client, name, cin, cout, len, k, d, warmup, iterations, parity_dir,
+            client, name, cin, cout, len, k, d, warmup, iterations, parity_dir, sync_only,
         ) {
             Ok(result) => {
                 eprintln!(
-                    "[{backend}] {name}: direct {:.3} ms, packed {:.3} ms, quad {:.3} ms, quad interior {:.3} ms, error {:.6}",
+                    "[{backend}] {name}: direct {:.3} ms, packed {:.3} ms, quad {:.3} ms, quad interior {:.3} ms, quad linear {:.3} ms, pair interior {:.3} ms, error {:.6}",
                     result.direct_ms,
                     result.packed_ms,
                     result.quad_ms,
                     result.quad_interior_ms,
+                    result.quad_linear_ms,
+                    result.pair_interior_ms,
                     result
                         .max_abs_error
                         .max(result.max_abs_error_quad)
                         .max(result.max_abs_error_quad_interior)
+                        .max(result.max_abs_error_quad_linear)
+                        .max(result.max_abs_error_pair_interior)
                 );
                 results.push(result);
             }
@@ -324,7 +427,11 @@ fn run(
                     tool: "rvc-cubecl-gpu-bench",
                     backend: backend.into(),
                     status: "error",
-                    semantics: "launch + synchronous CPU readback; warmed median; model shapes but deterministic synthetic data",
+                    semantics: if sync_only {
+                        "launch + sync barrier, output resident and no per-iteration readback; warmed median; synthetic data"
+                    } else {
+                        "launch + synchronous CPU readback; warmed median; model shapes but deterministic synthetic data"
+                    },
                     results,
                 };
             }
@@ -339,13 +446,17 @@ fn run(
         tool: "rvc-cubecl-gpu-bench",
         backend: backend.into(),
         status,
-        semantics: "launch + synchronous CPU readback; warmed median; model shapes but deterministic synthetic data",
+        semantics: if sync_only {
+            "launch + sync barrier, output resident and no per-iteration readback; warmed median; synthetic data"
+        } else {
+            "launch + synchronous CPU readback; warmed median; model shapes but deterministic synthetic data"
+        },
         results,
     }
 }
 fn usage() {
     println!(
-        "rvc-cubecl-gpu-bench --backend wgpu|cuda --warmup 3 --iterations 10 --json report.json\nGPU backends are compiled via Cargo features. CUDA Toolkit is not installed by this program.\nMeasured time includes kernel dispatch and synchronous CPU readback (not device-only kernel time)."
+        "rvc-cubecl-gpu-bench --backend cpu|wgpu|cuda --warmup 3 --iterations 10 --case \"NSF K3\" --sync-only --json report.json\nBackends are compiled via Cargo features. CUDA Toolkit is not installed by this program.\nMeasured time includes kernel dispatch and synchronous CPU readback (not kernel-only time)."
     );
 }
 fn main() {
@@ -355,6 +466,8 @@ fn main() {
     let mut warmup = 3usize;
     let mut json = None::<PathBuf>;
     let mut parity_dir = None::<PathBuf>;
+    let mut case_filter = None::<String>;
+    let mut sync_only = false;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "-h" | "--help" => {
@@ -362,6 +475,8 @@ fn main() {
                 return;
             }
             "--backend" => backend = args.next().expect("--backend value"),
+            "--case" => case_filter = Some(args.next().expect("--case name")),
+            "--sync-only" => sync_only = true,
             "--iterations" => {
                 iterations = args
                     .next()
@@ -400,7 +515,33 @@ fn main() {
                 std::process::exit(3);
             }
             let client = WgpuRuntime::<WgslCompiler>::client(&Default::default());
-            run(&client, &backend, warmup, iterations, parity_dir.as_deref())
+            run(
+                &client,
+                &backend,
+                warmup,
+                iterations,
+                parity_dir.as_deref(),
+                case_filter.as_deref(),
+                sync_only,
+            )
+        }
+        #[cfg(feature = "cpu")]
+        "cpu" => {
+            use cubecl_cpu::CpuRuntime;
+            if !CpuRuntime::is_available() {
+                eprintln!("CubeCL CPU runtime is unavailable");
+                std::process::exit(3);
+            }
+            let client = CpuRuntime::client(&Default::default());
+            run(
+                &client,
+                &backend,
+                warmup,
+                iterations,
+                parity_dir.as_deref(),
+                case_filter.as_deref(),
+                sync_only,
+            )
         }
         #[cfg(feature = "cuda")]
         "cuda" => {
@@ -410,7 +551,15 @@ fn main() {
                 std::process::exit(3);
             }
             let client = CudaRuntime::client(&Default::default());
-            run(&client, &backend, warmup, iterations, parity_dir.as_deref())
+            run(
+                &client,
+                &backend,
+                warmup,
+                iterations,
+                parity_dir.as_deref(),
+                case_filter.as_deref(),
+                sync_only,
+            )
         }
         _ => {
             eprintln!("Backend '{backend}' was not compiled in or is unknown");

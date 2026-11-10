@@ -26,6 +26,7 @@ fn prepacked_temporal_kernel<E: Numeric, NOut: Size>(
     dilation: u32,
     padding: i32,
     #[define(E)] _dtype: ElemType,
+    #[comptime] fast_interior: bool,
 ) {
     let out_vector = output.vector_size();
     let cout_group = weight.shape(3) as u32;
@@ -54,29 +55,50 @@ fn prepacked_temporal_kernel<E: Numeric, NOut: Size>(
     let base_bias: ComptimeOption<Vector<E, NOut>> = bias.map(|x| x[vector_index as usize]);
     let mut sum0 = base_bias.unwrap_or_else(|| Vector::zero());
     let mut sum1 = sum0;
-    for k in 0..kernel {
-        let i0 = (t0 * stride + k * dilation) as i32 - padding;
-        let i1 = (t1 * stride + k * dilation) as i32 - padding;
-        let valid0 = i0 >= 0 && (i0 as u32) < in_len;
-        let valid1 = t1 < out_len && i1 >= 0 && (i1 as u32) < in_len;
-        if valid0 || valid1 {
+    let first_input = (t0 * stride) as i32 - padding;
+    let last_input = (t1 * stride + (kernel - 1) * dilation) as i32 - padding;
+    let fully_interior = t1 < out_len && first_input >= 0 && last_input < in_len as i32;
+    if fast_interior && fully_interior {
+        let batch_base = b as usize * input.stride(0);
+        let channel_base = (g * cin_group) as usize;
+        for k in 0..kernel {
+            let i0 = ((t0 * stride + k * dilation) as i32 - padding) as usize;
+            let i1 = i0 + stride as usize;
+            let x0 = batch_base + i0 * input.stride(1) + channel_base;
+            let x1 = batch_base + i1 * input.stride(1) + channel_base;
+            let weight_base =
+                g as usize * weight.stride(0) + k as usize * weight.stride(1) + local_oc as usize;
             for ci in 0..cin_group {
-                let weight_index = g as usize * weight.stride(0)
-                    + k as usize * weight.stride(1)
-                    + ci as usize * weight.stride(2)
-                    + local_oc as usize;
-                let w = weight[weight_index / out_vector];
-                if valid0 {
-                    let x_index = b as usize * input.stride(0)
-                        + i0 as usize * input.stride(1)
-                        + (g * cin_group + ci) as usize;
-                    sum0 += w * Vector::new(input[x_index]);
-                }
-                if valid1 {
-                    let x_index = b as usize * input.stride(0)
-                        + i1 as usize * input.stride(1)
-                        + (g * cin_group + ci) as usize;
-                    sum1 += w * Vector::new(input[x_index]);
+                let w = weight[(weight_base + ci as usize * weight.stride(2)) / out_vector];
+                sum0 += w * Vector::new(input[x0 + ci as usize]);
+                sum1 += w * Vector::new(input[x1 + ci as usize]);
+            }
+        }
+    } else {
+        for k in 0..kernel {
+            let i0 = (t0 * stride + k * dilation) as i32 - padding;
+            let i1 = (t1 * stride + k * dilation) as i32 - padding;
+            let valid0 = i0 >= 0 && (i0 as u32) < in_len;
+            let valid1 = t1 < out_len && i1 >= 0 && (i1 as u32) < in_len;
+            if valid0 || valid1 {
+                for ci in 0..cin_group {
+                    let weight_index = g as usize * weight.stride(0)
+                        + k as usize * weight.stride(1)
+                        + ci as usize * weight.stride(2)
+                        + local_oc as usize;
+                    let w = weight[weight_index / out_vector];
+                    if valid0 {
+                        let x_index = b as usize * input.stride(0)
+                            + i0 as usize * input.stride(1)
+                            + (g * cin_group + ci) as usize;
+                        sum0 += w * Vector::new(input[x_index]);
+                    }
+                    if valid1 {
+                        let x_index = b as usize * input.stride(0)
+                            + i1 as usize * input.stride(1)
+                            + (g * cin_group + ci) as usize;
+                        sum1 += w * Vector::new(input[x_index]);
+                    }
                 }
             }
         }
@@ -102,6 +124,27 @@ pub fn launch_prepacked_temporal_pair(
     args: ConvolutionArgs<1>,
     groups: usize,
     dtype: ElemType,
+) -> Result<(), ConvSetupError> {
+    launch_pair_impl(client, tensors, args, groups, dtype, false)
+}
+
+pub fn launch_prepacked_temporal_pair_interior(
+    client: &Client,
+    tensors: DirectTensors,
+    args: ConvolutionArgs<1>,
+    groups: usize,
+    dtype: ElemType,
+) -> Result<(), ConvSetupError> {
+    launch_pair_impl(client, tensors, args, groups, dtype, true)
+}
+
+fn launch_pair_impl(
+    client: &Client,
+    tensors: DirectTensors,
+    args: ConvolutionArgs<1>,
+    groups: usize,
+    dtype: ElemType,
+    fast_interior: bool,
 ) -> Result<(), ConvSetupError> {
     let DirectTensors {
         input,
@@ -157,6 +200,7 @@ pub fn launch_prepacked_temporal_pair(
             args.dilation[0] as u32,
             args.padding[0] as i32,
             dtype,
+            fast_interior,
         );
     }
     Ok(())

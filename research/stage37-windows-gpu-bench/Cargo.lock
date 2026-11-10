@@ -3506,10 +3506,12 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "cubecl",
+ "cubecl-cpu",
  "cubecl-cuda",
  "cubecl-server",
  "cubecl-wgpu",
  "cubek-convolution",
+ "futures-lite",
  "serde",
  "serde_json",
 ]
