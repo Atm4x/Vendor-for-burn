@@ -1,0 +1,36 @@
+name: Import RVC Stage39 verified Git bundle
+
+on:
+  push:
+    branches:
+      - bridge/rvc-stage39-import-20261110
+    paths:
+      - bridge/stage39.bundle.b64
+
+permissions:
+  contents: write
+
+jobs:
+  import-candidate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify and import exact Git commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=62a24015e2ccab2bc93556407d3cfee56ebc029c
+          HEAD=2e728f5519f15cf6184a2aed1bf8b619016f303f
+          FILE="$RUNNER_TEMP/stage39.bundle"
+          base64 --decode bridge/stage39.bundle.b64 > "$FILE"
+          echo "7c73712d37ce766b7688103ca3735f6e4c442059413ae6a1b1a159efbeafc713  $FILE" | sha256sum --check
+          git cat-file -e "$BASE^{commit}"
+          git bundle verify "$FILE"
+          git fetch "$FILE" refs/heads/experiment/conv-kernel-rnd-stage33-20261110:refs/heads/bridge/rvc-stage39-candidate-20261110
+          test "$(git rev-parse refs/heads/bridge/rvc-stage39-candidate-20261110)" = "$HEAD"
+          git merge-base --is-ancestor "$BASE" "$HEAD"
+          git fsck --no-reflogs --full
+          git push origin refs/heads/bridge/rvc-stage39-candidate-20261110:refs/heads/bridge/rvc-stage39-candidate-20261110
