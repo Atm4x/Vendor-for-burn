@@ -44,3 +44,4 @@ jobs:
           compression-level: 0
           if-no-files-found: error
           retention-days: 3
+# Stage40 reproducible CPU R&D export refresh 2026-11-10
