@@ -1,0 +1,87 @@
+[
+  {
+    "name": "small K3",
+    "shape": [
+      4,
+      8,
+      15,
+      3
+    ],
+    "dilation": 1,
+    "iterations": 12,
+    "reference_max_abs": 9.536743e-7,
+    "strided_max_abs": 9.536743e-7,
+    "resident_contiguous_ms": 0.034561,
+    "copy_and_direct_ms": 0.044366,
+    "strided_direct_ms": 0.034941,
+    "predicted_speedup": 1.2697404195644086
+  },
+  {
+    "name": "small K11 D3",
+    "shape": [
+      4,
+      8,
+      63,
+      11
+    ],
+    "dilation": 3,
+    "iterations": 12,
+    "reference_max_abs": 0.0000021457672,
+    "strided_max_abs": 0.0000023841858,
+    "resident_contiguous_ms": 0.037866,
+    "copy_and_direct_ms": 0.06071,
+    "strided_direct_ms": 0.043284,
+    "predicted_speedup": 1.4025968025136308
+  },
+  {
+    "name": "NSF K3",
+    "shape": [
+      256,
+      256,
+      240,
+      3
+    ],
+    "dilation": 1,
+    "iterations": 12,
+    "reference_max_abs": 0.000030517578,
+    "strided_max_abs": 0.00002861023,
+    "resident_contiguous_ms": 2.4370529999999997,
+    "copy_and_direct_ms": 4.636245,
+    "strided_direct_ms": 19.627789999999997,
+    "predicted_speedup": 0.2362082027574169
+  },
+  {
+    "name": "NSF K11 D5",
+    "shape": [
+      128,
+      128,
+      2400,
+      11
+    ],
+    "dilation": 5,
+    "iterations": 12,
+    "reference_max_abs": 0.000091552734,
+    "strided_max_abs": 0.00009918213,
+    "resident_contiguous_ms": 21.043771999999997,
+    "copy_and_direct_ms": 25.237202,
+    "strided_direct_ms": 203.269744,
+    "predicted_speedup": 0.12415621480784667
+  },
+  {
+    "name": "NSF K11",
+    "shape": [
+      32,
+      32,
+      9600,
+      11
+    ],
+    "dilation": 1,
+    "iterations": 12,
+    "reference_max_abs": 0.00011444092,
+    "strided_max_abs": 0.00012207031,
+    "resident_contiguous_ms": 5.625728,
+    "copy_and_direct_ms": 5.977057,
+    "strided_direct_ms": 43.784155,
+    "predicted_speedup": 0.13651187284532498
+  }
+]
