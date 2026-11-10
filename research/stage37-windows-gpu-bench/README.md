@@ -1,6 +1,6 @@
 # RVC CubeCL Windows GPU Benchmark — Stage 37
 
-This is a **standalone Conv1d kernel benchmark**, not full voice conversion. No private weights or WAV required. It exercises the three RVC NSF layer geometries with deterministic FP32 tensors and compares stock CubeCL Direct with the experimental device-packed output-channel SIMD kernel (two temporal positions) and the independent four-position TemporalQuad variant. It optionally compares against `torch.nn.functional.conv1d` with cuDNN enabled.
+This is a **standalone Conv1d kernel benchmark**, not full voice conversion. No private weights or WAV required. It exercises the three RVC NSF layer geometries with deterministic FP32 tensors and compares stock CubeCL Direct with the experimental device-packed output-channel SIMD kernel (two temporal positions) the independent four-position TemporalQuad variant, and an experimental boundary-specialized QuadInterior variant. It optionally compares against `torch.nn.functional.conv1d` with cuDNN enabled.
 
 ## Running
 
@@ -22,13 +22,13 @@ To test a single backend: `-Backend cuda` or `-Backend wgpu`; use `-Warmup 5 -It
 
 ## Methodology and limitations
 
-- Each Rust repetition includes kernel dispatch, synchronous CPU readback and output buffer allocation. First three iterations are warmup. Direct and packed order alternates. This measures a **synchronous end-to-end operation**, not isolated GPU kernel latency.
+- Each Rust repetition includes kernel dispatch, synchronous CPU readback and output buffer allocation. First three iterations are warmup. The four variants alternate execution order on successive repetitions. This measures a **synchronous end-to-end operation**, not isolated GPU kernel latency.
 - Device-side weight packing is measured separately and excluded from repeated inference; weights are packed once and read back to verify correctness. This matches the model-resident use case, but `pack_ms` includes a verification readback.
 - PyTorch uses the same integer-generated tensors; `conv1d` is run with cuDNN enabled when CUDA is available, and the output is copied back to CPU for an analogous latency comparison. Whether a given convolution actually used a cuDNN kernel depends on PyTorch's internal dispatch; confirm with a profiler before claiming a specific cuDNN algorithm.
-- Numerical parity: Direct vs Packed and Direct vs Quad over entire output arrays. With the optional `--parity-dir` input, each runtime saves little-endian full FP32 arrays and `compare_tensor_dumps.py` compares every element against strict-FP32 PyTorch. The JSON probes alone are not full PyTorch parity.
+- Numerical parity: Direct vs Packed, Direct vs Quad, and Direct vs QuadInterior over entire output arrays. With the optional `--parity-dir` input, each runtime saves little-endian full FP32 arrays and `compare_tensor_dumps.py` compares every element against strict-FP32 PyTorch. The JSON probes alone are not full PyTorch parity.
 - Performance on Windows GitHub Actions is **not** representative of user GPU: the hosted runner is only used to compile and check `--help`, not to assert CUDA availability.
 - Different backends may choose different physical adapters. WGPU might choose a different device than CUDA on multi-GPU machines; include the diagnostic files.
-- No conclusion about the CUDA/WGPU GPU performance is possible before a real-device run.
+- Prior Stage 38 hardware results are recorded in `STAGE39_GPU_RESULTS_AND_INTERIOR_RND.md`; the new QuadInterior variant has not yet been measured on physical CUDA/WGPU hardware.
 
 ## Artifacts
 
@@ -37,3 +37,11 @@ To test a single backend: `-Backend cuda` or `-Backend wgpu`; use `-Warmup 5 -It
 ## Stage 38 experiments
 
 The CLI now reports `quad_ms` and `speedup_pair_over_quad` in addition to the existing Direct/Packed fields. Pass `--parity-dir <directory>` to export full outputs for all three variants. The PowerShell runner enables these dumps and runs PyTorch with TF32 **disabled** by default; use the standalone PyTorch script `--tf32 allow` only for a separate TF32 comparison. Quad is **not** a claimed improvement until actual CUDA/WGPU measurements confirm its benefit. See [STAGE38_TEMPORAL_QUAD_RND.md](STAGE38_TEMPORAL_QUAD_RND.md).
+
+## Stage 39 experiments
+
+The fourth GPU variant, `quad_interior`, uses the same four-position tile and prepacked weights as TemporalQuad. A whole-tile predicate selects a branch-free spatial interior loop when all output positions are in bounds; edge tiles follow the original checked path. The old `quad` remains unchanged as an independently benchmarked reference.
+
+New fields: `quad_interior_ms`, `speedup_quad_over_interior`, and `max_abs_error_quad_interior`. The full-tensor comparator checks four variants against PyTorch strict FP32. Keep `-Warmup 5 -Iterations 20` (or longer) and compare against the same benchmark executable; identical CUDA and WGPU performance is not expected.
+
+See [STAGE39_GPU_RESULTS_AND_INTERIOR_RND.md](STAGE39_GPU_RESULTS_AND_INTERIOR_RND.md).

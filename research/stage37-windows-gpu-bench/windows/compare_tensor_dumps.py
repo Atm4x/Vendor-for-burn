@@ -52,7 +52,7 @@ def main():
     results = []
     for name in ("nsf_k3", "nsf_k11_d5", "nsf_k11"):
         reference = read_f32(args.torch_dir / f"{name}_pytorch.f32le")
-        for variant in ("direct", "packed", "quad"):
+        for variant in ("direct", "packed", "quad", "quad_interior"):
             candidate = read_f32(args.cubecl_dir / f"{name}_{variant}.f32le")
             entry = {"case": name, "variant": variant, **compare(reference, candidate)}
             results.append(entry)

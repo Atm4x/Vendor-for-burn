@@ -16,5 +16,5 @@ pub use launch::launch_kernel;
 pub use direct_temporal_pair::launch_temporal_pair;
 pub use direct_temporal_pair_vector::launch_temporal_pair_vector;
 pub use direct_prepacked::launch_prepacked_temporal_pair;
-pub use direct_prepacked_quad::launch_prepacked_temporal_quad;
+pub use direct_prepacked_quad::{launch_prepacked_temporal_quad, launch_prepacked_temporal_quad_interior};
 pub use pack_weights::launch_pack_conv1d_weights;

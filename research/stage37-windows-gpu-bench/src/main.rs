@@ -2,6 +2,7 @@ use cubecl::{prelude::*, std::tensor::TensorHandle, zspace::Shape};
 use cubecl_server::runtime::Runtime;
 use cubek_convolution::kernels::forward::{
     launch_pack_conv1d_weights, launch_prepacked_temporal_pair, launch_prepacked_temporal_quad,
+    launch_prepacked_temporal_quad_interior,
 };
 use cubek_convolution::{ConvolutionArgs, DirectTensors, launch_direct};
 use serde::Serialize;
@@ -24,6 +25,9 @@ struct CaseResult {
     direct_ms: f64,
     packed_ms: f64,
     quad_ms: f64,
+    quad_interior_ms: f64,
+    speedup_quad_over_interior: f64,
+    max_abs_error_quad_interior: f32,
     speedup_pair_over_quad: f64,
     max_abs_error_quad: f32,
     speedup_direct_over_packed: f64,
@@ -114,14 +118,16 @@ fn run_case(
     let mut direct = Vec::new();
     let mut packed = Vec::new();
     let mut quad = Vec::new();
+    let mut quad_interior = Vec::new();
     let mut direct_out = Vec::new();
     let mut packed_out = Vec::new();
     let mut quad_out = Vec::new();
+    let mut quad_interior_out = Vec::new();
     for repeat in 0..(warmup + iterations) {
         for variant in if repeat % 2 == 0 {
-            [0, 1, 2]
+            [0, 1, 2, 3]
         } else {
-            [2, 1, 0]
+            [3, 2, 1, 0]
         } {
             let out = TensorHandle::empty(
                 client,
@@ -151,7 +157,7 @@ fn run_case(
                     f32::elem_type_native(),
                 )
                 .map_err(|e| format!("packed failed: {e:?}"))?;
-            } else {
+            } else if variant == 2 {
                 launch_prepacked_temporal_quad(
                     client,
                     tensors,
@@ -160,6 +166,15 @@ fn run_case(
                     f32::elem_type_native(),
                 )
                 .map_err(|e| format!("quad failed: {e:?}"))?;
+            } else {
+                launch_prepacked_temporal_quad_interior(
+                    client,
+                    tensors,
+                    opts.clone(),
+                    1,
+                    f32::elem_type_native(),
+                )
+                .map_err(|e| format!("quad interior failed: {e:?}"))?;
             }
             let values = read(client, out);
             black_box(&values);
@@ -169,8 +184,10 @@ fn run_case(
                     direct.push(elapsed);
                 } else if variant == 1 {
                     packed.push(elapsed);
-                } else {
+                } else if variant == 2 {
                     quad.push(elapsed);
+                } else {
+                    quad_interior.push(elapsed);
                 }
             }
             if repeat == warmup {
@@ -178,13 +195,18 @@ fn run_case(
                     direct_out = values;
                 } else if variant == 1 {
                     packed_out = values;
-                } else {
+                } else if variant == 2 {
                     quad_out = values;
+                } else {
+                    quad_interior_out = values;
                 }
             }
         }
     }
-    if direct_out.len() != packed_out.len() || direct_out.len() != quad_out.len() {
+    if direct_out.len() != packed_out.len()
+        || direct_out.len() != quad_out.len()
+        || direct_out.len() != quad_interior_out.len()
+    {
         return Err("output sizes differ".into());
     }
     let mut max_abs_error = 0.0f32;
@@ -199,6 +221,11 @@ fn run_case(
         .zip(&quad_out)
         .map(|(a, b)| (*a - *b).abs())
         .fold(0.0_f32, f32::max);
+    let max_abs_error_quad_interior = direct_out
+        .iter()
+        .zip(&quad_interior_out)
+        .map(|(a, b)| (*a - *b).abs())
+        .fold(0.0_f32, f32::max);
     if let Some(dir) = parity_dir {
         fs::create_dir_all(dir).map_err(|e| format!("parity directory: {e}"))?;
         let tag = name.to_ascii_lowercase().replace(' ', "_");
@@ -206,6 +233,7 @@ fn run_case(
             ("direct", &direct_out),
             ("packed", &packed_out),
             ("quad", &quad_out),
+            ("quad_interior", &quad_interior_out),
         ] {
             let mut bytes = Vec::with_capacity(values.len() * 4);
             for value in values {
@@ -218,8 +246,11 @@ fn run_case(
     let direct_ms = median(&mut direct);
     let packed_ms = median(&mut packed);
     let quad_ms = median(&mut quad);
+    let quad_interior_ms = median(&mut quad_interior);
     let passed = max_normalized_error <= 0.0002
         && max_abs_error_quad <= 0.0002
+        && max_abs_error_quad_interior <= 0.0002
+        && quad_interior_ms.is_finite()
         && direct_ms.is_finite()
         && packed_ms.is_finite()
         && quad_ms.is_finite();
@@ -240,6 +271,9 @@ fn run_case(
         direct_ms,
         packed_ms,
         quad_ms,
+        quad_interior_ms,
+        speedup_quad_over_interior: quad_ms / quad_interior_ms,
+        max_abs_error_quad_interior,
         speedup_pair_over_quad: packed_ms / quad_ms,
         max_abs_error_quad,
         speedup_direct_over_packed: direct_ms / packed_ms,
@@ -272,11 +306,15 @@ fn run(
         ) {
             Ok(result) => {
                 eprintln!(
-                    "[{backend}] {name}: direct {:.3} ms, packed {:.3} ms, quad {:.3} ms, error {:.6}",
+                    "[{backend}] {name}: direct {:.3} ms, packed {:.3} ms, quad {:.3} ms, quad interior {:.3} ms, error {:.6}",
                     result.direct_ms,
                     result.packed_ms,
                     result.quad_ms,
-                    result.max_abs_error.max(result.max_abs_error_quad)
+                    result.quad_interior_ms,
+                    result
+                        .max_abs_error
+                        .max(result.max_abs_error_quad)
+                        .max(result.max_abs_error_quad_interior)
                 );
                 results.push(result);
             }
