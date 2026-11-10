@@ -63,3 +63,16 @@ The script executes two order-balanced rounds of Baseline Parallel, Sequential D
 ## Next research after Windows GPU results
 
 Select a backend-specific **choice of kernel variant**, not a backend-specific implementation: one shared set of CubeCL operators with measured dispatch parameters. If CPU favors Packed and CUDA favors QuadInterior, the layer dispatch policy may differ by geometry and backend. Next evaluate a device-native model-owned weight pack and preserve NLC layouts across adjacent operators; only after a stable end-to-end baseline revisit CUDA Graph replay to reduce launch overhead.
+
+## Control A/B — one pinned logical CPU
+
+To separate CPU scheduler oversubscription from actual compute/layout savings, ran two additional processes per option on one pinned CPU (0), 6 iterations after 4 warmups. CPU batch-8 Parallel baseline vs CPU batch-32 Sequential (Direct, Packed, QuadInterior), in forward and reverse order.
+
+| Mode | 4 frames | 64 frames | 256 frames |
+|---|---:|---:|---:|
+| Parallel / batch 8 / Direct | 45.960 ms | 46.248 ms | 47.709 ms |
+| Sequential / batch 32 / Direct | 36.014 ms | 36.222 ms | 38.174 ms |
+| Sequential / batch 32 / Packed | **28.009 ms** | 28.042 ms | **28.303 ms** |
+| Sequential / batch 32 / QuadInterior | 28.012 ms | **28.007 ms** | 30.168 ms |
+
+Medians of two independent process medians. At 64 frames this is ~1.65× end-to-end, much less than on five contended CPU workers but still a material benefit. All **24** complete one-core FP32 output comparisons passed with `max_abs_error ≤ 3.3527613e-8`. Raw per-process timings: `evidence/stage50-cpu/onecore_nsf_matrix.json`.
