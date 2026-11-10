@@ -28,3 +28,8 @@ futures-lite = "=2.6.1"
 name = "bench_pipeline_stage41"
 path = "src/bin/bench_pipeline_stage41.rs"
 required-features = ["cpu"]
+
+[[bin]]
+name = "bench_conv_stride_stage46"
+path = "src/bin/bench_conv_stride_stage46.rs"
+required-features = ["cpu"]
