@@ -25,7 +25,9 @@ fn pack_conv1d_weights_kernel<E: Numeric>(
         let k = (x / cin_per_group) % k_size;
         let group = x / (cin_per_group * k_size);
         let source_oc = group * cout_per_group + oc;
-        let src_pos = source_oc * source.stride(0) + k * source.stride(1) + ci;
+        let src_pos = source_oc * source.stride(0)
+            + k * source.stride(1)
+            + ci * source.stride(2);
         output[pos] = source[src_pos];
     }
 }
