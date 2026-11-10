@@ -1,6 +1,7 @@
 use burn::tensor::{activation, module, ops::{ConvOptions, ConvTransposeOptions}, Device, Tensor, TensorData};
 use serde::Deserialize;
 use rayon::prelude::*;
+use std::time::Instant;
 
 use crate::checkpoint::RvcCheckpoint;
 use crate::nsf_source::SourceModuleHnNSF;
@@ -9,6 +10,29 @@ use crate::nsf_source::SourceModuleHnNSF;
 pub enum ResidualExecution {
     Sequential,
     Parallel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResidualAggregation {
+    ZeroSeeded,
+    FirstBranch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NsfScheduling {
+    Default,
+    FlushPerBranch,
+    FlushPerStage,
+    SyncPerBranch,
+    FlushPerPair,
+    FlushPerConv,
+    SyncPerPair,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct NsfProfileStep {
+    pub section: String,
+    pub milliseconds: f64,
 }
 
 struct Conv1d {
@@ -99,11 +123,64 @@ impl ResBlock1 {
         Ok(Self {first, second, channels: channels.unwrap()})
     }
 
-    pub fn forward(&self, mut x: Tensor<3>) -> Tensor<3> {
+    pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
+        self.forward_with_scheduling(x, NsfScheduling::Default)
+    }
+
+    fn forward_with_scheduling(&self, mut x: Tensor<3>, scheduling: NsfScheduling) -> Tensor<3> {
         assert_eq!(x.dims()[1], self.channels);
         for (first, second) in self.first.iter().zip(&self.second) {
-            let h = second.forward(activation::leaky_relu(first.forward(activation::leaky_relu(x.clone(), 0.1)), 0.1));
+            let h = activation::leaky_relu(x.clone(), 0.1);
+            let h = first.forward(h);
+            if scheduling == NsfScheduling::FlushPerConv {
+                h.device().flush().expect("NSF first Conv flush failed");
+            }
+            let h = activation::leaky_relu(h, 0.1);
+            let h = second.forward(h);
+            if scheduling == NsfScheduling::FlushPerConv {
+                h.device().flush().expect("NSF second Conv flush failed");
+            }
             x = x + h;
+            match scheduling {
+                NsfScheduling::FlushPerPair => x.device().flush().expect("NSF pair flush failed"),
+                NsfScheduling::SyncPerPair => x.device().sync().expect("NSF pair sync failed"),
+                _ => {},
+            }
+        }
+        x
+    }
+
+    fn profile_cpu(
+        &self,
+        mut x: Tensor<3>,
+        steps: &mut Vec<NsfProfileStep>,
+        stage_index: usize,
+        block_index: usize,
+    ) -> Tensor<3> {
+        let prefix = format!("stage{stage_index}.residual{block_index}");
+        for (index, (first, second)) in self.first.iter().zip(&self.second).enumerate() {
+            let mut record = |section: &str, tensor: &Tensor<3>, start: Instant| {
+                let _ = tensor.clone().into_data();
+                steps.push(NsfProfileStep {
+                    section: format!("{prefix}.pair{index}.{section}"),
+                    milliseconds: start.elapsed().as_secs_f64() * 1000.0,
+                });
+            };
+            let start = Instant::now();
+            let h = activation::leaky_relu(x.clone(), 0.1);
+            record("first_activation", &h, start);
+            let start = Instant::now();
+            let h = first.forward(h);
+            record("first_conv", &h, start);
+            let start = Instant::now();
+            let h = activation::leaky_relu(h, 0.1);
+            record("second_activation", &h, start);
+            let start = Instant::now();
+            let h = second.forward(h);
+            record("second_conv", &h, start);
+            let start = Instant::now();
+            x = x + h;
+            record("residual_add", &x, start);
         }
         x
     }
@@ -152,26 +229,121 @@ impl DecoderStage {
         harmonic_source: Tensor<3>,
         execution: ResidualExecution,
     ) -> Tensor<3> {
+        self.forward_with_aggregation(input, harmonic_source, execution, ResidualAggregation::ZeroSeeded)
+    }
+
+    fn forward_with_aggregation(
+        &self,
+        input: Tensor<3>,
+        harmonic_source: Tensor<3>,
+        execution: ResidualExecution,
+        aggregation: ResidualAggregation,
+    ) -> Tensor<3> {
+        self.forward_with_scheduling(input, harmonic_source, execution, aggregation, NsfScheduling::Default)
+    }
+
+    fn forward_with_scheduling(
+        &self,
+        input: Tensor<3>,
+        harmonic_source: Tensor<3>,
+        execution: ResidualExecution,
+        aggregation: ResidualAggregation,
+        scheduling: NsfScheduling,
+    ) -> Tensor<3> {
         let upsampled = self.upsample_only(input);
         let source = self.noise.forward(harmonic_source);
         assert_eq!(upsampled.dims(), source.dims(), "harmonic source must align with upsampled features");
         let prepared = upsampled + source;
-        let mut result = Tensor::<3>::zeros(prepared.dims(), &prepared.device());
+        let mut result = match aggregation {
+            ResidualAggregation::ZeroSeeded => Some(Tensor::<3>::zeros(prepared.dims(), &prepared.device())),
+            ResidualAggregation::FirstBranch => None,
+        };
+        let mut accumulate = |branch: Tensor<3>| {
+            result = Some(match result.take() {
+                Some(current) => current + branch,
+                None => branch,
+            });
+        };
         match execution {
             ResidualExecution::Sequential => {
                 for block in &self.residual {
-                    result = result + block.forward(prepared.clone());
+                    let branch = block.forward_with_scheduling(prepared.clone(), scheduling);
+                    match scheduling {
+                        NsfScheduling::FlushPerBranch => branch.device().flush().expect("NSF branch flush failed"),
+                        NsfScheduling::SyncPerBranch => branch.device().sync().expect("NSF branch sync failed"),
+                        _ => {},
+                    }
+                    accumulate(branch);
                 }
             }
             ResidualExecution::Parallel => {
                 let branches: Vec<Tensor<3>> = self.residual.par_iter()
-                    .map(|block| block.forward(prepared.clone())).collect();
+                    .map(|block| block.forward_with_scheduling(prepared.clone(), scheduling)).collect();
                 for branch in branches {
-                    result = result + branch;
+                    match scheduling {
+                        NsfScheduling::FlushPerBranch => branch.device().flush().expect("NSF branch flush failed"),
+                        NsfScheduling::SyncPerBranch => branch.device().sync().expect("NSF branch sync failed"),
+                        _ => {},
+                    }
+                    accumulate(branch);
                 }
             }
         }
-        result / self.residual.len() as f32
+        let result = result.expect("decoder stage must contain residual blocks") / self.residual.len() as f32;
+        if scheduling == NsfScheduling::FlushPerStage {
+            result.device().flush().expect("NSF stage flush failed");
+        }
+        result
+    }
+
+    fn profile_cpu(
+        &self,
+        input: Tensor<3>,
+        harmonic_source: Tensor<3>,
+        steps: &mut Vec<NsfProfileStep>,
+        stage_index: usize,
+        aggregation: ResidualAggregation,
+    ) -> Tensor<3> {
+        fn record(steps: &mut Vec<NsfProfileStep>, stage_index: usize, label: &str, tensor: &Tensor<3>, start: Instant) {
+            let _ = tensor.clone().into_data();
+            steps.push(NsfProfileStep {
+                section: format!("stage{stage_index}.{label}"),
+                milliseconds: start.elapsed().as_secs_f64() * 1000.0,
+            });
+        }
+        let start = Instant::now();
+        let upsampled = self.upsample_only(input);
+        record(steps, stage_index, "upsample", &upsampled, start);
+        let start = Instant::now();
+        let source = self.noise.forward(harmonic_source);
+        record(steps, stage_index, "noise_conv", &source, start);
+        let start = Instant::now();
+        let prepared = upsampled + source;
+        record(steps, stage_index, "prepare_add", &prepared, start);
+        let mut branches = Vec::with_capacity(self.residual.len());
+        for (index, block) in self.residual.iter().enumerate() {
+            let start = Instant::now();
+            let branch = block.profile_cpu(prepared.clone(), steps, stage_index, index);
+            steps.push(NsfProfileStep {
+                section: format!("stage{stage_index}.residual{index}.total"),
+                milliseconds: start.elapsed().as_secs_f64() * 1000.0,
+            });
+            branches.push(branch);
+        }
+        let start = Instant::now();
+        let mut acc = match aggregation {
+            ResidualAggregation::ZeroSeeded => Some(Tensor::<3>::zeros(prepared.dims(), &prepared.device())),
+            ResidualAggregation::FirstBranch => None,
+        };
+        for branch in branches {
+            acc = Some(match acc.take() {
+                Some(prev) => prev + branch,
+                None => branch,
+            });
+        }
+        let result = acc.expect("decoder stage must contain residual blocks") / self.residual.len() as f32;
+        record(steps, stage_index, "aggregate", &result, start);
+        result
     }
 
     pub fn residual_count(&self) -> usize { self.residual.len() }
@@ -264,6 +436,29 @@ impl NsfWaveformDecoder {
         g: Option<Tensor<3>>,
         execution: ResidualExecution,
     ) -> Tensor<3> {
+        self.forward_with_aggregation(input, harmonic_source, g, execution, ResidualAggregation::ZeroSeeded)
+    }
+
+    pub fn forward_with_aggregation(
+        &self,
+        input: Tensor<3>,
+        harmonic_source: Tensor<3>,
+        g: Option<Tensor<3>>,
+        execution: ResidualExecution,
+        aggregation: ResidualAggregation,
+    ) -> Tensor<3> {
+        self.forward_with_scheduling(input, harmonic_source, g, execution, aggregation, NsfScheduling::Default)
+    }
+
+    pub fn forward_with_scheduling(
+        &self,
+        input: Tensor<3>,
+        harmonic_source: Tensor<3>,
+        g: Option<Tensor<3>>,
+        execution: ResidualExecution,
+        aggregation: ResidualAggregation,
+        scheduling: NsfScheduling,
+    ) -> Tensor<3> {
         let [batch, _, time] = input.dims();
         assert_eq!(harmonic_source.dims(), [batch, 1, time * self.total_upsample]);
         let mut x = self.pre.forward(input);
@@ -273,9 +468,43 @@ impl NsfWaveformDecoder {
             _ => panic!("NSF decoder conditioning does not match checkpoint"),
         }
         for stage in &self.stages {
-            x = stage.forward_with_execution(x, harmonic_source.clone(), execution);
+            x = stage.forward_with_scheduling(x, harmonic_source.clone(), execution, aggregation, scheduling);
         }
         activation::tanh(self.post.forward(activation::leaky_relu(x, 0.01)))
+    }
+
+    pub fn profile_cpu(
+        &self,
+        input: Tensor<3>,
+        harmonic_source: Tensor<3>,
+        g: Option<Tensor<3>>,
+        aggregation: ResidualAggregation,
+    ) -> (Tensor<3>, Vec<NsfProfileStep>) {
+        let [batch, _, time] = input.dims();
+        assert_eq!(harmonic_source.dims(), [batch, 1, time * self.total_upsample]);
+        let mut steps = Vec::new();
+        let start = Instant::now();
+        let mut x = self.pre.forward(input);
+        let _ = x.clone().into_data();
+        steps.push(NsfProfileStep { section: "pre_conv".into(), milliseconds: start.elapsed().as_secs_f64() * 1000.0 });
+        match (&self.condition, g) {
+            (Some(conv), Some(condition)) => {
+                let start = Instant::now();
+                x = x + conv.forward(condition);
+                let _ = x.clone().into_data();
+                steps.push(NsfProfileStep { section: "conditioning".into(), milliseconds: start.elapsed().as_secs_f64() * 1000.0 });
+            }
+            (None, None) => {},
+            _ => panic!("NSF decoder conditioning does not match checkpoint"),
+        }
+        for (index, stage) in self.stages.iter().enumerate() {
+            x = stage.profile_cpu(x, harmonic_source.clone(), &mut steps, index, aggregation);
+        }
+        let start = Instant::now();
+        let out = activation::tanh(self.post.forward(activation::leaky_relu(x, 0.01)));
+        let _ = out.clone().into_data();
+        steps.push(NsfProfileStep { section: "post_conv_activation".into(), milliseconds: start.elapsed().as_secs_f64() * 1000.0 });
+        (out, steps)
     }
 
     pub fn forward_from_f0(

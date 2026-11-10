@@ -1,0 +1,22 @@
+   Compiling burn-flex v0.22.1
+   Compiling pytorch-reader v0.22.1
+   Compiling burn-dispatch v0.22.1
+   Compiling burn-tensor v0.22.1
+   Compiling burn-core v0.22.1
+   Compiling burn-linalg v0.22.1
+   Compiling burn-nn v0.22.1
+   Compiling burn v0.22.1
+   Compiling tts-with-rvc-rs v0.1.0 (/mnt/data/rvc-stage40-work/repository/models/tts-with-rvc-rs)
+    Finished `release` profile [optimized] target(s) in 1m 22s
+     Running tests/parity.rs (/mnt/data/rvc-stage40-work/target/release/deps/parity-e0c257963bee8056)
+
+running 7 tests
+test complete_nsf_decoder_with_external_harmonic_matches_original_pytorch ... ok
+test nsf_residual_execution_modes_are_bitwise_equal ... ok
+test nsf_f0_to_waveform_matches_original_generator ... ok
+test nsf_first_branch_aggregation_matches_original_execution ... ok
+test unsupported_multiharmonic_nsf_fails_explicitly ... ok
+test nsf_sine_generation_and_linear_source_match_original_torch ... ok
+test tensor_batch_nsf_from_f0_matches_individual_waveforms ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 25 filtered out; finished in 0.01s
