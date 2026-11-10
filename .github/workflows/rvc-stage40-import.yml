@@ -1,0 +1,36 @@
+name: Import RVC Stage40 verified Git bundle
+
+on:
+  push:
+    branches:
+      - bridge/rvc-stage39-import-20261110
+    paths:
+      - bridge/stage40.bundle.b64
+
+permissions:
+  contents: write
+
+jobs:
+  import-candidate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify exact Stage40 Git objects
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=2ff4628fbe80133b58a295b2f2d9655c5b35e141
+          HEAD=0f46c52f5785e40de6530cf4302f4d68e4e58c02
+          FILE="$RUNNER_TEMP/stage40.bundle"
+          base64 --decode bridge/stage40.bundle.b64 > "$FILE"
+          echo "248250ff22d9e6770cd079d7a5e16759193520fd0f08d4f94517dbf83386e546  $FILE" | sha256sum --check
+          git cat-file -e "$BASE^{commit}"
+          git bundle verify "$FILE"
+          git fetch "$FILE" refs/heads/experiment-stage40:refs/heads/bridge/rvc-stage40-candidate-20261110
+          test "$(git rev-parse refs/heads/bridge/rvc-stage40-candidate-20261110)" = "$HEAD"
+          git merge-base --is-ancestor "$BASE" "$HEAD"
+          git fsck --no-reflogs --full
+          git push origin refs/heads/bridge/rvc-stage40-candidate-20261110:refs/heads/bridge/rvc-stage40-candidate-20261110
