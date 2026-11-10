@@ -3,7 +3,10 @@ use burn::tensor::{Device, Tensor, TensorData};
 #[cfg(feature = "cpu")]
 use std::{hint::black_box, time::Instant};
 #[cfg(feature = "cpu")]
-use tts_with_rvc_rs::{checkpoint::RvcCheckpoint, decoder::NsfDecoderFixture};
+use tts_with_rvc_rs::{
+    checkpoint::RvcCheckpoint,
+    decoder::{NsfDecoderFixture, ResidualExecution},
+};
 
 #[cfg(feature = "cpu")]
 fn median(mut xs: Vec<f64>) -> f64 {
@@ -27,6 +30,14 @@ fn main() {
         .map(|x| x.parse().unwrap())
         .unwrap_or(12);
     let warmup = 4;
+    let dump_prefix = std::env::args()
+        .position(|arg| arg == "--dump-prefix")
+        .and_then(|index| std::env::args().nth(index + 1));
+    let execution = if std::env::args().any(|arg| arg == "--sequential") {
+        ResidualExecution::Sequential
+    } else {
+        ResidualExecution::Parallel
+    };
     for frames in [4usize, 64, 256] {
         let [batch, channels, original] = fixture.input_shape;
         let upsample = fixture.source_shape[2] / original;
@@ -53,9 +64,15 @@ fn main() {
         });
         let mut samples = Vec::new();
         let mut control: Option<(f64, usize)> = None;
+        let mut last_output = None;
         for i in 0..(warmup + iterations) {
             let start = Instant::now();
-            let result = decoder.forward(input.clone(), source.clone(), conditioning.clone());
+            let result = decoder.forward_with_execution(
+                input.clone(),
+                source.clone(),
+                conditioning.clone(),
+                execution,
+            );
             let output = black_box(result.into_data().try_into_vec::<f32>().unwrap());
             let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
             if i >= warmup {
@@ -70,6 +87,17 @@ fn main() {
             } else {
                 control = Some((s, output.len()));
             }
+            if i + 1 == warmup + iterations {
+                last_output = Some(output);
+            }
+        }
+        if let Some(prefix) = &dump_prefix {
+            let bytes: Vec<u8> = last_output
+                .expect("missing final NSF output")
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect();
+            std::fs::write(format!("{prefix}-{frames}.f32le"), bytes).unwrap();
         }
         let (sum, len) = control.unwrap();
         println!(
@@ -81,6 +109,6 @@ fn main() {
 
 #[cfg(not(feature = "cpu"))]
 fn main() {
-    eprintln!("Stage43 CPU benchmark requires --no-default-features --features cpu");
+    eprintln!("Stage44 CPU profiler requires --features cpu");
     std::process::exit(2);
 }
