@@ -12,7 +12,6 @@ pub enum ResidualExecution {
     Parallel,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 fn prepack_conv1d_weight(weight: Tensor<3>, device: &Device) -> Tensor<3> {
     let [out_channels, in_channels, kernel] = weight.dims();
     let original = weight.into_data().try_into_vec::<f32>().expect("conv weight must be FP32");
@@ -31,6 +30,7 @@ fn prepack_conv1d_weight(weight: Tensor<3>, device: &Device) -> Tensor<3> {
     ).swap_dims(1, 2)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResidualAggregation {
     ZeroSeeded,
     FirstBranch,
