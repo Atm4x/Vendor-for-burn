@@ -1,5 +1,7 @@
 mod conv1d_layout;
 mod phone_features;
+#[cfg(any(feature = "cuda", feature = "cpu", feature = "wgpu"))]
+mod faiss_gpu;
 use burn::tensor::{Int, Tensor, TensorData, activation, module};
 use burn::tensor::Device;
 use serde::Deserialize;

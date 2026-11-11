@@ -60,10 +60,10 @@ use burn::tensor::Device;
 
 pub(crate) fn selected_device(name: &str) -> Result<Device, String> {
     match name {
-        #[cfg(feature = "flex")]
-        "cpu" => Ok(Device::flex()),
-        #[cfg(all(feature = "cpu", not(feature = "flex")))]
+        #[cfg(feature = "cpu")]
         "cpu" => Ok(Device::cpu()),
+        #[cfg(all(not(feature = "cpu"), feature = "flex"))]
+        "cpu" => Ok(Device::flex()),
         #[cfg(feature = "cuda")]
         "cuda" => Ok(Device::cuda(0)),
         #[cfg(feature = "wgpu")]
@@ -211,7 +211,9 @@ mod cli_tests {
         assert!(selected_device("cuda").unwrap_err().contains("not compiled"));
         #[cfg(not(feature = "wgpu"))]
         assert!(selected_device("wgpu").unwrap_err().contains("not compiled"));
-        #[cfg(feature = "flex")]
-        assert!(selected_device("cpu").is_ok());
+        #[cfg(feature = "cpu")]
+        assert_eq!(selected_device("cpu").unwrap(), Device::cpu());
+        #[cfg(all(not(feature = "cpu"), feature = "flex"))]
+        assert_eq!(selected_device("cpu").unwrap(), Device::flex());
     }
 }

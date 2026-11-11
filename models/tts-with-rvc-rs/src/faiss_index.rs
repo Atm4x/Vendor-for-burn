@@ -12,6 +12,17 @@ pub struct Neighbor {
     pub squared_distance: f32,
 }
 
+#[cfg(any(feature = "cpu", feature = "cuda", feature = "wgpu"))]
+pub(crate) struct PackedGpuIndex {
+    pub dimension: usize,
+    pub nprobe: usize,
+    pub centroids: Vec<f32>,
+    pub codes: Vec<f32>,
+    pub ids: Vec<u32>,
+    pub offsets: Vec<u32>,
+    pub max_list: usize,
+}
+
 #[derive(Debug)]
 struct InvertedList {
     codes: Vec<f32>,
@@ -136,6 +147,41 @@ impl IvfFlatIndex {
     }
     pub fn nprobe(&self) -> usize {
         self.nprobe
+    }
+
+    /// Flatten IVF lists for resident GPU search, preserving slot order and original IDs.
+    #[cfg(any(feature = "cpu", feature = "cuda", feature = "wgpu"))]
+    pub(crate) fn packed_gpu_data(&self) -> Result<PackedGpuIndex, String> {
+        if self.total > u32::MAX as usize
+            || self.lists.len() > u32::MAX as usize
+            || self.dimension > u32::MAX as usize
+        {
+            return Err("FAISS index exceeds GPU u32 addressable limits".into());
+        }
+        let mut offsets = Vec::with_capacity(self.lists.len() + 1);
+        let code_capacity = self.total.checked_mul(self.dimension)
+            .ok_or("GPU IVF code allocation overflow")?;
+        let mut codes = Vec::with_capacity(code_capacity);
+        let mut ids = Vec::with_capacity(self.total);
+        let mut max_list = 0;
+        for list in &self.lists {
+            offsets.push(u32::try_from(ids.len()).map_err(|e| e.to_string())?);
+            max_list = max_list.max(list.ids.len());
+            codes.extend_from_slice(&list.codes);
+            for &id in &list.ids {
+                ids.push(u32::try_from(id).map_err(|e| e.to_string())?);
+            }
+        }
+        offsets.push(u32::try_from(ids.len()).map_err(|e| e.to_string())?);
+        Ok(PackedGpuIndex {
+            dimension: self.dimension,
+            nprobe: self.nprobe,
+            centroids: self.centroids.clone(),
+            codes,
+            ids,
+            offsets,
+            max_list,
+        })
     }
 
     pub fn reconstruct(&self, id: usize) -> Option<&[f32]> {

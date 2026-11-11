@@ -203,7 +203,7 @@ fn run() -> Result<(), String> {
     let flow_fixture_path = if command == "verify-flow" || command == "verify-text-encoder-pth" || command == "verify-decoder-stage" || command == "verify-nsf-decoder" || command == "verify-nsf-source" || command == "verify-nsf-from-f0" || command == "verify-hubert-conv" || command == "verify-hubert-frontend" || command == "verify-hubert-transformer" || command == "verify-hubert-stack" || command == "verify-hubert-position" || command == "verify-hubert-encoder" || command == "verify-hubert-model" || command == "verify-rmvpe-head" || command == "verify-rmvpe-encoder" || command == "verify-rmvpe-intermediate" || command == "verify-rmvpe-decoder" || command == "verify-rmvpe-unet" || command == "verify-rmvpe-gru" || command == "verify-rmvpe-network" || command == "verify-rmvpe-audio" {
         Some(args.next().ok_or("missing flow fixture path")?)
     } else { None };
-    let backend = args.next().unwrap_or_else(|| "flex".to_owned());
+    let backend = args.next().unwrap_or_else(|| "cpu".to_owned());
     let device = match backend.as_str() {
         #[cfg(feature = "flex")]
         "flex" => Device::flex(),

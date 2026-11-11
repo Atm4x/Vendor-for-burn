@@ -6539,6 +6539,7 @@ name = "tts-with-rvc-rs"
 version = "0.1.0"
 dependencies = [
  "burn",
+ "burn-cubecl",
  "burn-flex",
  "half",
  "pytorch-reader",

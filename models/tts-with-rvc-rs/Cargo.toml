@@ -6,7 +6,7 @@ edition = "2024"
 rust-version = "1.98"
 
 [features]
-default = ["flex"]
+default = ["cpu"]
 flex = ["burn/flex", "dep:burn-flex"]
 cpu = ["burn/cpu"]
 cuda = ["burn/cuda"]
@@ -14,6 +14,7 @@ wgpu = ["burn/wgpu"]
 
 [dependencies]
 burn = { version = "=0.22.1", default-features = false, features = ["std", "extension", "cubecl"] }
+burn-cubecl = { version = "=0.22.1", default-features = false }
 burn-flex = { version = "=0.22.1", default-features = false, features = ["std", "simd", "rayon"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

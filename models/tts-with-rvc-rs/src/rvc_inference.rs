@@ -1,3 +1,5 @@
+#[cfg(any(feature = "cpu", feature = "cuda", feature = "wgpu"))]
+use crate::faiss_gpu::GpuIvfIndex;
 use burn::tensor::{Device, Int, Tensor, TensorData};
 
 use crate::{
@@ -55,6 +57,8 @@ pub struct RvcV2Inferencer {
     speaker_count: usize,
     speaker_channels: usize,
     index: Option<IvfFlatIndex>,
+    #[cfg(any(feature = "cpu", feature = "cuda", feature = "wgpu"))]
+    gpu_index: Option<GpuIvfIndex>,
 }
 
 impl RvcV2Inferencer {
@@ -98,7 +102,24 @@ impl RvcV2Inferencer {
                 ));
             }
         }
+        #[cfg(any(feature = "cpu", feature = "cuda", feature = "wgpu"))]
+        let gpu_index = if std::env::var_os("RVC_GPU_FAISS").is_some() {
+            Some(GpuIvfIndex::new(
+                index
+                    .as_ref()
+                    .ok_or("GPU FAISS requested without an index")?,
+                &device,
+            )?)
+        } else {
+            None
+        };
+        #[cfg(not(any(feature = "cpu", feature = "cuda", feature = "wgpu")))]
+        if std::env::var_os("RVC_GPU_FAISS").is_some() {
+            return Err("GPU FAISS requires a CubeCL backend compiled into this executable".into());
+        }
         Ok(Self {
+            #[cfg(any(feature = "cpu", feature = "cuda", feature = "wgpu"))]
+            gpu_index,
             device,
             hubert,
             rmvpe,
@@ -223,7 +244,11 @@ impl RvcV2Inferencer {
             ));
         }
         let retrieval_enabled = options.iter().any(|setting| setting.index_rate > 0.0);
-        let raw = if retrieval_enabled {
+        #[cfg(any(feature = "cpu", feature = "cuda", feature = "wgpu"))]
+        let gpu_retrieval = retrieval_enabled && self.gpu_index.is_some();
+        #[cfg(not(any(feature = "cpu", feature = "cuda", feature = "wgpu")))]
+        let gpu_retrieval = false;
+        let raw = if retrieval_enabled && !gpu_retrieval {
             Some(
                 content
                     .clone()
@@ -238,7 +263,7 @@ impl RvcV2Inferencer {
             eprintln!(
                 "profile hubert B={batch} {:.3}s, host_content_bytes={}",
                 phase.elapsed().as_secs_f64(),
-                if retrieval_enabled {
+                if raw.is_some() {
                     batch * content_time * channels * std::mem::size_of::<f32>()
                 } else {
                     0
@@ -264,9 +289,19 @@ impl RvcV2Inferencer {
         let mut all_features = Vec::with_capacity(batch * frames * channels);
         let mut all_pitch = Vec::with_capacity(batch * frames);
         let mut all_f0 = Vec::with_capacity(batch * frames);
+        let mut protect_coefficients = Vec::with_capacity(batch * frames);
         let mut random_sources = Vec::with_capacity(batch);
         for (b, (f0, opts)) in f0_batch.iter_mut().zip(options).enumerate() {
             f0.truncate(frames);
+            if gpu_retrieval {
+                protect_coefficients.extend(f0.iter().map(|&hz| {
+                    if opts.index_rate > 0.0 && opts.protect < 0.5 && hz < 1.0 {
+                        1.0 - opts.protect
+                    } else {
+                        0.0
+                    }
+                }));
+            }
             let pitch_factor = 2.0_f32.powf(opts.pitch_shift_semitones / 12.0);
             if let Some(raw) = &raw {
                 let original = &raw[b * content_time * channels..(b + 1) * content_time * channels];
@@ -308,7 +343,30 @@ impl RvcV2Inferencer {
             );
             phase = std::time::Instant::now();
         }
-        let phone = if retrieval_enabled {
+        let phone = if gpu_retrieval {
+            #[cfg(any(feature = "cpu", feature = "cuda", feature = "wgpu"))]
+            {
+                let rates = options
+                    .iter()
+                    .map(|opts| opts.index_rate)
+                    .collect::<Vec<_>>();
+                let blended = self
+                    .gpu_index
+                    .as_ref()
+                    .expect("GPU retrieval requested")
+                    .blend(content.clone(), &rates)?;
+                let phones = upsample_without_retrieval(blended, frames);
+                let original = upsample_without_retrieval(content, frames);
+                let mask = Tensor::<3>::from_data(
+                    TensorData::new(protect_coefficients, [batch, frames, 1]),
+                    &self.device,
+                );
+                let inv_mask = Tensor::<3>::ones([batch, frames, 1], &self.device) - mask.clone();
+                phones * inv_mask + original * mask
+            }
+            #[cfg(not(any(feature = "cpu", feature = "cuda", feature = "wgpu")))]
+            unreachable!("GPU FAISS is not compiled")
+        } else if retrieval_enabled {
             Tensor::from_data(
                 TensorData::new(all_features, [batch, frames, channels]),
                 &self.device,
@@ -467,5 +525,117 @@ mod tests {
         for _ in 0..100 {
             assert_eq!(a.sample(), b.sample());
         }
+    }
+}
+
+#[cfg(all(test, feature = "flex"))]
+mod fp32_f0_study {
+    use super::*;
+    use crate::rmvpe::{F0_BINS, salience_to_f0};
+
+    fn decode_f0_f32(salience: &[f32], threshold: f32) -> Vec<f32> {
+        salience
+            .chunks_exact(F0_BINS)
+            .map(|frame| {
+                let mut peak = 0;
+                for idx in 1..F0_BINS {
+                    if frame[idx] > frame[peak] {
+                        peak = idx;
+                    }
+                }
+                if frame[peak] <= threshold {
+                    return 0.0;
+                }
+                let mut weighted = 0.0_f32;
+                let mut total = 0.0_f32;
+                for (idx, &value) in frame
+                    .iter()
+                    .enumerate()
+                    .take((peak + 5).min(F0_BINS))
+                    .skip(peak.saturating_sub(4))
+                {
+                    weighted += value * (1997.3794084376191_f32 + 20.0 * idx as f32);
+                    total += value;
+                }
+                let cents = if total > 0.0 { weighted / total } else { 0.0 };
+                if cents == 0.0 {
+                    0.0
+                } else {
+                    10.0 * 2.0_f32.powf(cents / 1200.0)
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn f0_fp32_math_stays_close_on_dense_synthetic_salience() {
+        let mut values = Vec::new();
+        for row in 0..2048_usize {
+            for bin in 0..F0_BINS {
+                let peak = (row * 31) % F0_BINS;
+                let distance = peak.abs_diff(bin);
+                let value = (1.0 / (1.0 + distance as f32))
+                    + (((row * 131 + bin * 17) % 47) as f32) * 0.00001;
+                values.push(value);
+            }
+        }
+        let original = salience_to_f0(&values, 0.03).unwrap();
+        let candidate = decode_f0_f32(&values, 0.03);
+        let max = original
+            .iter()
+            .zip(&candidate)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        let pitch_mismatch = coarse_f0(&original)
+            .iter()
+            .zip(coarse_f0(&candidate).iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        eprintln!(
+            "FP32-F0 synthetic 2048 frames max_hz_error={max:.9}, pitch_mismatches={pitch_mismatch}"
+        );
+        assert!(max < 0.05);
+    }
+
+    #[test]
+    #[ignore = "opt-in requires private RMVPE checkpoint and original WAV"]
+    fn fp32_f0_on_real_rmvpe_salience() {
+        let checkpoint_path = std::env::var("RVC_REAL_RMVPE_CHECKPOINT").unwrap();
+        let audio_path = std::env::var("RVC_REAL_INPUT_WAV").unwrap();
+        let checkpoint = RvcCheckpoint::open_root(checkpoint_path).unwrap();
+        let device = Device::flex();
+        let model = RmvpeAudioModel::load(&checkpoint, &device).unwrap();
+        let audio = crate::audio_io::read_mono_wav(audio_path).unwrap();
+        let mut max_hz = 0.0_f32;
+        let mut pitch_mismatch = 0_usize;
+        let mut tested = 0_usize;
+        for (start, duration) in [(0.0, 0.35), (22.4, 0.7), (47.1, 1.0)] {
+            let begin = (start * audio.sample_rate as f64) as usize;
+            let end = ((start + duration) * audio.sample_rate as f64) as usize;
+            let pcm =
+                crate::audio_io::resample(&audio.samples[begin..end], audio.sample_rate, 16000)
+                    .unwrap();
+            let (salience, frames) = model.forward_pcm(&pcm, &device).unwrap();
+            let data = salience.into_data().try_into_vec::<f32>().unwrap();
+            let original = salience_to_f0(&data, 0.03).unwrap();
+            let reduced = decode_f0_f32(&data, 0.03);
+            max_hz = max_hz.max(
+                original
+                    .iter()
+                    .zip(&reduced)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0, f32::max),
+            );
+            pitch_mismatch += coarse_f0(&original)
+                .iter()
+                .zip(coarse_f0(&reduced))
+                .filter(|(a, b)| **a != *b)
+                .count();
+            tested += frames;
+        }
+        eprintln!(
+            "FP32-F0 REAL frames={tested}, max_hz_error={max_hz:.9}, coarse_pitch_mismatches={pitch_mismatch}"
+        );
+        assert!(max_hz < 0.05);
     }
 }
