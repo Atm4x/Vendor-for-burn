@@ -94,7 +94,7 @@ impl RvcCheckpoint {
         Ok(Tensor::from_data(TensorData::new(weights, shape), device))
     }
 
-    pub fn weight_norm_conv1d_dim2(&self, prefix: &str, device: &Device) -> Result<Tensor<3>, String> {
+    pub fn weight_norm_conv1d_dim2_values(&self, prefix: &str) -> Result<([usize; 3], Vec<f32>), String> {
         let (shape, mut weights) = self.tensor_f32(&format!("{prefix}.weight_v"))?;
         if shape.len() != 3 || shape.contains(&0) {
             return Err(format!("{prefix}: expected nonempty rank-3 positional Conv1d, found {shape:?}"));
@@ -122,7 +122,12 @@ impl RvcCheckpoint {
                 *value *= gain;
             }
         }
-        Ok(Tensor::from_data(TensorData::new(weights, [out_channels, input_per_group, kernel]), device))
+        Ok(([out_channels, input_per_group, kernel], weights))
+    }
+
+    pub fn weight_norm_conv1d_dim2(&self, prefix: &str, device: &Device) -> Result<Tensor<3>, String> {
+        let (shape, weights) = self.weight_norm_conv1d_dim2_values(prefix)?;
+        Ok(Tensor::from_data(TensorData::new(weights, shape), device))
     }
 
 }

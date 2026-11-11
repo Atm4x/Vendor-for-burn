@@ -54,6 +54,9 @@ impl IvfFlatIndex {
             return Err("unexpected IVF centroid vector length".into());
         }
         let centroids = read_f32_vector(&mut input, centroid_elements)?;
+        if centroids.iter().any(|value| !value.is_finite()) {
+            return Err("non-finite IVF centroid".into());
+        }
 
         let direct_map_type = read_u8(&mut input)?;
         let direct_map_entries = read_size(&mut input)?;
@@ -88,6 +91,9 @@ impl IvfFlatIndex {
         let mut id_locations = vec![(usize::MAX, usize::MAX); total];
         for (list_index, size) in sizes.into_iter().enumerate() {
             let codes = read_f32_vector(&mut input, checked_mul(size, dimension)?)?;
+            if codes.iter().any(|value| !value.is_finite()) {
+                return Err("non-finite IVF stored vector".into());
+            }
             let mut ids = Vec::with_capacity(size);
             for slot in 0..size {
                 let id = read_size(&mut input)?;
@@ -154,16 +160,21 @@ impl IvfFlatIndex {
         if nprobe == 0 || nprobe > self.nlist() || k == 0 {
             return Err("FAISS search requires positive k and nprobe <= nlist".into());
         }
-        let mut centroids: Vec<(usize, f32)> = self
-            .centroids
-            .chunks_exact(self.dimension)
-            .enumerate()
-            .map(|(i, centroid)| (i, squared_l2(query, centroid)))
-            .collect();
-        centroids.select_nth_unstable_by(nprobe - 1, |a, b| order_by_distance(a.1, a.0, b.1, b.0));
+        let selected: Vec<usize> = if nprobe == 1 {
+            vec![self.nearest_centroid_exact(query)]
+        } else {
+            let mut centroids: Vec<(usize, f32)> = self
+                .centroids
+                .chunks_exact(self.dimension)
+                .enumerate()
+                .map(|(i, centroid)| (i, squared_l2(query, centroid)))
+                .collect();
+            centroids.select_nth_unstable_by(nprobe - 1, |a, b| order_by_distance(a.1, a.0, b.1, b.0));
+            centroids[..nprobe].iter().map(|(i, _)| *i).collect()
+        };
         let mut neighbors = Vec::new();
-        for (index, _) in &centroids[..nprobe] {
-            let list = &self.lists[*index];
+        for index in selected {
+            let list = &self.lists[index];
             for (slot, stored) in list.codes.chunks_exact(self.dimension).enumerate() {
                 neighbors.push(Neighbor {
                     id: list.ids[slot],
@@ -176,6 +187,20 @@ impl IvfFlatIndex {
         });
         neighbors.truncate(k);
         Ok(neighbors)
+    }
+
+    fn nearest_centroid_exact(&self, query: &[f32]) -> usize {
+        let mut centroids = self.centroids.chunks_exact(self.dimension).enumerate();
+        let (_, first) = centroids.next().expect("nonempty IVF centroids");
+        let mut best = (0usize, squared_l2(query, first));
+        for (id, centroid) in centroids {
+            if let Some(distance) = squared_l2_bounded(query, centroid, best.1) {
+                if order_by_distance(distance, id, best.1, best.0).is_lt() {
+                    best = (id, distance);
+                }
+            }
+        }
+        best.0
     }
 
     /// Apply the original RVC inverse-square-distance 8-NN retrieval blend in the
@@ -250,6 +275,19 @@ impl IvfFlatIndex {
 
 fn squared_l2(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum()
+}
+
+fn squared_l2_bounded(a: &[f32], b: &[f32], bound: f32) -> Option<f32> {
+    let mut total = 0.0f32;
+    for (left, right) in a.chunks(32).zip(b.chunks(32)) {
+        for (&x, &y) in left.iter().zip(right) {
+            total += (x - y) * (x - y);
+        }
+        if total > bound {
+            return None;
+        }
+    }
+    Some(total)
 }
 
 fn order_by_distance(a: f32, a_id: usize, b: f32, b_id: usize) -> Ordering {
@@ -411,6 +449,58 @@ mod tests {
         }
         index.blend_features(&mut parallel, 0.75).unwrap();
         assert_eq!(serial, parallel);
+    }
+
+    #[test]
+    fn bounded_l2_preserves_exact_fp32_distances_when_not_pruned() {
+        for dimension in [1, 7, 31, 32, 33, 65, 768] {
+            for offset in [0, 1, 13, 41] {
+                let left: Vec<f32> = (0..dimension)
+                    .map(|i| ((i * 17 + offset * 7) % 89) as f32 / 91.0)
+                    .collect();
+                let right: Vec<f32> = (0..dimension)
+                    .map(|i| ((i * 29 + offset * 11) % 101) as f32 / 103.0)
+                    .collect();
+                let exact = squared_l2(&left, &right);
+                for bound in [0.0, exact / 2.0, exact, exact + 1.0, f32::INFINITY] {
+                    match squared_l2_bounded(&left, &right, bound) {
+                        Some(actual) => assert_eq!(actual.to_bits(), exact.to_bits()),
+                        None => assert!(exact > bound),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_centroid_selection_preserves_ties_and_full_scan() {
+        let index = IvfFlatIndex::read(build_fixture().as_slice()).unwrap();
+        for value in 0..1024 {
+            let query = [value as f32 / 10.0 - 10.0, (value % 13) as f32 / 10.0];
+            let exhaustive = index.centroids.chunks_exact(index.dimension).enumerate()
+                .map(|(id, centroid)| (id, squared_l2(&query, centroid)))
+                .min_by(|a, b| order_by_distance(a.1, a.0, b.1, b.0)).unwrap().0;
+            assert_eq!(index.nearest_centroid_exact(&query), exhaustive);
+        }
+        let identical_centroids = [0.0f32, 0.0, 0.0, 0.0];
+        let index = IvfFlatIndex { centroids: identical_centroids.to_vec(), ..index };
+        assert_eq!(index.nearest_centroid_exact(&[0.0, 0.0]), 0);
+    }
+
+    #[test]
+    fn real_index_centroids_match_full_scan_when_available() {
+        let Ok(path) = std::env::var("RVC_REAL_FAISS_INDEX") else { return; };
+        let index = IvfFlatIndex::open(path).unwrap();
+        for row in 0..24 {
+            let id = (row * 7_919 + 19) % index.len();
+            let query: Vec<f32> = index.reconstruct(id).unwrap().iter().enumerate()
+                .map(|(column, &value)| value + ((row * 17 + column * 13) % 11) as f32 * 0.0007)
+                .collect();
+            let expected = index.centroids.chunks_exact(index.dimension).enumerate()
+                .map(|(i, centroid)| (i, squared_l2(&query, centroid)))
+                .min_by(|a, b| order_by_distance(a.1, a.0, b.1, b.0)).unwrap().0;
+            assert_eq!(index.nearest_centroid_exact(&query), expected, "row={row}");
+        }
     }
 
     #[test]
