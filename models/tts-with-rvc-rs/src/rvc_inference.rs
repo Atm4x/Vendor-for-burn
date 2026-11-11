@@ -4,7 +4,7 @@ use burn::tensor::{Device, Int, Tensor, TensorData};
 
 use crate::{
     checkpoint::RvcCheckpoint,
-    chunked::{ChunkConfig, ChunkProgress, infer_chunked_batched_with_progress},
+    chunked::{ChunkConfig, ChunkProgress, chunk_ranges, infer_chunked_batched_with_progress, reflect_index},
     decoder::NsfWaveformDecoder,
     faiss_index::IvfFlatIndex,
     flow::ResidualCouplingBlock,
@@ -168,6 +168,24 @@ impl RvcV2Inferencer {
         batch_size: usize,
         progress: impl FnMut(ChunkProgress),
     ) -> Result<Vec<f32>, String> {
+        let shared_f0 = std::env::var_os("RVC_GLOBAL_F0").is_some_and(|value| value == "1");
+        if shared_f0 && std::env::var_os("RVC_GPU_F0").is_some_and(|value| value == "1") {
+            return Err("shared F0 requires CPU-decoded RMVPE F0; RVC_GPU_F0=1 is incompatible".into());
+        }
+        config.validate()?;
+        let cached_f0 = if shared_f0 {
+            let started = std::time::Instant::now();
+            let timeline = self.rmvpe.infer_f0_long_windowed(
+                filtered_pcm, &self.device, options.rmvpe_threshold,
+            )?;
+            if std::env::var_os("RVC_PROFILE").is_some() {
+                eprintln!("profile shared_f0 prepass_frames={} elapsed_ms={:.2}", timeline.len(), started.elapsed().as_secs_f64() * 1000.0);
+            }
+            Some(timeline)
+        } else {
+            None
+        };
+        let chunks = cached_f0.as_ref().map(|_| chunk_ranges(filtered_pcm.len().div_ceil(160), config));
         infer_chunked_batched_with_progress(
             filtered_pcm,
             config,
@@ -183,7 +201,14 @@ impl RvcV2Inferencer {
                         settings
                     })
                     .collect();
-                self.infer_16khz_batch(segments, &settings)
+                let pitch = cached_f0.as_ref().map(|timeline| {
+                    let chunks = chunks.as_ref().expect("cached F0 has chunk ranges");
+                    indices.iter().zip(segments).map(|(&i, segment)| {
+                        let (start, _) = chunks[i];
+                        aligned_f0_slice(timeline, start, config.context_frames, segment.len() / 160)
+                    }).collect::<Vec<_>>()
+                });
+                self.infer_16khz_batch_with_f0(segments, &settings, pitch.as_deref())
             },
             progress,
         )
@@ -200,6 +225,15 @@ impl RvcV2Inferencer {
         &self,
         audios: &[Vec<f32>],
         options: &[InferenceOptions],
+    ) -> Result<Vec<Vec<f32>>, String> {
+        self.infer_16khz_batch_with_f0(audios, options, None)
+    }
+
+    fn infer_16khz_batch_with_f0(
+        &self,
+        audios: &[Vec<f32>],
+        options: &[InferenceOptions],
+        provided_f0: Option<&[Vec<f32>]>,
     ) -> Result<Vec<Vec<f32>>, String> {
         let batch = audios.len();
         if batch == 0 || batch != options.len() || batch > 32 {
@@ -299,13 +333,22 @@ impl RvcV2Inferencer {
         };
         #[cfg(not(any(feature = "cpu", feature = "cuda", feature = "wgpu")))]
         let resident_f0: Option<Tensor<2>> = None;
+        if let Some(rows) = provided_f0 {
+            if gpu_f0 || rows.len() != batch || rows.iter().any(|row| {
+                row.len() < audio_len / 160 || row.iter().any(|value| !value.is_finite())
+            }) {
+                return Err("provided F0 timeline has invalid batch, length or values".into());
+            }
+        }
         let mut f0_batch = if gpu_f0 {
             None
+        } else if let Some(rows) = provided_f0 {
+            Some(rows.to_vec())
         } else {
             Some(self.rmvpe.infer_f0_batch_thresholds(audios, &self.device, &thresholds)?)
         };
         crate::diagnostic::measure(&self.device, "rvc.rmvpe_total", started,
-            serde_json::json!({"batch":batch,"mode":"dense_cpu_f0"}));
+            serde_json::json!({"batch":batch,"mode":if provided_f0.is_some() {"shared_cpu_f0"} else if gpu_f0 {"resident_gpu_f0"} else {"dense_cpu_f0"}}));
         if profile {
             eprintln!(
                 "profile rmvpe B={batch} {:.3}s",
@@ -620,6 +663,49 @@ impl Gaussian {
         let theta = 2.0 * std::f64::consts::PI * u2;
         self.spare = Some((radius * theta.sin()) as f32);
         (radius * theta.cos()) as f32
+    }
+}
+
+fn aligned_f0_slice(timeline: &[f32], start_frame: usize, context_frames: usize, segment_frames: usize) -> Vec<f32> {
+    let start = start_frame as i64 - context_frames as i64;
+    (0..=segment_frames).map(|offset| {
+        timeline[reflect_index(start + offset as i64, timeline.len())]
+    }).collect()
+}
+
+#[cfg(test)]
+mod shared_f0_tests {
+    use super::*;
+
+    #[test]
+    fn shared_f0_slices_follow_global_frame_timeline() {
+        let timeline: Vec<f32> = (0..1_000).map(|frame| frame as f32).collect();
+        let first = aligned_f0_slice(&timeline, 0, 40, 384);
+        assert_eq!(first.len(), 385);
+        assert_eq!(first[40], 0.0);
+        assert_eq!(first[39], 1.0);
+        assert_eq!(first[384], 344.0);
+        let next = aligned_f0_slice(&timeline, 288, 40, 384);
+        assert_eq!(next[40], 288.0);
+        assert_eq!(next[384], 632.0);
+        let tail = aligned_f0_slice(&timeline, 900, 40, 200);
+        assert_eq!(tail.len(), 201);
+        assert_eq!(tail[40], 900.0);
+        assert_eq!(tail[200], 940.0);
+    }
+
+    #[test]
+    fn shared_f0_windows_cover_odd_lengths_without_holes() {
+        for frames in [1, 99, 900, 901, 1_799, 8_994] {
+            let config = ChunkConfig::default();
+            let timeline: Vec<f32> = (0..frames).map(|frame| frame as f32).collect();
+            for (start, end) in chunk_ranges(frames, config) {
+                let segment_frames = end - start + 2 * config.context_frames + config.trailing_frames;
+                let slice = aligned_f0_slice(&timeline, start, config.context_frames, segment_frames);
+                assert_eq!(slice.len(), segment_frames + 1);
+                assert_eq!(slice[config.context_frames], start as f32);
+            }
+        }
     }
 }
 

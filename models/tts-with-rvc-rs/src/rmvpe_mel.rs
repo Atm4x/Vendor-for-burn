@@ -201,6 +201,46 @@ impl RmvpeAudioModel {
         Ok(output)
     }
 
+    pub fn infer_f0_long_windowed(
+        &self,
+        audio: &[f32],
+        device: &Device,
+        threshold: f32,
+    ) -> Result<Vec<f32>, String> {
+        if audio.len() < 3_200 || audio.iter().any(|value| !value.is_finite()) {
+            return Err("global RMVPE requires at least 0.2 seconds of finite 16 kHz audio".into());
+        }
+        const CORE_FRAMES: usize = 900;
+        const HALO_FRAMES: usize = 40;
+        let total_frames = audio.len().div_ceil(HOP_LENGTH);
+        let mut result = Vec::with_capacity(total_frames);
+        for start in (0..total_frames).step_by(CORE_FRAMES) {
+            let core = (total_frames - start).min(CORE_FRAMES);
+            let frames = core + HALO_FRAMES * 2;
+            let sample_start = (start as i64 - HALO_FRAMES as i64) * HOP_LENGTH as i64;
+            let segment = (0..frames * HOP_LENGTH)
+                .map(|offset| {
+                    let index = sample_start + offset as i64;
+                    audio[crate::chunked::reflect_index(index, audio.len())]
+                })
+                .collect::<Vec<_>>();
+            let start_time = std::time::Instant::now();
+            let pitch = self.infer_f0_batch_thresholds(&[segment], device, &[threshold])?;
+            let row = pitch.first().ok_or("RMVPE window returned no F0")?;
+            if row.len() < HALO_FRAMES + core {
+                return Err("RMVPE window F0 is shorter than its unpadded core".into());
+            }
+            result.extend_from_slice(&row[HALO_FRAMES..HALO_FRAMES + core]);
+            if std::env::var_os("RVC_PROFILE").is_some() {
+                eprintln!("profile shared_f0 window={} frames={} elapsed_ms={:.2}", start / CORE_FRAMES, frames, start_time.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
+        if result.len() != total_frames || result.iter().any(|value| !value.is_finite()) {
+            return Err("global RMVPE produced invalid F0 timeline".into());
+        }
+        Ok(result)
+    }
+
     pub fn infer_f0_batch(
         &self,
         audios: &[Vec<f32>],

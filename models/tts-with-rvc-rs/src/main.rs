@@ -405,6 +405,8 @@ fn run() -> Result<(), String> {
             "tensor_batch_size": tensor_batch_size,
             "gpu_faiss": std::env::var_os("RVC_GPU_FAISS").is_some(),
             "gpu_f0": std::env::var_os("RVC_GPU_F0").is_some(),
+            "global_f0": std::env::var_os("RVC_GLOBAL_F0").is_some_and(|value| value == "1"),
+            "nsf_execution": "sequential",
             "warm_definition": "same process, identical full WAV, persistent weights, synchronized outputs; iterations 1..N; no CUDA Graph",
         });
         let path = format!("{target}.benchmark.json");

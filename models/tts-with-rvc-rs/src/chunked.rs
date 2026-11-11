@@ -90,15 +90,7 @@ pub fn infer_chunked_batched_with_progress(
     let output_length = pcm.len().checked_mul(OUTPUT_HZ)
         .ok_or("RVC output length overflow")? / INPUT_HZ;
     let total_frames = pcm.len().div_ceil(HOP);
-    let step = config.core_frames - config.overlap_frames;
-    let mut chunks = Vec::new();
-    let mut start = 0;
-    loop {
-        let end = (start + config.core_frames).min(total_frames);
-        chunks.push((start, end));
-        if end == total_frames { break; }
-        start += step;
-    }
+    let chunks = chunk_ranges(total_frames, config);
     let mut output = vec![0.0f32; output_length];
     let mut weight_sum = vec![0.0f32; output_length];
     let mut chunk_index = 0;
@@ -166,7 +158,22 @@ pub fn infer_chunked_batched_with_progress(
     Ok(output)
 }
 
-fn reflect_index(mut position: i64, length: usize) -> usize {
+pub(crate) fn chunk_ranges(total_frames: usize, config: ChunkConfig) -> Vec<(usize, usize)> {
+    let step = config.core_frames - config.overlap_frames;
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    loop {
+        let end = (start + config.core_frames).min(total_frames);
+        chunks.push((start, end));
+        if end == total_frames {
+            break;
+        }
+        start += step;
+    }
+    chunks
+}
+
+pub(crate) fn reflect_index(mut position: i64, length: usize) -> usize {
     if length <= 1 {
         return 0;
     }
