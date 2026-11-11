@@ -145,6 +145,140 @@ fn run() -> Result<(), String> {
         println!("RVC WAV→WAV complete: samples={} sr=40000 path={target}", converted.len());
         return Ok(());
     }
+    if command == "infer-wav-full-benchmark" {
+        use tts_with_rvc_rs::{
+            audio_io, chunked::ChunkConfig,
+            rvc_inference::{InferenceOptions, RvcV2Inferencer},
+        };
+        let voice = args.next().ok_or("missing RVC .pth")?;
+        let hubert = args.next().ok_or("missing HuBERT .pt")?;
+        let rmvpe = args.next().ok_or("missing RMVPE .pt")?;
+        let index = args.next().ok_or("missing RVC .index (use - to disable)")?;
+        let source = args.next().ok_or("missing full input WAV")?;
+        let target = args.next().ok_or("missing output WAV")?;
+        if source == target {
+            return Err("benchmark must not overwrite the input WAV".into());
+        }
+        let index_rate: f32 = args.next().ok_or("missing index rate")?
+            .parse().map_err(|e| format!("invalid index rate: {e}"))?;
+        let backend = args.next().ok_or("missing backend")?;
+        let runs: usize = args.next().ok_or("missing full inference runs")?
+            .parse().map_err(|e| format!("invalid runs: {e}"))?;
+        let core_frames: usize = args.next().ok_or("missing core frames")?
+            .parse().map_err(|e| format!("invalid core frames: {e}"))?;
+        let tensor_batch_size: usize = args.next().ok_or("missing tensor batch size")?
+            .parse().map_err(|e| format!("invalid tensor batch size: {e}"))?;
+        if args.next().is_some() || !(2..=16).contains(&runs) || !(1..=32).contains(&tensor_batch_size) {
+            return Err("full benchmark requires 2..16 runs and 1..32 tensor batch size, without extra arguments".into());
+        }
+        if !index_rate.is_finite() || !(0.0..=1.0).contains(&index_rate)
+            || (index_rate > 0.0 && index == "-") {
+            return Err("index rate requires a real index and must be in 0..1".into());
+        }
+        let config = ChunkConfig { core_frames, ..ChunkConfig::default() };
+        config.validate()?;
+        let device = user_cli::selected_device(&backend)?;
+        let mut opts = InferenceOptions::default();
+        opts.index_rate = index_rate;
+
+        let load_start = std::time::Instant::now();
+        let inferencer = RvcV2Inferencer::load(
+            &voice, &hubert, &rmvpe, (index != "-").then_some(index.as_str()), device.clone()
+        )?;
+        device.sync().map_err(|e| format!("model load sync failed: {e}"))?;
+        let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
+
+        let prepare_start = std::time::Instant::now();
+        let wave = audio_io::read_mono_wav(&source)?;
+        let pcm = audio_io::resample(&wave.samples, wave.sample_rate, 16_000)?;
+        let filtered = tts_with_rvc_rs::preprocess::highpass_48hz_zero_phase(&pcm)?;
+        let source_seconds = wave.samples.len() as f64 / wave.sample_rate as f64;
+        let model_seconds = filtered.len() as f64 / 16_000.0;
+        if filtered.len() < 3_200 {
+            return Err("full benchmark requires at least 0.2 seconds of source audio".into());
+        }
+        let expected_samples = filtered.len().checked_mul(5)
+            .ok_or("full benchmark output size overflow")? / 2;
+        let prepare_ms = prepare_start.elapsed().as_secs_f64() * 1000.0;
+        let mut timings = Vec::with_capacity(runs);
+        let mut previous: Option<Vec<f32>> = None;
+        let mut max_iteration_delta = 0.0_f32;
+        let mut exact_iterations = true;
+        let mut chunk_counts = Vec::with_capacity(runs);
+        let mut converted = Vec::new();
+        for iteration in 0..runs {
+            device.sync().map_err(|e| format!("pre-inference sync failed: {e}"))?;
+            let start = std::time::Instant::now();
+            let mut count = 0_usize;
+            converted = inferencer.infer_long_filtered_16khz_batched(
+                &filtered, &opts, config, tensor_batch_size,
+                |progress| {
+                    count = progress.chunk_count;
+                    eprintln!("profile full_wav iteration={iteration} chunk={}/{} output_samples={}",
+                        progress.chunk_index, progress.chunk_count, progress.output_samples);
+                },
+            )?;
+            device.sync().map_err(|e| format!("post-inference sync failed: {e}"))?;
+            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+            if converted.len() != expected_samples || converted.iter().any(|x| !x.is_finite()) {
+                return Err(format!("full RVC output is invalid: got {} samples, expected {expected_samples}", converted.len()));
+            }
+            if let Some(old) = &previous {
+                for (a,b) in old.iter().zip(&converted) {
+                    if a.to_bits() != b.to_bits() { exact_iterations = false; }
+                    max_iteration_delta = max_iteration_delta.max((a-b).abs());
+                }
+            }
+            previous = Some(converted.clone());
+            timings.push(elapsed_ms);
+            chunk_counts.push(count);
+            eprintln!("profile full_wav iteration={iteration} elapsed_ms={elapsed_ms:.3} source_seconds={model_seconds:.3} chunks={count}");
+        }
+        let write_start = std::time::Instant::now();
+        audio_io::mix_rms_envelope(&filtered, 16_000, &mut converted, 40_000, 0.5)?;
+        audio_io::normalize_peak(&mut converted)?;
+        audio_io::write_mono_wav(&target, &converted, 40_000)?;
+        let postprocess_write_ms = write_start.elapsed().as_secs_f64() * 1000.0;
+        let mut warmed = timings.iter().skip(1).copied().collect::<Vec<_>>();
+        warmed.sort_by(f64::total_cmp);
+        let mid = warmed.len()/2;
+        let warm_median_ms = if warmed.len()%2 == 0 { (warmed[mid-1]+warmed[mid])/2.0 } else { warmed[mid] };
+        let report = serde_json::json!({
+            "stage": 63,
+            "benchmark": "full-wav-chunked-resident-rvc",
+            "backend": backend,
+            "graph_replay": false,
+            "source_seconds": source_seconds,
+            "model_input_seconds": model_seconds,
+            "source_samples": wave.samples.len(),
+            "source_sample_rate": wave.sample_rate,
+            "output_samples": converted.len(),
+            "output_sample_rate": 40000,
+            "load_ms": load_ms,
+            "prepare_ms": prepare_ms,
+            "postprocess_write_ms": postprocess_write_ms,
+            "inference_ms": timings,
+            "first_inference_ms": timings[0],
+            "warm_median_ms": warm_median_ms,
+            "warm_rtf": warm_median_ms / (model_seconds * 1000.0),
+            "iterations_exact_f32": exact_iterations,
+            "max_abs_iteration_delta": max_iteration_delta,
+            "chunk_counts": chunk_counts,
+            "core_frames": config.core_frames,
+            "overlap_frames": config.overlap_frames,
+            "context_frames": config.context_frames,
+            "tensor_batch_size": tensor_batch_size,
+            "gpu_faiss": std::env::var_os("RVC_GPU_FAISS").is_some(),
+            "gpu_f0": std::env::var_os("RVC_GPU_F0").is_some(),
+            "warm_definition": "same process, identical full WAV, persistent weights, synchronized outputs; iterations 1..N; no CUDA Graph",
+        });
+        let path = format!("{target}.benchmark.json");
+        fs::write(&path, serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("cannot save full WAV benchmark report: {e}"))?;
+        println!("Full RVC completed, {:.3}s source => {:.3}s output; warm median {:.3}ms, RTF {:.4}; report={path}",
+            source_seconds, converted.len() as f64 / 40000.0, warm_median_ms, warm_median_ms/(model_seconds*1000.0));
+        return Ok(());
+    }
     if command == "infer-wav-full" || command == "infer-wav-batch" {
         use tts_with_rvc_rs::{
             chunked::ChunkConfig,

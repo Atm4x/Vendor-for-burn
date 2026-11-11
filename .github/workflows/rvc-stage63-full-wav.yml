@@ -1,0 +1,79 @@
+name: RVC Stage63 full-WAV unified Windows release gate
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - experiment/conv-kernel-rnd-stage33-20261110
+    paths:
+      - 'models/tts-with-rvc-rs/src/main.rs'
+      - 'models/tts-with-rvc-rs/src/user_cli.rs'
+      - 'models/tts-with-rvc-rs/src/chunked.rs'
+      - 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage63.ps1'
+      - '.github/workflows/rvc-stage63-full-wav.yml'
+permissions:
+  contents: read
+jobs:
+  full-wav-single-executable:
+    runs-on: windows-latest
+    timeout-minutes: 115
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cache/tracel
+          key: stage63-unified-${{ hashFiles('Cargo.lock') }}
+      - name: Restore vendored checksums
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Vendored checksum restore failed' }
+      - name: Check PowerShell runner syntax
+        shell: pwsh
+        run: |
+          $script = 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage63.ps1'
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $script).Path, [ref]$tokens, [ref]$errors)
+          if ($errors.Count -ne 0) { $errors | Format-List | Out-String | Write-Host; throw 'Invalid Stage63 PowerShell syntax' }
+      - name: Compile unified CPU CUDA WGPU full-WAV EXE
+        shell: pwsh
+        run: |
+          cargo build --release --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs
+          if ($LASTEXITCODE -ne 0) { throw 'Unified native build failed' }
+      - name: Verify runner CLI exists
+        shell: pwsh
+        run: |
+          & target/release/tts-with-rvc-rs.exe doctor
+          if ($LASTEXITCODE -ne 0) { throw 'Doctor failed' }
+          & target/release/tts-with-rvc-rs.exe infer-wav-full-benchmark
+          if ($LASTEXITCODE -eq 0) { throw 'Invalid invocation unexpectedly succeeded' }
+      - name: Package full-WAV release gate
+        shell: pwsh
+        run: |
+          $folder = 'dist/stage63-full-wav'
+          New-Item -ItemType Directory -Force -Path $folder | Out-Null
+          Copy-Item target/release/tts-with-rvc-rs.exe $folder
+          Copy-Item research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage63.ps1 $folder
+          @'
+          One executable supports CubeCL CPU, CUDA and WGPU. No CPU fallback.
+          Copy your private models and the full input WAV to .\embed\ before running.
+          The runner performs ENTIRE-WAV chunked RVC with a persistent model for each mode.
+          Reports load/prepare/first/warmed inference, RTF, chunk counts and PCM parity.
+          This Stage63 package does NOT include CUDA Graph Replay or GPU-only timings.
+          All GPU-resident modes remain experimental; baseline (CPU FAISS/F0) is the trusted path.
+          Models, FAISS indexes and WAV recordings are never included in CI artifacts.
+          '@ | Set-Content "$folder/README.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rvc-stage63-full-wav-unified-windows-x64
+          path: dist/stage63-full-wav/
+          retention-days: 14
+          if-no-files-found: warn
