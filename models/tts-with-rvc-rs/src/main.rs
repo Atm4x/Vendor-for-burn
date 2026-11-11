@@ -145,6 +145,141 @@ fn run() -> Result<(), String> {
         println!("RVC WAV→WAV complete: samples={} sr=40000 path={target}", converted.len());
         return Ok(());
     }
+    if command == "infer-wav-full-diagnostic" {
+        use tts_with_rvc_rs::{
+            audio_io, chunked::ChunkConfig, diagnostic,
+            rvc_inference::{InferenceOptions, RvcV2Inferencer},
+        };
+        let voice = args.next().ok_or("missing RVC .pth")?;
+        let hubert = args.next().ok_or("missing HuBERT .pt")?;
+        let rmvpe = args.next().ok_or("missing RMVPE .pt")?;
+        let index = args.next().ok_or("missing RVC .index")?;
+        let source = args.next().ok_or("missing input WAV")?;
+        let target = args.next().ok_or("missing output WAV")?;
+        let backend = args.next().ok_or("missing backend: cuda")?;
+        let core_frames = args.next().ok_or("missing core frames")?.parse::<usize>()
+            .map_err(|e| format!("invalid core frames: {e}"))?;
+        let batch_size = args.next().ok_or("missing tensor batch size")?.parse::<usize>()
+            .map_err(|e| format!("invalid tensor batch size: {e}"))?;
+        if args.next().is_some() || backend != "cuda" || index == "-"
+            || source == target || !(1..=32).contains(&batch_size)
+        {
+            return Err("Stage64 accepts only cuda, a real index, one full WAV and batch size 1..32".into());
+        }
+        for incompatible in [
+            "RVC_GPU_FAISS", "RVC_GPU_F0", "RVC_RMVPE_COMPACT_READBACK",
+            "RVC_RMVPE_FUSED_READBACK", "RVC_RMVPE_PLANE_READBACK",
+        ] {
+            if env::var_os(incompatible).is_some() {
+                return Err(format!("Stage64 rejects experimental mode {incompatible}"));
+            }
+        }
+        if !diagnostic::enabled() {
+            return Err("Stage64 requires RVC_DIAGNOSTIC_TRACE=1; detailed stage timing is mandatory".into());
+        }
+        let config = ChunkConfig { core_frames, ..ChunkConfig::default() };
+        config.validate()?;
+        let device = user_cli::selected_device(&backend)?;
+        let opts = InferenceOptions::default();
+        diagnostic::emit("benchmark_config", serde_json::json!({
+            "backend":backend,"index_rate":opts.index_rate,"protect":opts.protect,
+            "core_frames":core_frames,"tensor_batch_size":batch_size,
+            "graph_replay":false,"gpu_ivf":false,"gpu_f0":false,
+            "single_mode":true,"measured_full_passes":1,
+        }));
+        let started = std::time::Instant::now();
+        let inferencer = RvcV2Inferencer::load(&voice, &hubert, &rmvpe, Some(index.as_str()), device.clone())?;
+        device.sync().map_err(|e| format!("model load sync: {e}"))?;
+        let load_ms = diagnostic::ms(started);
+        diagnostic::emit("model_load_complete", serde_json::json!({"load_ms":load_ms}));
+
+        let started = std::time::Instant::now();
+        let wave = audio_io::read_mono_wav(&source)?;
+        let original_seconds = wave.samples.len() as f64 / wave.sample_rate as f64;
+        let resampled = audio_io::resample(&wave.samples, wave.sample_rate, 16000)?;
+        let filtered = tts_with_rvc_rs::preprocess::highpass_48hz_zero_phase(&resampled)?;
+        let prepare_ms = diagnostic::ms(started);
+        let model_seconds = filtered.len() as f64 / 16000.0;
+        if filtered.len() < 3200 { return Err("full diagnostic requires 0.2 seconds of input".into()); }
+        diagnostic::emit("input_prepared", serde_json::json!({
+            "source_seconds":original_seconds, "model_seconds":model_seconds,
+            "source_hz":wave.sample_rate,"source_samples":wave.samples.len(),
+            "model_input_samples":filtered.len(),"prepare_ms":prepare_ms,
+        }));
+
+        diagnostic::set_phase("warmup");
+        let warmup_samples = (core_frames + 2 * config.context_frames + config.trailing_frames)
+            .checked_mul(160).ok_or("warmup size overflow")?;
+        let warmup = (0..warmup_samples).map(|i| filtered[i % filtered.len()]).collect::<Vec<_>>();
+        let warm_inputs = vec![warmup; batch_size];
+        device.sync().map_err(|e| format!("pre-warmup sync: {e}"))?;
+        let started = std::time::Instant::now();
+        let warm_options = vec![opts.clone(); batch_size];
+        let warm_output = inferencer.infer_16khz_batch(&warm_inputs, &warm_options)?;
+        device.sync().map_err(|e| format!("warmup sync: {e}"))?;
+        let warmup_ms = diagnostic::ms(started);
+        diagnostic::emit("representative_shape_warmup", serde_json::json!({
+            "warmup_ms":warmup_ms,"warmup_batch":batch_size,
+            "warmup_samples_per_item":warmup_samples,
+            "warmup_outputs":warm_output.len(),
+            "note":"one representative batch excluded from the single full-WAV benchmark",
+        }));
+
+        device.sync().map_err(|e| format!("pre-inference sync: {e}"))?;
+        diagnostic::set_phase("measured");
+        diagnostic::emit("measured_full_pass_begin", serde_json::json!({"source_seconds":model_seconds}));
+        let started = std::time::Instant::now();
+        let mut chunk_count = 0usize;
+        let mut converted = inferencer.infer_long_filtered_16khz_batched(
+            &filtered, &opts, config, batch_size, |progress| {
+                chunk_count = progress.chunk_count;
+                diagnostic::emit("chunk_complete", serde_json::json!({
+                    "chunk_index":progress.chunk_index,
+                    "chunk_count":progress.chunk_count,
+                    "output_samples":progress.output_samples,
+                }));
+            },
+        )?;
+        device.sync().map_err(|e| format!("post-inference sync: {e}"))?;
+        let inference_ms = diagnostic::ms(started);
+        let expected_samples = filtered.len().checked_mul(5).ok_or("output length overflow")? / 2;
+        if converted.len() != expected_samples || converted.iter().any(|v| !v.is_finite()) {
+            return Err(format!("full-WAV output invalid: got {}, expected {expected_samples}", converted.len()));
+        }
+        diagnostic::emit("measured_full_pass_end", serde_json::json!({
+            "inference_ms":inference_ms,"rtf":inference_ms / (model_seconds*1000.0),
+            "chunks":chunk_count,"samples":converted.len(),
+        }));
+        diagnostic::set_phase("postprocess");
+        let started = std::time::Instant::now();
+        audio_io::mix_rms_envelope(&filtered, 16000, &mut converted, 40000, 0.5)?;
+        audio_io::normalize_peak(&mut converted)?;
+        audio_io::write_mono_wav(&target, &converted, 40000)?;
+        let postprocess_write_ms = diagnostic::ms(started);
+        diagnostic::emit("postprocess_write", serde_json::json!({
+            "postprocess_write_ms":postprocess_write_ms,"output_samples":converted.len(),
+        }));
+        let report = serde_json::json!({
+            "stage":64,"benchmark":"single_cuda_full_wav_diagnostic",
+            "mode":"cpu_faiss_cpu_fp64_f0","backend":backend,
+            "model_input_seconds":model_seconds,"source_seconds":original_seconds,
+            "output_seconds":converted.len() as f64 / 40000.0,
+            "source_sample_rate":wave.sample_rate,"output_sample_rate":40000,
+            "output_samples":converted.len(),"chunk_count":chunk_count,
+            "core_frames":config.core_frames,"overlap_frames":config.overlap_frames,
+            "context_frames":config.context_frames,"tensor_batch_size":batch_size,
+            "load_ms":load_ms,"prepare_ms":prepare_ms,"warmup_ms":warmup_ms,
+            "full_inference_ms":inference_ms,"rtf":inference_ms / (model_seconds*1000.0),
+            "postprocess_write_ms":postprocess_write_ms,"measured_full_passes":1,
+            "graph_replay":false,"gpu_faiss":false,"gpu_f0":false,
+            "profiling":"synchronization after each traced stage, including nested stages; measured timing includes instrumentation overhead and must not be compared directly against unprofiled Stage63 RTF",
+        });
+        let report_path = format!("{target}.diagnostic.json");
+        fs::write(&report_path, serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("cannot write diagnostic report: {e}"))?;
+        println!("Stage64 full CUDA diagnostic: {model_seconds:.3}s input, {inference_ms:.3}ms inference, RTF {:.4}; report={report_path}", inference_ms/(model_seconds*1000.0));
+        return Ok(());
+    }
     if command == "infer-wav-full-benchmark" {
         use tts_with_rvc_rs::{
             audio_io, chunked::ChunkConfig,

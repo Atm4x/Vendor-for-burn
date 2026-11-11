@@ -168,8 +168,17 @@ impl RmvpeNetwork {
             frames > 0 && frames % factor == 0,
             "RMVPE mel frames must be padded to a multiple of the downsampling factor"
         );
+        let device = mel.device();
         let input = mel.swap_dims(1, 2).reshape([batch, 1, frames, bins]);
-        self.head
-            .forward(self.gru.forward(self.unet.forward_gru_features(input)))
+        let started = std::time::Instant::now();
+        let unet = self.unet.forward_gru_features(input);
+        crate::diagnostic::measure(&device, "rmvpe.unet", started, serde_json::json!({"output_shape":unet.dims()}));
+        let started = std::time::Instant::now();
+        let gru = self.gru.forward(unet);
+        crate::diagnostic::measure(&device, "rmvpe.bidirectional_gru", started, serde_json::json!({"output_shape":gru.dims()}));
+        let started = std::time::Instant::now();
+        let out = self.head.forward(gru);
+        crate::diagnostic::measure(&device, "rmvpe.f0_head", started, serde_json::json!({"output_shape":out.dims()}));
+        out
     }
 }

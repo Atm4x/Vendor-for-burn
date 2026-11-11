@@ -228,14 +228,21 @@ impl RvcV2Inferencer {
                 return Err("invalid RVC index, protection, pitch shift or noise settings".into());
             }
         }
+        let (diag_id, diag_total_start) = crate::diagnostic::batch_start(batch, audio_len, audio_len / 160);
         let profile = std::env::var_os("RVC_PROFILE").is_some();
         let mut phase = std::time::Instant::now();
+        let started = std::time::Instant::now();
         let samples: Vec<f32> = audios.iter().flat_map(|pcm| pcm.iter().copied()).collect();
         let waveform = Tensor::from_data(
             TensorData::new(samples, [batch, 1, audio_len]),
             &self.device,
         );
+        crate::diagnostic::measure(&self.device, "rvc.audio_h2d", started,
+            serde_json::json!({"bytes_h2d_estimate":batch * audio_len * 4}));
+        let started = std::time::Instant::now();
         let content = self.hubert.forward(waveform, None);
+        crate::diagnostic::measure(&self.device, "rvc.hubert_total", started,
+            serde_json::json!({"tensor_shape":content.dims()}));
         let [result_batch, content_time, channels] = content.dims();
         if result_batch != batch || channels != CONTENT_CHANNELS {
             return Err(format!(
@@ -248,6 +255,7 @@ impl RvcV2Inferencer {
         let gpu_retrieval = retrieval_enabled && self.gpu_index.is_some();
         #[cfg(not(any(feature = "cpu", feature = "cuda", feature = "wgpu")))]
         let gpu_retrieval = false;
+        let started = std::time::Instant::now();
         let raw = if retrieval_enabled && !gpu_retrieval {
             Some(
                 content
@@ -259,6 +267,8 @@ impl RvcV2Inferencer {
         } else {
             None
         };
+        crate::diagnostic::measure(&self.device, "rvc.hubert_d2h", started,
+            serde_json::json!({"bytes_d2h":raw.as_ref().map_or(0, |v| v.len()*4),"content_frames":content_time,"channels":channels}));
         if profile {
             eprintln!(
                 "profile hubert B={batch} {:.3}s, host_content_bytes={}",
@@ -271,6 +281,7 @@ impl RvcV2Inferencer {
             );
             phase = std::time::Instant::now();
         }
+        let started = std::time::Instant::now();
         let thresholds: Vec<f32> = options.iter().map(|x| x.rmvpe_threshold).collect();
         let gpu_f0 = std::env::var_os("RVC_GPU_F0").is_some_and(|v| v == "1");
         if gpu_f0 && retrieval_enabled && !gpu_retrieval {
@@ -293,6 +304,8 @@ impl RvcV2Inferencer {
         } else {
             Some(self.rmvpe.infer_f0_batch_thresholds(audios, &self.device, &thresholds)?)
         };
+        crate::diagnostic::measure(&self.device, "rvc.rmvpe_total", started,
+            serde_json::json!({"batch":batch,"mode":"dense_cpu_f0"}));
         if profile {
             eprintln!(
                 "profile rmvpe B={batch} {:.3}s",
@@ -306,6 +319,7 @@ impl RvcV2Inferencer {
         if frames == 0 || f0_batch.as_ref().is_some_and(|rows| rows.iter().any(|row| row.len() < frames)) {
             return Err("HuBERT/RMVPE returned no aligned frames".into());
         }
+        let started = std::time::Instant::now();
         let mut all_features = Vec::with_capacity(batch * frames * channels);
         let mut all_pitch = Vec::with_capacity(batch * frames);
         let mut all_f0 = Vec::with_capacity(batch * frames);
@@ -359,6 +373,10 @@ impl RvcV2Inferencer {
             all_pitch.extend(coarse_f0(f0));
             all_f0.extend(f0.iter().copied());
         }
+        if !gpu_retrieval {
+            crate::diagnostic::measure(&self.device, "rvc.cpu_faiss_protect_pitch", started,
+                serde_json::json!({"features_host_bytes":all_features.len()*4,"pitch_host_bytes":all_pitch.len()*8,"f0_host_bytes":all_f0.len()*4,"frames":frames,"retrieval":retrieval_enabled}));
+        }
         if profile && !gpu_retrieval {
             eprintln!(
                 "profile retrieval B={batch} {:.6}s",
@@ -366,6 +384,7 @@ impl RvcV2Inferencer {
             );
         }
         phase = std::time::Instant::now();
+        let started = std::time::Instant::now();
         let phone = if gpu_retrieval {
             #[cfg(any(feature = "cpu", feature = "cuda", feature = "wgpu"))]
             {
@@ -442,9 +461,14 @@ impl RvcV2Inferencer {
         } else {
             Tensor::<2, Int>::from_data(TensorData::new(all_pitch, [batch, frames]), &self.device)
         };
+        crate::diagnostic::measure(&self.device, "rvc.phone_pitch_h2d", started,
+            serde_json::json!({"feature_h2d_bytes_estimate":if gpu_retrieval {0} else {batch*frames*channels*4},"pitch_h2d_bytes_estimate":if gpu_f0 {0} else {batch*frames*8}}));
+        let started = std::time::Instant::now();
         let encoded = self
             .encoder
             .forward(phone, Some(pitch_tensor), &vec![frames; batch], None);
+        crate::diagnostic::measure(&self.device, "rvc.text_encoder", started,
+            serde_json::json!({"mean_shape":encoded.mean.dims()}));
         if profile {
             eprintln!(
                 "profile encoder B={batch} {:.3}s",
@@ -452,6 +476,7 @@ impl RvcV2Inferencer {
             );
             phase = std::time::Instant::now();
         }
+        let started = std::time::Instant::now();
         let [_, latent_channels, latent_frames] = encoded.mean.dims();
         let mut noise = Vec::with_capacity(batch * latent_channels * latent_frames);
         for (random, setting) in random_sources.iter_mut().zip(options) {
@@ -475,9 +500,14 @@ impl RvcV2Inferencer {
             TensorData::new(speaker_embeddings, [batch, self.speaker_channels, 1]),
             &self.device,
         );
+        crate::diagnostic::measure(&self.device, "rvc.latent_noise_speaker_h2d", started,
+            serde_json::json!({"noise_h2d_bytes_estimate":batch*latent_channels*latent_frames*4,"speaker_h2d_bytes_estimate":batch*self.speaker_channels*4,"latent_frames":latent_frames}));
+        let started = std::time::Instant::now();
         let latent = self
             .flow
             .forward(latent, encoded.mask, Some(speaker.clone()), true);
+        crate::diagnostic::measure(&self.device, "rvc.flow", started,
+            serde_json::json!({"output_shape":latent.dims()}));
         if profile {
             eprintln!(
                 "profile flow B={batch} {:.3}s",
@@ -485,6 +515,7 @@ impl RvcV2Inferencer {
             );
             phase = std::time::Instant::now();
         }
+        let started = std::time::Instant::now();
         let initial_phase = Tensor::zeros([1, 1, 1], &self.device);
         let mut gaussian_noise = Vec::with_capacity(batch * frames * RVC_HOP);
         for random in &mut random_sources {
@@ -497,6 +528,9 @@ impl RvcV2Inferencer {
         let f0_tensor = resident_final_f0.unwrap_or_else(|| {
             Tensor::from_data(TensorData::new(all_f0, [batch, frames]), &self.device)
         });
+        crate::diagnostic::measure(&self.device, "rvc.nsf_inputs", started,
+            serde_json::json!({"sine_h2d_bytes_estimate":batch*frames*RVC_HOP*4,"f0_h2d_bytes_estimate":if gpu_f0 {0} else {batch*frames*4}}));
+        let started = std::time::Instant::now();
         let output = self.decoder.forward_from_f0(
             latent,
             f0_tensor,
@@ -505,6 +539,8 @@ impl RvcV2Inferencer {
             initial_phase,
             sine_noise,
         )?;
+        crate::diagnostic::measure(&self.device, "rvc.nsf_compute", started,
+            serde_json::json!({"output_shape":output.dims()}));
         let [wave_batch, channel_count, sample_count] = output.dims();
         if wave_batch != batch || channel_count != 1 {
             return Err(format!(
@@ -512,10 +548,14 @@ impl RvcV2Inferencer {
                 output.dims()
             ));
         }
+        let started = std::time::Instant::now();
         let samples = output
             .into_data()
             .try_into_vec::<f32>()
             .map_err(|e| e.to_string())?;
+        crate::diagnostic::measure(&self.device, "rvc.nsf_d2h", started,
+            serde_json::json!({"bytes_d2h":samples.len()*4,"output_samples_per_item":sample_count}));
+        crate::diagnostic::batch_end(diag_id, diag_total_start);
         if profile {
             eprintln!(
                 "profile nsf B={batch} {:.3}s",

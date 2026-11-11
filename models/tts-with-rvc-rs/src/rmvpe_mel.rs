@@ -151,6 +151,7 @@ impl RmvpeAudioModel {
         }
         let frames = first_len / HOP_LENGTH + 1;
         let padded = frames.div_ceil(32) * 32;
+        let diag_start = std::time::Instant::now();
         let mut features = Vec::with_capacity(audios.len() * MEL_BINS * padded);
         for audio in audios {
             let (mel, nframes) = self.mel.forward(audio)?;
@@ -163,8 +164,21 @@ impl RmvpeAudioModel {
             }
         }
         let batch = audios.len();
+        if crate::diagnostic::enabled() {
+            crate::diagnostic::emit("rmvpe.mel_fft_cpu", serde_json::json!({
+                "wall_ms": crate::diagnostic::ms(diag_start), "frames": frames,
+                "padded_frames": padded, "batch": batch, "fft_size": FFT_SIZE,
+                "mel_bins": MEL_BINS, "host_mel_bytes": features.len() * 4,
+            }));
+        }
+        let started = std::time::Instant::now();
         let mel = Tensor::from_data(TensorData::new(features, [batch, MEL_BINS, padded]), device);
+        crate::diagnostic::measure(device, "rmvpe.mel_upload", started,
+            serde_json::json!({"bytes_h2d_estimate": batch * MEL_BINS * padded * 4}));
+        let started = std::time::Instant::now();
         let result = self.network.forward(mel);
+        crate::diagnostic::measure(device, "rmvpe.neural_network", started,
+            serde_json::json!({"output_shape": result.dims()}));
         Ok((result.slice([0..batch, 0..frames, 0..F0_BINS]), frames))
     }
 
@@ -317,21 +331,30 @@ fn decode_salience_batch(
             .map(|(row, &threshold)| compact_salience_to_f0(row, threshold))
             .collect()
     } else {
+        let device = salience.device();
+        let started = std::time::Instant::now();
         let values = salience
             .into_data()
             .try_into_vec::<f32>()
             .map_err(|error| error.to_string())?;
+        crate::diagnostic::measure(&device, "rmvpe.salience_readback", started,
+            serde_json::json!({"bytes_d2h":values.len() * 4,"frames":frames,"batch":batch,"bins":bins}));
         if std::env::var_os("RVC_PROFILE").is_some() {
             eprintln!(
                 "profile rmvpe_f0_readback dense B={batch} frames={frames} host_bytes={}",
                 values.len() * 4
             );
         }
-        values
+        let started = std::time::Instant::now();
+        let decoded: Result<Vec<Vec<f32>>, String> = values
             .chunks_exact(frames * F0_BINS)
             .zip(thresholds)
             .map(|(row, &threshold)| salience_to_f0(row, threshold))
-            .collect()
+            .collect();
+        if crate::diagnostic::enabled() {
+            crate::diagnostic::emit("rmvpe.f0_decode_fp64_cpu", serde_json::json!({"wall_ms":crate::diagnostic::ms(started),"frames":frames,"batch":batch}));
+        }
+        decoded
     }
 }
 

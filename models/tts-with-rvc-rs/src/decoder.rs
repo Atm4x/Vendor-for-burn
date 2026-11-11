@@ -464,16 +464,25 @@ impl NsfWaveformDecoder {
     ) -> Tensor<3> {
         let [batch, _, time] = input.dims();
         assert_eq!(harmonic_source.dims(), [batch, 1, time * self.total_upsample]);
+        let device = input.device();
+        let pre_started = std::time::Instant::now();
         let mut x = self.pre.forward(input);
         match (&self.condition, g) {
             (Some(conv), Some(condition)) => x = x + conv.forward(condition),
             (None, None) => {},
             _ => panic!("NSF decoder conditioning does not match checkpoint"),
         }
-        for stage in &self.stages {
+        crate::diagnostic::measure(&device, "nsf.conv_pre_condition", pre_started, serde_json::json!({"shape":x.dims()}));
+        for (stage_idx, stage) in self.stages.iter().enumerate() {
+            let started = std::time::Instant::now();
             x = stage.forward_with_scheduling(x, harmonic_source.clone(), execution, aggregation, scheduling);
+            crate::diagnostic::measure(&device, "nsf.upsample_resblocks", started,
+                serde_json::json!({"stage":stage_idx,"shape":x.dims()}));
         }
-        activation::tanh(self.post.forward(activation::leaky_relu(x, 0.01)))
+        let started = std::time::Instant::now();
+        let output = activation::tanh(self.post.forward(activation::leaky_relu(x, 0.01)));
+        crate::diagnostic::measure(&device, "nsf.conv_post", started, serde_json::json!({"shape":output.dims()}));
+        output
     }
 
     pub fn profile_cpu(
@@ -538,8 +547,14 @@ impl NsfWaveformDecoder {
         if f0.dims() != [batch, frames] {
             return Err("NSF decoder F0 shape must match input frames".into());
         }
+        let device = f0.device();
+        let started = std::time::Instant::now();
         let (harmonic, _) = source.forward_with_random(f0, self.total_upsample, initial_phases, gaussian_noise)?;
-        Ok(self.forward_with_execution(input, harmonic.permute([0, 2, 1]), condition, execution))
+        crate::diagnostic::measure(&device, "nsf.source_generation", started, serde_json::json!({"harmonic_shape":harmonic.dims()}));
+        let started = std::time::Instant::now();
+        let output = self.forward_with_execution(input, harmonic.permute([0, 2, 1]), condition, execution);
+        crate::diagnostic::measure(&device, "nsf.decoder_all", started, serde_json::json!({"output_shape":output.dims()}));
+        Ok(output)
     }
 
     pub fn stage_count(&self) -> usize { self.stages.len() }

@@ -89,8 +89,14 @@ impl HubertEncoder {
     }
 
     pub fn forward(&self, input: Tensor<3>, valid_keys: Option<Tensor<2>>) -> Tensor<3> {
+        let device = input.device();
+        let started = std::time::Instant::now();
         let input = self.position.forward(input, valid_keys.clone());
-        self.stack.forward(input, valid_keys)
+        crate::diagnostic::measure(&device, "hubert.position_conv", started, serde_json::json!({"output_shape":input.dims()}));
+        let started = std::time::Instant::now();
+        let out = self.stack.forward(input, valid_keys);
+        crate::diagnostic::measure(&device, "hubert.transformer_stack", started, serde_json::json!({"layers":self.layers(),"output_shape":out.dims()}));
+        out
     }
 }
 
