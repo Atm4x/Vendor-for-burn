@@ -531,13 +531,14 @@ impl RvcV2Inferencer {
         crate::diagnostic::measure(&self.device, "rvc.nsf_inputs", started,
             serde_json::json!({"sine_h2d_bytes_estimate":batch*frames*RVC_HOP*4,"f0_h2d_bytes_estimate":if gpu_f0 {0} else {batch*frames*4}}));
         let started = std::time::Instant::now();
-        let output = self.decoder.forward_from_f0(
+        let output = self.decoder.forward_from_f0_with_execution(
             latent,
             f0_tensor,
             Some(speaker),
             &self.source,
             initial_phase,
             sine_noise,
+            crate::decoder::ResidualExecution::PRODUCTION,
         )?;
         crate::diagnostic::measure(&self.device, "rvc.nsf_compute", started,
             serde_json::json!({"output_shape":output.dims()}));

@@ -1,0 +1,88 @@
+name: RVC Stage65 full-WAV unified Windows release gate
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - experiment/conv-kernel-rnd-stage33-20261110
+    paths:
+      - 'models/tts-with-rvc-rs/src/main.rs'
+      - 'models/tts-with-rvc-rs/src/decoder.rs'
+      - 'models/tts-with-rvc-rs/src/rvc_inference.rs'
+      - 'models/tts-with-rvc-rs/src/user_cli.rs'
+      - 'models/tts-with-rvc-rs/src/chunked.rs'
+      - 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage65.ps1'
+      - '.github/workflows/rvc-stage65-full-wav.yml'
+permissions:
+  contents: read
+jobs:
+  full-wav-single-executable:
+    runs-on: windows-latest
+    timeout-minutes: 115
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cache/tracel
+          key: stage65-unified-${{ hashFiles('Cargo.lock') }}
+      - name: Restore vendored checksums
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Vendored checksum restore failed' }
+      - name: Check PowerShell runner syntax
+        shell: pwsh
+        run: |
+          $script = 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage65.ps1'
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $script).Path, [ref]$tokens, [ref]$errors)
+          if ($errors.Count -ne 0) { $errors | Format-List | Out-String | Write-Host; throw 'Invalid Stage65 PowerShell syntax' }
+      - name: Compile unified CPU CUDA WGPU full-WAV EXE
+        shell: pwsh
+        run: |
+          cargo build --release --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs
+          if ($LASTEXITCODE -ne 0) { throw 'Unified native build failed' }
+      - name: Verify production Sequential policy
+        shell: pwsh
+        run: |
+          $decoder = Get-Content 'models/tts-with-rvc-rs/src/decoder.rs' -Raw
+          $inference = Get-Content 'models/tts-with-rvc-rs/src/rvc_inference.rs' -Raw
+          if ($decoder -notmatch 'pub const PRODUCTION: Self = Self::Sequential;') { throw 'NSF production default must be Sequential' }
+          if ($inference -notmatch 'ResidualExecution::PRODUCTION') { throw 'RVC inference must specify production policy' }
+          cargo test --offline --locked -p tts-with-rvc-rs --no-default-features --features cpu --lib production_residuals_are_sequential
+          if ($LASTEXITCODE -ne 0) { throw 'Production policy regression test failed' }
+      - name: Verify unified CLI metadata
+        shell: pwsh
+        run: |
+          & target/release/tts-with-rvc-rs.exe doctor
+          if ($LASTEXITCODE -ne 0) { throw 'Doctor failed' }
+      - name: Package full-WAV release gate
+        shell: pwsh
+        run: |
+          $folder = 'dist/stage65-full-wav'
+          New-Item -ItemType Directory -Force -Path $folder | Out-Null
+          Copy-Item target/release/tts-with-rvc-rs.exe $folder
+          Copy-Item research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage65.ps1 $folder
+          @'
+          One executable supports CubeCL CPU, CUDA and WGPU. No CPU fallback.
+          Copy your private models and the full input WAV to .\embed\ before running.
+          The runner performs ENTIRE-WAV chunked RVC using Sequential NSF with a persistent model for each mode.
+          Reports load/prepare/first/warmed inference, RTF, chunk counts and PCM parity.
+          This Stage65 package has production Sequential NSF; it does NOT include CUDA Graph Replay or GPU-only timings.
+          All GPU-resident modes remain experimental; baseline (CPU FAISS/F0) is the trusted path.
+          Models, FAISS indexes and WAV recordings are never included in CI artifacts.
+          '@ | Set-Content "$folder/README.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rvc-stage65-full-wav-unified-windows-x64
+          path: dist/stage65-full-wav/
+          retention-days: 14
+          if-no-files-found: warn

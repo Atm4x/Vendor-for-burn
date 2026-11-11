@@ -45,3 +45,4 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 # Stage52 reproduce Stage51 CUDA Graph source export 2026-11-11
+# Stage65: export the sequential production head on this branch push.

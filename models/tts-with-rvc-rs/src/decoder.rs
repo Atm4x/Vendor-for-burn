@@ -12,6 +12,10 @@ pub enum ResidualExecution {
     Parallel,
 }
 
+impl ResidualExecution {
+    pub const PRODUCTION: Self = Self::Sequential;
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResidualAggregation {
     ZeroSeeded,
@@ -223,7 +227,7 @@ impl DecoderStage {
     }
 
     pub fn forward(&self, input: Tensor<3>, harmonic_source: Tensor<3>) -> Tensor<3> {
-        self.forward_with_execution(input, harmonic_source, ResidualExecution::Parallel)
+        self.forward_with_execution(input, harmonic_source, ResidualExecution::PRODUCTION)
     }
 
     fn forward_with_execution(
@@ -429,7 +433,7 @@ impl NsfWaveformDecoder {
     }
 
     pub fn forward(&self, input: Tensor<3>, harmonic_source: Tensor<3>, g: Option<Tensor<3>>) -> Tensor<3> {
-        self.forward_with_execution(input, harmonic_source, g, ResidualExecution::Parallel)
+        self.forward_with_execution(input, harmonic_source, g, ResidualExecution::PRODUCTION)
     }
 
     pub fn forward_with_execution(
@@ -529,7 +533,7 @@ impl NsfWaveformDecoder {
         gaussian_noise: Tensor<3>,
     ) -> Result<Tensor<3>, String> {
         self.forward_from_f0_with_execution(
-            input, f0, condition, source, initial_phases, gaussian_noise, ResidualExecution::Parallel,
+            input, f0, condition, source, initial_phases, gaussian_noise, ResidualExecution::PRODUCTION,
         )
     }
 
@@ -586,5 +590,15 @@ impl NsfDecoderFixture {
 
     pub fn load(&self, checkpoint: &RvcCheckpoint, device: &Device) -> Result<NsfWaveformDecoder, String> {
         NsfWaveformDecoder::load(checkpoint, &self.upsample_rates, self.kernels_per_stage, self.dilations, device)
+    }
+}
+
+#[cfg(test)]
+mod production_execution_tests {
+    use super::ResidualExecution;
+
+    #[test]
+    fn production_residuals_are_sequential() {
+        assert_eq!(ResidualExecution::PRODUCTION, ResidualExecution::Sequential);
     }
 }
