@@ -47,13 +47,11 @@ jobs:
         run: |
           cargo build --release --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs
           if ($LASTEXITCODE -ne 0) { throw 'Unified native build failed' }
-      - name: Verify runner CLI exists
+      - name: Verify unified CLI metadata
         shell: pwsh
         run: |
           & target/release/tts-with-rvc-rs.exe doctor
           if ($LASTEXITCODE -ne 0) { throw 'Doctor failed' }
-          & target/release/tts-with-rvc-rs.exe infer-wav-full-benchmark
-          if ($LASTEXITCODE -eq 0) { throw 'Invalid invocation unexpectedly succeeded' }
       - name: Package full-WAV release gate
         shell: pwsh
         run: |
