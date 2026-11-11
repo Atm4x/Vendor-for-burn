@@ -234,6 +234,24 @@ fn decode_salience_batch(
     if batch != thresholds.len() || bins != F0_BINS || frames == 0 {
         return Err("RMVPE salience/threshold shapes do not match".into());
     }
+    if std::env::var_os("RVC_RMVPE_FUSED_READBACK").is_some_and(|value| value == "1") {
+        #[cfg(any(feature = "cpu", feature = "cuda", feature = "wgpu"))]
+        {
+            let values = crate::rmvpe_fused::fused_compact_salience(salience)?;
+            if std::env::var_os("RVC_PROFILE").is_some() {
+                eprintln!("profile rmvpe_f0_readback fused B={batch} frames={frames} host_bytes={}", values.len() * 4);
+            }
+            return values
+                .chunks_exact(frames * COMPACT_F0_WIDTH)
+                .zip(thresholds)
+                .map(|(row, &threshold)| compact_salience_to_f0(row, threshold))
+                .collect();
+        }
+        #[cfg(not(any(feature = "cpu", feature = "cuda", feature = "wgpu")))]
+        {
+            return Err("RMVPE fused readback requires a CubeCL-enabled build".into());
+        }
+    }
     if compact {
         let values = compact_salience(salience)
             .into_data()

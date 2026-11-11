@@ -150,6 +150,9 @@ pub mod flow;
 pub mod decoder;
 
 pub mod rmvpe;
+
+#[cfg(any(feature = "cpu", feature = "cuda", feature = "wgpu"))]
+mod rmvpe_fused;
 pub mod rmvpe_gru;
 pub mod rmvpe_mel;
 pub mod hubert;
