@@ -303,6 +303,54 @@ mod tensor_batch_tests {
     }
 
     #[test]
+    fn long_audio_batch_boundaries_and_partial_samples_match_scalar() {
+        let config = ChunkConfig::default();
+        for length in [1, 159, 160, 161, 3_201, 159_997, 1_440_017] {
+            let pcm: Vec<f32> = (0..length)
+                .map(|sample| (((sample * 103 + 71) % 19_997) as f32 - 10_000.0) / 19_997.0)
+                .collect();
+            let render = |segment: &[f32]| {
+                (0..segment.len() * 5 / 2)
+                    .map(|sample| segment[sample * 2 / 5])
+                    .collect::<Vec<f32>>()
+            };
+            let mut scalar_progress = Vec::new();
+            let scalar = infer_chunked_with_progress(
+                &pcm,
+                config,
+                |segment, _| Ok(render(segment)),
+                |event| scalar_progress.push(event),
+            )
+            .unwrap();
+            let mut batch_progress = Vec::new();
+            let mut batches = Vec::new();
+            let batched = infer_chunked_batched_with_progress(
+                &pcm,
+                config,
+                4,
+                |segments, indices| {
+                    batches.push((segments.len(), indices.to_vec()));
+                    Ok(segments.iter().map(|segment| render(segment)).collect())
+                },
+                |event| batch_progress.push(event),
+            )
+            .unwrap();
+            assert_eq!(scalar, batched, "batch/scalar changed PCM at length {length}");
+            assert_eq!(scalar_progress, batch_progress);
+            assert_eq!(scalar.len(), length * OUTPUT_HZ / INPUT_HZ);
+            assert!(scalar.iter().all(|value| value.is_finite()));
+            assert!(batches.iter().all(|(size, indices)| *size == indices.len()));
+            for (output_sample, &value) in scalar.iter().enumerate() {
+                let expected = pcm[output_sample * INPUT_HZ / OUTPUT_HZ];
+                assert!(
+                    (value - expected).abs() < 2e-6,
+                    "unexpected chunk boundary: input={length}, output={output_sample}, actual={value}, expected={expected}",
+                );
+            }
+        }
+    }
+
+    #[test]
     fn batch_rejects_missing_outputs_and_oversized_batch() {
         let pcm = vec![0.1; 18_000];
         let cfg = ChunkConfig { core_frames: 30, overlap_frames: 4, context_frames: 12, trailing_frames: 4 };

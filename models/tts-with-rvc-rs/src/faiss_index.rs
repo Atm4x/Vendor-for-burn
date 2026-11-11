@@ -503,6 +503,78 @@ mod tests {
         }
     }
 
+    fn exhaustive_search(index: &IvfFlatIndex, query: &[f32], k: usize, nprobe: usize) -> Vec<Neighbor> {
+        let mut centroids: Vec<(usize, f32)> = index
+            .centroids
+            .chunks_exact(index.dimension)
+            .enumerate()
+            .map(|(id, centroid)| (id, squared_l2(query, centroid)))
+            .collect();
+        centroids.sort_unstable_by(|a, b| order_by_distance(a.1, a.0, b.1, b.0));
+        let mut result = Vec::new();
+        for &(list_id, _) in centroids.iter().take(nprobe) {
+            let list = &index.lists[list_id];
+            for (slot, vector) in list.codes.chunks_exact(index.dimension).enumerate() {
+                result.push(Neighbor {
+                    id: list.ids[slot],
+                    squared_distance: squared_l2(query, vector),
+                });
+            }
+        }
+        result.sort_unstable_by(|a, b| {
+            order_by_distance(a.squared_distance, a.id, b.squared_distance, b.id)
+        });
+        result.truncate(k);
+        result
+    }
+
+    fn assert_same_neighbors(actual: &[Neighbor], expected: &[Neighbor]) {
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert_eq!(actual.id, expected.id);
+            assert_eq!(actual.squared_distance.to_bits(), expected.squared_distance.to_bits());
+        }
+    }
+
+    #[test]
+    fn exact_top_k_preserves_exhaustive_order_distances_and_ties() {
+        let index = IvfFlatIndex::read(build_fixture().as_slice()).unwrap();
+        for x in 0..257 {
+            let query = [x as f32 / 12.0 - 4.0, (x % 19) as f32 / 30.0];
+            for nprobe in [1, 2] {
+                for k in [1, 2, 3, 8, 16] {
+                    let expected = exhaustive_search(&index, &query, k, nprobe);
+                    let actual = index.search_with_nprobe(&query, k, nprobe).unwrap();
+                    assert_same_neighbors(&actual, &expected);
+                }
+            }
+        }
+        for k in [1, 2, 3, 8] {
+            let query = [0.0, 0.0];
+            let expected = exhaustive_search(&index, &query, k, 1);
+            assert_same_neighbors(&index.search(&query, k).unwrap(), &expected);
+        }
+    }
+
+    #[test]
+    fn real_index_top_k_preserves_exhaustive_results_when_available() {
+        let Ok(path) = std::env::var("RVC_REAL_FAISS_INDEX") else { return; };
+        let index = IvfFlatIndex::open(path).unwrap();
+        for row in 0..28 {
+            let source = index.reconstruct((row * 7_919 + 19) % index.len()).unwrap();
+            let query: Vec<f32> = source.iter().enumerate().map(|(column, &x)| {
+                x + (((row * 17 + column * 13) % 11) as f32 - 5.0) * 0.0007
+            }).collect();
+            for nprobe in [1, 2, 4, 8] {
+                for k in [1, 4, 8, 16] {
+                    let actual = index.search_with_nprobe(&query, k, nprobe).unwrap();
+                    let expected = exhaustive_search(&index, &query, k, nprobe);
+                    assert_same_neighbors(&actual, &expected);
+                }
+            }
+        }
+    }
+
     #[test]
     fn rejects_corruption() {
         let mut bytes = build_fixture();

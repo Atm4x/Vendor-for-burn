@@ -36,14 +36,14 @@ pub(crate) fn process_wave_job(
         audio.samples.len(),
         audio.sample_rate
     );
-    let mut converted = inferencer.infer_long_16khz_batched(&pcm, &settings, config, tensor_batch_size, |p| {
+    let filtered = tts_with_rvc_rs::preprocess::highpass_48hz_zero_phase(&pcm)?;
+    let mut converted = inferencer.infer_long_filtered_16khz_batched(&filtered, &settings, config, tensor_batch_size, |p| {
         eprintln!(
             "RVC chunks={}/{} output_samples={}",
             p.chunk_index, p.chunk_count, p.output_samples
         );
     })?;
     let mix = job.rms_mix_rate.unwrap_or(0.5);
-    let filtered = tts_with_rvc_rs::preprocess::highpass_48hz_zero_phase(&pcm)?;
     audio_io::mix_rms_envelope(&filtered, 16_000, &mut converted, 40_000, mix)?;
     audio_io::normalize_peak(&mut converted)?;
     audio_io::write_mono_wav(&job.output, &converted, 40_000)?;

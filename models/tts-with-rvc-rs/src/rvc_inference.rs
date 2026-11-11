@@ -133,8 +133,21 @@ impl RvcV2Inferencer {
         progress: impl FnMut(ChunkProgress),
     ) -> Result<Vec<f32>, String> {
         let filtered = highpass_48hz_zero_phase(pcm)?;
+        self.infer_long_filtered_16khz_batched(&filtered, options, config, batch_size, progress)
+    }
+
+    /// Run chunked inference on PCM already high-pass filtered at 16 kHz.
+    /// The caller owns the filtered buffer and may reuse it for output RMS matching.
+    pub fn infer_long_filtered_16khz_batched(
+        &self,
+        filtered_pcm: &[f32],
+        options: &InferenceOptions,
+        config: ChunkConfig,
+        batch_size: usize,
+        progress: impl FnMut(ChunkProgress),
+    ) -> Result<Vec<f32>, String> {
         infer_chunked_batched_with_progress(
-            &filtered,
+            filtered_pcm,
             config,
             batch_size,
             |segments, indices| {
