@@ -229,6 +229,7 @@ fn main() {
         .split(',')
         .map(|f| f.parse::<usize>().expect("invalid frame count"))
         .collect::<Vec<_>>();
+    let dump_prefix = argument(&args, "--dump-prefix").map(str::to_owned);
     let iterations = argument(&args, "--iterations")
         .unwrap_or("16")
         .parse::<usize>()
@@ -331,6 +332,14 @@ fn main() {
                 .all(|(a, b)| a.to_bits() == b.to_bits());
             exact &= bitwise_equal;
             assert!(bitwise_equal, "dynamic graph FP32 bitwise mismatch at frame {frame_count}, step {i}: max error {error}");
+            if let Some(prefix) = &dump_prefix {
+                if i < 4 {
+                    let path = format!("{prefix}-{frame_count}-{i}.f32le");
+                    let bytes: Vec<u8> = normal.iter().flat_map(|value| value.to_le_bytes()).collect();
+                    std::fs::write(&path, bytes)
+                        .unwrap_or_else(|error| panic!("cannot write {path}: {error}"));
+                }
+            }
             let changed = reference_first
                 .as_ref()
                 .is_some_and(|first| max_abs(first, &normal) > 1e-6);
