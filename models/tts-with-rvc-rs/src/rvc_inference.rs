@@ -8,6 +8,7 @@ use crate::{
     flow::ResidualCouplingBlock,
     hubert_model::HubertFeatureModel,
     nsf_source::SourceModuleHnNSF,
+    phone_features::upsample_without_retrieval,
     preprocess::highpass_48hz_zero_phase,
     rmvpe_mel::RmvpeAudioModel,
     text_encoder::TextEncoder,
@@ -200,8 +201,18 @@ impl RvcV2Inferencer {
         if result_batch != batch || channels != CONTENT_CHANNELS {
             return Err(format!("HuBERT expected [{batch}, T, {CONTENT_CHANNELS}], got {:?}", content.dims()));
         }
-        let raw = content.into_data().try_into_vec::<f32>().map_err(|e| e.to_string())?;
-        if profile { eprintln!("profile hubert B={batch} {:.3}s", phase.elapsed().as_secs_f64()); phase = std::time::Instant::now(); }
+        let retrieval_enabled = options.iter().any(|setting| setting.index_rate > 0.0);
+        let raw = if retrieval_enabled {
+            Some(content.clone().into_data().try_into_vec::<f32>().map_err(|e| e.to_string())?)
+        } else {
+            None
+        };
+        if profile {
+            eprintln!("profile hubert B={batch} {:.3}s, host_content_bytes={}",
+                phase.elapsed().as_secs_f64(),
+                if retrieval_enabled { batch * content_time * channels * std::mem::size_of::<f32>() } else { 0 });
+            phase = std::time::Instant::now();
+        }
         let thresholds_uniform = options.iter().all(|x| x.rmvpe_threshold == options[0].rmvpe_threshold);
         let mut f0_batch = if thresholds_uniform {
             self.rmvpe.infer_f0_batch(audios, &self.device, options[0].rmvpe_threshold)?
@@ -223,32 +234,42 @@ impl RvcV2Inferencer {
         let mut random_sources = Vec::with_capacity(batch);
         for (b, (f0, opts)) in f0_batch.iter_mut().zip(options).enumerate() {
             f0.truncate(frames);
-            let original = &raw[b * content_time * channels..(b + 1) * content_time * channels];
-            let mut retrieved = original.to_vec();
-            if opts.index_rate > 0.0 {
-                let index = self.index.as_ref().ok_or("FAISS retrieval requested but no index was loaded")?;
-                index.blend_features(&mut retrieved, opts.index_rate)?;
-            }
             let pitch_factor = 2.0_f32.powf(opts.pitch_shift_semitones / 12.0);
-            for (frame, value) in f0.iter_mut().enumerate() {
-                let frame_src = frame / 2 * channels;
-                let data = &retrieved[frame_src..frame_src + channels];
-                if opts.index_rate > 0.0 && opts.protect < 0.5 && *value < 1.0 {
-                    let source = &original[frame_src..frame_src + channels];
-                    for (&retrieved, &raw) in data.iter().zip(source) {
-                        all_features.push(retrieved * opts.protect + raw * (1.0 - opts.protect));
-                    }
-                } else {
-                    all_features.extend_from_slice(data);
+            if let Some(raw) = &raw {
+                let original = &raw[b * content_time * channels..(b + 1) * content_time * channels];
+                let mut retrieved = original.to_vec();
+                if opts.index_rate > 0.0 {
+                    let index = self.index.as_ref().ok_or("FAISS retrieval requested but no index was loaded")?;
+                    index.blend_features(&mut retrieved, opts.index_rate)?;
                 }
-                *value *= pitch_factor;
+                for (frame, value) in f0.iter_mut().enumerate() {
+                    let frame_src = frame / 2 * channels;
+                    let data = &retrieved[frame_src..frame_src + channels];
+                    if opts.index_rate > 0.0 && opts.protect < 0.5 && *value < 1.0 {
+                        let source = &original[frame_src..frame_src + channels];
+                        for (&retrieved, &raw) in data.iter().zip(source) {
+                            all_features.push(retrieved * opts.protect + raw * (1.0 - opts.protect));
+                        }
+                    } else {
+                        all_features.extend_from_slice(data);
+                    }
+                    *value *= pitch_factor;
+                }
+            } else {
+                for value in f0.iter_mut() {
+                    *value *= pitch_factor;
+                }
             }
             all_pitch.extend(coarse_f0(f0));
             all_f0.extend(f0.iter().copied());
             random_sources.push(Gaussian::new(opts.seed));
         }
         if profile { eprintln!("profile retrieval B={batch} {:.3}s", phase.elapsed().as_secs_f64()); phase = std::time::Instant::now(); }
-        let phone = Tensor::from_data(TensorData::new(all_features, [batch, frames, channels]), &self.device);
+        let phone = if retrieval_enabled {
+            Tensor::from_data(TensorData::new(all_features, [batch, frames, channels]), &self.device)
+        } else {
+            upsample_without_retrieval(content, frames)
+        };
         let pitch_tensor = Tensor::<2, Int>::from_data(TensorData::new(all_pitch, [batch, frames]), &self.device);
         let encoded = self.encoder.forward(phone, Some(pitch_tensor), &vec![frames; batch], None);
         if profile { eprintln!("profile encoder B={batch} {:.3}s", phase.elapsed().as_secs_f64()); phase = std::time::Instant::now(); }
