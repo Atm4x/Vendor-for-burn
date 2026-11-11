@@ -69,7 +69,104 @@ fn fused_salience_kernel(
     }
 }
 
+/// One logical plane per salience frame. Lane-reduced max and index preserve
+/// the first-maximum tie rule, including negative-only finite inputs.
+#[cfg(feature = "cuda")]
+#[cube(launch_unchecked)]
+fn plane_salience_kernel(
+    input: &[f32],
+    output: &mut [f32],
+    rows: usize,
+    frames: usize,
+    stride_batch: usize,
+    stride_frame: usize,
+    stride_bin: usize,
+) {
+    let row = CUBE_POS_X as usize;
+    if row < rows && PLANE_POS == 0 {
+        let lane = UNIT_POS_PLANE as usize;
+        let plane_width = PLANE_DIM as usize;
+        let batch = row / frames;
+        let frame = row % frames;
+        let start = batch * stride_batch + frame * stride_frame;
+        let mut peak = input[start + lane * stride_bin];
+        let mut center = lane as u32;
+        let mut invalid = !(peak == peak && peak <= f32::MAX && peak >= -f32::MAX);
+        let mut bin = lane + plane_width;
+        while bin < 360 {
+            let value = input[start + bin * stride_bin];
+            let finite = value == value && value <= f32::MAX && value >= -f32::MAX;
+            if !finite {
+                invalid = true;
+            } else if value > peak {
+                peak = value;
+                center = bin as u32;
+            }
+            bin += plane_width;
+        }
+        let has_nonfinite = plane_any(invalid);
+        let global_peak = plane_max(peak);
+        let candidate = if peak == global_peak {
+            center
+        } else {
+            u32::MAX
+        };
+        let first_peak = plane_min(candidate);
+        let out = row * 10;
+        if lane == 0 {
+            output[out] = if has_nonfinite {
+                -1.0f32
+            } else {
+                first_peak as f32
+            };
+        }
+        let mut offset = lane;
+        while offset < 9 {
+            let index = first_peak as i32 + offset as i32 - 4;
+            let clamped = if index < 0 {
+                0usize
+            } else if index >= 360 {
+                359usize
+            } else {
+                index as usize
+            };
+            output[out + offset + 1] = if has_nonfinite {
+                0.0f32
+            } else {
+                input[start + clamped * stride_bin]
+            };
+            offset += plane_width;
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SalienceDispatch {
+    Sequential,
+    #[cfg(feature = "cuda")]
+    Plane,
+}
+
+pub(crate) fn plane_compact_salience(salience: Tensor<3>) -> Result<Vec<f32>, String> {
+    #[cfg(feature = "cuda")]
+    {
+        compact_salience_with_dispatch(salience, SalienceDispatch::Plane)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = salience;
+        Err("RMVPE plane reductions require the CUDA backend; CubeCL CPU/LLVM has no plane operations".into())
+    }
+}
+
 pub(crate) fn fused_compact_salience(salience: Tensor<3>) -> Result<Vec<f32>, String> {
+    compact_salience_with_dispatch(salience, SalienceDispatch::Sequential)
+}
+
+fn compact_salience_with_dispatch(
+    salience: Tensor<3>,
+    dispatch: SalienceDispatch,
+) -> Result<Vec<f32>, String> {
     let [batch, frames, bins] = salience.dims();
     if batch == 0 || frames == 0 || bins != BINS {
         return Err("RMVPE fused salience requires nonempty [B,T,360]".into());
@@ -97,28 +194,49 @@ pub(crate) fn fused_compact_salience(salience: Tensor<3>) -> Result<Vec<f32>, St
     let rows = batch
         .checked_mul(frames)
         .ok_or("RMVPE fused row overflow")?;
-    if rows > (u32::MAX as usize).saturating_mul(64) {
+    let max_rows = match dispatch {
+        SalienceDispatch::Sequential => (u32::MAX as usize).saturating_mul(64),
+        #[cfg(feature = "cuda")]
+        SalienceDispatch::Plane => u32::MAX as usize,
+    };
+    if rows > max_rows {
         return Err("RMVPE fused launch grid exceeds CubeCL limits".into());
     }
     let bytes = rows
         .checked_mul(WIDTH * size_of::<f32>())
         .ok_or("RMVPE fused output size overflow")?;
     let output = cube.client.empty(bytes);
-    let cube_dim = CubeDim::new_1d(64);
-    let cube_count = CubeCount::Static(rows.div_ceil(64) as u32, 1, 1);
     unsafe {
-        fused_salience_kernel::launch_unchecked(
-            &cube.client,
-            cube_count,
-            cube_dim,
-            BufferArg::from_raw_parts(cube.handle.clone(), cube.handle.size_in_used() as usize / 4),
-            BufferArg::from_raw_parts(output.clone(), rows * WIDTH),
-            rows,
-            frames,
-            strides[0],
-            strides[1],
-            strides[2],
-        );
+        let input_arg =
+            BufferArg::from_raw_parts(cube.handle.clone(), cube.handle.size_in_used() as usize / 4);
+        let output_arg = BufferArg::from_raw_parts(output.clone(), rows * WIDTH);
+        match dispatch {
+            SalienceDispatch::Sequential => fused_salience_kernel::launch_unchecked(
+                &cube.client,
+                CubeCount::Static(rows.div_ceil(64) as u32, 1, 1),
+                CubeDim::new_1d(64),
+                input_arg,
+                output_arg,
+                rows,
+                frames,
+                strides[0],
+                strides[1],
+                strides[2],
+            ),
+            #[cfg(feature = "cuda")]
+            SalienceDispatch::Plane => plane_salience_kernel::launch_unchecked(
+                &cube.client,
+                CubeCount::Static(rows as u32, 1, 1),
+                CubeDim::new_1d(32),
+                input_arg,
+                output_arg,
+                rows,
+                frames,
+                strides[0],
+                strides[1],
+                strides[2],
+            ),
+        }
     }
     let bytes = cube
         .client
@@ -229,6 +347,111 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "cpu")]
+    fn simulated_lane_compact(values: &[f32]) -> Vec<f32> {
+        assert_eq!(values.len() % BINS, 0);
+        let mut output = Vec::with_capacity(values.len() / BINS * WIDTH);
+        for row in values.chunks_exact(BINS) {
+            let mut candidates = [(f32::NEG_INFINITY, 360usize); 32];
+            let mut has_nonfinite = false;
+            for (lane, candidate) in candidates.iter_mut().enumerate() {
+                let mut peak = row[lane];
+                let mut center = lane;
+                for bin in (lane..BINS).step_by(32).skip(1) {
+                    let value = row[bin];
+                    if value > peak {
+                        peak = value;
+                        center = bin;
+                    }
+                }
+                *candidate = (peak, center);
+            }
+            for value in row {
+                has_nonfinite |= !value.is_finite();
+            }
+            if has_nonfinite {
+                output.extend([-1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+                continue;
+            }
+            let global_peak = candidates
+                .iter()
+                .map(|(v, _)| *v)
+                .max_by(f32::total_cmp)
+                .unwrap();
+            let first_peak = candidates
+                .iter()
+                .filter(|(v, _)| *v == global_peak)
+                .map(|(_, center)| *center)
+                .min()
+                .unwrap();
+            output.push(first_peak as f32);
+            for delta in -4..=4 {
+                output.push(row[(first_peak as isize + delta).clamp(0, 359) as usize]);
+            }
+        }
+        output
+    }
+
+    #[cfg(feature = "cpu")]
+    #[test]
+    fn plane_reduction_math_matches_dense_and_sequential_kernel() {
+        let device = Device::cpu();
+        for batch in [1, 2, 4] {
+            for frames in [1, 7, 33, 70] {
+                let mut values = Vec::with_capacity(batch * frames * BINS);
+                for row in 0..batch * frames {
+                    let mut bins = (0..BINS)
+                        .map(|i| (((i * 37 + row * 19) % 359) as f32 - 180.0) / 360.0)
+                        .collect::<Vec<_>>();
+                    match row % 6 {
+                        0 => bins[0] = 2.0,
+                        1 => bins[359] = 2.0,
+                        2 => {
+                            bins[1] = 2.0;
+                            bins[5] = 2.0;
+                        }
+                        3 => bins.fill(0.0),
+                        4 => bins.fill(-f32::MAX),
+                        _ => bins[178] = 2.0,
+                    }
+                    values.extend(bins);
+                }
+                let tensor = Tensor::<3>::from_data(
+                    TensorData::new(values.clone(), [batch, frames, BINS]),
+                    &device,
+                );
+                let plane_math = simulated_lane_compact(&values);
+                let sequential = fused_compact_salience(tensor).unwrap();
+                assert_eq!(plane_math, sequential, "B={batch} T={frames}");
+                for threshold in [0.0, 0.03, 0.5, 1.0] {
+                    let dense_f0 = salience_to_f0(&values, threshold).unwrap();
+                    let plane_f0 = compact_salience_to_f0(&plane_math, threshold).unwrap();
+                    assert_eq!(
+                        dense_f0.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                        plane_f0.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                        "B={batch} T={frames} threshold={threshold}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "cpu")]
+    #[test]
+    fn plane_reduction_math_nonfinite_and_unsupported_backend() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut values = vec![0.0f32; BINS * 2];
+            values[300] = 2.0;
+            values[100] = bad;
+            let plane_math = simulated_lane_compact(&values);
+            assert_eq!(plane_math[0], -1.0);
+            assert!(compact_salience_to_f0(&plane_math, 0.03).is_err());
+        }
+        let device = Device::cpu();
+        let input = Tensor::<3>::zeros([1, 2, BINS], &device);
+        assert!(plane_compact_salience(input).is_err());
+    }
+
     #[cfg(all(feature = "flex", feature = "cpu"))]
     #[test]
     fn fused_requires_explicit_cube_backend() {
@@ -307,6 +530,8 @@ mod tests {
                 &cube_device,
             );
             let compact = fused_compact_salience(input).unwrap();
+            let plane_reference = simulated_lane_compact(&values);
+            assert_eq!(plane_reference, compact);
             for threshold in [0.0, 0.03, 0.5, 1.0] {
                 let dense_f0 = salience_to_f0(&values, threshold).unwrap();
                 let fused_f0 = compact_salience_to_f0(&compact, threshold).unwrap();
