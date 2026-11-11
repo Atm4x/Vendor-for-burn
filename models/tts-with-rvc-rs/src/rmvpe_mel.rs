@@ -3,7 +3,7 @@ use std::{f64::consts::PI, sync::Arc};
 
 use crate::{
     checkpoint::RvcCheckpoint,
-    rmvpe::{F0_BINS, salience_to_f0},
+    rmvpe::{COMPACT_F0_WIDTH, F0_BINS, compact_salience, compact_salience_to_f0, salience_to_f0},
     rmvpe_gru::RmvpeNetwork,
 };
 use burn::tensor::{Device, Tensor, TensorData};
@@ -174,15 +174,20 @@ impl RmvpeAudioModel {
         device: &Device,
         threshold: f32,
     ) -> Result<Vec<Vec<f32>>, String> {
-        let (salience, frames) = self.forward_pcm_batch(audios, device)?;
-        let values = salience
-            .into_data()
-            .try_into_vec::<f32>()
-            .map_err(|error| error.to_string())?;
-        values
-            .chunks_exact(frames * F0_BINS)
-            .map(|frame| salience_to_f0(frame, threshold))
-            .collect()
+        self.infer_f0_batch_thresholds(audios, device, &vec![threshold; audios.len()])
+    }
+
+    pub fn infer_f0_batch_thresholds(
+        &self,
+        audios: &[Vec<f32>],
+        device: &Device,
+        thresholds: &[f32],
+    ) -> Result<Vec<Vec<f32>>, String> {
+        if audios.is_empty() || audios.len() != thresholds.len() {
+            return Err("RMVPE thresholds must match the nonempty input batch".into());
+        }
+        let (salience, _frames) = self.forward_pcm_batch(audios, device)?;
+        decode_salience_batch(salience, thresholds, compact_readback_enabled())
     }
 
     pub fn forward_pcm(
@@ -208,11 +213,99 @@ impl RmvpeAudioModel {
         threshold: f32,
     ) -> Result<Vec<f32>, String> {
         let (salience, _) = self.forward_pcm(audio_16k, device)?;
+        decode_salience_batch(salience, &[threshold], compact_readback_enabled())?
+            .into_iter()
+            .next()
+            .ok_or("RMVPE returned an empty F0 batch".into())
+    }
+}
+
+/// Opt-in until RTX 4060 latency and full-route parity are verified.
+fn compact_readback_enabled() -> bool {
+    std::env::var_os("RVC_RMVPE_COMPACT_READBACK").is_some_and(|value| value == "1")
+}
+
+fn decode_salience_batch(
+    salience: Tensor<3>,
+    thresholds: &[f32],
+    compact: bool,
+) -> Result<Vec<Vec<f32>>, String> {
+    let [batch, frames, bins] = salience.dims();
+    if batch != thresholds.len() || bins != F0_BINS || frames == 0 {
+        return Err("RMVPE salience/threshold shapes do not match".into());
+    }
+    if compact {
+        let values = compact_salience(salience)
+            .into_data()
+            .try_into_vec::<f32>()
+            .map_err(|error| error.to_string())?;
+        if std::env::var_os("RVC_PROFILE").is_some() {
+            eprintln!(
+                "profile rmvpe_f0_readback compact B={batch} frames={frames} host_bytes={}",
+                values.len() * 4
+            );
+        }
+        values
+            .chunks_exact(frames * COMPACT_F0_WIDTH)
+            .zip(thresholds)
+            .map(|(row, &threshold)| compact_salience_to_f0(row, threshold))
+            .collect()
+    } else {
         let values = salience
             .into_data()
             .try_into_vec::<f32>()
             .map_err(|error| error.to_string())?;
-        salience_to_f0(&values, threshold)
+        if std::env::var_os("RVC_PROFILE").is_some() {
+            eprintln!(
+                "profile rmvpe_f0_readback dense B={batch} frames={frames} host_bytes={}",
+                values.len() * 4
+            );
+        }
+        values
+            .chunks_exact(frames * F0_BINS)
+            .zip(thresholds)
+            .map(|(row, &threshold)| salience_to_f0(row, threshold))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod readback_tests {
+    use super::*;
+
+    #[test]
+    fn mixed_thresholds_and_batches_agree_exactly_between_transfer_modes() {
+        let device = Device::flex();
+        let batch = 4;
+        let frames = 17;
+        let mut values = vec![0.0f32; batch * frames * F0_BINS];
+        for row in 0..batch * frames {
+            let center = [0, 359, 4, 355, 179, 300, 12][row % 7];
+            for bin in 0..F0_BINS {
+                values[row * F0_BINS + bin] = if bin == center {
+                    0.9
+                } else {
+                    0.1 + (bin % 7) as f32 / 1000.0
+                };
+            }
+        }
+        let thresholds = [0.03, 0.7, 0.9, 0.99];
+        let input = || {
+            Tensor::<3>::from_data(
+                TensorData::new(values.clone(), [batch, frames, F0_BINS]),
+                &device,
+            )
+        };
+        let dense = decode_salience_batch(input(), &thresholds, false).unwrap();
+        let compact = decode_salience_batch(input(), &thresholds, true).unwrap();
+        assert_eq!(dense.len(), batch);
+        for (full, small) in dense.iter().zip(compact.iter()) {
+            assert!(
+                full.iter()
+                    .zip(small)
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+            );
+        }
     }
 }
 

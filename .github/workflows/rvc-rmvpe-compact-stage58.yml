@@ -1,0 +1,80 @@
+name: RVC Stage58 RMVPE compact readback Windows CUDA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - experiment/conv-kernel-rnd-stage33-20261110
+    paths:
+      - 'models/tts-with-rvc-rs/src/rmvpe.rs'
+      - 'models/tts-with-rvc-rs/src/rmvpe_mel.rs'
+      - 'models/tts-with-rvc-rs/src/rvc_inference.rs'
+      - 'research/stage37-windows-gpu-bench/windows/Run-RVC-RMVPE-Compact-Stage58.ps1'
+      - '.github/workflows/rvc-rmvpe-compact-stage58.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  native-stage58:
+    runs-on: windows-latest
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cache/tracel
+          key: rvc-stage58-${{ hashFiles('Cargo.lock') }}
+      - name: Restore vendored checksums
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Vendored checksum restore failed' }
+      - name: Validate PowerShell runner syntax before packaging
+        shell: pwsh
+        run: |
+          $runner = 'research/stage37-windows-gpu-bench/windows/Run-RVC-RMVPE-Compact-Stage58.ps1'
+          $tokens = $null
+          $parseErrors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $runner).Path, [ref]$tokens, [ref]$parseErrors)
+          if ($parseErrors.Count -gt 0) {
+            $parseErrors | Format-List | Out-String | Write-Host
+            throw "Stage58 runner parse errors: $($parseErrors.Count)"
+          }
+      - name: Build native RVC CPU+CUDA executable
+        shell: pwsh
+        run: |
+          cargo build --release --locked --offline -p tts-with-rvc-rs --features cuda --bin tts-with-rvc-rs
+          if ($LASTEXITCODE -ne 0) { throw 'RVC CUDA compilation failed' }
+          cargo test --locked --offline -p tts-with-rvc-rs --features cuda --bin tts-with-rvc-rs
+          if ($LASTEXITCODE -ne 0) { throw 'RVC CLI tests failed' }
+      - name: Stage58 smoke and package
+        shell: pwsh
+        run: |
+          $exe = 'target/release/tts-with-rvc-rs.exe'
+          & $exe --help
+          if ($LASTEXITCODE -ne 0) { throw 'RVC help failed' }
+          New-Item -ItemType Directory -Force -Path dist/rvc-stage58 | Out-Null
+          Copy-Item $exe dist/rvc-stage58/
+          Copy-Item research/stage37-windows-gpu-bench/windows/Run-RVC-RMVPE-Compact-Stage58.ps1 dist/rvc-stage58/
+          @'
+          Stage58: experimental compact RMVPE salience readback vs dense baseline.
+          Native Rust/CUDA RVC. Use your own private model files and WAV locally.
+          This is NOT a claim of CUDA speedup; compare full WAV SHA and per-stage times.
+          Runner: Run-RVC-RMVPE-Compact-Stage58.ps1 -Voice PATH -Hubert PATH -Rmvpe PATH -Index PATH -InputWav PATH -Duration 0.7 -Device cuda
+          Output: RVC_STAGE58_RMVPE_COMPACT_RESULTS.zip. Does not require Python.
+          '@ | Set-Content dist/rvc-stage58/README.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rvc-stage58-rmvpe-compact-windows-x64
+          path: dist/rvc-stage58/
+          retention-days: 14
+          if-no-files-found: warn

@@ -152,11 +152,16 @@ impl RvcV2Inferencer {
             config,
             batch_size,
             |segments, indices| {
-                let settings: Vec<_> = indices.iter().map(|&i| {
-                    let mut settings = options.clone();
-                    settings.seed = options.seed.wrapping_add((i as u64).wrapping_mul(0x9e3779b97f4a7c15));
-                    settings
-                }).collect();
+                let settings: Vec<_> = indices
+                    .iter()
+                    .map(|&i| {
+                        let mut settings = options.clone();
+                        settings.seed = options
+                            .seed
+                            .wrapping_add((i as u64).wrapping_mul(0x9e3779b97f4a7c15));
+                        settings
+                    })
+                    .collect();
                 self.infer_16khz_batch(segments, &settings)
             },
             progress,
@@ -165,19 +170,29 @@ impl RvcV2Inferencer {
 
     pub fn infer_16khz(&self, pcm: &[f32], options: &InferenceOptions) -> Result<Vec<f32>, String> {
         self.infer_16khz_batch(&[pcm.to_vec()], std::slice::from_ref(options))?
-            .into_iter().next().ok_or("empty RVC inference result".into())
+            .into_iter()
+            .next()
+            .ok_or("empty RVC inference result".into())
     }
 
-    pub fn infer_16khz_batch(&self, audios: &[Vec<f32>], options: &[InferenceOptions]) -> Result<Vec<Vec<f32>>, String> {
+    pub fn infer_16khz_batch(
+        &self,
+        audios: &[Vec<f32>],
+        options: &[InferenceOptions],
+    ) -> Result<Vec<Vec<f32>>, String> {
         let batch = audios.len();
         if batch == 0 || batch != options.len() || batch > 32 {
             return Err("RVC batch inputs/options must match and size must be 1..=32".into());
         }
         let audio_len = audios[0].len();
-        if !(3_200..=160_000).contains(&audio_len) || audios.iter().any(|pcm| {
-            pcm.len() != audio_len || pcm.iter().any(|v| !v.is_finite())
-        }) {
-            return Err("RVC tensor batching requires 0.2–10 s equal-length finite 16-kHz PCM".into());
+        if !(3_200..=160_000).contains(&audio_len)
+            || audios
+                .iter()
+                .any(|pcm| pcm.len() != audio_len || pcm.iter().any(|v| !v.is_finite()))
+        {
+            return Err(
+                "RVC tensor batching requires 0.2–10 s equal-length finite 16-kHz PCM".into(),
+            );
         }
         for setting in options {
             if setting.speaker_id >= self.speaker_count {
@@ -195,35 +210,53 @@ impl RvcV2Inferencer {
         let profile = std::env::var_os("RVC_PROFILE").is_some();
         let mut phase = std::time::Instant::now();
         let samples: Vec<f32> = audios.iter().flat_map(|pcm| pcm.iter().copied()).collect();
-        let waveform = Tensor::from_data(TensorData::new(samples, [batch, 1, audio_len]), &self.device);
+        let waveform = Tensor::from_data(
+            TensorData::new(samples, [batch, 1, audio_len]),
+            &self.device,
+        );
         let content = self.hubert.forward(waveform, None);
         let [result_batch, content_time, channels] = content.dims();
         if result_batch != batch || channels != CONTENT_CHANNELS {
-            return Err(format!("HuBERT expected [{batch}, T, {CONTENT_CHANNELS}], got {:?}", content.dims()));
+            return Err(format!(
+                "HuBERT expected [{batch}, T, {CONTENT_CHANNELS}], got {:?}",
+                content.dims()
+            ));
         }
         let retrieval_enabled = options.iter().any(|setting| setting.index_rate > 0.0);
         let raw = if retrieval_enabled {
-            Some(content.clone().into_data().try_into_vec::<f32>().map_err(|e| e.to_string())?)
+            Some(
+                content
+                    .clone()
+                    .into_data()
+                    .try_into_vec::<f32>()
+                    .map_err(|e| e.to_string())?,
+            )
         } else {
             None
         };
         if profile {
-            eprintln!("profile hubert B={batch} {:.3}s, host_content_bytes={}",
+            eprintln!(
+                "profile hubert B={batch} {:.3}s, host_content_bytes={}",
                 phase.elapsed().as_secs_f64(),
-                if retrieval_enabled { batch * content_time * channels * std::mem::size_of::<f32>() } else { 0 });
+                if retrieval_enabled {
+                    batch * content_time * channels * std::mem::size_of::<f32>()
+                } else {
+                    0
+                }
+            );
             phase = std::time::Instant::now();
         }
-        let thresholds_uniform = options.iter().all(|x| x.rmvpe_threshold == options[0].rmvpe_threshold);
-        let mut f0_batch = if thresholds_uniform {
-            self.rmvpe.infer_f0_batch(audios, &self.device, options[0].rmvpe_threshold)?
-        } else {
-            let (salience, frames) = self.rmvpe.forward_pcm_batch(audios, &self.device)?;
-            let values = salience.into_data().try_into_vec::<f32>().map_err(|e| e.to_string())?;
-            values.chunks_exact(frames * crate::rmvpe::F0_BINS).zip(options)
-                .map(|(row, opts)| crate::rmvpe::salience_to_f0(row, opts.rmvpe_threshold))
-                .collect::<Result<Vec<_>,_>>()?
-        };
-        if profile { eprintln!("profile rmvpe B={batch} {:.3}s", phase.elapsed().as_secs_f64()); phase = std::time::Instant::now(); }
+        let thresholds: Vec<f32> = options.iter().map(|x| x.rmvpe_threshold).collect();
+        let mut f0_batch =
+            self.rmvpe
+                .infer_f0_batch_thresholds(audios, &self.device, &thresholds)?;
+        if profile {
+            eprintln!(
+                "profile rmvpe B={batch} {:.3}s",
+                phase.elapsed().as_secs_f64()
+            );
+            phase = std::time::Instant::now();
+        }
         let frames = (content_time * 2).min(f0_batch[0].len());
         if frames == 0 || f0_batch.iter().any(|row| row.len() < frames) {
             return Err("HuBERT/RMVPE returned no aligned frames".into());
@@ -239,7 +272,10 @@ impl RvcV2Inferencer {
                 let original = &raw[b * content_time * channels..(b + 1) * content_time * channels];
                 let mut retrieved = original.to_vec();
                 if opts.index_rate > 0.0 {
-                    let index = self.index.as_ref().ok_or("FAISS retrieval requested but no index was loaded")?;
+                    let index = self
+                        .index
+                        .as_ref()
+                        .ok_or("FAISS retrieval requested but no index was loaded")?;
                     index.blend_features(&mut retrieved, opts.index_rate)?;
                 }
                 for (frame, value) in f0.iter_mut().enumerate() {
@@ -248,7 +284,8 @@ impl RvcV2Inferencer {
                     if opts.index_rate > 0.0 && opts.protect < 0.5 && *value < 1.0 {
                         let source = &original[frame_src..frame_src + channels];
                         for (&retrieved, &raw) in data.iter().zip(source) {
-                            all_features.push(retrieved * opts.protect + raw * (1.0 - opts.protect));
+                            all_features
+                                .push(retrieved * opts.protect + raw * (1.0 - opts.protect));
                         }
                     } else {
                         all_features.extend_from_slice(data);
@@ -264,51 +301,109 @@ impl RvcV2Inferencer {
             all_f0.extend(f0.iter().copied());
             random_sources.push(Gaussian::new(opts.seed));
         }
-        if profile { eprintln!("profile retrieval B={batch} {:.3}s", phase.elapsed().as_secs_f64()); phase = std::time::Instant::now(); }
+        if profile {
+            eprintln!(
+                "profile retrieval B={batch} {:.3}s",
+                phase.elapsed().as_secs_f64()
+            );
+            phase = std::time::Instant::now();
+        }
         let phone = if retrieval_enabled {
-            Tensor::from_data(TensorData::new(all_features, [batch, frames, channels]), &self.device)
+            Tensor::from_data(
+                TensorData::new(all_features, [batch, frames, channels]),
+                &self.device,
+            )
         } else {
             upsample_without_retrieval(content, frames)
         };
-        let pitch_tensor = Tensor::<2, Int>::from_data(TensorData::new(all_pitch, [batch, frames]), &self.device);
-        let encoded = self.encoder.forward(phone, Some(pitch_tensor), &vec![frames; batch], None);
-        if profile { eprintln!("profile encoder B={batch} {:.3}s", phase.elapsed().as_secs_f64()); phase = std::time::Instant::now(); }
+        let pitch_tensor =
+            Tensor::<2, Int>::from_data(TensorData::new(all_pitch, [batch, frames]), &self.device);
+        let encoded = self
+            .encoder
+            .forward(phone, Some(pitch_tensor), &vec![frames; batch], None);
+        if profile {
+            eprintln!(
+                "profile encoder B={batch} {:.3}s",
+                phase.elapsed().as_secs_f64()
+            );
+            phase = std::time::Instant::now();
+        }
         let [_, latent_channels, latent_frames] = encoded.mean.dims();
         let mut noise = Vec::with_capacity(batch * latent_channels * latent_frames);
         for (random, setting) in random_sources.iter_mut().zip(options) {
-            noise.extend((0..latent_channels * latent_frames).map(|_| random.sample() * setting.latent_noise_scale));
+            noise.extend(
+                (0..latent_channels * latent_frames)
+                    .map(|_| random.sample() * setting.latent_noise_scale),
+            );
         }
         let latent_noise = Tensor::from_data(
-            TensorData::new(noise, [batch, latent_channels, latent_frames]), &self.device);
+            TensorData::new(noise, [batch, latent_channels, latent_frames]),
+            &self.device,
+        );
         let latent = (encoded.mean + encoded.log_scale.exp() * latent_noise) * encoded.mask.clone();
         let mut speaker_embeddings = Vec::with_capacity(batch * self.speaker_channels);
         for setting in options {
             let start = setting.speaker_id * self.speaker_channels;
-            speaker_embeddings.extend_from_slice(&self.speaker_embeddings[start..start + self.speaker_channels]);
+            speaker_embeddings
+                .extend_from_slice(&self.speaker_embeddings[start..start + self.speaker_channels]);
         }
-        let speaker = Tensor::from_data(TensorData::new(speaker_embeddings, [batch, self.speaker_channels, 1]), &self.device);
-        let latent = self.flow.forward(latent, encoded.mask, Some(speaker.clone()), true);
-        if profile { eprintln!("profile flow B={batch} {:.3}s", phase.elapsed().as_secs_f64()); phase = std::time::Instant::now(); }
+        let speaker = Tensor::from_data(
+            TensorData::new(speaker_embeddings, [batch, self.speaker_channels, 1]),
+            &self.device,
+        );
+        let latent = self
+            .flow
+            .forward(latent, encoded.mask, Some(speaker.clone()), true);
+        if profile {
+            eprintln!(
+                "profile flow B={batch} {:.3}s",
+                phase.elapsed().as_secs_f64()
+            );
+            phase = std::time::Instant::now();
+        }
         let initial_phase = Tensor::zeros([1, 1, 1], &self.device);
         let mut gaussian_noise = Vec::with_capacity(batch * frames * RVC_HOP);
         for random in &mut random_sources {
             gaussian_noise.extend((0..frames * RVC_HOP).map(|_| random.sample()));
         }
-        let sine_noise = Tensor::from_data(TensorData::new(gaussian_noise, [batch, frames * RVC_HOP, 1]), &self.device);
+        let sine_noise = Tensor::from_data(
+            TensorData::new(gaussian_noise, [batch, frames * RVC_HOP, 1]),
+            &self.device,
+        );
         let f0_tensor = Tensor::from_data(TensorData::new(all_f0, [batch, frames]), &self.device);
-        let output = self.decoder.forward_from_f0(latent, f0_tensor, Some(speaker), &self.source, initial_phase, sine_noise)?;
+        let output = self.decoder.forward_from_f0(
+            latent,
+            f0_tensor,
+            Some(speaker),
+            &self.source,
+            initial_phase,
+            sine_noise,
+        )?;
         let [wave_batch, channel_count, sample_count] = output.dims();
         if wave_batch != batch || channel_count != 1 {
-            return Err(format!("NSF decoder returned invalid batch shape {:?}", output.dims()));
+            return Err(format!(
+                "NSF decoder returned invalid batch shape {:?}",
+                output.dims()
+            ));
         }
-        let samples = output.into_data().try_into_vec::<f32>().map_err(|e| e.to_string())?;
-        if profile { eprintln!("profile nsf B={batch} {:.3}s", phase.elapsed().as_secs_f64()); }
+        let samples = output
+            .into_data()
+            .try_into_vec::<f32>()
+            .map_err(|e| e.to_string())?;
+        if profile {
+            eprintln!(
+                "profile nsf B={batch} {:.3}s",
+                phase.elapsed().as_secs_f64()
+            );
+        }
         if samples.iter().any(|x| !x.is_finite()) {
             return Err("RVC generated non-finite waveform".into());
         }
-        Ok(samples.chunks_exact(sample_count).map(|row| row.to_vec()).collect())
+        Ok(samples
+            .chunks_exact(sample_count)
+            .map(|row| row.to_vec())
+            .collect())
     }
-
 }
 
 fn coarse_f0(values: &[f32]) -> Vec<i64> {
