@@ -20,6 +20,46 @@ fn run() -> Result<(), String> {
         }
         return Ok(());
     }
+    if command == "inspect-assets" {
+        use tts_with_rvc_rs::{checkpoint::RvcCheckpoint, faiss_index::IvfFlatIndex};
+        let voice_path = args.next().ok_or("missing voice .pth")?;
+        let hubert_path = args.next().ok_or("missing HuBERT .pt")?;
+        let rmvpe_path = args.next().ok_or("missing RMVPE .pt")?;
+        let index_path = args.next().unwrap_or_else(|| "-".to_owned());
+        if args.next().is_some() {
+            return Err("inspect-assets accepts voice.pth hubert.pt rmvpe.pt [index|-]".into());
+        }
+        let voice = RvcCheckpoint::open(&voice_path)?;
+        let (speaker_shape, _) = voice.tensor_f32("emb_g.weight")?;
+        let phone = voice.tensor_f32("enc_p.emb_phone.weight")?.0;
+        if speaker_shape.len() != 2 || phone.len() != 2 || phone[1] != 768 {
+            return Err("unsupported RVC voice, expected v2 768-channel content".into());
+        }
+        let hubert = RvcCheckpoint::open_model(&hubert_path)?;
+        let hubert_first = hubert.tensor_f32("feature_extractor.conv_layers.0.0.weight")?.0;
+        let rmvpe = RvcCheckpoint::open_root(&rmvpe_path)?;
+        let rmvpe_first = rmvpe.tensor_f32("unet.encoder.layers.0.conv.0.conv.0.weight")?.0;
+        let index = if index_path == "-" { None } else { Some(IvfFlatIndex::open(index_path)?) };
+        if let Some(index) = &index {
+            if index.dimension() != 768 {
+                return Err(format!("RVC v2 expects 768-dim index, found {}", index.dimension()));
+            }
+        }
+        println!("{}", serde_json::json!({
+            "voice_tensors": voice.tensor_count(),
+            "voice_speakers": speaker_shape[0],
+            "content_channels": phone[1],
+            "hubert_tensors": hubert.tensor_count(),
+            "hubert_first_conv_shape": hubert_first,
+            "rmvpe_tensors": rmvpe.tensor_count(),
+            "rmvpe_first_conv_shape": rmvpe_first,
+            "faiss": index.map(|index| serde_json::json!({
+                "dimension": index.dimension(), "vectors": index.len(),
+                "nlist": index.nlist(), "nprobe": index.nprobe(),
+            })),
+        }));
+        return Ok(());
+    }
     if command == "infer-wav-segment" {
         use tts_with_rvc_rs::{audio_io, rvc_inference::{InferenceOptions, RvcV2Inferencer}};
         let voice = args.next().ok_or("missing RVC .pth")?;
@@ -38,9 +78,6 @@ fn run() -> Result<(), String> {
         let end = (((start + duration) * wave.sample_rate as f64) as usize).min(wave.samples.len());
         if begin >= end { return Err("specified WAV segment is outside the file".into()); }
         let input = audio_io::resample(&wave.samples[begin..end], wave.sample_rate, 16_000)?;
-        let device = Device::flex();
-        let inferencer = RvcV2Inferencer::load(&voice, &hubert, &rmvpe,
-            (index != "-").then_some(index.as_str()), device)?;
         let mut options = InferenceOptions::default();
         if index == "-" { options.index_rate = 0.0; }
         if let Some(rate) = args.next() {
@@ -49,6 +86,11 @@ fn run() -> Result<(), String> {
         if let Some(shift) = args.next() {
             options.pitch_shift_semitones = shift.parse().map_err(|e| format!("invalid pitch shift: {e}"))?;
         }
+        let backend = args.next().unwrap_or_else(|| "cpu".to_owned());
+        if args.next().is_some() { return Err("too many segment arguments".into()); }
+        let device = user_cli::selected_device(&backend)?;
+        let inferencer = RvcV2Inferencer::load(&voice, &hubert, &rmvpe,
+            (index != "-").then_some(index.as_str()), device)?;
 
         let filtered = tts_with_rvc_rs::preprocess::highpass_48hz_zero_phase(&input)?;
         let converted = inferencer.infer_16khz(&filtered, &options)?;
@@ -113,9 +155,6 @@ fn run() -> Result<(), String> {
         if !(1..=32).contains(&tensor_batch_size) {
             return Err("tensor batch size must be 1..=32".into());
         }
-        if args.next().is_some() {
-            return Err("too many inference parameters".into());
-        }
         config.validate()?;
         let mut outputs = std::collections::HashSet::new();
         let inputs: std::collections::HashSet<_> =
@@ -131,7 +170,8 @@ fn run() -> Result<(), String> {
                 );
             }
         }
-        let device = Device::flex();
+        let backend = args.next().unwrap_or_else(|| "cpu".to_owned());
+        let device = user_cli::selected_device(&backend)?;
         let inferencer = RvcV2Inferencer::load(
             &voice,
             &hubert,

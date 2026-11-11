@@ -1,3 +1,4 @@
+mod conv1d_layout;
 use burn::tensor::{Int, Tensor, TensorData, activation, module};
 use burn::tensor::Device;
 use serde::Deserialize;

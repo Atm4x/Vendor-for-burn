@@ -1,0 +1,71 @@
+name: RVC Stage54 native full pipeline Windows CUDA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - experiment/conv-kernel-rnd-stage33-20261110
+    paths:
+      - 'models/tts-with-rvc-rs/src/**'
+      - 'models/tts-with-rvc-rs/Cargo.toml'
+      - 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage54.ps1'
+      - '.github/workflows/rvc-native-full-cuda-stage54.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  windows-native-rvc:
+    runs-on: windows-latest
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cache/tracel
+          key: rvc-stage54-native-${{ hashFiles('Cargo.lock') }}
+      - name: Restore vendored source checksums
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Vendored checksum restore failed' }
+      - name: Build full native RVC with CPU and CUDA
+        shell: pwsh
+        run: |
+          cargo build --release --locked --offline -p tts-with-rvc-rs --features cuda --bin tts-with-rvc-rs
+          if ($LASTEXITCODE -ne 0) { throw 'Full native RVC CUDA build failed' }
+          cargo test --locked --offline -p tts-with-rvc-rs --features cuda --bin tts-with-rvc-rs
+          if ($LASTEXITCODE -ne 0) { throw 'Native RVC CLI tests failed' }
+      - name: Smoke test and package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = 'target/release/tts-with-rvc-rs.exe'
+          & $exe --help
+          if ($LASTEXITCODE -ne 0) { throw 'Help check failed' }
+          & $exe doctor
+          if ($LASTEXITCODE -ne 0) { throw 'Doctor check failed' }
+          New-Item -ItemType Directory -Force -Path dist/rvc-stage54 | Out-Null
+          Copy-Item $exe dist/rvc-stage54/
+          Copy-Item research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage54.ps1 dist/rvc-stage54/
+          @'
+          Native RVC Stage54: full pipeline HuBERT -> RMVPE -> IVF Flat -> TextEncoder -> Flow -> NSF.
+          Built with both CPU/Flex and CUDA backends. Python and PyTorch are not required.
+          Place private .pth/.pt/.index/WAV files outside the extracted archive.
+          Run: powershell -ExecutionPolicy Bypass -File .\Run-RVC-Full-Stage54.ps1 -Voice "C:\models\CrazyMita.pth" -Hubert "C:\models\hubert_base.pt" -Rmvpe "C:\models\rmvpe.pt" -Index "C:\models\CrazyMita.index" -InputWav "C:\audio\MitaKind.wav" -Duration 2
+          Outputs: converted 40k WAV and stage54_results.json; GPU runtime execution is not validated by GitHub Actions.
+          '@ | Set-Content dist/rvc-stage54/README.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rvc-stage54-native-full-cuda-windows-x64
+          path: dist/rvc-stage54/
+          retention-days: 14
+          if-no-files-found: warn

@@ -1,3 +1,4 @@
+use rayon::prelude::*;
 use std::{
     cmp::Ordering,
     fs::File,
@@ -189,11 +190,21 @@ impl IvfFlatIndex {
         if index_rate == 0.0 {
             return Ok(());
         }
+        let rows = features.len() / self.dimension;
+        if rows >= 32 {
+            features.par_chunks_exact_mut(self.dimension)
+                .try_for_each(|query| self.blend_row(query, index_rate))
+        } else {
+            features.chunks_exact_mut(self.dimension)
+                .try_for_each(|query| self.blend_row(query, index_rate))
+        }
+    }
+
+    fn blend_row(&self, query: &mut [f32], index_rate: f32) -> Result<(), String> {
         let mut average = vec![0.0f32; self.dimension];
-        for query in features.chunks_exact_mut(self.dimension) {
             let neighbors = self.search(query, 8)?;
             if neighbors.len() != 8 {
-                continue;
+                return Ok(());
             }
             let zeros: Vec<_> = neighbors
                 .iter()
@@ -233,7 +244,6 @@ impl IvfFlatIndex {
             for (x, retrieved) in query.iter_mut().zip(average.iter()) {
                 *x = *x * (1.0 - index_rate) + retrieved * index_rate;
             }
-        }
         Ok(())
     }
 }
@@ -389,6 +399,18 @@ mod tests {
         assert_eq!(query, [3.4, 0.0]);
         index.blend_features(&mut query, 0.5).unwrap();
         assert!(query[0] > 3.0 && query[0] < 3.5);
+    }
+
+    #[test]
+    fn parallel_blend_matches_sequential_for_many_frames() {
+        let index = IvfFlatIndex::read(build_fixture().as_slice()).unwrap();
+        let mut serial = (0..64).flat_map(|i| [i as f32 / 20.0, 0.0]).collect::<Vec<_>>();
+        let mut parallel = serial.clone();
+        for row in serial.chunks_exact_mut(index.dimension()) {
+            index.blend_row(row, 0.75).unwrap();
+        }
+        index.blend_features(&mut parallel, 0.75).unwrap();
+        assert_eq!(serial, parallel);
     }
 
     #[test]

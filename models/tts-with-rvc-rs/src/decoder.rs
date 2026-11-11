@@ -3,31 +3,13 @@ use serde::Deserialize;
 use rayon::prelude::*;
 use std::time::Instant;
 
-use crate::checkpoint::RvcCheckpoint;
+use crate::{checkpoint::RvcCheckpoint, conv1d_layout::{Conv1dWeightLayout, default_conv1d_layout, load_conv1d_weight}};
 use crate::nsf_source::SourceModuleHnNSF;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResidualExecution {
     Sequential,
     Parallel,
-}
-
-fn prepack_conv1d_weight(weight: Tensor<3>, device: &Device) -> Tensor<3> {
-    let [out_channels, in_channels, kernel] = weight.dims();
-    let original = weight.into_data().try_into_vec::<f32>().expect("conv weight must be FP32");
-    let mut packed = vec![0.0f32; original.len()];
-    for out in 0..out_channels {
-        for channel in 0..in_channels {
-            for k in 0..kernel {
-                packed[(out * kernel + k) * in_channels + channel] =
-                    original[(out * in_channels + channel) * kernel + k];
-            }
-        }
-    }
-    Tensor::from_data(
-        TensorData::new(packed, [out_channels, kernel, in_channels]),
-        device,
-    ).swap_dims(1, 2)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,20 +35,6 @@ pub struct NsfProfileStep {
     pub milliseconds: f64,
 }
 
-fn prepack_conv1d_weight_for_temporal(weight: Tensor<3>, device: &Device) -> Tensor<3> {
-    let [cout, cin, kernel] = weight.dims();
-    let original = weight.into_data().try_into_vec::<f32>().expect("Conv1d weight must be FP32");
-    let mut packed = vec![0.0f32; original.len()];
-    for oc in 0..cout {
-        for ci in 0..cin {
-            for k in 0..kernel {
-                packed[(k * cin + ci) * cout + oc] = original[(oc * cin + ci) * kernel + k];
-            }
-        }
-    }
-    Tensor::from_data(TensorData::new(packed, [kernel, cin, cout]), device).swap_dims(0, 2)
-}
-
 struct Conv1d {
     weight: Tensor<3>,
     bias: Option<Tensor<1>>,
@@ -80,19 +48,14 @@ impl Conv1d {
         if stride == 0 || dilation == 0 {
             return Err(format!("{prefix}: stride/dilation must be positive"));
         }
-        let weight = if checkpoint.contains(&format!("{prefix}.weight_v")) {
-            checkpoint.weight_norm_conv1d(prefix, device)?
-        } else {
-            checkpoint.tensor::<3>(&format!("{prefix}.weight"), device)?
-        };
+        let normalized = checkpoint.contains(&format!("{prefix}.weight_v"));
         let kernel_mode = std::env::var("RVC_NSF_CONV_KERNEL").unwrap_or_default();
-        let weight = if matches!(kernel_mode.as_str(), "packed" | "quad" | "quad_interior") {
-            prepack_conv1d_weight_for_temporal(weight, device)
-        } else if std::env::var_os("RVC_CONV_WEIGHT_PREPACK").is_some() {
-            prepack_conv1d_weight(weight, device)
+        let layout = if matches!(kernel_mode.as_str(), "packed" | "quad" | "quad_interior") {
+            Conv1dWeightLayout::Temporal
         } else {
-            weight
+            default_conv1d_layout()
         };
+        let weight = load_conv1d_weight(checkpoint, prefix, normalized, layout, device)?;
         let bias = checkpoint.contains(&format!("{prefix}.bias"))
             .then(|| checkpoint.tensor::<1>(&format!("{prefix}.bias"), device))
             .transpose()?;
