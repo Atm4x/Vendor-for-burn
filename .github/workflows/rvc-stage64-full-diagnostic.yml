@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - experiment/conv-kernel-rnd-stage33-20261110
+      - ci/stage64-diagnostic-artifact-retry-20261112
     paths:
       - 'models/tts-with-rvc-rs/src/diagnostic.rs'
       - 'models/tts-with-rvc-rs/src/rvc_inference.rs'
