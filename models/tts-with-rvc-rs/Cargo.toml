@@ -13,7 +13,7 @@ cuda = ["burn/cuda"]
 wgpu = ["burn/wgpu"]
 
 [dependencies]
-burn = { version = "=0.22.1", default-features = false, features = ["std"] }
+burn = { version = "=0.22.1", default-features = false, features = ["std", "extension", "cubecl"] }
 burn-flex = { version = "=0.22.1", default-features = false, features = ["std", "simd", "rayon"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
