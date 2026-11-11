@@ -9,12 +9,8 @@ use burn::cubecl::{bytes::Bytes, client::Client, server::Handle};
 use burn::tensor::{DType, Device, Tensor};
 use burn_cubecl::tensor::CubeTensor;
 
-#[cfg(feature = "cuda")]
-type CubeBackend = burn::backend::Cuda;
-#[cfg(all(not(feature = "cuda"), feature = "cpu"))]
-type CubeBackend = burn::backend::Cpu;
-#[cfg(all(not(feature = "cuda"), not(feature = "cpu"), feature = "wgpu"))]
-type CubeBackend = burn::backend::Wgpu;
+// All CubeCL runtimes share this primitive type; the device selects the runtime.
+type CubeBackend = burn_cubecl::Cube;
 
 const K: usize = 8;
 const WORKGROUP: u32 = 64;
@@ -159,20 +155,28 @@ fn rank_kernel(
                 picked[target + rank] = (begin + best_slot as usize) as u32;
             }
             let mut zeros = 0_u32;
-            let mut sum = 0.0_f32;
+            let mut smallest = distances[row * max_list + (picked[target] as usize - begin)];
             for rank in 0..8 {
                 let loc = picked[target + rank] as usize - begin;
                 let dist = distances[row * max_list + loc];
                 if dist == 0.0_f32 {
                     zeros += 1;
-                } else {
+                } else if dist < smallest {
+                    smallest = dist;
+                }
+            }
+            let mut sum = 0.0_f32;
+            if zeros == 0 {
+                for rank in 0..8 {
+                    let loc = picked[target + rank] as usize - begin;
+                    let dist = distances[row * max_list + loc];
                     let safe = if dist < f32::MIN_POSITIVE {
                         f32::MIN_POSITIVE
                     } else {
                         dist
                     };
-                    let raw = 1.0_f32 / (safe * safe);
-                    sum += raw;
+                    let ratio = smallest / safe;
+                    sum += ratio * ratio;
                 }
             }
             for rank in 0..8 {
@@ -190,11 +194,8 @@ fn rank_kernel(
                     } else {
                         dist
                     };
-                    weights[target + rank] = if !(sum > 0.0_f32 && sum <= f32::MAX) {
-                        f32::NAN
-                    } else {
-                        (1.0_f32 / (safe * safe)) / sum
-                    };
+                    let ratio = smallest / safe;
+                    weights[target + rank] = (ratio * ratio) / sum;
                 }
             }
         }

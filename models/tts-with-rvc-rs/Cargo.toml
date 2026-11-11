@@ -6,7 +6,7 @@ edition = "2024"
 rust-version = "1.98"
 
 [features]
-default = ["cpu"]
+default = ["cpu", "cuda", "wgpu"]
 flex = ["burn/flex", "dep:burn-flex"]
 cpu = ["burn/cpu"]
 cuda = ["burn/cuda"]

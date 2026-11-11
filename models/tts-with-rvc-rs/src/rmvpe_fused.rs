@@ -2,12 +2,7 @@ use burn::cubecl;
 use burn::cubecl::prelude::*;
 use burn::tensor::{DType, Tensor};
 
-#[cfg(feature = "cuda")]
-type CubeBackend = burn::backend::Cuda;
-#[cfg(all(not(feature = "cuda"), feature = "cpu"))]
-type CubeBackend = burn::backend::Cpu;
-#[cfg(all(not(feature = "cuda"), not(feature = "cpu"), feature = "wgpu"))]
-type CubeBackend = burn::backend::Wgpu;
+type CubeBackend = burn_cubecl::Cube;
 
 const BINS: usize = 360;
 const WIDTH: usize = 10;

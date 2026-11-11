@@ -168,6 +168,25 @@ impl RmvpeAudioModel {
         Ok((result.slice([0..batch, 0..frames, 0..F0_BINS]), frames))
     }
 
+    /// Experimental GPU-resident FP32 F0; no host salience readback.
+    #[cfg(any(feature = "cuda", feature = "cpu", feature = "wgpu"))]
+    pub fn infer_f0_batch_resident(
+        &self,
+        audios: &[Vec<f32>],
+        device: &Device,
+        thresholds: &[f32],
+    ) -> Result<Tensor<2>, String> {
+        if audios.is_empty() || audios.len() != thresholds.len() {
+            return Err("RMVPE thresholds must match input batch".into());
+        }
+        let (salience, _) = self.forward_pcm_batch(audios, device)?;
+        let output = crate::rmvpe_gpu_f0::resident_f0(salience, thresholds)?;
+        if std::env::var_os("RVC_PROFILE").is_some() {
+            eprintln!("profile rmvpe_f0_readback gpu_resident B={} frames={} host_bytes=0", audios.len(), output.dims()[1]);
+        }
+        Ok(output)
+    }
+
     pub fn infer_f0_batch(
         &self,
         audios: &[Vec<f32>],
@@ -322,7 +341,7 @@ mod readback_tests {
 
     #[test]
     fn mixed_thresholds_and_batches_agree_exactly_between_transfer_modes() {
-        let device = Device::flex();
+        let device = Device::cpu();
         let batch = 4;
         let frames = 17;
         let mut values = vec![0.0f32; batch * frames * F0_BINS];

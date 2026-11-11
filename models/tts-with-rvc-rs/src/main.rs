@@ -60,7 +60,7 @@ fn run() -> Result<(), String> {
         }));
         return Ok(());
     }
-    if command == "infer-wav-segment" {
+    if command == "infer-wav-segment" || command == "infer-wav-segment-benchmark" {
         use tts_with_rvc_rs::{audio_io, rvc_inference::{InferenceOptions, RvcV2Inferencer}};
         let voice = args.next().ok_or("missing RVC .pth")?;
         let hubert = args.next().ok_or("missing HuBERT .pt")?;
@@ -87,14 +87,61 @@ fn run() -> Result<(), String> {
             options.pitch_shift_semitones = shift.parse().map_err(|e| format!("invalid pitch shift: {e}"))?;
         }
         let backend = args.next().unwrap_or_else(|| "cpu".to_owned());
-        if args.next().is_some() { return Err("too many segment arguments".into()); }
+        let runs = if command == "infer-wav-segment-benchmark" {
+            args.next().unwrap_or_else(|| "8".to_owned()).parse::<usize>()
+                .map_err(|e| format!("invalid benchmark iterations: {e}"))?
+        } else {
+            1
+        };
+        if !(1..=64).contains(&runs) || args.next().is_some() {
+            return Err("segment benchmark iterations must be 1..64 and no extra arguments are allowed".into());
+        }
         let device = user_cli::selected_device(&backend)?;
+        let load_start = std::time::Instant::now();
         let inferencer = RvcV2Inferencer::load(&voice, &hubert, &rmvpe,
-            (index != "-").then_some(index.as_str()), device)?;
-
+            (index != "-").then_some(index.as_str()), device.clone())?;
+        device.sync().map_err(|e| format!("model load synchronization failed: {e}"))?;
+        let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
+        let prepare_start = std::time::Instant::now();
         let filtered = tts_with_rvc_rs::preprocess::highpass_48hz_zero_phase(&input)?;
-        let converted = inferencer.infer_16khz(&filtered, &options)?;
+        let prepare_ms = prepare_start.elapsed().as_secs_f64() * 1000.0;
+        let mut timings = Vec::with_capacity(runs);
+        let mut converted = Vec::new();
+        for iteration in 0..runs {
+            device.sync().map_err(|e| format!("pre-inference synchronization failed: {e}"))?;
+            let start = std::time::Instant::now();
+            converted = inferencer.infer_16khz(&filtered, &options)?;
+            device.sync().map_err(|e| format!("post-inference synchronization failed: {e}"))?;
+            let inference_ms = start.elapsed().as_secs_f64() * 1000.0;
+            eprintln!("profile resident_inference iteration={iteration} inference_ms={inference_ms:.6} samples={}", converted.len());
+            timings.push(inference_ms);
+        }
         audio_io::write_mono_wav(&target, &converted, 40_000)?;
+        if command == "infer-wav-segment-benchmark" {
+            let mut warmed = timings.iter().skip(1).copied().collect::<Vec<_>>();
+            warmed.sort_by(f64::total_cmp);
+            let median = if warmed.is_empty() { None } else {
+                let mid = warmed.len() / 2;
+                Some(if warmed.len() % 2 == 0 { (warmed[mid - 1] + warmed[mid]) / 2.0 } else { warmed[mid] })
+            };
+            let report = serde_json::json!({
+                "stage": 62,
+                "backend": backend,
+                "load_ms": load_ms,
+                "prepare_ms": prepare_ms,
+                "inference_ms": timings,
+                "warm_median_ms": median,
+                "warm_definition": "iterations 1..N in same process and same loaded model; synchronized full-output readback",
+                "gpu_faiss": std::env::var_os("RVC_GPU_FAISS").is_some(),
+                "gpu_f0": std::env::var_os("RVC_GPU_F0").is_some(),
+                "graph_replay": false,
+                "output_samples": converted.len(),
+            });
+            let report_path = format!("{target}.benchmark.json");
+            fs::write(&report_path, serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?)
+                .map_err(|e| format!("cannot save benchmark report: {e}"))?;
+            println!("RVC resident benchmark: {report_path}");
+        }
         println!("RVC WAV→WAV complete: samples={} sr=40000 path={target}", converted.len());
         return Ok(());
     }

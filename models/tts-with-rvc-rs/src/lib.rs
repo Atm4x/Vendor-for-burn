@@ -155,6 +155,8 @@ pub mod rmvpe;
 
 #[cfg(any(feature = "cpu", feature = "cuda", feature = "wgpu"))]
 mod rmvpe_fused;
+#[cfg(any(feature = "cuda", feature = "cpu", feature = "wgpu"))]
+mod rmvpe_gpu_f0;
 pub mod rmvpe_gru;
 pub mod rmvpe_mel;
 pub mod hubert;

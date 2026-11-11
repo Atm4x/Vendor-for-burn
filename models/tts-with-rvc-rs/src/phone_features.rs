@@ -19,7 +19,7 @@ mod tests {
 
     #[test]
     fn native_upsampling_preserves_every_fp32_bit_and_batch_boundary() {
-        let device = Device::flex();
+        let device = Device::cpu();
         for batch in [1, 2, 3] {
             for time in [1, 2, 7, 21] {
                 for channels in [1, 3, 17, 768] {

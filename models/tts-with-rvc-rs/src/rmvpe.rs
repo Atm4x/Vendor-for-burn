@@ -160,7 +160,7 @@ mod compact_tests {
 
     #[test]
     fn compact_salience_matches_dense_cpu_on_boundaries_ties_and_noise() {
-        let device = Device::flex();
+        let device = Device::cpu();
         for batch in [1, 2, 4] {
             for frames in [1, 2, 7, 31, 33] {
                 let mut values = Vec::with_capacity(batch * frames * F0_BINS);
@@ -233,7 +233,7 @@ mod compact_tests {
     fn benchmark_compact_readback_vs_dense_cpu() {
         use std::hint::black_box;
         use std::time::Instant;
-        let device = Device::flex();
+        let device = Device::cpu();
         for batch in [1, 4] {
             for frames in [35, 70, 200, 1000] {
                 let values: Vec<f32> = (0..batch * frames * F0_BINS)
@@ -278,7 +278,7 @@ mod compact_tests {
 
     #[test]
     fn compact_salience_rejects_nonfinite_anywhere_and_invalid_thresholds() {
-        let device = Device::flex();
+        let device = Device::cpu();
         for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             let mut values = vec![0.1f32; F0_BINS];
             values[200] = bad;

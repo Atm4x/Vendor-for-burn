@@ -272,9 +272,27 @@ impl RvcV2Inferencer {
             phase = std::time::Instant::now();
         }
         let thresholds: Vec<f32> = options.iter().map(|x| x.rmvpe_threshold).collect();
-        let mut f0_batch =
-            self.rmvpe
-                .infer_f0_batch_thresholds(audios, &self.device, &thresholds)?;
+        let gpu_f0 = std::env::var_os("RVC_GPU_F0").is_some_and(|v| v == "1");
+        if gpu_f0 && retrieval_enabled && !gpu_retrieval {
+            return Err("GPU F0 with retrieval requires RVC_GPU_FAISS=1; no implicit CPU transfer".into());
+        }
+        #[cfg(not(any(feature = "cpu", feature = "cuda", feature = "wgpu")))]
+        if gpu_f0 {
+            return Err("GPU F0 requires a direct CubeCL backend".into());
+        }
+        #[cfg(any(feature = "cpu", feature = "cuda", feature = "wgpu"))]
+        let resident_f0 = if gpu_f0 {
+            Some(self.rmvpe.infer_f0_batch_resident(audios, &self.device, &thresholds)?)
+        } else {
+            None
+        };
+        #[cfg(not(any(feature = "cpu", feature = "cuda", feature = "wgpu")))]
+        let resident_f0: Option<Tensor<2>> = None;
+        let mut f0_batch = if gpu_f0 {
+            None
+        } else {
+            Some(self.rmvpe.infer_f0_batch_thresholds(audios, &self.device, &thresholds)?)
+        };
         if profile {
             eprintln!(
                 "profile rmvpe B={batch} {:.3}s",
@@ -282,8 +300,10 @@ impl RvcV2Inferencer {
             );
             phase = std::time::Instant::now();
         }
-        let frames = (content_time * 2).min(f0_batch[0].len());
-        if frames == 0 || f0_batch.iter().any(|row| row.len() < frames) {
+        let f0_frames = resident_f0.as_ref().map(|v| v.dims()[1])
+            .or_else(|| f0_batch.as_ref().map(|v| v[0].len())).ok_or("missing RMVPE F0")?;
+        let frames = (content_time * 2).min(f0_frames);
+        if frames == 0 || f0_batch.as_ref().is_some_and(|rows| rows.iter().any(|row| row.len() < frames)) {
             return Err("HuBERT/RMVPE returned no aligned frames".into());
         }
         let mut all_features = Vec::with_capacity(batch * frames * channels);
@@ -291,7 +311,11 @@ impl RvcV2Inferencer {
         let mut all_f0 = Vec::with_capacity(batch * frames);
         let mut protect_coefficients = Vec::with_capacity(batch * frames);
         let mut random_sources = Vec::with_capacity(batch);
-        for (b, (f0, opts)) in f0_batch.iter_mut().zip(options).enumerate() {
+        for (b, opts) in options.iter().enumerate() {
+            random_sources.push(Gaussian::new(opts.seed));
+            let Some(f0) = f0_batch.as_mut().and_then(|rows| rows.get_mut(b)) else {
+                continue;
+            };
             f0.truncate(frames);
             if gpu_retrieval {
                 protect_coefficients.extend(f0.iter().map(|&hz| {
@@ -334,15 +358,14 @@ impl RvcV2Inferencer {
             }
             all_pitch.extend(coarse_f0(f0));
             all_f0.extend(f0.iter().copied());
-            random_sources.push(Gaussian::new(opts.seed));
         }
-        if profile {
+        if profile && !gpu_retrieval {
             eprintln!(
-                "profile retrieval B={batch} {:.3}s",
+                "profile retrieval B={batch} {:.6}s",
                 phase.elapsed().as_secs_f64()
             );
-            phase = std::time::Instant::now();
         }
+        phase = std::time::Instant::now();
         let phone = if gpu_retrieval {
             #[cfg(any(feature = "cpu", feature = "cuda", feature = "wgpu"))]
             {
@@ -350,17 +373,43 @@ impl RvcV2Inferencer {
                     .iter()
                     .map(|opts| opts.index_rate)
                     .collect::<Vec<_>>();
+                if profile {
+                    self.device.sync().map_err(|e| format!("GPU IVF pre-sync failed: {e}"))?;
+                }
+                let gpu_start = std::time::Instant::now();
                 let blended = self
                     .gpu_index
                     .as_ref()
                     .expect("GPU retrieval requested")
                     .blend(content.clone(), &rates)?;
+                if profile {
+                    self.device.sync().map_err(|e| format!("GPU IVF post-sync failed: {e}"))?;
+                    eprintln!(
+                        "profile retrieval B={batch} {:.6}s",
+                        gpu_start.elapsed().as_secs_f64()
+                    );
+                }
                 let phones = upsample_without_retrieval(blended, frames);
                 let original = upsample_without_retrieval(content, frames);
-                let mask = Tensor::<3>::from_data(
-                    TensorData::new(protect_coefficients, [batch, frames, 1]),
-                    &self.device,
-                );
+                let mask = if let Some(unshifted) = &resident_f0 {
+                    let factors = options.iter().map(|opts| {
+                        if opts.index_rate > 0.0 && opts.protect < 0.5 {
+                            1.0 - opts.protect
+                        } else {
+                            0.0
+                        }
+                    }).collect::<Vec<f32>>();
+                    let weights = Tensor::<3>::from_data(
+                        TensorData::new(factors, [batch, 1, 1]), &self.device
+                    );
+                    unshifted.clone().slice([0..batch, 0..frames])
+                        .lower_elem(1.0).float().reshape([batch, frames, 1]) * weights
+                } else {
+                    Tensor::<3>::from_data(
+                        TensorData::new(protect_coefficients, [batch, frames, 1]),
+                        &self.device,
+                    )
+                };
                 let inv_mask = Tensor::<3>::ones([batch, frames, 1], &self.device) - mask.clone();
                 phones * inv_mask + original * mask
             }
@@ -374,8 +423,25 @@ impl RvcV2Inferencer {
         } else {
             upsample_without_retrieval(content, frames)
         };
-        let pitch_tensor =
-            Tensor::<2, Int>::from_data(TensorData::new(all_pitch, [batch, frames]), &self.device);
+        let resident_final_f0 = resident_f0.map(|values| {
+            let factors = options.iter().map(|opts| {
+                2.0_f32.powf(opts.pitch_shift_semitones / 12.0)
+            }).collect::<Vec<_>>();
+            let shift = Tensor::<2>::from_data(
+                TensorData::new(factors, [batch, 1]), &self.device
+            );
+            values.slice([0..batch, 0..frames]) * shift
+        });
+        let pitch_tensor = if let Some(values) = &resident_final_f0 {
+            let min = 1127.0_f32 * (1.0 + 50.0_f32 / 700.0).ln();
+            let max = 1127.0_f32 * (1.0 + 1100.0_f32 / 700.0).ln();
+            let mel = (values.clone() / 700.0 + 1.0).log() * 1127.0;
+            let coarse = ((mel - min) * (254.0 / (max - min)) + 1.0)
+                .round().clamp(1.0, 255.0);
+            coarse.mask_fill(values.clone().lower_equal_elem(0.0), 1.0).int()
+        } else {
+            Tensor::<2, Int>::from_data(TensorData::new(all_pitch, [batch, frames]), &self.device)
+        };
         let encoded = self
             .encoder
             .forward(phone, Some(pitch_tensor), &vec![frames; batch], None);
@@ -428,7 +494,9 @@ impl RvcV2Inferencer {
             TensorData::new(gaussian_noise, [batch, frames * RVC_HOP, 1]),
             &self.device,
         );
-        let f0_tensor = Tensor::from_data(TensorData::new(all_f0, [batch, frames]), &self.device);
+        let f0_tensor = resident_final_f0.unwrap_or_else(|| {
+            Tensor::from_data(TensorData::new(all_f0, [batch, frames]), &self.device)
+        });
         let output = self.decoder.forward_from_f0(
             latent,
             f0_tensor,
@@ -603,7 +671,7 @@ mod fp32_f0_study {
         let checkpoint_path = std::env::var("RVC_REAL_RMVPE_CHECKPOINT").unwrap();
         let audio_path = std::env::var("RVC_REAL_INPUT_WAV").unwrap();
         let checkpoint = RvcCheckpoint::open_root(checkpoint_path).unwrap();
-        let device = Device::flex();
+        let device = Device::cpu();
         let model = RmvpeAudioModel::load(&checkpoint, &device).unwrap();
         let audio = crate::audio_io::read_mono_wav(audio_path).unwrap();
         let mut max_hz = 0.0_f32;
