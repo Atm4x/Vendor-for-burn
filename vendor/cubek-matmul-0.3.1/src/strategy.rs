@@ -1,6 +1,9 @@
 use std::fmt::Display;
 
-use cubecl::{client::Client, prelude::TensorBinding};
+use cubecl::{
+    client::Client,
+    prelude::{Scalar, TensorBinding},
+};
 use cubek_std::InputBinding;
 
 use crate::definition::{MatmulElems, MatmulSetupError};
@@ -67,6 +70,12 @@ impl Strategy {
     }
 }
 
+#[cfg(all(feature = "multi-level", feature = "tiled"))]
+fn matrix_axis_contiguous(strides: &[usize]) -> bool {
+    let len = strides.len();
+    len >= 2 && (strides[len - 1] == 1 || strides[len - 2] == 1)
+}
+
 /// Accelerated first, falling back to the routine that needs no accelerator. A storage-tiled
 /// operand is a fact of the data, not a knob: it was stored in tiles for the tiled cmma routine, which
 /// stages to its tiles, so it goes there (the multi-level routines refuse it).
@@ -80,7 +89,14 @@ fn auto(
 ) -> Result<(), MatmulSetupError> {
     #[cfg(feature = "tiled")]
     if client.properties().hardware.num_cpu_cores.is_some()
-        && std::env::var_os("CUBEK_EXPERIMENT_CPU_GEMM").is_some()
+        && dtypes == &MatmulElems::from_single_dtype(f32::elem_type_native())
+        && !matches!(&lhs, InputBinding::Quantized { .. })
+        && !matches!(&rhs, InputBinding::Quantized { .. })
+        && !lhs.data().tiling.is_tiled()
+        && !rhs.data().tiling.is_tiled()
+        && matrix_axis_contiguous(&lhs.data().strides)
+        && matrix_axis_contiguous(&rhs.data().strides)
+        && matrix_axis_contiguous(&out.strides)
     {
         return tiled::Strategy::CpuGemm(Default::default())
             .launch_ref(client, lhs, rhs, out, dtypes);

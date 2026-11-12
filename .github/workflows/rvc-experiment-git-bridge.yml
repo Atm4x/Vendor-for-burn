@@ -50,3 +50,4 @@ jobs:
 # Stage67: export the current GPU elephant-kernel experiment source head.
 # Stage68 profiling: export current full GPU diagnostic source history after this branch push.
 # Stage70 real CubeCL CPU CpuGemm R&D with measured HuBERT parity and performance.
+# Stage71: export automatically selected CPU CpuGemm and its 11-shape regression harness.
