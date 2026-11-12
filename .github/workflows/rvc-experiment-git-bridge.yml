@@ -59,3 +59,4 @@ jobs:
 # Stage76: export causal voiced-threshold F0 reference ablation on real full CUDA RVC.
 # Stage76: export final PowerShell-verified causal F0 ablation source head.
 # Stage77: TF32x2 compensated Conv2d source and RTX4060 A/B Windows runner.
+# Stage78: benchmark packed-batch compensated TF32x2 against validated separate kernels on RTX4060.

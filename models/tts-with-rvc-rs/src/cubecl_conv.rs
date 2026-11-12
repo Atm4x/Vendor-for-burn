@@ -120,3 +120,24 @@ pub(crate) fn conv2d_compensated_tf32(
     let low_result = conv2d(low, weight, None, options);
     high_result + low_result
 }
+
+pub(crate) fn conv2d_compensated_tf32_batched(
+    input: Tensor<4>,
+    weight: Tensor<4>,
+    bias: Option<Tensor<1>>,
+    options: ConvOptions<2>,
+) -> Tensor<4> {
+    let batch = input.dims()[0];
+    let packed = crate::tf32_compensated::split_tf32_packed(input)
+        .expect("TF32 packed convolution requires supported CubeCL tensor");
+    let output = conv2d(packed, weight, None, options);
+    let dims = output.dims();
+    assert_eq!(dims[0], 2 * batch, "TF32 packed convolution doubled batch mismatch");
+    let high = output.clone().slice([0..batch, 0..dims[1], 0..dims[2], 0..dims[3]]);
+    let low = output.slice([batch..dims[0], 0..dims[1], 0..dims[2], 0..dims[3]]);
+    let high = match bias {
+        Some(bias) => high + bias.reshape([1, dims[1], 1, 1]),
+        None => high,
+    };
+    high + low
+}
