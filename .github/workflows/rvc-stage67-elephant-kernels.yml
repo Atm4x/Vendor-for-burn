@@ -1,0 +1,95 @@
+name: RVC Stage67 NSF GEMM and persistent BiGRU Windows gate
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - experiment/conv-kernel-rnd-stage33-20261110
+    paths:
+      - 'models/tts-with-rvc-rs/src/decoder.rs'
+      - 'models/tts-with-rvc-rs/src/nsf_gemm.rs'
+      - 'models/tts-with-rvc-rs/src/rmvpe_gru.rs'
+      - 'models/tts-with-rvc-rs/src/rmvpe_persistent.rs'
+      - 'models/tts-with-rvc-rs/src/lib.rs'
+      - 'models/tts-with-rvc-rs/src/main.rs'
+      - 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage67.ps1'
+      - '.github/workflows/rvc-stage67-elephant-kernels.yml'
+permissions:
+  contents: read
+jobs:
+  full-wav-single-executable:
+    runs-on: windows-latest
+    timeout-minutes: 115
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cache/tracel
+          key: stage67-unified-${{ hashFiles('Cargo.lock') }}
+      - name: Restore vendored checksums
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Vendored checksum restore failed' }
+      - name: Check PowerShell runner syntax
+        shell: pwsh
+        run: |
+          $script = 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage67.ps1'
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $script).Path, [ref]$tokens, [ref]$errors)
+          if ($errors.Count -ne 0) { $errors | Format-List | Out-String | Write-Host; throw 'Invalid Stage67 PowerShell syntax' }
+      - name: Compile unified CPU CUDA WGPU full-WAV EXE
+        shell: pwsh
+        run: |
+          cargo build --release --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs
+          if ($LASTEXITCODE -ne 0) { throw 'Unified native build failed' }
+      - name: Verify production Sequential policy
+        shell: pwsh
+        run: |
+          $decoder = Get-Content 'models/tts-with-rvc-rs/src/decoder.rs' -Raw
+          $inference = Get-Content 'models/tts-with-rvc-rs/src/rvc_inference.rs' -Raw
+          if ($decoder -notmatch 'pub const PRODUCTION: Self = Self::Sequential;') { throw 'NSF production default must be Sequential' }
+          if ($inference -notmatch 'ResidualExecution::PRODUCTION') { throw 'RVC inference must specify production policy' }
+          if (-not (Select-String -Path 'models/tts-with-rvc-rs/src/rmvpe_gru.rs' -Pattern 'RVC_RMVPE_GRU_PERSISTENT' -Quiet)) { throw 'Persistent BiGRU not wired' }
+          if (-not (Select-String -Path 'models/tts-with-rvc-rs/src/decoder.rs' -Pattern 'RVC_NSF_IMPLICIT_GEMM' -Quiet)) { throw 'NSF GEMM not wired' }
+          cargo test --offline --locked -p tts-with-rvc-rs --no-default-features --features cpu --lib production_residuals_are_sequential
+          if ($LASTEXITCODE -ne 0) { throw 'Sequential production regression test failed' }
+          cargo test --offline --locked -p tts-with-rvc-rs --no-default-features --features cpu --lib shared_f0_
+          if ($LASTEXITCODE -ne 0) { throw 'Production policy regression test failed' }
+      - name: Verify unified CLI metadata
+        shell: pwsh
+        run: |
+          & target/release/tts-with-rvc-rs.exe doctor
+          if ($LASTEXITCODE -ne 0) { throw 'Doctor failed' }
+      - name: Package full-WAV release gate
+        shell: pwsh
+        run: |
+          $folder = 'dist/stage67-full-wav'
+          New-Item -ItemType Directory -Force -Path $folder | Out-Null
+          Copy-Item target/release/tts-with-rvc-rs.exe $folder
+          Copy-Item research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage67.ps1 $folder
+          @'
+          Stage67 full WAV RVC experiment on RTX4060. CPU FAISS/F0, Sequential NSF.
+          baseline: NSF Direct + stepwise bidirectional GRU.
+          nsf: ImplicitGemm Conv1d and GEMM ConvTranspose1d.
+          gru: one persistent bidirectional GRU kernel per model tensor batch.
+          both: both accelerated GPU paths enabled together.
+          Physical NVIDIA GPU kernel execution and numerical parity are NOT validated by CI.
+          Keep weights, index and input WAV privately under .\embed\.
+          Run Stage67 PowerShell script: -Modes both or -Modes all.
+          No CPU fallback; accelerated modes fail if kernels unsupported.
+          '@ | Set-Content "$folder/README.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rvc-stage67-elephant-kernels-windows-x64
+          path: dist/stage67-full-wav/
+          retention-days: 14
+          if-no-files-found: warn

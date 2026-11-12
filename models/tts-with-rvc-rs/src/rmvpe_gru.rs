@@ -99,6 +99,10 @@ impl GruDirection {
 pub struct RmvpeBiGru {
     forward_direction: GruDirection,
     reverse_direction: GruDirection,
+    fused_input_weight: Tensor<2>,
+    fused_input_bias: Tensor<1>,
+    fused_hidden_weight: Tensor<3>,
+    fused_hidden_bias: Tensor<2>,
 }
 
 impl RmvpeBiGru {
@@ -110,9 +114,25 @@ impl RmvpeBiGru {
         {
             return Err("RMVPE bidirectional GRU dimensions differ".into());
         }
+        let fused_input_weight = Tensor::cat(vec![
+            forward_direction.input_weight.clone(), reverse_direction.input_weight.clone(),
+        ], 0);
+        let fused_input_bias = Tensor::cat(vec![
+            forward_direction.input_bias.clone(), reverse_direction.input_bias.clone(),
+        ], 0);
+        let fused_hidden_weight = Tensor::stack(vec![
+            forward_direction.hidden_weight.clone(), reverse_direction.hidden_weight.clone(),
+        ], 0);
+        let fused_hidden_bias = Tensor::stack(vec![
+            forward_direction.hidden_bias.clone(), reverse_direction.hidden_bias.clone(),
+        ], 0);
         Ok(Self {
             forward_direction,
             reverse_direction,
+            fused_input_weight,
+            fused_input_bias,
+            fused_hidden_weight,
+            fused_hidden_bias,
         })
     }
 
@@ -124,6 +144,16 @@ impl RmvpeBiGru {
     }
 
     pub fn forward(&self, input: Tensor<3>) -> Tensor<3> {
+        if std::env::var("RVC_RMVPE_GRU_PERSISTENT").as_deref() == Ok("1") {
+            let [batch, time, features] = input.dims();
+            let gates = (input.reshape([batch * time, features])
+                .matmul(self.fused_input_weight.clone().transpose())
+                + self.fused_input_bias.clone().reshape([1, 6 * self.hidden_size()]))
+            .reshape([batch, time, 6 * self.hidden_size()]);
+            return crate::rmvpe_persistent::forward(
+                gates, self.fused_hidden_weight.clone(), self.fused_hidden_bias.clone(),
+            ).expect("persistent RMVPE BiGRU explicitly requested but unavailable");
+        }
         Tensor::cat(
             vec![
                 self.forward_direction.forward(input.clone(), false),

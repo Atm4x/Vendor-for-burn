@@ -151,6 +151,7 @@ pub mod checkpoint;
 pub mod flow;
 
 pub mod decoder;
+mod nsf_gemm;
 
 pub mod rmvpe;
 
@@ -159,6 +160,7 @@ mod rmvpe_fused;
 #[cfg(any(feature = "cuda", feature = "cpu", feature = "wgpu"))]
 mod rmvpe_gpu_f0;
 pub mod rmvpe_gru;
+mod rmvpe_persistent;
 pub mod rmvpe_mel;
 pub mod hubert;
 

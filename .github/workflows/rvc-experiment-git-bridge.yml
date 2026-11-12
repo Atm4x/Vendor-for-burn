@@ -47,3 +47,4 @@ jobs:
 # Stage52 reproduce Stage51 CUDA Graph source export 2026-11-11
 # Stage65: export the sequential production head on this branch push.
 # Stage66: export the shared-F0 experimental head on this branch push.
+# Stage67: export the current GPU elephant-kernel experiment source head.
