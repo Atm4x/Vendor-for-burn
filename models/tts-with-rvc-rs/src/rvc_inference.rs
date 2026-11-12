@@ -691,7 +691,10 @@ mod shared_f0_tests {
         let tail = aligned_f0_slice(&timeline, 900, 40, 200);
         assert_eq!(tail.len(), 201);
         assert_eq!(tail[40], 900.0);
-        assert_eq!(tail[200], 940.0);
+        assert_eq!(tail[139], 999.0);
+        assert_eq!(tail[140], 998.0);
+        assert_eq!(tail[141], 997.0);
+        assert_eq!(tail[200], 938.0);
     }
 
     #[test]
