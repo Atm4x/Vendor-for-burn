@@ -57,3 +57,4 @@ jobs:
 # Stage74: export independent NSF Conv1d and ConvTranspose1d CUDA benchmark source head.
 # Stage75: export real full-RVC production chunk F0 audit and CUDA numerical parity research.
 # Stage76: export causal voiced-threshold F0 reference ablation on real full CUDA RVC.
+# Stage76: export final PowerShell-verified causal F0 ablation source head.
