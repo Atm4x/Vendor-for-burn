@@ -363,6 +363,33 @@ impl RvcV2Inferencer {
         if frames == 0 || f0_batch.as_ref().is_some_and(|rows| rows.iter().any(|row| row.len() < frames)) {
             return Err("HuBERT/RMVPE returned no aligned frames".into());
         }
+        if let Some(directory) = std::env::var_os("RVC_F0_REFERENCE_DIR") {
+            if gpu_f0 || provided_f0.is_some()
+                || options.iter().any(|item| item.pitch_shift_semitones != 0.0)
+            {
+                return Err(
+                    "F0 reference ablation requires per-chunk CPU F0 and zero pitch shift".into()
+                );
+            }
+            let indices = chunk_indices.ok_or(
+                "F0 reference ablation requires real chunk indices"
+            )?;
+            let requested_mode = std::env::var("RVC_F0_REFERENCE_MODE")
+                .map_err(|_| "RVC_F0_REFERENCE_MODE is required for reference ablation")?;
+            let mode = crate::f0_audit::ReferenceMode::parse(&requested_mode)?;
+            let stats = crate::f0_audit::apply_reference(
+                std::path::Path::new(&directory),
+                indices,
+                audio_len,
+                frames,
+                f0_batch.as_mut().ok_or("missing reference F0 buffer")?,
+                mode,
+            )?;
+            eprintln!(
+                "RVC_F0_REFERENCE mode={mode:?} chunks={} frames={} voicing_flips={} overridden_frames={}",
+                indices.len(), stats.frames, stats.voicing_changes, stats.replaced_values
+            );
+        }
         let started = std::time::Instant::now();
         let mut all_features = Vec::with_capacity(batch * frames * channels);
         let mut all_pitch = Vec::with_capacity(batch * frames);

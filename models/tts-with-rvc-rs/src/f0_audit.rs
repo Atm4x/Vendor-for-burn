@@ -53,9 +53,129 @@ pub(crate) fn write_batch(
     Ok(())
 }
 
+
+/// Experimental full-RVC ablation: compare a fast F0 path against a reference
+/// recorded from the exact same deterministic chunks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReferenceMode {
+    Voicing,
+    Full,
+}
+
+impl ReferenceMode {
+    pub(crate) fn parse(input: &str) -> Result<Self, String> {
+        match input {
+            "voicing" => Ok(Self::Voicing),
+            "full" => Ok(Self::Full),
+            other => Err(format!("unknown F0 reference ablation mode: {other}")),
+        }
+    }
+}
+
+#[derive(Default, Debug)]
+pub(crate) struct ReferenceStats {
+    pub(crate) frames: usize,
+    pub(crate) voicing_changes: usize,
+    pub(crate) replaced_values: usize,
+}
+
+pub(crate) fn apply_reference(
+    directory: &Path,
+    chunk_indices: &[usize],
+    input_samples: usize,
+    frames: usize,
+    candidates: &mut [Vec<f32>],
+    mode: ReferenceMode,
+) -> Result<ReferenceStats, String> {
+    if chunk_indices.is_empty() || candidates.len() != chunk_indices.len() || frames == 0 {
+        return Err("invalid reference F0 batch dimensions".into());
+    }
+    let mut stats = ReferenceStats::default();
+    for (&index, candidate) in chunk_indices.iter().zip(candidates.iter_mut()) {
+        if candidate.len() < frames {
+            return Err(format!("candidate F0 too short for chunk {index}"));
+        }
+        let prefix = directory.join(format!("chunk_{index:03}"));
+        let metadata_bytes = fs::read(prefix.with_extension("json"))
+            .map_err(|error| format!("F0 reference metadata missing for chunk {index}: {error}"))?;
+        let metadata: serde_json::Value = serde_json::from_slice(&metadata_bytes)
+            .map_err(|error| format!("invalid F0 reference metadata for chunk {index}: {error}"))?;
+        if metadata["chunk_index"].as_u64() != Some(index as u64)
+            || metadata["frames"].as_u64() != Some(frames as u64)
+            || metadata["input_samples_16khz"].as_u64() != Some(input_samples as u64)
+        {
+            return Err(format!("F0 reference chunk geometry mismatch for chunk {index}"));
+        }
+        let bytes = fs::read(prefix.with_extension("f0.f32le"))
+            .map_err(|error| format!("F0 reference data missing for chunk {index}: {error}"))?;
+        if bytes.len() != frames * std::mem::size_of::<f32>() {
+            return Err(format!("F0 reference length mismatch for chunk {index}"));
+        }
+        for (position, encoded) in bytes.chunks_exact(4).enumerate() {
+            let reference = f32::from_le_bytes(encoded.try_into().expect("four bytes"));
+            let current = &mut candidate[position];
+            if !reference.is_finite()
+                || !(0.0..=2_000.0).contains(&reference)
+                || !current.is_finite() || *current < 0.0
+            {
+                return Err(format!("nonfinite or invalid F0 at chunk {index} frame {position}"));
+            }
+            let voicing_changed = (*current > 0.0) != (reference > 0.0);
+            if voicing_changed {
+                stats.voicing_changes += 1;
+            }
+            if (mode == ReferenceMode::Full || voicing_changed)
+                && current.to_bits() != reference.to_bits()
+            {
+                *current = reference;
+                stats.replaced_values += 1;
+            }
+        }
+        stats.frames += frames;
+    }
+    Ok(stats)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reference_ablation_only_restores_voicing_or_all_values() {
+        let path = std::env::temp_dir().join(format!("rvc-f0-reference-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        write_batch(
+            &path, &[5, 14], 61_440, 4,
+            &[100.0, 0.0, 200.0, 240.0, 0.0, 238.5, 225.0, 0.0],
+            &[30, 1, 50, 67, 1, 66, 63, 1],
+        ).unwrap();
+        let source = [
+            vec![100.01, 186.7, 199.99, 240.02],
+            vec![0.0, 0.0, 225.01, 0.0],
+        ];
+        let mut voicing = source.clone();
+        let result = apply_reference(
+            &path, &[5, 14], 61_440, 4, &mut voicing, ReferenceMode::Voicing,
+        ).unwrap();
+        assert_eq!(result.frames, 8);
+        assert_eq!(result.voicing_changes, 2);
+        assert_eq!(result.replaced_values, 2);
+        assert_eq!(voicing[0], [100.01, 0.0, 199.99, 240.02]);
+        assert_eq!(voicing[1], [0.0, 238.5, 225.01, 0.0]);
+        let mut full = source;
+        let result = apply_reference(
+            &path, &[5, 14], 61_440, 4, &mut full, ReferenceMode::Full,
+        ).unwrap();
+        assert_eq!(result.voicing_changes, 2);
+        assert_eq!(result.replaced_values, 6);
+        assert_eq!(full[0], [100.0, 0.0, 200.0, 240.0]);
+        assert_eq!(full[1], [0.0, 238.5, 225.0, 0.0]);
+        assert!(apply_reference(
+            &path, &[5, 14], 60_800, 4, &mut full, ReferenceMode::Full,
+        ).is_err());
+        fs::remove_dir_all(&path).unwrap();
+    }
+
 
     #[test]
     fn writes_exact_f0_and_pitch_rows() {

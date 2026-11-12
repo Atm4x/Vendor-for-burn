@@ -1,0 +1,9 @@
+# Stage 77 — analyze causal voiced-boundary F0 test on real RTX4060
+
+Get the newest PR #2 Git Bridge. Read \`research/STAGE76_RMVPE_VOICING_THRESHOLD_CAUSAL_2026-11-12.md\` and user's \`RVC_STAGE76_F0_CAUSAL_RESULTS.zip\`.
+
+Grounded Stage75 real full 89.94s WAV: Direct 12.2958s; RMVPE Conv2d GEMM 10.3378s; only 15 changed coarse pitch bins / 11990 frames, 3 voiced switches at chunk 5/frame289 (16.89s), chunk14/frame123 (41.15s), chunk27/frame72 (78.08s). Those three chunks (~10% duration) contain 99.904% of total squared PCM error; overall PCM RMSE985.61, correlation0.875. RMVPE decoder thresholds salience max at 0.03, and SineGen accumulates pitch phase. Offline original SineGen-formula ablation restoring only three voiced decisions cuts sine squared error by ~99.974%, but full neural decoder yet untested.
+
+Stage76 opt-in \`RVC_F0_REFERENCE_DIR\`, \`RVC_F0_REFERENCE_MODE=voicing|full\` inject baseline Direct F0 before pitch bins, protection, TextEncoder, NSF. Four-mode runner creates Direct baseline, raw Conv2d, Conv2d+voicing-only, Conv2d+full reference under identical real chunks. Inspect: WAV RMSE/SNR, all 32 F0 chunks, frames overridden (expected 3 per inference pass in voicing mode), bit-exact full-reference baseline, any errors. Confirm true causal link before designing deployable stable RMVPE threshold policy. **Do not rely on saved reference audio/F0 for production** or silently smooth pitch without reference-quality A/B on multiple voices.
+
+If most PCM drift disappears, next R&D: confidence-margin diagnostics (peak salience near 0.03) to find robust, faithful threshold/hysteresis or source phase behavior preserving source model quality. If F0 restoration fails, inspect latent/NSF inputs with identical deterministic seeds. CUDA Graph capture/replay remains separate and inactive in production, do not claim performance without real RTX device tests.
