@@ -29,12 +29,12 @@ impl HubertFirstConv {
 
     pub fn forward(&self, waveform: Tensor<3>) -> Tensor<3> {
         assert_eq!(waveform.dims()[1], 1);
-        let x = module::conv1d(
-            waveform,
-            self.weight.clone(),
-            None,
-            ConvOptions::new_with_padding([5], [(0, 0)], [1], 1),
-        );
+        let options = ConvOptions::new_with_padding([5], [(0, 0)], [1], 1);
+        let x = if std::env::var("RVC_HUBERT_FRONTEND_GEMM").as_deref() == Ok("1") {
+            crate::cubecl_conv::conv1d(waveform, self.weight.clone(), None, options)
+        } else {
+            module::conv1d(waveform, self.weight.clone(), None, options)
+        };
         let mean = x.clone().mean_dim(2);
         let centered = x - mean;
         let variance = centered.clone().powf_scalar(2.0).mean_dim(2);
@@ -90,10 +90,13 @@ impl HubertFrontend {
     pub fn conv_features(&self, waveform: Tensor<3>) -> Tensor<3> {
         let mut x = self.first.forward(waveform);
         for weight in &self.rest {
-            x = activation::gelu(module::conv1d(
-                x, weight.clone(), None,
-                ConvOptions::new_with_padding([2], [(0, 0)], [1], 1),
-            ));
+            let options = ConvOptions::new_with_padding([2], [(0, 0)], [1], 1);
+            let conv = if std::env::var("RVC_HUBERT_FRONTEND_GEMM").as_deref() == Ok("1") {
+                crate::cubecl_conv::conv1d(x, weight.clone(), None, options)
+            } else {
+                module::conv1d(x, weight.clone(), None, options)
+            };
+            x = activation::gelu(conv);
         }
         x
     }

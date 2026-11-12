@@ -74,7 +74,7 @@ impl Conv1d {
     fn forward(&self, input: Tensor<3>) -> Tensor<3> {
         let options = ConvOptions::new_with_padding([self.stride], [(self.padding, self.padding)], [self.dilation], 1);
         if std::env::var("RVC_NSF_IMPLICIT_GEMM").as_deref() == Ok("1") {
-            crate::nsf_gemm::conv1d(input, self.weight.clone(), self.bias.clone(), options)
+            crate::cubecl_conv::conv1d(input, self.weight.clone(), self.bias.clone(), options)
         } else {
             module::conv1d(input, self.weight.clone(), self.bias.clone(), options)
         }
@@ -102,7 +102,7 @@ impl TransposedConv1d {
 
     fn forward(&self, input: Tensor<3>) -> Tensor<3> {
         if std::env::var("RVC_NSF_IMPLICIT_GEMM").as_deref() == Ok("1") {
-            crate::nsf_gemm::conv_transpose1d(input, self.weight.clone(), self.bias.clone(), self.stride, self.padding)
+            crate::cubecl_conv::conv_transpose1d(input, self.weight.clone(), self.bias.clone(), self.stride, self.padding)
         } else {
             module::conv_transpose1d(input, self.weight.clone(), Some(self.bias.clone()),
                 ConvTransposeOptions::new([self.stride], [self.padding], [0], [1], 1))

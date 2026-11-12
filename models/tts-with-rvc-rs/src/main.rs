@@ -408,6 +408,8 @@ fn run() -> Result<(), String> {
             "global_f0": std::env::var_os("RVC_GLOBAL_F0").is_some_and(|value| value == "1"),
             "rmvpe_gru_execution": if std::env::var("RVC_RMVPE_GRU_PERSISTENT").as_deref() == Ok("1") {"persistent"} else {"stepwise"},
             "nsf_conv_execution": if std::env::var("RVC_NSF_IMPLICIT_GEMM").as_deref() == Ok("1") {"implicit_gemm"} else {"direct"},
+            "hubert_frontend_conv_execution": if std::env::var("RVC_HUBERT_FRONTEND_GEMM").as_deref() == Ok("1") {"implicit_gemm"} else {"direct"},
+            "rmvpe_unet_conv_execution": if std::env::var("RVC_RMVPE_UNET_GEMM").as_deref() == Ok("1") {"implicit_gemm"} else {"direct"},
             "nsf_execution": "sequential",
             "warm_definition": "same process, identical full WAV, persistent weights, synchronized outputs; iterations 1..N; no CUDA Graph",
         });

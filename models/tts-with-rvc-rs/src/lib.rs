@@ -151,7 +151,7 @@ pub mod checkpoint;
 pub mod flow;
 
 pub mod decoder;
-mod nsf_gemm;
+mod cubecl_conv;
 
 pub mod rmvpe;
 
