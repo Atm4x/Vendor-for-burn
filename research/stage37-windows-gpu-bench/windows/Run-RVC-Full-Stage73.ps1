@@ -97,7 +97,7 @@ try {
                 $report.nsf_conv_execution -ne $expectedNsf -or $report.nsf_temporal_conv_kernel -ne $expectedTemporal -or
                 $report.rmvpe_gru_execution -ne 'persistent' -or $report.rmvpe_unet_conv_execution -ne $expectedConv -or
                 $report.hubert_frontend_conv_execution -ne $expectedHubert -or $report.iterations_exact_f32 -ne $true) {
-                throw "$name: invalid execution metadata or non-deterministic output"
+                throw "${name}: invalid execution metadata or non-deterministic output"
             }
             $rows += [pscustomobject]@{
                 mode=$name; group=$case.group; nsf=$case.nsf;
