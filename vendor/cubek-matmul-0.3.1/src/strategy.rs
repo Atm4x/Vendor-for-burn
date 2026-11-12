@@ -79,6 +79,13 @@ fn auto(
     dtypes: &mut MatmulElems,
 ) -> Result<(), MatmulSetupError> {
     #[cfg(feature = "tiled")]
+    if client.properties().hardware.num_cpu_cores.is_some()
+        && std::env::var_os("CUBEK_EXPERIMENT_CPU_GEMM").is_some()
+    {
+        return tiled::Strategy::CpuGemm(Default::default())
+            .launch_ref(client, lhs, rhs, out, dtypes);
+    }
+    #[cfg(feature = "tiled")]
     if lhs.data().tiling.is_tiled() || rhs.data().tiling.is_tiled() {
         return tiled::Strategy::Cmma(Default::default()).launch_ref(client, lhs, rhs, out, dtypes);
     }
