@@ -54,3 +54,4 @@ jobs:
 # Stage72: export full GPU A/B kernels and Stage67/68 real-WAV measurements.
 # Stage73: export the RMVPE salience/F0 parity and real-NSF Quad test head.
 # Stage73 final runner fixes validated by Windows PowerShell parser; export exact head.
+# Stage74: export independent NSF Conv1d and ConvTranspose1d CUDA benchmark source head.

@@ -407,7 +407,18 @@ fn run() -> Result<(), String> {
             "gpu_f0": std::env::var_os("RVC_GPU_F0").is_some(),
             "global_f0": std::env::var_os("RVC_GLOBAL_F0").is_some_and(|value| value == "1"),
             "rmvpe_gru_execution": if std::env::var("RVC_RMVPE_GRU_PERSISTENT").as_deref() == Ok("1") {"persistent"} else {"stepwise"},
-            "nsf_conv_execution": if std::env::var("RVC_NSF_IMPLICIT_GEMM").as_deref() == Ok("1") {"implicit_gemm"} else {"direct"},
+            "nsf_conv_execution": if std::env::var("RVC_NSF_IMPLICIT_GEMM").as_deref() == Ok("1")
+                || (std::env::var("RVC_NSF_CONV1D_GEMM").as_deref() == Ok("1")
+                    && std::env::var("RVC_NSF_TRANSPOSE_GEMM").as_deref() == Ok("1"))
+                {"implicit_gemm"} else if std::env::var("RVC_NSF_CONV1D_GEMM").as_deref() == Ok("1")
+                    || std::env::var("RVC_NSF_TRANSPOSE_GEMM").as_deref() == Ok("1")
+                {"mixed"} else {"direct"},
+            "nsf_conv1d_execution": if std::env::var("RVC_NSF_IMPLICIT_GEMM").as_deref() == Ok("1")
+                || std::env::var("RVC_NSF_CONV1D_GEMM").as_deref() == Ok("1")
+                {"implicit_gemm"} else {"direct"},
+            "nsf_transpose_execution": if std::env::var("RVC_NSF_IMPLICIT_GEMM").as_deref() == Ok("1")
+                || std::env::var("RVC_NSF_TRANSPOSE_GEMM").as_deref() == Ok("1")
+                {"gemm"} else {"direct"},
             "hubert_frontend_conv_execution": if std::env::var("RVC_HUBERT_FRONTEND_GEMM").as_deref() == Ok("1") {"implicit_gemm"} else {"direct"},
             "rmvpe_unet_conv_execution": if std::env::var("RVC_RMVPE_UNET_GEMM").as_deref() == Ok("1") {"implicit_gemm"} else if std::env::var("RVC_RMVPE_UNET_CONV2D_GEMM").as_deref() == Ok("1") && std::env::var("RVC_RMVPE_UNET_TRANSPOSE2D_GEMM").as_deref() == Ok("1") {"implicit_gemm"} else if std::env::var("RVC_RMVPE_UNET_CONV2D_GEMM").as_deref() == Ok("1") {"conv2d_implicit_gemm"} else if std::env::var("RVC_RMVPE_UNET_TRANSPOSE2D_GEMM").as_deref() == Ok("1") {"transpose2d_gemm"} else {"direct"},
             "nsf_temporal_conv_kernel": std::env::var("RVC_NSF_CONV_KERNEL").unwrap_or_default(),
