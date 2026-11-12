@@ -53,3 +53,4 @@ jobs:
 # Stage71: export automatically selected CPU CpuGemm and its 11-shape regression harness.
 # Stage72: export full GPU A/B kernels and Stage67/68 real-WAV measurements.
 # Stage73: export the RMVPE salience/F0 parity and real-NSF Quad test head.
+# Stage73 final runner fixes validated by Windows PowerShell parser; export exact head.
