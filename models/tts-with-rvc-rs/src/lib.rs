@@ -1,4 +1,5 @@
 pub mod diagnostic;
+mod f0_audit;
 mod conv1d_layout;
 mod phone_features;
 #[cfg(any(feature = "cuda", feature = "cpu", feature = "wgpu"))]

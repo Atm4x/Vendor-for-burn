@@ -208,7 +208,7 @@ impl RvcV2Inferencer {
                         aligned_f0_slice(timeline, start, config.context_frames, segment.len() / 160)
                     }).collect::<Vec<_>>()
                 });
-                self.infer_16khz_batch_with_f0(segments, &settings, pitch.as_deref())
+                self.infer_16khz_batch_with_f0(segments, &settings, pitch.as_deref(), Some(indices))
             },
             progress,
         )
@@ -226,7 +226,7 @@ impl RvcV2Inferencer {
         audios: &[Vec<f32>],
         options: &[InferenceOptions],
     ) -> Result<Vec<Vec<f32>>, String> {
-        self.infer_16khz_batch_with_f0(audios, options, None)
+        self.infer_16khz_batch_with_f0(audios, options, None, None)
     }
 
     fn infer_16khz_batch_with_f0(
@@ -234,6 +234,7 @@ impl RvcV2Inferencer {
         audios: &[Vec<f32>],
         options: &[InferenceOptions],
         provided_f0: Option<&[Vec<f32>]>,
+        chunk_indices: Option<&[usize]>,
     ) -> Result<Vec<Vec<f32>>, String> {
         let batch = audios.len();
         if batch == 0 || batch != options.len() || batch > 32 {
@@ -415,6 +416,20 @@ impl RvcV2Inferencer {
             }
             all_pitch.extend(coarse_f0(f0));
             all_f0.extend(f0.iter().copied());
+        }
+        if let Some(directory) = std::env::var_os("RVC_F0_AUDIT_DIR") {
+            let indices = chunk_indices.ok_or("F0 audit requires real chunk indices")?;
+            if gpu_f0 {
+                return Err("F0 audit currently requires CPU-decoded F0; RVC_GPU_F0=1 unsupported".into());
+            }
+            crate::f0_audit::write_batch(
+                std::path::Path::new(&directory),
+                indices,
+                audio_len,
+                frames,
+                &all_f0,
+                &all_pitch,
+            )?;
         }
         if !gpu_retrieval {
             crate::diagnostic::measure(&self.device, "rvc.cpu_faiss_protect_pitch", started,

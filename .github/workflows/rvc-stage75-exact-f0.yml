@@ -1,0 +1,103 @@
+name: RVC Stage75 exact full-RVC RMVPE F0 chunk audit
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - experiment/conv-kernel-rnd-stage33-20261110
+    paths:
+      - 'models/tts-with-rvc-rs/src/lib.rs'
+      - 'models/tts-with-rvc-rs/src/rvc_inference.rs'
+      - 'models/tts-with-rvc-rs/src/f0_audit.rs'
+      - 'research/stage37-windows-gpu-bench/windows/Run-RVC-Exact-F0-Stage75.ps1'
+      - '.github/workflows/rvc-stage75-exact-f0.yml'
+permissions:
+  contents: read
+jobs:
+  full-wav-single-executable:
+    runs-on: windows-latest
+    timeout-minutes: 115
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cache/tracel
+          key: stage75-exact-f0-${{ hashFiles('Cargo.lock') }}
+      - name: Restore vendored checksums
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Vendored checksum restore failed' }
+      - name: Check PowerShell runner syntax
+        shell: pwsh
+        run: |
+          $script = 'research/stage37-windows-gpu-bench/windows/Run-RVC-Exact-F0-Stage75.ps1'
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $script).Path, [ref]$tokens, [ref]$errors)
+          if ($errors.Count -ne 0) { $errors | Format-List | Out-String | Write-Host; throw 'Invalid Stage75 PowerShell runner syntax' }
+      - name: Compile unified CPU CUDA WGPU full-WAV EXE
+        shell: pwsh
+        run: |
+          cargo build --release --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs
+          if ($LASTEXITCODE -ne 0) { throw 'Unified native build failed' }
+      - name: Verify production Sequential policy
+        shell: pwsh
+        run: |
+          $decoder = Get-Content 'models/tts-with-rvc-rs/src/decoder.rs' -Raw
+          $inference = Get-Content 'models/tts-with-rvc-rs/src/rvc_inference.rs' -Raw
+          if ($decoder -notmatch 'pub const PRODUCTION: Self = Self::Sequential;') { throw 'NSF production default must be Sequential' }
+          if ($inference -notmatch 'ResidualExecution::PRODUCTION') { throw 'RVC inference must specify production policy' }
+          if (-not (Select-String -Path 'models/tts-with-rvc-rs/src/rmvpe_gru.rs' -Pattern 'RVC_RMVPE_GRU_PERSISTENT' -Quiet)) { throw 'Persistent BiGRU not wired' }
+          if (-not (Select-String -Path 'models/tts-with-rvc-rs/src/decoder.rs' -Pattern 'RVC_NSF_IMPLICIT_GEMM' -Quiet)) { throw 'NSF GEMM not wired' }
+          if (-not (Select-String -Path 'models/tts-with-rvc-rs/src/decoder.rs' -Pattern 'RVC_NSF_CONV1D_GEMM' -Quiet)) { throw 'NSF Conv1d split not wired' }
+          if (-not (Select-String -Path 'models/tts-with-rvc-rs/src/decoder.rs' -Pattern 'RVC_NSF_TRANSPOSE_GEMM' -Quiet)) { throw 'NSF Transpose split not wired' }
+          if (-not (Select-String -Path 'models/tts-with-rvc-rs/src/hubert.rs' -Pattern 'RVC_HUBERT_FRONTEND_GEMM' -Quiet)) { throw 'HuBERT GEMM not wired' }
+          if (-not (Select-String -Path 'models/tts-with-rvc-rs/src/rmvpe_unet.rs' -Pattern 'RVC_RMVPE_UNET_GEMM' -Quiet)) { throw 'RMVPE UNet GEMM not wired' }
+          if ($inference -notmatch 'RVC_F0_AUDIT_DIR') { throw 'Exact RVC F0 audit not wired' }
+          if (-not (Test-Path 'models/tts-with-rvc-rs/src/f0_audit.rs')) { throw 'Exact F0 writer missing' }
+          cargo test --offline --locked -p tts-with-rvc-rs --no-default-features --features cpu --lib production_residuals_are_sequential
+          if ($LASTEXITCODE -ne 0) { throw 'Sequential production regression test failed' }
+          cargo test --offline --locked -p tts-with-rvc-rs --no-default-features --features cpu --lib shared_f0_
+          if ($LASTEXITCODE -ne 0) { throw 'Production policy regression test failed' }
+          cargo test --offline --locked -p tts-with-rvc-rs --no-default-features --features cpu --lib writes_exact_f0_and_pitch_rows
+          if ($LASTEXITCODE -ne 0) { throw 'F0 audit file parity test failed' }
+      - name: Verify unified CLI metadata
+        shell: pwsh
+        run: |
+          & target/release/tts-with-rvc-rs.exe doctor
+          if ($LASTEXITCODE -ne 0) { throw 'Doctor failed' }
+      - name: Package full-WAV release gate
+        shell: pwsh
+        run: |
+          $folder = 'dist/stage75-exact-f0'
+          New-Item -ItemType Directory -Force -Path $folder | Out-Null
+          Copy-Item target/release/tts-with-rvc-rs.exe $folder
+          Copy-Item research/stage37-windows-gpu-bench/windows/Run-RVC-Exact-F0-Stage75.ps1 $folder
+          @'
+          Stage75 exact production-chunk F0 numerical audit.
+          Use Run-RVC-Exact-F0-Stage75.ps1 -Modes all on real RTX4060.
+          Baseline NSF ImplicitGemm + persistent RMVPE BiGRU remains unchanged.
+          Modes: original RMVPE U-Net Direct; Conv2d ImplicitGemm; Transpose2d GEMM; both.
+          RVC_F0_AUDIT_DIR records each real post-filter/post-reflection/real-batch
+          F0 and coarse pitch frame immediately before TextEncoder and NSF.
+          Summary reports coarse pitch bin changes, voiced/unvoiced changes,
+          F0 RMSE and worst chunk, alongside WAV and full-WAV timings.
+          Diagnostic writes alter timing; rely on earlier Stage72 for clean speed baselines.
+          Initial 4s independent segment had F0 max 0.025Hz and unchanged coarse bins;
+          full RVC showed much larger PCM difference, cause still under investigation.
+          No CUDA Graph replay; private model checkpoints, index, WAV not committed.
+          '@ | Set-Content "$folder/README.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rvc-stage75-exact-f0-windows-x64
+          path: dist/stage75-exact-f0/
+          retention-days: 14
+          if-no-files-found: warn
