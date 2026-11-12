@@ -146,21 +146,32 @@ impl RmvpeBiGru {
     pub fn forward(&self, input: Tensor<3>) -> Tensor<3> {
         if std::env::var("RVC_RMVPE_GRU_PERSISTENT").as_deref() == Ok("1") {
             let [batch, time, features] = input.dims();
+            let device = input.device();
+            let started = std::time::Instant::now();
             let gates = (input.reshape([batch * time, features])
                 .matmul(self.fused_input_weight.clone().transpose())
                 + self.fused_input_bias.clone().reshape([1, 6 * self.hidden_size()]))
             .reshape([batch, time, 6 * self.hidden_size()]);
-            return crate::rmvpe_persistent::forward(
+            crate::diagnostic::measure(&device, "rmvpe.gru_fused_input_projection", started,
+                serde_json::json!({"batch": batch, "frames": time, "hidden": self.hidden_size()}));
+            let started = std::time::Instant::now();
+            let output = crate::rmvpe_persistent::forward(
                 gates, self.fused_hidden_weight.clone(), self.fused_hidden_bias.clone(),
             ).expect("persistent RMVPE BiGRU explicitly requested but unavailable");
+            crate::diagnostic::measure(&device, "rmvpe.gru_persistent_recurrent", started,
+                serde_json::json!({"batch": batch, "frames": time, "hidden": self.hidden_size()}));
+            return output;
         }
-        Tensor::cat(
-            vec![
-                self.forward_direction.forward(input.clone(), false),
-                self.reverse_direction.forward(input, true),
-            ],
-            2,
-        )
+        let device = input.device();
+        let started = std::time::Instant::now();
+        let forward = self.forward_direction.forward(input.clone(), false);
+        crate::diagnostic::measure(&device, "rmvpe.gru_stepwise_forward", started,
+            serde_json::json!({"shape": forward.dims()}));
+        let started = std::time::Instant::now();
+        let reverse = self.reverse_direction.forward(input, true);
+        crate::diagnostic::measure(&device, "rmvpe.gru_stepwise_reverse", started,
+            serde_json::json!({"shape": reverse.dims()}));
+        Tensor::cat(vec![forward, reverse], 2)
     }
 }
 

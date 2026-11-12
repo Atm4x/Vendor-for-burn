@@ -48,3 +48,4 @@ jobs:
 # Stage65: export the sequential production head on this branch push.
 # Stage66: export the shared-F0 experimental head on this branch push.
 # Stage67: export the current GPU elephant-kernel experiment source head.
+# Stage68 profiling: export current full GPU diagnostic source history after this branch push.

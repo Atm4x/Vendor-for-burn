@@ -254,7 +254,7 @@ impl DecoderStage {
         execution: ResidualExecution,
         aggregation: ResidualAggregation,
     ) -> Tensor<3> {
-        self.forward_with_scheduling(input, harmonic_source, execution, aggregation, NsfScheduling::Default)
+        self.forward_with_scheduling(input, harmonic_source, execution, aggregation, NsfScheduling::Default, None)
     }
 
     fn forward_with_scheduling(
@@ -264,11 +264,25 @@ impl DecoderStage {
         execution: ResidualExecution,
         aggregation: ResidualAggregation,
         scheduling: NsfScheduling,
+        diagnostic_stage: Option<usize>,
     ) -> Tensor<3> {
+        let trace = diagnostic_stage.filter(|_| crate::diagnostic::enabled());
+        let device = trace.map(|_| input.device());
+        let started = trace.map(|_| Instant::now());
         let upsampled = self.upsample_only(input);
+        if let (Some(stage), Some(device), Some(started)) = (trace, &device, started) {
+            crate::diagnostic::measure(device, "nsf.stage_upsample", started,
+                serde_json::json!({"stage": stage, "shape": upsampled.dims()}));
+        }
+        let started = trace.map(|_| Instant::now());
         let source = self.noise.forward(harmonic_source);
+        if let (Some(stage), Some(device), Some(started)) = (trace, &device, started) {
+            crate::diagnostic::measure(device, "nsf.stage_noise_conv", started,
+                serde_json::json!({"stage": stage, "shape": source.dims()}));
+        }
         assert_eq!(upsampled.dims(), source.dims(), "harmonic source must align with upsampled features");
         let prepared = upsampled + source;
+        let residual_started = trace.map(|_| Instant::now());
         let mut result = match aggregation {
             ResidualAggregation::ZeroSeeded => Some(Tensor::<3>::zeros(prepared.dims(), &prepared.device())),
             ResidualAggregation::FirstBranch => None,
@@ -307,6 +321,10 @@ impl DecoderStage {
         let result = result.expect("decoder stage must contain residual blocks") / self.residual.len() as f32;
         if scheduling == NsfScheduling::FlushPerStage {
             result.device().flush().expect("NSF stage flush failed");
+        }
+        if let (Some(stage), Some(device), Some(started)) = (trace, &device, residual_started) {
+            crate::diagnostic::measure(device, "nsf.stage_residuals_aggregate", started,
+                serde_json::json!({"stage": stage, "residual_count": self.residual.len(), "shape": result.dims()}));
         }
         result
     }
@@ -487,7 +505,7 @@ impl NsfWaveformDecoder {
         crate::diagnostic::measure(&device, "nsf.conv_pre_condition", pre_started, serde_json::json!({"shape":x.dims()}));
         for (stage_idx, stage) in self.stages.iter().enumerate() {
             let started = std::time::Instant::now();
-            x = stage.forward_with_scheduling(x, harmonic_source.clone(), execution, aggregation, scheduling);
+            x = stage.forward_with_scheduling(x, harmonic_source.clone(), execution, aggregation, scheduling, Some(stage_idx));
             crate::diagnostic::measure(&device, "nsf.upsample_resblocks", started,
                 serde_json::json!({"stage":stage_idx,"shape":x.dims()}));
         }
