@@ -51,7 +51,7 @@ try {
             if ($report.stage -ne 73 -or $report.gru_persistent -ne $true -or
                 $report.unet_conv2d_gemm -ne $case.conv -or
                 $report.unet_transpose2d_gemm -ne $case.transpose -or $report.frames -lt 50) {
-                throw "$name: wrong execution metadata"
+                throw "${name}: wrong execution metadata"
             }
             $rows += [pscustomobject]@{
                 mode=$name; frames=$report.frames; first_ms=$report.first_salience_ms;
@@ -70,7 +70,7 @@ try {
             foreach ($row in @($rows | Where-Object mode -ne 'direct')) {
                 $bBytes = [IO.File]::ReadAllBytes((Join-Path $root "$($row.mode).$kind.f32le"))
                 if ($aBytes.Length -ne $bBytes.Length -or ($aBytes.Length % 4) -ne 0) {
-                    throw "$($row.mode) $kind: incompatible FP32 array lengths"
+                    throw "$($row.mode) ${kind}: incompatible FP32 array lengths"
                 }
                 $count = [int]($aBytes.Length / 4)
                 $a = [float[]]::new($count)
