@@ -153,6 +153,7 @@ pub mod flow;
 
 pub mod decoder;
 mod cubecl_conv;
+mod tf32_compensated;
 
 pub mod rmvpe;
 

@@ -58,3 +58,4 @@ jobs:
 # Stage75: export real full-RVC production chunk F0 audit and CUDA numerical parity research.
 # Stage76: export causal voiced-threshold F0 reference ablation on real full CUDA RVC.
 # Stage76: export final PowerShell-verified causal F0 ablation source head.
+# Stage77: TF32x2 compensated Conv2d source and RTX4060 A/B Windows runner.

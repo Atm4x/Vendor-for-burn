@@ -106,3 +106,17 @@ pub(crate) fn conv_transpose2d_gemm(
         .expect("CubeCL 2D GEMM transpose is unsupported on this backend or shape");
     Tensor::from_primitive::<Cube>(result)
 }
+
+
+pub(crate) fn conv2d_compensated_tf32(
+    input: Tensor<4>,
+    weight: Tensor<4>,
+    bias: Option<Tensor<1>>,
+    options: ConvOptions<2>,
+) -> Tensor<4> {
+    let (high, low) = crate::tf32_compensated::split_tf32(input)
+        .expect("TF32 compensated convolution requires a supported CubeCL tensor");
+    let high_result = conv2d(high, weight.clone(), bias, options.clone());
+    let low_result = conv2d(low, weight, None, options);
+    high_result + low_result
+}

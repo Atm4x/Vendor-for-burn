@@ -1,0 +1,102 @@
+name: RVC Stage77 compensated TF32x2 full-WAV CUDA gate
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - experiment/conv-kernel-rnd-stage33-20261110
+    paths:
+      - 'models/tts-with-rvc-rs/src/cubecl_conv.rs'
+      - 'models/tts-with-rvc-rs/src/tf32_compensated.rs'
+      - 'models/tts-with-rvc-rs/src/rmvpe_unet.rs'
+      - 'models/tts-with-rvc-rs/src/lib.rs'
+      - 'models/tts-with-rvc-rs/src/main.rs'
+      - 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage77.ps1'
+      - '.github/workflows/rvc-stage77-tf32x2.yml'
+permissions:
+  contents: read
+jobs:
+  full-wav-single-executable:
+    runs-on: windows-latest
+    timeout-minutes: 115
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cache/tracel
+          key: stage77-tf32x2-${{ hashFiles('Cargo.lock') }}
+      - name: Restore vendored checksums
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Vendored checksum restore failed' }
+      - name: Check PowerShell runner syntax
+        shell: pwsh
+        run: |
+          $script = 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage77.ps1'
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $script).Path, [ref]$tokens, [ref]$errors)
+          if ($errors.Count -ne 0) { $errors | Format-List | Out-String | Write-Host; throw 'Invalid Stage77 PowerShell runner syntax' }
+      - name: Compile unified CPU CUDA WGPU full-WAV EXE
+        shell: pwsh
+        run: |
+          cargo build --release --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs
+          if ($LASTEXITCODE -ne 0) { throw 'Unified native build failed' }
+      - name: Verify production Sequential policy
+        shell: pwsh
+        run: |
+          $decoder = Get-Content 'models/tts-with-rvc-rs/src/decoder.rs' -Raw
+          $inference = Get-Content 'models/tts-with-rvc-rs/src/rvc_inference.rs' -Raw
+          if ($decoder -notmatch 'pub const PRODUCTION: Self = Self::Sequential;') { throw 'NSF production default must be Sequential' }
+          if ($inference -notmatch 'ResidualExecution::PRODUCTION') { throw 'RVC inference must specify production policy' }
+          if (-not (Select-String -Path 'models/tts-with-rvc-rs/src/rmvpe_gru.rs' -Pattern 'RVC_RMVPE_GRU_PERSISTENT' -Quiet)) { throw 'Persistent BiGRU not wired' }
+          if (-not (Select-String -Path 'models/tts-with-rvc-rs/src/decoder.rs' -Pattern 'RVC_NSF_IMPLICIT_GEMM' -Quiet)) { throw 'NSF GEMM not wired' }
+          if (-not (Select-String -Path 'models/tts-with-rvc-rs/src/decoder.rs' -Pattern 'RVC_NSF_CONV1D_GEMM' -Quiet)) { throw 'NSF Conv1d split not wired' }
+          if (-not (Select-String -Path 'models/tts-with-rvc-rs/src/decoder.rs' -Pattern 'RVC_NSF_TRANSPOSE_GEMM' -Quiet)) { throw 'NSF Transpose split not wired' }
+          if (-not (Select-String -Path 'models/tts-with-rvc-rs/src/hubert.rs' -Pattern 'RVC_HUBERT_FRONTEND_GEMM' -Quiet)) { throw 'HuBERT GEMM not wired' }
+          if (-not (Select-String -Path 'models/tts-with-rvc-rs/src/rmvpe_unet.rs' -Pattern 'RVC_RMVPE_UNET_GEMM' -Quiet)) { throw 'RMVPE UNet GEMM not wired' }
+          if ($inference -notmatch 'RVC_F0_AUDIT_DIR') { throw 'Exact RVC F0 audit not wired' }
+          if (-not (Test-Path 'models/tts-with-rvc-rs/src/tf32_compensated.rs')) { throw 'TF32x2 CUDA splitter missing' }
+          if (-not (Select-String -Path 'models/tts-with-rvc-rs/src/rmvpe_unet.rs' -Pattern 'RVC_RMVPE_UNET_COMPENSATED_TF32' -Quiet)) { throw 'TF32x2 option not wired to RMVPE Conv2d' }
+          cargo test --offline --locked -p tts-with-rvc-rs --no-default-features --features cpu --lib production_residuals_are_sequential
+          if ($LASTEXITCODE -ne 0) { throw 'Sequential production regression test failed' }
+          cargo test --offline --locked -p tts-with-rvc-rs --no-default-features --features cpu --lib shared_f0_
+          if ($LASTEXITCODE -ne 0) { throw 'Production policy regression test failed' }
+          cargo test --offline --locked -p tts-with-rvc-rs --no-default-features --features cpu --lib tf32_split_recovers_fp32_to_squared_rounding_error
+          if ($LASTEXITCODE -ne 0) { throw 'TF32x2 decomposition arithmetic test failed' }
+      - name: Verify unified CLI metadata
+        shell: pwsh
+        run: |
+          & target/release/tts-with-rvc-rs.exe doctor
+          if ($LASTEXITCODE -ne 0) { throw 'Doctor failed' }
+      - name: Package full-WAV release gate
+        shell: pwsh
+        run: |
+          $folder = 'dist/stage77-tf32x2'
+          New-Item -ItemType Directory -Force -Path $folder | Out-Null
+          Copy-Item target/release/tts-with-rvc-rs.exe $folder
+          Copy-Item research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage77.ps1 $folder
+          @'
+          Stage77 full-WAV RTX4060 A/B: baseline Direct RMVPE Conv2d,
+          original ImplicitGemm/TF32 (fast but boundary F0 mismatch), and
+          experimental two-pass compensated TF32x2 convolution.
+          Every case uses proven NSF implicit GEMM, persistent BiGRU and prepacked weights.
+          Copy private CrazyMita.pth, hubert_base.pt, rmvpe.pt, CrazyMita.index and MitaKind.wav
+          into .\embed\ and run Run-RVC-Full-Stage77.ps1 -Modes all.
+          Compare full WAV PCM16 RMSE, voiced boundaries, warm latency and errors.
+          Experimental only. No CUDA Graph replay; do not change production defaults.
+          '@ | Set-Content "$folder/README.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rvc-stage77-tf32x2-windows-x64
+          path: dist/stage77-tf32x2/
+          retention-days: 14
+          if-no-files-found: warn
