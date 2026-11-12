@@ -107,7 +107,7 @@ try {
                 if ($line -match 'overridden_frames=(\d+)') { $overriddenFromLog += [int]$matches[1] }
             }
             if ($case.reference -ne 'none' -and $referenceLog.Count -eq 0) {
-                throw "$name: F0 reference replay was not activated"
+                throw "${name}: F0 reference replay was not activated"
             }
             $rows += [pscustomobject]@{
                 name=$name; conv2d_gemm=$case.conv; reference_mode=$case.reference;
