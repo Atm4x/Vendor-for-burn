@@ -56,7 +56,9 @@ impl Conv2d {
 
     fn forward(&self, input: Tensor<4>) -> Tensor<4> {
         let options = ConvOptions::new([1, 1], [self.padding, self.padding], [1, 1], 1);
-        if std::env::var("RVC_RMVPE_UNET_GEMM").as_deref() == Ok("1") {
+        if std::env::var("RVC_RMVPE_UNET_GEMM").as_deref() == Ok("1")
+            || std::env::var("RVC_RMVPE_UNET_CONV2D_GEMM").as_deref() == Ok("1")
+        {
             crate::cubecl_conv::conv2d(input, self.weight.clone(), self.bias.clone(), options)
         } else {
             module::conv2d(input, self.weight.clone(), self.bias.clone(), options)
@@ -234,7 +236,9 @@ impl TransposedConv2d {
         let options = burn::tensor::ops::ConvTransposeOptions::new(
             self.stride, [1, 1], self.padding_out, [1, 1], 1,
         );
-        let value = if std::env::var("RVC_RMVPE_UNET_GEMM").as_deref() == Ok("1") {
+        let value = if std::env::var("RVC_RMVPE_UNET_GEMM").as_deref() == Ok("1")
+            || std::env::var("RVC_RMVPE_UNET_TRANSPOSE2D_GEMM").as_deref() == Ok("1")
+        {
             crate::cubecl_conv::conv_transpose2d_gemm(input, self.weight.clone(), None, options)
         } else {
             module::conv_transpose2d(input, self.weight.clone(), None, options)

@@ -1,0 +1,106 @@
+name: RVC Stage73 RMVPE F0 parity and NSF Quad full-WAV gate
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - experiment/conv-kernel-rnd-stage33-20261110
+    paths:
+      - 'models/tts-with-rvc-rs/src/decoder.rs'
+      - 'models/tts-with-rvc-rs/src/cubecl_conv.rs'
+      - 'models/tts-with-rvc-rs/src/hubert.rs'
+      - 'models/tts-with-rvc-rs/src/rmvpe_unet.rs'
+      - 'models/tts-with-rvc-rs/src/bin/profile_rmvpe_f0_stage73.rs'
+      - 'research/stage37-windows-gpu-bench/windows/Run-RVC-RMVPE-F0-Stage73.ps1'
+      - 'models/tts-with-rvc-rs/src/rmvpe_gru.rs'
+      - 'models/tts-with-rvc-rs/src/rmvpe_persistent.rs'
+      - 'models/tts-with-rvc-rs/src/lib.rs'
+      - 'models/tts-with-rvc-rs/src/main.rs'
+      - 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage73.ps1'
+      - '.github/workflows/rvc-stage73-quality-gpu-ab.yml'
+permissions:
+  contents: read
+jobs:
+  full-wav-single-executable:
+    runs-on: windows-latest
+    timeout-minutes: 115
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cache/tracel
+          key: stage73-unified-${{ hashFiles('Cargo.lock') }}
+      - name: Restore vendored checksums
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Vendored checksum restore failed' }
+      - name: Check PowerShell runner syntax
+        shell: pwsh
+        run: |
+          $scripts = @('research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage73.ps1', 'research/stage37-windows-gpu-bench/windows/Run-RVC-RMVPE-F0-Stage73.ps1')
+          foreach ($script in $scripts) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $script).Path, [ref]$tokens, [ref]$errors)
+            if ($errors.Count -ne 0) { $errors | Format-List | Out-String | Write-Host; throw "Invalid Stage73 PowerShell syntax: $script" }
+          }
+      - name: Compile unified CPU CUDA WGPU full-WAV EXE
+        shell: pwsh
+        run: |
+          cargo build --release --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs --bin profile_rmvpe_f0_stage73
+          if ($LASTEXITCODE -ne 0) { throw 'Unified native build failed' }
+      - name: Verify production Sequential policy
+        shell: pwsh
+        run: |
+          $decoder = Get-Content 'models/tts-with-rvc-rs/src/decoder.rs' -Raw
+          $inference = Get-Content 'models/tts-with-rvc-rs/src/rvc_inference.rs' -Raw
+          if ($decoder -notmatch 'pub const PRODUCTION: Self = Self::Sequential;') { throw 'NSF production default must be Sequential' }
+          if ($inference -notmatch 'ResidualExecution::PRODUCTION') { throw 'RVC inference must specify production policy' }
+          if (-not (Select-String -Path 'models/tts-with-rvc-rs/src/rmvpe_gru.rs' -Pattern 'RVC_RMVPE_GRU_PERSISTENT' -Quiet)) { throw 'Persistent BiGRU not wired' }
+          if (-not (Select-String -Path 'models/tts-with-rvc-rs/src/decoder.rs' -Pattern 'RVC_NSF_IMPLICIT_GEMM' -Quiet)) { throw 'NSF GEMM not wired' }
+          if (-not (Select-String -Path 'models/tts-with-rvc-rs/src/hubert.rs' -Pattern 'RVC_HUBERT_FRONTEND_GEMM' -Quiet)) { throw 'HuBERT GEMM not wired' }
+          if (-not (Select-String -Path 'models/tts-with-rvc-rs/src/rmvpe_unet.rs' -Pattern 'RVC_RMVPE_UNET_GEMM' -Quiet)) { throw 'RMVPE UNet GEMM not wired' }
+          cargo test --offline --locked -p tts-with-rvc-rs --no-default-features --features cpu --lib production_residuals_are_sequential
+          if ($LASTEXITCODE -ne 0) { throw 'Sequential production regression test failed' }
+          cargo test --offline --locked -p tts-with-rvc-rs --no-default-features --features cpu --lib shared_f0_
+          if ($LASTEXITCODE -ne 0) { throw 'Production policy regression test failed' }
+      - name: Verify unified CLI metadata
+        shell: pwsh
+        run: |
+          & target/release/tts-with-rvc-rs.exe doctor
+          if ($LASTEXITCODE -ne 0) { throw 'Doctor failed' }
+      - name: Package full-WAV release gate
+        shell: pwsh
+        run: |
+          $folder = 'dist/stage73-full-wav'
+          New-Item -ItemType Directory -Force -Path $folder | Out-Null
+          Copy-Item target/release/tts-with-rvc-rs.exe $folder
+          Copy-Item target/release/profile_rmvpe_f0_stage73.exe $folder
+          Copy-Item research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage73.ps1 $folder
+          Copy-Item research/stage37-windows-gpu-bench/windows/Run-RVC-RMVPE-F0-Stage73.ps1 $folder
+          @'
+          Stage73: real RMVPE F0 parity and full-WAV NSF kernel A/B.
+          Run-RVC-RMVPE-F0-Stage73.ps1: Direct vs GEMM Conv2d vs GEMM ConvTranspose2d vs both.
+          Records real RMVPE FP32 salience + decoded F0 before NSF.
+          Run-RVC-Full-Stage73.ps1 -Suite nsf: baseline ImplicitGemm, Prepacked Direct,
+          Quad and QuadInterior. The latter three DISABLE NSF implicit GEMM.
+          Run-RVC-Full-Stage73.ps1 -Suite unet: independent UNet convolution A/B.
+          Use real private models and MitaKind.wav in .\embed\.
+          The Stage72 UNet GEMM produced PCM RMSE 991 and must not be enabled by default.
+          CUDA Graph replay remains DISABLED; historical captures used synthetic NSF only.
+          The Windows CI runner has no CUDA GPU; compiled kernels still need real RTX validation.
+          '@ | Set-Content "$folder/README.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rvc-stage73-quality-gpu-ab-windows-x64
+          path: dist/stage73-full-wav/
+          retention-days: 14
+          if-no-files-found: warn

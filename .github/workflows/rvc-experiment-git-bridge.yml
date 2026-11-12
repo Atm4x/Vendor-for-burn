@@ -52,3 +52,4 @@ jobs:
 # Stage70 real CubeCL CPU CpuGemm R&D with measured HuBERT parity and performance.
 # Stage71: export automatically selected CPU CpuGemm and its 11-shape regression harness.
 # Stage72: export full GPU A/B kernels and Stage67/68 real-WAV measurements.
+# Stage73: export the RMVPE salience/F0 parity and real-NSF Quad test head.
