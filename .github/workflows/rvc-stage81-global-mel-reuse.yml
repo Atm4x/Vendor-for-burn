@@ -1,0 +1,82 @@
+name: RVC Stage81 exact cross-chunk Mel reuse CUDA gate
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - experiment/conv-kernel-rnd-stage33-20261110
+    paths:
+      - 'models/tts-with-rvc-rs/src/rmvpe_mel.rs'
+      - 'models/tts-with-rvc-rs/src/rvc_inference.rs'
+      - 'models/tts-with-rvc-rs/src/main.rs'
+      - 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage81.ps1'
+      - '.github/workflows/rvc-stage81-global-mel-reuse.yml'
+permissions:
+  contents: read
+jobs:
+  exact-mel-cache-and-windows-binary:
+    runs-on: windows-latest
+    timeout-minutes: 115
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cache/tracel
+          key: stage81-mel-cache-${{ hashFiles('Cargo.lock') }}
+      - name: Restore vendored checksums
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Vendored checksum restore failed' }
+      - name: Check PowerShell syntax
+        shell: pwsh
+        run: |
+          $script = 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage81.ps1'
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $script).Path, [ref]$tokens, [ref]$errors)
+          if ($errors.Count -ne 0) { $errors | Format-List | Out-String | Write-Host; throw 'Stage81 PowerShell syntax invalid' }
+      - name: Verify exact STFT overlap reuse on CPU
+        shell: pwsh
+        run: |
+          cargo test --offline --locked -p tts-with-rvc-rs --no-default-features --features cpu --lib mel_reuse_tests
+          if ($LASTEXITCODE -ne 0) { throw 'Mel reuse bitwise tests failed' }
+      - name: Build unified native release executable
+        shell: pwsh
+        run: |
+          cargo build --release --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs
+          if ($LASTEXITCODE -ne 0) { throw 'Stage81 unified native build failed' }
+      - name: Doctor
+        shell: pwsh
+        run: |
+          & target/release/tts-with-rvc-rs.exe doctor
+          if ($LASTEXITCODE -ne 0) { throw 'Doctor failed' }
+      - name: Package full-WAV A/B with original embed assets
+        shell: pwsh
+        run: |
+          $folder = 'dist/stage81-global-mel-reuse'
+          New-Item -ItemType Directory -Force -Path $folder | Out-Null
+          Copy-Item target/release/tts-with-rvc-rs.exe $folder
+          Copy-Item research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage81.ps1 $folder
+          @'
+          Stage81: exact cross-chunk RMVPE Mel STFT reuse.
+          Runs original Direct full RVC unchanged and opt-in RVC_RMVPE_MEL_REUSE=1.
+          All core and model settings identical; PCM16 output MUST be bitwise identical.
+          Copy private CrazyMita.pth, hubert_base.pt, rmvpe.pt, CrazyMita.index,
+          MitaKind.wav into .\embed\ and run Run-RVC-Full-Stage81.ps1 -Modes all.
+          A/B compares timing, WAV hashes, PCM16 parity. Native Stage81 EXE required.
+          No reference-F0 injection or CUDA Graph. Production remains unchanged.
+          '@ | Set-Content "$folder/README.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rvc-stage81-global-mel-reuse-windows-x64
+          path: dist/stage81-global-mel-reuse/
+          retention-days: 14
+          if-no-files-found: warn

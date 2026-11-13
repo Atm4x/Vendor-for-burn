@@ -16,6 +16,22 @@ const MEL_FMIN: f64 = 30.0;
 const MEL_FMAX: f64 = 8_000.0;
 const LOG_CLAMP: f32 = 1e-5;
 
+/// Exact, source-aligned STFT/Mel frames shared by every chunk that sees the
+/// same sample neighborhood. Local segment-boundary frames stay unshared.
+/// This stores only preprocessing, never GRU state or predicted F0.
+#[derive(Debug)]
+pub(crate) struct MelReuseCache {
+    source_samples: usize,
+    frames: usize,
+    mel: Vec<f32>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MelReuseStats {
+    pub reused: usize,
+    pub recomputed: usize,
+}
+
 pub struct RmvpeMelSpectrogram {
     fft: Arc<dyn Fft<f32>>,
     window: Vec<f32>,
@@ -77,6 +93,31 @@ impl RmvpeMelSpectrogram {
     }
 
     pub fn forward(&self, audio: &[f32]) -> Result<(Vec<f32>, usize), String> {
+        let (mel, frames, _) = self.forward_with_cache(audio, None)?;
+        Ok((mel, frames))
+    }
+
+    pub(crate) fn build_reuse_cache(&self, source: &[f32]) -> Result<MelReuseCache, String> {
+        let frames = source.len() / HOP_LENGTH + 1;
+        let bytes = frames.checked_mul(MEL_BINS).and_then(|n| n.checked_mul(4))
+            .ok_or("RMVPE Mel reuse cache size overflow")?;
+        // Experimental bounded cache: long recordings need a rolling cache, not O(recording) storage.
+        if bytes > 128 * 1024 * 1024 {
+            return Err(format!("RMVPE Mel reuse cache requires {bytes} bytes (>128 MiB); use the normal path for long inputs"));
+        }
+        let (mel, frames) = self.forward(source)?;
+        Ok(MelReuseCache { source_samples: source.len(), frames, mel })
+    }
+
+    /// `source_start_sample` is the position of audio[0] on the original 16 kHz
+    /// grid, before per-chunk reflection. Reuse requires an entire 1024-sample
+    /// STFT window to fit inside this local segment. All other frames use the
+    /// original STFT implementation, preserving double-reflection semantics.
+    pub(crate) fn forward_with_cache(
+        &self,
+        audio: &[f32],
+        cache: Option<(&MelReuseCache, i64)>,
+    ) -> Result<(Vec<f32>, usize, MelReuseStats), String> {
         if audio.len() <= FFT_SIZE / 2 || audio.iter().any(|v| !v.is_finite()) {
             return Err("RMVPE requires at least 513 finite mono PCM16k samples".into());
         }
@@ -84,8 +125,30 @@ impl RmvpeMelSpectrogram {
         let mut output = vec![0.0f32; MEL_BINS * frames];
         let mut spectrum = vec![Complex32::new(0.0, 0.0); FFT_SIZE];
         let mut magnitude = vec![0.0_f32; FFT_SIZE / 2 + 1];
+        let mut stats = MelReuseStats::default();
         for frame in 0..frames {
-            let start = (frame * HOP_LENGTH) as isize - (FFT_SIZE / 2) as isize;
+            let center = frame * HOP_LENGTH;
+            let reuse = cache.and_then(|(source, source_start)| {
+                if center < FFT_SIZE / 2 || center.checked_add(FFT_SIZE / 2)? > audio.len() {
+                    return None;
+                }
+                let absolute = source_start.checked_add(center as i64)?;
+                if absolute < 0 || absolute % HOP_LENGTH as i64 != 0 {
+                    return None;
+                }
+                let original_frame = usize::try_from(absolute / HOP_LENGTH as i64).ok()?;
+                (original_frame < source.frames && original_frame * HOP_LENGTH <= source.source_samples)
+                    .then_some((source, original_frame))
+            });
+            if let Some((source, original_frame)) = reuse {
+                for band in 0..MEL_BINS {
+                    output[band * frames + frame] = source.mel[band * source.frames + original_frame];
+                }
+                stats.reused += 1;
+                continue;
+            }
+            stats.recomputed += 1;
+            let start = center as isize - (FFT_SIZE / 2) as isize;
             for (index, value) in spectrum.iter_mut().enumerate() {
                 let position = reflect_index(start + index as isize, audio.len());
                 *value = Complex32::new(audio[position] * self.window[index], 0.0);
@@ -106,7 +169,7 @@ impl RmvpeMelSpectrogram {
                 output[mel * frames + frame] = energy.max(LOG_CLAMP).ln();
             }
         }
-        Ok((output, frames))
+        Ok((output, frames, stats))
     }
 }
 
@@ -137,11 +200,29 @@ impl RmvpeAudioModel {
         })
     }
 
+    pub(crate) fn build_mel_reuse_cache(&self, source: &[f32]) -> Result<MelReuseCache, String> {
+        self.mel.build_reuse_cache(source)
+    }
+
     pub fn forward_pcm_batch(
         &self,
         audios: &[Vec<f32>],
         device: &Device,
     ) -> Result<(Tensor<3>, usize), String> {
+        self.forward_pcm_batch_with_cache(audios, device, None)
+    }
+
+    pub(crate) fn forward_pcm_batch_with_cache(
+        &self,
+        audios: &[Vec<f32>],
+        device: &Device,
+        cache: Option<(&MelReuseCache, &[i64])>,
+    ) -> Result<(Tensor<3>, usize), String> {
+        if let Some((_, offsets)) = cache {
+            if offsets.len() != audios.len() || offsets.iter().any(|offset| offset % HOP_LENGTH as i64 != 0) {
+                return Err("RMVPE cached segment offsets must match audio and 160-sample alignment".into());
+            }
+        }
         let first_len = audios
             .first()
             .ok_or("RMVPE requires a nonempty batch")?
@@ -153,8 +234,12 @@ impl RmvpeAudioModel {
         let padded = frames.div_ceil(32) * 32;
         let diag_start = std::time::Instant::now();
         let mut features = Vec::with_capacity(audios.len() * MEL_BINS * padded);
-        for audio in audios {
-            let (mel, nframes) = self.mel.forward(audio)?;
+        let mut reuse_stats = MelReuseStats::default();
+        for (i, audio) in audios.iter().enumerate() {
+            let context = cache.map(|(shared, offsets)| (shared, offsets[i]));
+            let (mel, nframes, stats) = self.mel.forward_with_cache(audio, context)?;
+            reuse_stats.reused += stats.reused;
+            reuse_stats.recomputed += stats.recomputed;
             if nframes != frames {
                 return Err("RMVPE frame count mismatch".into());
             }
@@ -164,8 +249,12 @@ impl RmvpeAudioModel {
             }
         }
         let batch = audios.len();
+        if cache.is_some() && std::env::var_os("RVC_PROFILE").is_some() {
+            eprintln!("profile rmvpe_mel_cache B={batch} reused_frames={} recomputed_frames={}", reuse_stats.reused, reuse_stats.recomputed);
+        }
         if crate::diagnostic::enabled() {
             crate::diagnostic::emit("rmvpe.mel_fft_cpu", serde_json::json!({
+                "reused_frames": reuse_stats.reused, "computed_fft_frames": reuse_stats.recomputed,
                 "wall_ms": crate::diagnostic::ms(diag_start), "frames": frames,
                 "padded_frames": padded, "batch": batch, "fft_size": FFT_SIZE,
                 "mel_bins": MEL_BINS, "host_mel_bytes": features.len() * 4,
@@ -193,7 +282,18 @@ impl RmvpeAudioModel {
         if audios.is_empty() || audios.len() != thresholds.len() {
             return Err("RMVPE thresholds must match input batch".into());
         }
-        let (salience, _) = self.forward_pcm_batch(audios, device)?;
+        self.infer_f0_batch_resident_with_cache(audios, device, thresholds, None)
+    }
+
+    #[cfg(any(feature = "cuda", feature = "cpu", feature = "wgpu"))]
+    pub(crate) fn infer_f0_batch_resident_with_cache(
+        &self, audios: &[Vec<f32>], device: &Device, thresholds: &[f32],
+        cache: Option<(&MelReuseCache, &[i64])>,
+    ) -> Result<Tensor<2>, String> {
+        if audios.is_empty() || audios.len() != thresholds.len() {
+            return Err("RMVPE thresholds must match input batch".into());
+        }
+        let (salience, _) = self.forward_pcm_batch_with_cache(audios, device, cache)?;
         let output = crate::rmvpe_gpu_f0::resident_f0(salience, thresholds)?;
         if std::env::var_os("RVC_PROFILE").is_some() {
             eprintln!("profile rmvpe_f0_readback gpu_resident B={} frames={} host_bytes=0", audios.len(), output.dims()[1]);
@@ -256,10 +356,17 @@ impl RmvpeAudioModel {
         device: &Device,
         thresholds: &[f32],
     ) -> Result<Vec<Vec<f32>>, String> {
+        self.infer_f0_batch_thresholds_with_cache(audios, device, thresholds, None)
+    }
+
+    pub(crate) fn infer_f0_batch_thresholds_with_cache(
+        &self, audios: &[Vec<f32>], device: &Device, thresholds: &[f32],
+        cache: Option<(&MelReuseCache, &[i64])>,
+    ) -> Result<Vec<Vec<f32>>, String> {
         if audios.is_empty() || audios.len() != thresholds.len() {
             return Err("RMVPE thresholds must match the nonempty input batch".into());
         }
-        let (salience, _frames) = self.forward_pcm_batch(audios, device)?;
+        let (salience, _frames) = self.forward_pcm_batch_with_cache(audios, device, cache)?;
         decode_salience_batch(salience, thresholds, compact_readback_enabled())
     }
 
@@ -553,5 +660,65 @@ mod sparse_mel_tests {
             mel.spans.iter().map(|(s, e)| e - s).sum::<usize>(),
             MEL_BINS * (FFT_SIZE / 2 + 1)
         );
+    }
+}
+
+#[cfg(test)]
+mod mel_reuse_tests {
+    use super::*;
+    use crate::chunked::{ChunkConfig, chunk_ranges, reflect_index as source_reflect};
+
+    fn assemble_segment(source: &[f32], start: usize, end: usize, context: usize, trailing: usize) -> (Vec<f32>, i64) {
+        let offset = (start as i64 - context as i64) * HOP_LENGTH as i64;
+        let samples = (context * 2 + trailing + end - start) * HOP_LENGTH;
+        let segment = (0..samples)
+            .map(|i| source[source_reflect(offset + i as i64, source.len())])
+            .collect();
+        (segment, offset)
+    }
+
+    #[test]
+    fn overlap_mel_reuse_is_bitwise_identical_even_at_double_reflected_boundaries() {
+        let stft = RmvpeMelSpectrogram::new();
+        for len in [3_200_usize, 8_009, 16_000, 42_093, 87_773] {
+            let audio: Vec<f32> = (0..len)
+                .map(|i| ((i as f32 * 0.034321).sin() + (i as f32 * 0.01371).cos()) * 0.19)
+                .collect();
+            let cache = stft.build_reuse_cache(&audio).unwrap();
+            for config in [
+                ChunkConfig { core_frames: 35, overlap_frames: 6, context_frames: 12, trailing_frames: 4 },
+                ChunkConfig { core_frames: 93, overlap_frames: 12, context_frames: 25, trailing_frames: 4 },
+            ] {
+                let mut reused_total = 0;
+                let mut recomputed_total = 0;
+                for (start, end) in chunk_ranges(len.div_ceil(HOP_LENGTH), config) {
+                    let (segment, offset) = assemble_segment(&audio, start, end, config.context_frames, config.trailing_frames);
+                    let (reference, frames) = stft.forward(&segment).unwrap();
+                    let (cached, cached_frames, stats) = stft.forward_with_cache(&segment, Some((&cache, offset))).unwrap();
+                    assert_eq!(frames, cached_frames);
+                    assert_eq!(reference.len(), cached.len());
+                    for (i, (original, actual)) in reference.iter().zip(cached.iter()).enumerate() {
+                        assert_eq!(original.to_bits(), actual.to_bits(), "PCM size={len} start={start} offset={offset} mel index={i}");
+                    }
+                    assert_eq!(stats.reused + stats.recomputed, frames);
+                    reused_total += stats.reused;
+                    recomputed_total += stats.recomputed;
+                }
+                assert!(reused_total > 0, "no reuse for PCM size={len}");
+                assert!(recomputed_total > 0, "no edge recompute for PCM size={len}");
+            }
+        }
+    }
+
+    #[test]
+    fn cache_never_reuses_local_stft_edge_frames() {
+        let stft = RmvpeMelSpectrogram::new();
+        let audio = (0..32_017).map(|i| ((i as f32) * 0.13).sin()).collect::<Vec<_>>();
+        let cache = stft.build_reuse_cache(&audio).unwrap();
+        let (segment, offset) = assemble_segment(&audio, 50, 100, 20, 4);
+        let (_, frames, stats) = stft.forward_with_cache(&segment, Some((&cache, offset))).unwrap();
+        assert_eq!(frames, 95);
+        assert_eq!(stats.recomputed, 8); // 4 leading + 4 trailing partial FFT windows
+        assert_eq!(stats.reused, frames - stats.recomputed);
     }
 }

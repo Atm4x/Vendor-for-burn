@@ -12,7 +12,7 @@ use crate::{
     nsf_source::SourceModuleHnNSF,
     phone_features::upsample_without_retrieval,
     preprocess::highpass_48hz_zero_phase,
-    rmvpe_mel::RmvpeAudioModel,
+    rmvpe_mel::{MelReuseCache, RmvpeAudioModel},
     text_encoder::TextEncoder,
 };
 
@@ -169,6 +169,10 @@ impl RvcV2Inferencer {
         progress: impl FnMut(ChunkProgress),
     ) -> Result<Vec<f32>, String> {
         let shared_f0 = std::env::var_os("RVC_GLOBAL_F0").is_some_and(|value| value == "1");
+        let shared_mel = std::env::var_os("RVC_RMVPE_MEL_REUSE").is_some_and(|value| value == "1");
+        if shared_f0 && shared_mel {
+            return Err("global F0 already removes per-chunk RMVPE work; disable RVC_RMVPE_MEL_REUSE".into());
+        }
         if shared_f0 && std::env::var_os("RVC_GPU_F0").is_some_and(|value| value == "1") {
             return Err("shared F0 requires CPU-decoded RMVPE F0; RVC_GPU_F0=1 is incompatible".into());
         }
@@ -185,7 +189,18 @@ impl RvcV2Inferencer {
         } else {
             None
         };
-        let chunks = cached_f0.as_ref().map(|_| chunk_ranges(filtered_pcm.len().div_ceil(160), config));
+        let mel_cache = if shared_mel {
+            let started = std::time::Instant::now();
+            let result = self.rmvpe.build_mel_reuse_cache(filtered_pcm)?;
+            if std::env::var_os("RVC_PROFILE").is_some() {
+                eprintln!("profile rmvpe_mel_cache_prepass elapsed_ms={:.2}", started.elapsed().as_secs_f64() * 1000.0);
+            }
+            Some(result)
+        } else {
+            None
+        };
+        let chunks = (cached_f0.is_some() || mel_cache.is_some())
+            .then(|| chunk_ranges(filtered_pcm.len().div_ceil(160), config));
         infer_chunked_batched_with_progress(
             filtered_pcm,
             config,
@@ -208,7 +223,14 @@ impl RvcV2Inferencer {
                         aligned_f0_slice(timeline, start, config.context_frames, segment.len() / 160)
                     }).collect::<Vec<_>>()
                 });
-                self.infer_16khz_batch_with_f0(segments, &settings, pitch.as_deref(), Some(indices))
+                let offsets = mel_cache.as_ref().map(|_| {
+                    let ranges = chunks.as_ref().expect("cached Mel requires chunk ranges");
+                    indices.iter().map(|&index| {
+                        (ranges[index].0 as i64 - config.context_frames as i64) * 160
+                    }).collect::<Vec<_>>()
+                });
+                let mel = mel_cache.as_ref().zip(offsets.as_deref());
+                self.infer_16khz_batch_with_f0(segments, &settings, pitch.as_deref(), Some(indices), mel)
             },
             progress,
         )
@@ -226,7 +248,7 @@ impl RvcV2Inferencer {
         audios: &[Vec<f32>],
         options: &[InferenceOptions],
     ) -> Result<Vec<Vec<f32>>, String> {
-        self.infer_16khz_batch_with_f0(audios, options, None, None)
+        self.infer_16khz_batch_with_f0(audios, options, None, None, None)
     }
 
     fn infer_16khz_batch_with_f0(
@@ -235,6 +257,7 @@ impl RvcV2Inferencer {
         options: &[InferenceOptions],
         provided_f0: Option<&[Vec<f32>]>,
         chunk_indices: Option<&[usize]>,
+        mel_reuse: Option<(&MelReuseCache, &[i64])>,
     ) -> Result<Vec<Vec<f32>>, String> {
         let batch = audios.len();
         if batch == 0 || batch != options.len() || batch > 32 {
@@ -328,7 +351,7 @@ impl RvcV2Inferencer {
         }
         #[cfg(any(feature = "cpu", feature = "cuda", feature = "wgpu"))]
         let resident_f0 = if gpu_f0 {
-            Some(self.rmvpe.infer_f0_batch_resident(audios, &self.device, &thresholds)?)
+            Some(self.rmvpe.infer_f0_batch_resident_with_cache(audios, &self.device, &thresholds, mel_reuse)?)
         } else {
             None
         };
@@ -346,7 +369,7 @@ impl RvcV2Inferencer {
         } else if let Some(rows) = provided_f0 {
             Some(rows.to_vec())
         } else {
-            Some(self.rmvpe.infer_f0_batch_thresholds(audios, &self.device, &thresholds)?)
+            Some(self.rmvpe.infer_f0_batch_thresholds_with_cache(audios, &self.device, &thresholds, mel_reuse)?)
         };
         crate::diagnostic::measure(&self.device, "rvc.rmvpe_total", started,
             serde_json::json!({"batch":batch,"mode":if provided_f0.is_some() {"shared_cpu_f0"} else if gpu_f0 {"resident_gpu_f0"} else {"dense_cpu_f0"}}));

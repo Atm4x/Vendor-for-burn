@@ -406,6 +406,7 @@ fn run() -> Result<(), String> {
             "gpu_faiss": std::env::var_os("RVC_GPU_FAISS").is_some(),
             "gpu_f0": std::env::var_os("RVC_GPU_F0").is_some(),
             "global_f0": std::env::var_os("RVC_GLOBAL_F0").is_some_and(|value| value == "1"),
+            "rmvpe_mel_reuse": std::env::var_os("RVC_RMVPE_MEL_REUSE").is_some_and(|value| value == "1"),
             "rmvpe_gru_execution": if std::env::var("RVC_RMVPE_GRU_PERSISTENT").as_deref() == Ok("1") {"persistent"} else {"stepwise"},
             "nsf_conv_execution": if std::env::var("RVC_NSF_IMPLICIT_GEMM").as_deref() == Ok("1")
                 || (std::env::var("RVC_NSF_CONV1D_GEMM").as_deref() == Ok("1")
