@@ -2063,6 +2063,7 @@ dependencies = [
  "cubek-random",
  "cubek-reduce",
  "cubek-std",
+ "cubek-tile",
 ]
 
 [[package]]
@@ -6541,6 +6542,7 @@ dependencies = [
  "burn",
  "burn-cubecl",
  "burn-flex",
+ "cubek",
  "half",
  "pytorch-reader",
  "rayon",

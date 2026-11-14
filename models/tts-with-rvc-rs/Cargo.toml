@@ -15,6 +15,7 @@ wgpu = ["burn/wgpu"]
 [dependencies]
 burn = { version = "=0.22.1", default-features = false, features = ["std", "extension", "cubecl"] }
 burn-cubecl = { version = "=0.22.1", default-features = false }
+cubek = { version = "=0.3.1", default-features = false, features = ["attention", "std"] }
 burn-flex = { version = "=0.22.1", default-features = false, features = ["std", "simd", "rayon"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

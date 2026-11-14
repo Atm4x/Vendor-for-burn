@@ -1,0 +1,90 @@
+name: RVC Stage83 online and fused FlashAttention CUDA gate
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - experiment/conv-kernel-rnd-stage33-20261110
+    paths:
+      - 'models/tts-with-rvc-rs/src/attention.rs'
+      - 'models/tts-with-rvc-rs/src/online_attention.rs'
+      - 'models/tts-with-rvc-rs/src/hubert_transformer.rs'
+      - 'models/tts-with-rvc-rs/src/lib.rs'
+      - 'models/tts-with-rvc-rs/src/main.rs'
+      - 'models/tts-with-rvc-rs/tests/parity.rs'
+      - 'models/tts-with-rvc-rs/Cargo.toml'
+      - 'Cargo.lock'
+      - 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage83.ps1'
+      - '.github/workflows/rvc-stage83-streaming-attention.yml'
+permissions:
+  contents: read
+jobs:
+  streaming-attention-and-windows-binary:
+    runs-on: windows-latest
+    timeout-minutes: 115
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cache/tracel
+          key: stage83-online-attention-${{ hashFiles('Cargo.lock') }}
+      - name: Restore vendored checksums
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Vendored checksum restore failed' }
+      - name: Check PowerShell syntax
+        shell: pwsh
+        run: |
+          $script = 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage83.ps1'
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $script).Path, [ref]$tokens, [ref]$errors)
+          if ($errors.Count -ne 0) { $errors | Format-List | Out-String | Write-Host; throw 'Stage83 PowerShell syntax invalid' }
+      - name: Verify exact online-softmax and relative attention on CPU
+        shell: pwsh
+        run: |
+          cargo test --offline --locked -p tts-with-rvc-rs --no-default-features --features cpu --lib online_attention::tests
+          if ($LASTEXITCODE -ne 0) { throw 'Online-softmax parity tests failed' }
+          cargo test --offline --locked -p tts-with-rvc-rs --no-default-features --features 'cpu,flex' --test parity relative_attention_online_matches_pytorch_reference
+          if ($LASTEXITCODE -ne 0) { throw 'PyTorch relative-attention parity failed' }
+      - name: Build unified native release executable
+        shell: pwsh
+        run: |
+          cargo build --release --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs
+          if ($LASTEXITCODE -ne 0) { throw 'Stage83 unified native build failed' }
+      - name: Doctor
+        shell: pwsh
+        run: |
+          & target/release/tts-with-rvc-rs.exe doctor
+          if ($LASTEXITCODE -ne 0) { throw 'Doctor failed' }
+      - name: Package full-WAV A/B with original embed assets
+        shell: pwsh
+        run: |
+          $folder = 'dist/stage83-attention-redesign'
+          New-Item -ItemType Directory -Force -Path $folder | Out-Null
+          Copy-Item target/release/tts-with-rvc-rs.exe $folder
+          Copy-Item research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage83.ps1 $folder
+          @'
+          Stage83: alternative attention computation (not another RMVPE cache).
+          Online softmax streams both HuBERT and TextEncoder attention.
+          CubeK fused FlashAttention is opt-in for unmasked HuBERT.
+          Copy private CrazyMita.pth, hubert_base.pt, rmvpe.pt, CrazyMita.index,
+          MitaKind.wav into .\embed\ and run Run-RVC-Full-Stage83.ps1 -Modes all.
+          ABBA timing, PCM error and SHA256. Floating-point bitwise parity is NOT required.
+          Native Stage83 EXE required. No CUDA Graph or reference-F0 injection.
+          Production defaults remain unchanged.
+          '@ | Set-Content "$folder/README.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rvc-stage83-attention-redesign-windows-x64
+          path: dist/stage83-attention-redesign/
+          retention-days: 14
+          if-no-files-found: warn

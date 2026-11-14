@@ -59,6 +59,14 @@ impl RelativeSelfAttention {
     }
 
     pub fn forward(&self, x: Tensor<3>, x_mask: Tensor<3>) -> Tensor<3> {
+        self.forward_with_online(x, x_mask, std::env::var("RVC_ATTENTION_ONLINE").as_deref() == Ok("1"))
+    }
+
+    pub fn forward_online(&self, x: Tensor<3>, x_mask: Tensor<3>) -> Tensor<3> {
+        self.forward_with_online(x, x_mask, true)
+    }
+
+    fn forward_with_online(&self, x: Tensor<3>, x_mask: Tensor<3>, use_online: bool) -> Tensor<3> {
         let [batch, channels, time] = x.dims();
         assert_eq!(x_mask.dims(), [batch, 1, time]);
         let head_channels = channels / self.heads;
@@ -75,6 +83,19 @@ impl RelativeSelfAttention {
             .permute([0, 1, 3, 2]);
 
         let scaled_q = q * (1.0 / (head_channels as f64).sqrt());
+        if use_online {
+            let valid = x_mask.reshape([batch, time]);
+            let attended = crate::online_attention::forward(
+                scaled_q, k, v, Some(valid.clone()), Some(valid),
+                Some(crate::online_attention::RelativeAttention {
+                    keys: self.relative_keys.clone(),
+                    values: self.relative_values.clone(),
+                    window: self.window,
+                }), 32, 64,
+            );
+            let combined = attended.permute([0, 1, 3, 2]).reshape([batch, channels, time]);
+            return self.output.forward(combined);
+        }
         let relative_k = relative_positions(self.relative_keys.clone(), time, self.window);
         let relative_v = relative_positions(self.relative_values.clone(), time, self.window);
 

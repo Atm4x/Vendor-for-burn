@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use crate::{checkpoint::RvcCheckpoint, conv1d_layout::{Conv1dWeightLayout, default_conv1d_layout, load_conv1d_weight}};
 use crate::nsf_source::SourceModuleHnNSF;
+use crate::nsf_tiling::{ConvGeometry, NsfTileGeometry, StageGeometry};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResidualExecution {
@@ -148,7 +149,30 @@ impl ResBlock1 {
 
     fn forward_with_scheduling(&self, mut x: Tensor<3>, scheduling: NsfScheduling) -> Tensor<3> {
         assert_eq!(x.dims()[1], self.channels);
+        let fused_limit = std::env::var("RVC_NSF_FUSED_PAIR_MAX_CHANNELS").ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|limit| *limit > 0);
+        let shared_tile = std::env::var("RVC_NSF_PAIR_SHARED_TILE").as_deref() == Ok("1")
+            && scheduling == NsfScheduling::Default;
         for (first, second) in self.first.iter().zip(&self.second) {
+            if shared_tile && crate::nsf_pair_tile::supports(self.channels, second.weight.dims()[2], second.dilation) {
+                x = crate::nsf_pair_tile::forward(
+                    x, first.weight.clone(), first.bias.clone(), first.dilation, first.padding,
+                    second.weight.clone(), second.bias.clone(), second.dilation, second.padding,
+                ).expect("NSF shared-tile two-convolution kernel failed");
+                continue;
+            }
+            if scheduling == NsfScheduling::Default && fused_limit.is_some_and(|limit| self.channels <= limit) {
+                let h = crate::nsf_fused_pair::preact_conv(
+                    x.clone(), first.weight.clone(), first.bias.clone(), None,
+                    first.dilation, first.padding,
+                ).expect("NSF experimental first fused convolution failed");
+                x = crate::nsf_fused_pair::preact_conv(
+                    h, second.weight.clone(), second.bias.clone(), Some(x),
+                    second.dilation, second.padding,
+                ).expect("NSF experimental second fused convolution failed");
+                continue;
+            }
             let h = activation::leaky_relu(x.clone(), 0.1);
             let h = first.forward(h);
             if scheduling == NsfScheduling::FlushPerConv {
@@ -586,9 +610,98 @@ impl NsfWaveformDecoder {
         let (harmonic, _) = source.forward_with_random(f0, self.total_upsample, initial_phases, gaussian_noise)?;
         crate::diagnostic::measure(&device, "nsf.source_generation", started, serde_json::json!({"harmonic_shape":harmonic.dims()}));
         let started = std::time::Instant::now();
-        let output = self.forward_with_execution(input, harmonic.permute([0, 2, 1]), condition, execution);
+        let harmonic = harmonic.permute([0, 2, 1]);
+        let output = match std::env::var("RVC_NSF_TILE_CORE_FRAMES") {
+            Ok(frames) if !frames.is_empty() => {
+                let core = frames.parse::<usize>()
+                    .map_err(|_| "RVC_NSF_TILE_CORE_FRAMES must be a positive integer".to_string())?;
+                if execution != ResidualExecution::PRODUCTION {
+                    return Err("NSF tiling requires sequential production residual execution".into());
+                }
+                self.forward_tiled(input, harmonic, condition, core)?
+            }
+            _ => self.forward_with_execution(input, harmonic, condition, execution),
+        };
         crate::diagnostic::measure(&device, "nsf.decoder_all", started, serde_json::json!({"output_shape":output.dims()}));
         Ok(output)
+    }
+
+    pub fn tiling_geometry(&self) -> NsfTileGeometry {
+        let conv_geometry = |conv: &Conv1d| ConvGeometry {
+            kernel: conv.weight.dims()[2],
+            stride: conv.stride,
+            dilation: conv.dilation,
+            padding: conv.padding,
+        };
+        NsfTileGeometry {
+            pre: conv_geometry(&self.pre),
+            post: conv_geometry(&self.post),
+            stages: self.stages.iter().map(|stage| {
+                let max_residual_radius = stage.residual.iter().map(|block| {
+                    block.first.iter().zip(&block.second).map(|(first, second)| {
+                        (first.weight.dims()[2] - 1) * first.dilation / 2
+                            + (second.weight.dims()[2] - 1) * second.dilation / 2
+                    }).sum::<usize>()
+                }).max().unwrap_or(0);
+                StageGeometry {
+                    upsample: ConvGeometry {
+                        kernel: stage.upsample.weight.dims()[2],
+                        stride: stage.upsample.stride,
+                        dilation: 1,
+                        padding: stage.upsample.padding,
+                    },
+                    noise: conv_geometry(&stage.noise),
+                    max_residual_radius,
+                }
+            }).collect(),
+            total_upsample: self.total_upsample,
+        }
+    }
+
+    pub fn forward_tiled(
+        &self,
+        input: Tensor<3>,
+        harmonic_source: Tensor<3>,
+        condition: Option<Tensor<3>>,
+        core_frames: usize,
+    ) -> Result<Tensor<3>, String> {
+        let [batch, channels, frames] = input.dims();
+        let total_samples = frames.checked_mul(self.total_upsample)
+            .ok_or("NSF tiled sample count overflow")?;
+        if harmonic_source.dims() != [batch, 1, total_samples] {
+            return Err("NSF tiled harmonic input has unexpected shape".into());
+        }
+        if core_frames == 0 {
+            return Err("NSF tiled core frames must be positive".into());
+        }
+        let plan = self.tiling_geometry().plan(frames, core_frames)?;
+        let mut parts = Vec::with_capacity(plan.len());
+        for part in plan {
+            let latent = input.clone().slice([0..batch, 0..channels, part.input_start..part.input_end]);
+            let source_start = part.input_start * self.total_upsample;
+            let source_end = part.input_end * self.total_upsample;
+            let harmonic = harmonic_source.clone().slice([0..batch, 0..1, source_start..source_end]);
+            let tile_condition = match &condition {
+                Some(g) if g.dims()[0] != batch => {
+                    return Err("NSF tiled conditioning batch dimensions differ".into());
+                }
+                Some(g) if g.dims()[2] == 1 => Some(g.clone()),
+                Some(g) if g.dims()[2] == frames => Some(g.clone().slice([
+                    0..batch, 0..g.dims()[1], part.input_start..part.input_end,
+                ])),
+                Some(_) => return Err("NSF tiled conditioning must be broadcast or time-aligned".into()),
+                None => None,
+            };
+            let full_tile = self.forward_with_execution(
+                latent, harmonic, tile_condition, ResidualExecution::PRODUCTION,
+            );
+            let samples = (part.input_end - part.input_start) * self.total_upsample;
+            if full_tile.dims() != [batch, 1, samples] {
+                return Err("NSF tiled decoder output has unexpected shape".into());
+            }
+            parts.push(full_tile.slice([0..batch, 0..1, part.output_start..part.output_end]));
+        }
+        Ok(Tensor::cat(parts, 2))
     }
 
     pub fn stage_count(&self) -> usize { self.stages.len() }

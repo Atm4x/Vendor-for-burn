@@ -1,0 +1,83 @@
+name: RVC Stage84 analytically bounded NSF tiling Windows gate
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - experiment/conv-kernel-rnd-stage33-20261110
+    paths:
+      - 'models/tts-with-rvc-rs/src/nsf_tiling.rs'
+      - 'models/tts-with-rvc-rs/src/decoder.rs'
+      - 'models/tts-with-rvc-rs/src/lib.rs'
+      - 'models/tts-with-rvc-rs/src/main.rs'
+      - 'models/tts-with-rvc-rs/tests/nsf_tiled.rs'
+      - 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage84.ps1'
+      - '.github/workflows/rvc-stage84-nsf-tiling.yml'
+permissions:
+  contents: read
+jobs:
+  exact-geometry-and-native-executable:
+    runs-on: windows-latest
+    timeout-minutes: 115
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cache/tracel
+          key: stage84-nsf-tiling-${{ hashFiles('Cargo.lock') }}
+      - name: Restore vendored checksums
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Vendored checksum restore failed' }
+      - name: Validate PowerShell runner syntax
+        shell: pwsh
+        run: |
+          $script = 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage84.ps1'
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $script).Path, [ref]$tokens, [ref]$errors)
+          if ($errors.Count -ne 0) { $errors | Format-List | Out-String | Write-Host; throw 'Invalid Stage84 runner' }
+      - name: Verify dependency geometry, nonlinear signal and synthetic checkpoint parity
+        shell: pwsh
+        run: |
+          cargo test --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,flex' --lib nsf_tiling::tests
+          if ($LASTEXITCODE -ne 0) { throw 'NSF math geometry tests failed' }
+          cargo test --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,flex' --test nsf_tiled
+          if ($LASTEXITCODE -ne 0) { throw 'Synthetic full-vs-tiled NSF model parity failed' }
+      - name: Build release CPU CUDA WGPU executable
+        shell: pwsh
+        run: |
+          cargo build --release --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs
+          if ($LASTEXITCODE -ne 0) { throw 'Stage84 unified build failed' }
+          & target/release/tts-with-rvc-rs.exe doctor
+          if ($LASTEXITCODE -ne 0) { throw 'Stage84 doctor failed' }
+      - name: Package Windows A/B/BA release
+        shell: pwsh
+        run: |
+          $folder = 'dist/stage84-nsf-tiling'
+          New-Item -ItemType Directory -Force -Path $folder | Out-Null
+          Copy-Item target/release/tts-with-rvc-rs.exe $folder
+          Copy-Item research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage84.ps1 $folder
+          @'
+          Stage84: exact reverse-dependency whole-decoder NSF tiling.
+          Baseline and candidate use identical F0, noise, weights and chunk scheduler.
+          Modes all: baseline/tiled/tiled/baseline with identical parameters.
+          The hypothesis is bounded peak activation memory, not guaranteed speed.
+          Copy private CrazyMita.pth, hubert_base.pt, rmvpe.pt,
+          CrazyMita.index and MitaKind.wav into .\embed\ before running.
+          No production defaults changed. Requires native Stage84 EXE.
+          '@ | Set-Content "$folder/README.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rvc-stage84-nsf-tiling-windows-x64
+          path: dist/stage84-nsf-tiling/
+          retention-days: 14
+          if-no-files-found: warn

@@ -619,3 +619,15 @@ fn tensor_batch_nsf_from_f0_matches_individual_waveforms() {
     assert_eq!(actual.len(), expected.len());
     assert!(max_abs_error(&actual, &expected) < 2e-4);
 }
+
+#[test]
+fn relative_attention_online_matches_pytorch_reference() {
+    let fixture: tts_with_rvc_rs::attention::AttentionFixture =
+        serde_json::from_str(include_str!("fixtures/relative_attention.json")).unwrap();
+    let device = Device::flex();
+    let (inputs, mask) = fixture.inputs(&device);
+    let actual = fixture.model(&device).forward_online(inputs, mask)
+        .into_data().try_into_vec::<f32>().unwrap();
+    let error = max_abs_error(&actual, &fixture.expected);
+    assert!(error <= 1e-4, "online relative attention vs PyTorch max abs deviation {error}");
+}

@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 use burn::tensor::Device;
 use std::{env, fs, process::ExitCode};
 mod user_cli;
@@ -421,8 +422,15 @@ fn run() -> Result<(), String> {
                 || std::env::var("RVC_NSF_TRANSPOSE_GEMM").as_deref() == Ok("1")
                 {"gemm"} else {"direct"},
             "hubert_frontend_conv_execution": if std::env::var("RVC_HUBERT_FRONTEND_GEMM").as_deref() == Ok("1") {"implicit_gemm"} else {"direct"},
+            "attention_execution": if std::env::var("RVC_HUBERT_ATTENTION_FLASH").as_deref() == Ok("1") {"hubert_flash_unit"} else if std::env::var("RVC_ATTENTION_ONLINE").as_deref() == Ok("1") {"streaming_online_softmax"} else {"dense"},
+            "text_encoder_attention_execution": if std::env::var("RVC_ATTENTION_ONLINE").as_deref() == Ok("1") {"streaming_relative_online_softmax"} else {"dense_relative"},
             "rmvpe_unet_conv_execution": if std::env::var("RVC_RMVPE_UNET_COMPENSATED_BATCH_TF32").as_deref() == Ok("1") {"compensated_tf32x2_batched"} else if std::env::var("RVC_RMVPE_UNET_COMPENSATED_TF32").as_deref() == Ok("1") {"compensated_tf32x2"} else if std::env::var("RVC_RMVPE_UNET_GEMM").as_deref() == Ok("1") {"implicit_gemm"} else if std::env::var("RVC_RMVPE_UNET_CONV2D_GEMM").as_deref() == Ok("1") && std::env::var("RVC_RMVPE_UNET_TRANSPOSE2D_GEMM").as_deref() == Ok("1") {"implicit_gemm"} else if std::env::var("RVC_RMVPE_UNET_CONV2D_GEMM").as_deref() == Ok("1") {"conv2d_implicit_gemm"} else if std::env::var("RVC_RMVPE_UNET_TRANSPOSE2D_GEMM").as_deref() == Ok("1") {"transpose2d_gemm"} else {"direct"},
             "nsf_temporal_conv_kernel": std::env::var("RVC_NSF_CONV_KERNEL").unwrap_or_default(),
+            "nsf_tile_core_frames": std::env::var("RVC_NSF_TILE_CORE_FRAMES").ok()
+                .filter(|value| !value.is_empty()).and_then(|value| value.parse::<usize>().ok()),
+            "nsf_pair_shared_tile": std::env::var("RVC_NSF_PAIR_SHARED_TILE").as_deref() == Ok("1"),
+            "nsf_fused_pair_max_channels": std::env::var("RVC_NSF_FUSED_PAIR_MAX_CHANNELS").ok()
+                .filter(|value| !value.is_empty()).and_then(|value| value.parse::<usize>().ok()),
             "nsf_execution": "sequential",
             "warm_definition": "same process, identical full WAV, persistent weights, synchronized outputs; iterations 1..N; no CUDA Graph",
         });

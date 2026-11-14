@@ -1,4 +1,5 @@
 pub mod diagnostic;
+mod online_attention;
 mod f0_audit;
 mod conv1d_layout;
 mod phone_features;
@@ -152,6 +153,9 @@ pub mod checkpoint;
 pub mod flow;
 
 pub mod decoder;
+pub mod nsf_tiling;
+mod nsf_fused_pair;
+mod nsf_pair_tile;
 mod cubecl_conv;
 mod tf32_compensated;
 
