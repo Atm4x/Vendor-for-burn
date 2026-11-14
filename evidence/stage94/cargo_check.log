@@ -1,0 +1,10 @@
+warning: unused build dependency `burn-onnx`
+  --> Cargo.toml:68:1
+   |
+68 | burn-onnx = "=0.22.0"
+   | ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `cargo::unused_dependencies` is set to `warn` by default
+help: consider removing the dependency on `burn-onnx`
+warning: `neuromita-inference-vendor` (manifest) generated 1 warning
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.34s

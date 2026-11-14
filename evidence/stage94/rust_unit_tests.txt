@@ -1,0 +1,32 @@
+
+running 28 tests
+test chunk_plan::stage94_batch_tests::gathers_nonadjacent_equal_shapes_without_padding ... ok
+test chunk_plan::stage94_batch_tests::lookahead_is_bounded_and_size_one_keeps_order ... ok
+test chunk_plan::tests::cost_aware_matches_exhaustive_partition_optimum ... ok
+test chunk_plan::tests::attention_dominated_model_prefers_shorter_chunks ... ok
+test chunk_plan::tests::cost_aware_selects_quiet_boundary_in_equal_cost_plans ... ok
+test chunk_plan::tests::cost_aware_prefers_fewer_large_chunks_when_dispatch_dominates ... ok
+test chunk_plan::tests::deterministic_flat_energy_prefers_even_splits ... ok
+test chunk_plan::stage94_batch_tests::batch_aware_shapes_and_boundaries_are_deterministic ... ok
+test chunk_plan::tests::invalid_cost_aware_geometry_is_rejected ... ok
+test chunk_plan::tests::invalid_inputs_are_rejected ... ok
+test chunk_plan::stage94_batch_tests::batch_aware_search_never_worsens_its_proven_proxy_baseline ... ok
+test chunk_plan::tests::optional_extra_chunks_are_contiguous_and_bounded ... ok
+test chunk_plan::tests::silent_regions_are_preferred_over_loud_regions ... ok
+test chunked::stage90_tests::quiet_plan_rejects_gaps_and_uncovered_final_segment ... ok
+test chunk_plan::tests::exhaustive_partition_coverage_and_determinism ... ok
+test chunked::stage94_schedule_tests::shape_gather_is_bitwise_equivalent_to_chronological_execution ... ok
+test chunked::stage94_schedule_tests::shape_gather_preserves_overlap_add_with_nonadjacent_ids ... ok
+test chunked::tensor_batch_tests::batch_rejects_missing_outputs_and_oversized_batch ... ok
+test chunked::tensor_batch_tests::batched_chunking_matches_scalar_and_preserves_finite_boundaries ... ok
+test chunk_plan::tests::short_inputs_and_extra_splits_never_underflow ... ok
+test chunked::tests::chunk_index_progress_and_boundary_weights ... ok
+test chunked::tests::cost_aware_full_audio_assembly_has_no_gaps_or_overlaps ... ok
+test chunked::tests::exact_multiple_and_short_last_chunk_are_covered ... ok
+test chunked::tests::overlap_add_preserves_long_audio_and_exact_sample_count ... ok
+test chunked::tests::rejects_insufficient_decoder_output_and_bad_config ... ok
+test chunk_plan::tests::exhaustive_small_lengths_and_partial_frames ... ok
+test chunked::stage90_tests::quiet_splice_preserves_complete_waveform_with_partial_frames ... ok
+test chunked::tensor_batch_tests::long_audio_batch_boundaries_and_partial_samples_match_scalar ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.42s

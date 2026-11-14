@@ -6,7 +6,7 @@ use burn::tensor::{Device, Int, Tensor, TensorData};
 
 use crate::{
     checkpoint::RvcCheckpoint,
-    chunked::{ChunkConfig, ChunkProgress, planned_chunk_ranges, infer_chunked_batched_with_plan, reflect_index},
+    chunked::{ChunkConfig, ChunkProgress, planned_chunk_ranges_for_batch, infer_chunked_batched_with_plan, reflect_index},
     chunk_plan::ChunkStrategy,
     decoder::NsfWaveformDecoder,
     faiss_index::IvfFlatIndex,
@@ -191,7 +191,7 @@ impl RvcV2Inferencer {
         }
         config.validate()?;
         let strategy = ChunkStrategy::from_env()?;
-        let ranges = planned_chunk_ranges(filtered_pcm, config, strategy)?;
+        let ranges = planned_chunk_ranges_for_batch(filtered_pcm, config, strategy, batch_size)?;
         let cached_f0 = if shared_f0 {
             let started = std::time::Instant::now();
             let timeline = self.rmvpe.infer_f0_long_windowed(

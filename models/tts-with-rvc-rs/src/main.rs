@@ -334,7 +334,13 @@ fn run() -> Result<(), String> {
             return Err("full benchmark requires at least 0.2 seconds of source audio".into());
         }
         let strategy = tts_with_rvc_rs::chunk_plan::ChunkStrategy::from_env()?;
-        let plan = tts_with_rvc_rs::chunked::planned_chunk_ranges(&filtered, config, strategy)?;
+        let plan = tts_with_rvc_rs::chunked::planned_chunk_ranges_for_batch(
+            &filtered, config, strategy, tensor_batch_size,
+        )?;
+        let schedule_mode = tts_with_rvc_rs::chunk_plan::BatchSchedule::from_env(strategy)?;
+        let tensor_batches = tts_with_rvc_rs::chunk_plan::plan_tensor_batches(
+            &plan, tensor_batch_size, schedule_mode,
+        )?;
         let plan_forwarded_frames: usize = plan.iter().map(|&(start, end)| {
             end - start + 2 * config.context_frames + config.trailing_frames
         }).sum();
@@ -408,6 +414,11 @@ fn run() -> Result<(), String> {
             "max_abs_iteration_delta": max_iteration_delta,
             "chunk_counts": chunk_counts,
             "planned_chunk_count": plan.len(),
+            "planned_tensor_batches": tensor_batches.len(),
+            "batch_schedule": match schedule_mode {
+                tts_with_rvc_rs::chunk_plan::BatchSchedule::Contiguous => "contiguous",
+                tts_with_rvc_rs::chunk_plan::BatchSchedule::ShapeGather{..} => "shape-gather",
+            },
             "planned_model_input_seconds": plan_forwarded_frames as f64 / 100.0,
             "planned_cut_frames": plan_cuts,
             "core_frames": config.core_frames,

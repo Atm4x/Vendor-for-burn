@@ -1,4 +1,4 @@
-use crate::chunk_plan::{plan_quiet_splices_with_extra, ChunkStrategy};
+use crate::chunk_plan::{plan_quiet_splices_with_extra, plan_tensor_batches, BatchSchedule, ChunkStrategy};
 
 const INPUT_HZ: usize = 16_000;
 const OUTPUT_HZ: usize = 40_000;
@@ -83,7 +83,7 @@ pub fn infer_chunked_batched_with_progress(
     progress: impl FnMut(ChunkProgress),
 ) -> Result<Vec<f32>, String> {
     let strategy = ChunkStrategy::from_env()?;
-    let plan = planned_chunk_ranges(pcm, config, strategy)?;
+    let plan = planned_chunk_ranges_for_batch(pcm, config, strategy, batch_size)?;
     infer_chunked_batched_with_plan(pcm, config, batch_size, &plan, strategy, infer, progress)
 }
 
@@ -91,6 +91,12 @@ pub fn planned_chunk_ranges(
     pcm: &[f32],
     config: ChunkConfig,
     strategy: ChunkStrategy,
+) -> Result<Vec<(usize, usize)>, String> {
+    planned_chunk_ranges_for_batch(pcm, config, strategy, 1)
+}
+
+pub fn planned_chunk_ranges_for_batch(
+    pcm: &[f32], config: ChunkConfig, strategy: ChunkStrategy, batch_size: usize,
 ) -> Result<Vec<(usize, usize)>, String> {
     config.validate()?;
     if pcm.is_empty() || pcm.iter().any(|value| !value.is_finite()) {
@@ -102,6 +108,8 @@ pub fn planned_chunk_ranges(
             plan_quiet_splices_with_extra(pcm, config.core_frames, extra_chunks),
         ChunkStrategy::CostAware(model) =>
             crate::chunk_plan::plan_cost_aware(pcm, config.core_frames, config.context_frames, config.trailing_frames, model),
+        ChunkStrategy::BatchAware(model) =>
+            crate::chunk_plan::plan_batch_aware(pcm, config.core_frames, config.context_frames, config.trailing_frames, batch_size, model),
     }
 }
 
@@ -111,6 +119,22 @@ pub fn infer_chunked_batched_with_plan(
     batch_size: usize,
     chunks: &[(usize, usize)],
     strategy: ChunkStrategy,
+    infer: impl FnMut(&[Vec<f32>], &[usize]) -> Result<Vec<Vec<f32>>, String>,
+    progress: impl FnMut(ChunkProgress),
+) -> Result<Vec<f32>, String> {
+    let schedule = BatchSchedule::from_env(strategy)?;
+    infer_chunked_batched_with_plan_scheduled(
+        pcm, config, batch_size, chunks, strategy, schedule, infer, progress,
+    )
+}
+
+pub fn infer_chunked_batched_with_plan_scheduled(
+    pcm: &[f32],
+    config: ChunkConfig,
+    batch_size: usize,
+    chunks: &[(usize, usize)],
+    strategy: ChunkStrategy,
+    schedule: BatchSchedule,
     mut infer: impl FnMut(&[Vec<f32>], &[usize]) -> Result<Vec<Vec<f32>>, String>,
     mut progress: impl FnMut(ChunkProgress),
 ) -> Result<Vec<f32>, String> {
@@ -137,15 +161,15 @@ pub fn infer_chunked_batched_with_plan(
     }
     let mut output = vec![0.0f32; output_length];
     let mut weight_sum = vec![0.0f32; output_length];
-    let mut chunk_index = 0;
-    while chunk_index < chunks.len() {
-        let first_size = (chunks[chunk_index].1 - chunks[chunk_index].0) * HOP;
-        let mut audio_batch = Vec::new();
-        let mut indices = Vec::new();
-        while chunk_index + audio_batch.len() < chunks.len() && audio_batch.len() < batch_size {
-            let i = chunk_index + audio_batch.len();
+    let schedule = plan_tensor_batches(chunks, batch_size, schedule)?;
+    // Results are drained in original sequence order. Even if inference finishes
+    // out of order, overlap-add and progress retain the legacy write order.
+    let mut pending = vec![None::<Vec<f32>>; chunks.len()];
+    let mut next_output = 0usize;
+    for indices in schedule {
+        let mut audio_batch = Vec::with_capacity(indices.len());
+        for &i in &indices {
             let (start, end) = chunks[i];
-            if (end - start) * HOP != first_size { break; }
             let left = config.context_frames * HOP;
             let right = (config.context_frames + config.trailing_frames) * HOP;
             let core = (end - start) * HOP;
@@ -158,15 +182,18 @@ pub fn infer_chunked_batched_with_plan(
                 return Err(format!("RVC chunk {i} has invalid model input size {}", segment.len()));
             }
             audio_batch.push(segment);
-            indices.push(i);
         }
         let rendered_batch = infer(&audio_batch, &indices)
-            .map_err(|err| format!("RVC chunks {}..{}: {err}", chunk_index, chunk_index + audio_batch.len()))?;
+            .map_err(|err| format!("RVC chunk batch {indices:?}: {err}"))?;
         if rendered_batch.len() != audio_batch.len() {
             return Err(format!("RVC batch returned {} waveforms for {} inputs", rendered_batch.len(), audio_batch.len()));
         }
-        for (relative, rendered) in rendered_batch.into_iter().enumerate() {
-            let i = chunk_index + relative;
+        for (i, rendered) in indices.into_iter().zip(rendered_batch) {
+            pending[i] = Some(rendered);
+        }
+        while next_output < chunks.len() {
+            let Some(rendered) = pending[next_output].take() else { break; };
+            let i = next_output;
             let (start, end) = chunks[i];
             let out_start = start * OUTPUT_HOP;
             let out_end = (end * OUTPUT_HOP).min(output_length);
@@ -194,8 +221,11 @@ pub fn infer_chunked_batched_with_plan(
                 weight_sum[absolute] += weight;
             }
             progress(ChunkProgress { chunk_index: i + 1, chunk_count: chunks.len(), output_samples: out_end });
+            next_output += 1;
         }
-        chunk_index += audio_batch.len();
+    }
+    if next_output != chunks.len() {
+        return Err("RVC batch schedule did not render every chunk".into());
     }
     for (sample, weight) in output.iter_mut().zip(weight_sum) {
         if weight <= 0.0 || !weight.is_finite() {
@@ -476,5 +506,54 @@ mod stage90_tests {
             assert!(infer_chunked_batched_with_plan(&input, config, 2, plan,
                 ChunkStrategy::QuietSplice { extra_chunks: 0 }, |_, _| Ok(vec![]), |_| {}).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod stage94_schedule_tests {
+    use super::*;
+
+    #[test]
+    fn shape_gather_is_bitwise_equivalent_to_chronological_execution() {
+        let frames=190usize;
+        let pcm=(0..frames*HOP-29).map(|i| ((i*17%997) as f32)/997.0).collect::<Vec<_>>();
+        let ranges=[(0,40),(40,75),(75,115),(115,150),(150,190)];
+        let config=ChunkConfig{core_frames:50,context_frames:20,trailing_frames:4,overlap_frames:6};
+        let render=|segments:&[Vec<f32>],indices:&[usize]| -> Result<Vec<Vec<f32>>,String> {
+            Ok(segments.iter().zip(indices).map(|(segment,&id)|
+                (0..segment.len()*5/2).map(|i| segment[i*2/5]+id as f32*0.001).collect()
+            ).collect())
+        };
+        let mut original_progress=Vec::new();
+        let a=infer_chunked_batched_with_plan_scheduled(&pcm,config,2,&ranges,
+            ChunkStrategy::QuietSplice{extra_chunks:0},BatchSchedule::Contiguous,
+            render,|p|original_progress.push(p)).unwrap();
+        let mut gather_progress=Vec::new();
+        let mut ids_seen=Vec::new();
+        let b=infer_chunked_batched_with_plan_scheduled(&pcm,config,2,&ranges,
+            ChunkStrategy::QuietSplice{extra_chunks:0},BatchSchedule::ShapeGather{lookahead:8},
+            |s,ids|{ids_seen.push(ids.to_vec()); render(s,ids)},
+            |p|gather_progress.push(p)).unwrap();
+        assert_eq!(a.len(),b.len());
+        assert!(a.iter().zip(&b).all(|(a,b)| a.to_bits()==b.to_bits()));
+        assert_eq!(original_progress,gather_progress);
+        assert_eq!(ids_seen, vec![vec![0,2],vec![1,3],vec![4]]);
+    }
+
+    #[test]
+    fn shape_gather_preserves_overlap_add_with_nonadjacent_ids() {
+        let pcm=(0..220*160).map(|i| (i%127) as f32/127.0).collect::<Vec<_>>();
+        let ranges=[(0,50),(42,92),(84,130),(122,172),(164,214),(206,220)];
+        let config=ChunkConfig{core_frames:60,context_frames:20,trailing_frames:4,overlap_frames:8};
+        let render=|segments:&[Vec<f32>],indices:&[usize]| -> Result<Vec<Vec<f32>>,String> {
+            Ok(segments.iter().zip(indices).map(|(segment,&id)|
+                (0..segment.len()*5/2).map(|i| segment[i*2/5]+id as f32*0.01).collect()
+            ).collect())
+        };
+        let a=infer_chunked_batched_with_plan_scheduled(&pcm,config,3,&ranges,
+            ChunkStrategy::FixedOverlap,BatchSchedule::Contiguous,render, |_|{}).unwrap();
+        let b=infer_chunked_batched_with_plan_scheduled(&pcm,config,3,&ranges,
+            ChunkStrategy::FixedOverlap,BatchSchedule::ShapeGather{lookahead:12},render, |_|{}).unwrap();
+        assert!(a.iter().zip(&b).all(|(a,b)|a.to_bits()==b.to_bits()));
     }
 }

@@ -3,6 +3,7 @@ pub enum ChunkStrategy {
     FixedOverlap,
     QuietSplice { extra_chunks: usize },
     CostAware(CostModel),
+    BatchAware(CostModel),
 }
 
 impl ChunkStrategy {
@@ -19,7 +20,8 @@ impl ChunkStrategy {
                 Ok(Self::QuietSplice { extra_chunks })
             },
             Ok("cost-aware") => Ok(Self::CostAware(CostModel::from_env()?)),
-            Ok(value) => Err(format!("RVC_CHUNK_STRATEGY must be fixed, quiet-splice or cost-aware, got {value}")),
+            Ok("batch-aware") => Ok(Self::BatchAware(CostModel::from_env()?)),
+            Ok(value) => Err(format!("RVC_CHUNK_STRATEGY must be fixed, quiet-splice, cost-aware or batch-aware, got {value}")),
             Err(error) => Err(format!("invalid RVC_CHUNK_STRATEGY: {error}")),
         }
     }
@@ -139,6 +141,162 @@ pub fn plan_cost_aware(
     }
     chunks.reverse();
     Ok(chunks)
+}
+
+/// Batch execution is a separate decision from audio segmentation. Every group
+/// contains only exactly equal-length model inputs; padding changes attention
+/// and normalization and is intentionally unsupported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchSchedule {
+    Contiguous,
+    ShapeGather { lookahead: usize },
+}
+
+impl BatchSchedule {
+    pub fn from_env(strategy: ChunkStrategy) -> Result<Self, String> {
+        match std::env::var("RVC_BATCH_SCHEDULE").as_deref() {
+            Err(std::env::VarError::NotPresent) | Ok("") => {
+                if matches!(strategy, ChunkStrategy::BatchAware(_)) {
+                    Ok(Self::ShapeGather { lookahead: 64 })
+                } else {
+                    Ok(Self::Contiguous)
+                }
+            }
+            Ok("contiguous") => Ok(Self::Contiguous),
+            Ok("shape-gather") => {
+                let lookahead = match std::env::var("RVC_BATCH_LOOKAHEAD") {
+                    Ok(value) => value.parse::<usize>().ok()
+                        .filter(|&value| (2..=256).contains(&value))
+                        .ok_or("RVC_BATCH_LOOKAHEAD must be 2..=256")?,
+                    Err(std::env::VarError::NotPresent) => 64,
+                    Err(error) => return Err(format!("RVC_BATCH_LOOKAHEAD: {error}")),
+                };
+                Ok(Self::ShapeGather { lookahead })
+            },
+            Ok(value) => Err(format!("RVC_BATCH_SCHEDULE must be contiguous or shape-gather, got {value}")),
+            Err(error) => Err(format!("RVC_BATCH_SCHEDULE: {error}")),
+        }
+    }
+}
+
+/// Pure, deterministic batching. The original chunk IDs are retained, so seed,
+/// F0, phase and Gaussian-field coordinates remain tied to the recording and
+/// never to a batch slot. No chunks are padded to match a shape.
+pub fn plan_tensor_batches(
+    chunks: &[(usize, usize)], batch_size: usize, strategy: BatchSchedule,
+) -> Result<Vec<Vec<usize>>, String> {
+    if !(1..=32).contains(&batch_size) {
+        return Err("tensor batch size must be in 1..=32".into());
+    }
+    if matches!(strategy, BatchSchedule::ShapeGather { lookahead: 0 }) {
+        return Err("shape-gather requires a positive lookahead".into());
+    }
+    let mut used = vec![false; chunks.len()];
+    let mut batches = Vec::new();
+    for first in 0..chunks.len() {
+        if used[first] { continue; }
+        let target = chunks[first].1.checked_sub(chunks[first].0)
+            .filter(|&size| size > 0).ok_or("invalid chunk length")?;
+        used[first] = true;
+        let mut group = vec![first];
+        let end = match strategy {
+            BatchSchedule::Contiguous => first.saturating_add(batch_size).min(chunks.len()),
+            BatchSchedule::ShapeGather { lookahead } =>
+                first.saturating_add(lookahead).min(chunks.len()),
+        };
+        for next in first + 1..end {
+            if group.len() == batch_size { break; }
+            if used[next] {
+                if matches!(strategy, BatchSchedule::Contiguous) { break; }
+                continue;
+            }
+            let length = chunks[next].1.checked_sub(chunks[next].0)
+                .filter(|&size| size > 0).ok_or("invalid chunk length")?;
+            if length == target {
+                used[next] = true;
+                group.push(next);
+            } else if matches!(strategy, BatchSchedule::Contiguous) {
+                break;
+            }
+        }
+        batches.push(group);
+    }
+    Ok(batches)
+}
+
+/// A restricted global search for repeated, identical model shapes. It evaluates
+/// fixed-length lattices with one adjustable first segment and one remainder,
+/// plus the unrestricted Stage93 shortest-path solution. The proxy charges one
+/// launch per *batch*, but still charges every model input its full linear and
+/// quadratic work. This is not a measured GPU-latency optimizer.
+pub fn plan_batch_aware(
+    pcm: &[f32], max_core: usize, context: usize, trailing: usize,
+    batch_size: usize, model: CostModel,
+) -> Result<Vec<(usize, usize)>, String> {
+    if !(1..=32).contains(&batch_size) { return Err("batch-aware size must be 1..=32".into()); }
+    let baseline = plan_cost_aware(pcm, max_core, context, trailing, model)?;
+    if batch_size == 1 { return Ok(baseline); }
+    let total = pcm.len().div_ceil(160);
+    let mut frames = vec![0.0_f64; total];
+    for (i, &v) in pcm.iter().enumerate() { frames[i / 160] += (v as f64).powi(2); }
+    let mean_energy = (frames.iter().sum::<f64>() / pcm.len() as f64).max(1e-20);
+    let mut boundary_cost = vec![0.0; total + 1];
+    for t in 1..total {
+        let samples = ((t + 1) * 160).min(pcm.len()) - (t - 1) * 160;
+        boundary_cost[t] = (((frames[t-1] + frames[t]) / samples as f64) / mean_energy)
+            .min(10_000.0) * model.splice as f64;
+    }
+    let score = |plan: &[(usize, usize)]| -> f64 {
+        let mut cost = 0.0;
+        for &(start,end) in plan {
+            let len=end-start;
+            let model_frames=(len+2*context+trailing) as f64;
+            cost += model.linear as f64 * model_frames
+                + model.attention_milli as f64 / 1000.0 * model_frames * model_frames;
+            if start>0 {cost += boundary_cost[start];}
+        }
+        // Charge actual greedy gather groups, not an unachievable ideal
+        // grouping for longer recordings with bounded lookahead.
+        let batches = plan_tensor_batches(plan, batch_size,
+            BatchSchedule::ShapeGather { lookahead: 64 })
+            .expect("lattice candidates are strictly positive in length");
+        cost + batches.len() as f64 * model.launch as f64
+    };
+    let mut best = baseline;
+    let mut best_cost = score(&best);
+    // Keep the search bounded independently of the total audio duration.
+    // Lengths at 10-frame intervals admit efficient group sizes while allowing
+    // a broad attention-versus-launch tradeoff.
+    let mut cores = (20..=max_core).step_by(10).collect::<Vec<_>>();
+    cores.push(max_core);
+    cores.sort_unstable();
+    cores.dedup();
+    for core in cores {
+        // Shifting the first cut moves the entire lattice, enabling searches
+        // for global quiet corridors without introducing per-chunk padding.
+        let radius = (core/6).min(40);
+        for delta in -(radius as isize)..=radius as isize {
+            let first = core as isize + delta;
+            if first <= 0 || first as usize > max_core { continue; }
+            let mut ends = vec![];
+            let mut at = 0;
+            let mut next = first as usize;
+            while at < total {
+                let end = next.min(total);
+                ends.push((at,end));
+                at=end;
+                next=at.saturating_add(core);
+            }
+            let cost=score(&ends);
+            if cost < best_cost - 1e-9
+                || (cost-best_cost).abs()<1e-9 && ends.len()<best.len()
+            {
+                best=ends;
+                best_cost=cost;
+            }
+        }
+    }
+    Ok(best)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -436,5 +594,68 @@ mod tests {
         assert!(plan_quiet_splices(&[], 900).is_err());
         assert!(plan_quiet_splices(&[f32::NAN], 900).is_err());
         assert!(plan_quiet_splices(&[1.0], 0).is_err());
+    }
+}
+
+#[cfg(test)]
+mod stage94_batch_tests {
+    use super::*;
+
+    #[test]
+    fn gathers_nonadjacent_equal_shapes_without_padding() {
+        let ranges=[(0,40),(40,75),(75,115),(115,150),(150,190)];
+        let contiguous=plan_tensor_batches(&ranges,2,BatchSchedule::Contiguous).unwrap();
+        let gather=plan_tensor_batches(&ranges,2,BatchSchedule::ShapeGather{lookahead:5}).unwrap();
+        assert_eq!(contiguous.len(),5);
+        assert_eq!(gather,vec![vec![0,2],vec![1,3],vec![4]]);
+        let mut ids=gather.iter().flatten().copied().collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids,(0..ranges.len()).collect::<Vec<_>>());
+        for batch in gather {
+            assert!(batch.iter().all(|&i| ranges[i].1-ranges[i].0==ranges[batch[0]].1-ranges[batch[0]].0));
+        }
+    }
+
+    #[test]
+    fn lookahead_is_bounded_and_size_one_keeps_order() {
+        let chunks=[(0,40),(40,75),(75,115),(115,150),(150,190)];
+        let gather=plan_tensor_batches(&chunks,2,BatchSchedule::ShapeGather{lookahead:2}).unwrap();
+        assert_eq!(gather.len(),5);
+        let scalar=plan_tensor_batches(&chunks,1,BatchSchedule::ShapeGather{lookahead:32}).unwrap();
+        assert_eq!(scalar, vec![vec![0],vec![1],vec![2],vec![3],vec![4]]);
+        assert!(plan_tensor_batches(&chunks,0,BatchSchedule::Contiguous).is_err());
+        assert!(plan_tensor_batches(&chunks,33,BatchSchedule::Contiguous).is_err());
+    }
+
+    #[test]
+    fn batch_aware_search_never_worsens_its_proven_proxy_baseline() {
+        let model=CostModel{launch:100_000,linear:1,attention_milli:0,splice:0};
+        let pcm=vec![0.3_f32; 2_130*160-37];
+        let legacy=plan_cost_aware(&pcm,450,20,4,model).unwrap();
+        let chosen=plan_batch_aware(&pcm,450,20,4,3,model).unwrap();
+        let eval=|plan:&[(usize,usize)]| {
+            let groups=plan_tensor_batches(plan,3,BatchSchedule::ShapeGather{lookahead:64}).unwrap().len();
+            let linear=plan.iter().map(|(start,end)| end-start+44).sum::<usize>();
+            groups as f64 * model.launch as f64 + linear as f64 * model.linear as f64
+        };
+        assert!(eval(&chosen) <= eval(&legacy));
+        assert!(chosen.iter().all(|(start,end)|start<end && end-start<=450));
+        assert_eq!(chosen.first().unwrap().0,0);
+        assert_eq!(chosen.last().unwrap().1,2_130);
+        assert!(chosen.windows(2).all(|w| w[0].1==w[1].0));
+        assert_eq!(plan_batch_aware(&pcm,450,20,4,1,model).unwrap(),legacy);
+    }
+
+    #[test]
+    fn batch_aware_shapes_and_boundaries_are_deterministic() {
+        let model=CostModel::default();
+        for frames in [1,20,121,301,750,901,1_200] {
+            let pcm=(0..frames*160-1).map(|i| (i%127) as f32 / 127.0).collect::<Vec<_>>();
+            let a=plan_batch_aware(&pcm,300,20,4,2,model).unwrap();
+            let b=plan_batch_aware(&pcm,300,20,4,2,model).unwrap();
+            assert_eq!(a,b);
+            assert_eq!(a.last().unwrap().1,frames);
+            assert!(a.iter().all(|&(s,e)|s<e && e-s<=300));
+        }
     }
 }
