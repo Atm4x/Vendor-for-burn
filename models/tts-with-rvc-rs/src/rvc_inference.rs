@@ -13,6 +13,7 @@ use crate::{
     flow::ResidualCouplingBlock,
     hubert_model::HubertFeatureModel,
     nsf_source::SourceModuleHnNSF,
+    nsf_phase::GlobalNsfPhase,
     phone_features::upsample_without_retrieval,
     preprocess::highpass_48hz_zero_phase,
     rmvpe_mel::{MelReuseCache, RmvpeAudioModel},
@@ -172,6 +173,10 @@ impl RvcV2Inferencer {
         progress: impl FnMut(ChunkProgress),
     ) -> Result<Vec<f32>, String> {
         let shared_f0 = std::env::var_os("RVC_GLOBAL_F0").is_some_and(|value| value == "1");
+        let global_nsf_phase = std::env::var_os("RVC_NSF_GLOBAL_PHASE").is_some_and(|value| value == "1");
+        if global_nsf_phase && !shared_f0 {
+            return Err("RVC_NSF_GLOBAL_PHASE=1 requires RVC_GLOBAL_F0=1".into());
+        }
         let shared_mel = std::env::var_os("RVC_RMVPE_MEL_REUSE").is_some_and(|value| value == "1");
         if shared_f0 && shared_mel {
             return Err("global F0 already removes per-chunk RMVPE work; disable RVC_RMVPE_MEL_REUSE".into());
@@ -191,6 +196,15 @@ impl RvcV2Inferencer {
                 eprintln!("profile shared_f0 prepass_frames={} elapsed_ms={:.2}", timeline.len(), started.elapsed().as_secs_f64() * 1000.0);
             }
             Some(timeline)
+        } else {
+            None
+        };
+        let phase_timeline = if global_nsf_phase {
+            let timeline = cached_f0.as_deref()
+                .ok_or("global NSF phase requires global F0 timeline")?;
+            Some(GlobalNsfPhase::new(
+                timeline, options.pitch_shift_semitones, RVC_SAMPLE_RATE, RVC_HOP,
+            )?)
         } else {
             None
         };
@@ -233,7 +247,16 @@ impl RvcV2Inferencer {
                     }).collect::<Vec<_>>()
                 });
                 let mel = mel_cache.as_ref().zip(offsets.as_deref());
-                self.infer_16khz_batch_with_f0(segments, &settings, pitch.as_deref(), Some(indices), mel)
+                let phase_offsets = phase_timeline.as_ref().map(|timeline| {
+                    indices.iter().map(|&index| {
+                        let first = ranges[index].0 as i64 - config.context_frames as i64;
+                        timeline.phase_at(first)
+                    }).collect::<Result<Vec<_>, _>>()
+                }).transpose()?;
+                self.infer_16khz_batch_with_f0(
+                    segments, &settings, pitch.as_deref(), Some(indices), mel,
+                    phase_offsets.as_deref(),
+                )
             },
             progress,
         )
@@ -251,7 +274,7 @@ impl RvcV2Inferencer {
         audios: &[Vec<f32>],
         options: &[InferenceOptions],
     ) -> Result<Vec<Vec<f32>>, String> {
-        self.infer_16khz_batch_with_f0(audios, options, None, None, None)
+        self.infer_16khz_batch_with_f0(audios, options, None, None, None, None)
     }
 
     fn infer_16khz_batch_with_f0(
@@ -261,6 +284,7 @@ impl RvcV2Inferencer {
         provided_f0: Option<&[Vec<f32>]>,
         chunk_indices: Option<&[usize]>,
         mel_reuse: Option<(&MelReuseCache, &[i64])>,
+        global_phase_offsets: Option<&[f32]>,
     ) -> Result<Vec<Vec<f32>>, String> {
         let batch = audios.len();
         if batch == 0 || batch != options.len() || batch > 32 {
@@ -628,6 +652,14 @@ impl RvcV2Inferencer {
         }
         let started = std::time::Instant::now();
         let initial_phase = Tensor::zeros([1, 1, 1], &self.device);
+        let phase_offsets = global_phase_offsets.map(|offsets| {
+            if offsets.len() != batch || offsets.iter().any(|offset| !offset.is_finite()) {
+                return Err("invalid global NSF phase offsets for this tensor batch".to_string());
+            }
+            Ok(Tensor::from_data(
+                TensorData::new(offsets.to_vec(), [batch, 1, 1]), &self.device,
+            ))
+        }).transpose()?;
         let mut gaussian_noise = Vec::with_capacity(batch * frames * RVC_HOP);
         for random in &mut random_sources {
             gaussian_noise.extend((0..frames * RVC_HOP).map(|_| random.sample()));
@@ -642,13 +674,14 @@ impl RvcV2Inferencer {
         crate::diagnostic::measure(&self.device, "rvc.nsf_inputs", started,
             serde_json::json!({"sine_h2d_bytes_estimate":batch*frames*RVC_HOP*4,"f0_h2d_bytes_estimate":if gpu_f0 {0} else {batch*frames*4}}));
         let started = std::time::Instant::now();
-        let output = self.decoder.forward_from_f0_with_execution(
+        let output = self.decoder.forward_from_f0_with_execution_and_phase(
             latent,
             f0_tensor,
             Some(speaker),
             &self.source,
             initial_phase,
             sine_noise,
+            phase_offsets,
             crate::decoder::ResidualExecution::PRODUCTION,
         )?;
         crate::diagnostic::measure(&self.device, "rvc.nsf_compute", started,

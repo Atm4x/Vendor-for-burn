@@ -4,6 +4,7 @@ mod online_attention;
 mod f0_audit;
 mod conv1d_layout;
 mod nsf_precision;
+mod nsf_phase;
 mod phone_features;
 #[cfg(any(feature = "cuda", feature = "cpu", feature = "wgpu"))]
 mod faiss_gpu;

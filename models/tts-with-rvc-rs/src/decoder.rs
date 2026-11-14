@@ -623,13 +623,31 @@ impl NsfWaveformDecoder {
         gaussian_noise: Tensor<3>,
         execution: ResidualExecution,
     ) -> Result<Tensor<3>, String> {
+        self.forward_from_f0_with_execution_and_phase(
+            input, f0, condition, source, initial_phases, gaussian_noise, None, execution,
+        )
+    }
+
+    pub fn forward_from_f0_with_execution_and_phase(
+        &self,
+        input: Tensor<3>,
+        f0: Tensor<2>,
+        condition: Option<Tensor<3>>,
+        source: &SourceModuleHnNSF,
+        initial_phases: Tensor<3>,
+        gaussian_noise: Tensor<3>,
+        global_phase: Option<Tensor<3>>,
+        execution: ResidualExecution,
+    ) -> Result<Tensor<3>, String> {
         let [batch, _, frames] = input.dims();
         if f0.dims() != [batch, frames] {
             return Err("NSF decoder F0 shape must match input frames".into());
         }
         let device = f0.device();
         let started = std::time::Instant::now();
-        let (harmonic, _) = source.forward_with_random(f0, self.total_upsample, initial_phases, gaussian_noise)?;
+        let (harmonic, _) = source.forward_with_random_and_global_phase(
+            f0, self.total_upsample, initial_phases, gaussian_noise, global_phase,
+        )?;
         crate::diagnostic::measure(&device, "nsf.source_generation", started, serde_json::json!({"harmonic_shape":harmonic.dims()}));
         let started = std::time::Instant::now();
         let harmonic = harmonic.permute([0, 2, 1]);
