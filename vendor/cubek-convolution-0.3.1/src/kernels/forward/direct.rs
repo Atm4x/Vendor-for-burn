@@ -77,7 +77,7 @@ fn direct_conv2d_kernel<E: Numeric, NIn: Size, NOut: Size>(
         bias.map(|bias| bias[out_c as usize / vector_size_out]);
     let mut sum = bias.unwrap_or_else(|| Vector::zero());
 
-    let in_offs = b as usize * input.stride(0) + ic_start as usize;
+    let in_offs = b as usize * input.stride(0) + ic_start as usize * input.stride(input.rank() - 1);
 
     let stride_oc = weight.stride(0);
 
@@ -105,6 +105,8 @@ fn direct_conv2d_kernel<E: Numeric, NIn: Size, NOut: Size>(
         conv_params: args.conv_params,
         in_c_per_group,
         stride_oc,
+        stride_ic: input.stride(input.rank() - 1),
+        stride_wc: weight.stride(weight.rank() - 1),
     };
 
     let vector_size_in = input.vector_size();
@@ -181,6 +183,8 @@ struct LoopParams {
 
     in_c_per_group: u32,
     stride_oc: usize,
+    stride_ic: usize,
+    stride_wc: usize,
 }
 
 #[cube]
@@ -241,6 +245,8 @@ fn kernel_loop<E: Numeric, NIn: Size, NOut: Size>(
             weight_offs,
             params.in_c_per_group,
             params.stride_oc,
+            params.stride_ic,
+            params.stride_wc,
             accumulate_components,
             base_v,
         );
@@ -258,6 +264,8 @@ fn kernel_loop_inner<E: Numeric, NIn: Size, NOut: Size>(
     weight_offs: usize,
     in_c_per_group: u32,
     stride_oc: usize,
+    stride_ic: usize,
+    stride_wc: usize,
     #[comptime] accumulate_components: bool,
     #[comptime] base_v: usize,
 ) {
@@ -271,6 +279,8 @@ fn kernel_loop_inner<E: Numeric, NIn: Size, NOut: Size>(
                 weight_offs,
                 in_c_per_group,
                 stride_oc,
+                stride_ic,
+                stride_wc,
                 base_v,
             );
         } else {
@@ -282,6 +292,8 @@ fn kernel_loop_inner<E: Numeric, NIn: Size, NOut: Size>(
                 weight_offs,
                 in_c_per_group,
                 stride_oc,
+                stride_ic,
+                stride_wc,
             );
         }
     }
@@ -298,17 +310,19 @@ fn accumulate_in_components<E: Numeric, NIn: Size>(
     weight_offs: usize,
     in_c_per_group: u32,
     stride_oc: usize,
+    stride_ic: usize,
+    stride_wc: usize,
     #[comptime] base_v: usize,
 ) {
     let vector_size_in = input.vector_size();
     let block = partials.len();
 
     for in_c in range_stepped(0, in_c_per_group, vector_size_in as u32) {
-        let val = input[(in_offs + in_c as usize) / vector_size_in];
+        let val = input[(in_offs + in_c as usize * stride_ic) / vector_size_in];
 
         #[unroll]
         for j in 0..block {
-            let weight_offs = weight_offs + (base_v + j) * stride_oc + in_c as usize;
+            let weight_offs = weight_offs + (base_v + j) * stride_oc + in_c as usize * stride_wc;
 
             partials[j] += val * weight[weight_offs / vector_size_in];
         }
@@ -325,13 +339,15 @@ fn accumulate_per_step<E: Numeric, NIn: Size, NOut: Size>(
     weight_offs: usize,
     in_c_per_group: u32,
     stride_oc: usize,
+    stride_ic: usize,
+    stride_wc: usize,
 ) {
     let vector_size_in = input.vector_size();
     let vector_size_out = sum.vector_size();
 
     for in_c in range_stepped(0, in_c_per_group, vector_size_in as u32) {
-        let in_pos = in_offs + in_c as usize;
-        let mut weight_pos = weight_offs + in_c as usize;
+        let in_pos = in_offs + in_c as usize * stride_ic;
+        let mut weight_pos = weight_offs + in_c as usize * stride_wc;
 
         let val = input[in_pos / vector_size_in];
 
@@ -393,12 +409,16 @@ pub fn launch_direct<const N: usize>(
         dim_c,
     );
     // Use channels_per_group instead of in_channels to avoid issues here
-    let vector_size_in = tensor_vector_size_parallel(
-        client.io_optimized_vector_sizes(dtype.size()),
-        &weight.shape,
-        &weight.strides,
-        weight.shape.len() - 1,
-    );
+    let vector_size_in = if input.strides[dim_c] == 1 && weight.strides[dim_c] == 1 {
+        tensor_vector_size_parallel(
+            client.io_optimized_vector_sizes(dtype.size()),
+            &weight.shape,
+            &weight.strides,
+            dim_c,
+        )
+    } else {
+        1
+    };
 
     // Only a single-unit plane pays the dependency chain in full; a wide plane hides it and is
     // left with the extra input read per output channel. One component is exactly as serial as `sum`.

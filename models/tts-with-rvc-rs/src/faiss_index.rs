@@ -1,3 +1,4 @@
+use rayon::prelude::*;
 use std::{
     cmp::Ordering,
     fs::File,
@@ -9,6 +10,17 @@ use std::{
 pub struct Neighbor {
     pub id: usize,
     pub squared_distance: f32,
+}
+
+#[cfg(any(feature = "cpu", feature = "cuda", feature = "wgpu"))]
+pub(crate) struct PackedGpuIndex {
+    pub dimension: usize,
+    pub nprobe: usize,
+    pub centroids: Vec<f32>,
+    pub codes: Vec<f32>,
+    pub ids: Vec<u32>,
+    pub offsets: Vec<u32>,
+    pub max_list: usize,
 }
 
 #[derive(Debug)]
@@ -53,6 +65,9 @@ impl IvfFlatIndex {
             return Err("unexpected IVF centroid vector length".into());
         }
         let centroids = read_f32_vector(&mut input, centroid_elements)?;
+        if centroids.iter().any(|value| !value.is_finite()) {
+            return Err("non-finite IVF centroid".into());
+        }
 
         let direct_map_type = read_u8(&mut input)?;
         let direct_map_entries = read_size(&mut input)?;
@@ -87,6 +102,9 @@ impl IvfFlatIndex {
         let mut id_locations = vec![(usize::MAX, usize::MAX); total];
         for (list_index, size) in sizes.into_iter().enumerate() {
             let codes = read_f32_vector(&mut input, checked_mul(size, dimension)?)?;
+            if codes.iter().any(|value| !value.is_finite()) {
+                return Err("non-finite IVF stored vector".into());
+            }
             let mut ids = Vec::with_capacity(size);
             for slot in 0..size {
                 let id = read_size(&mut input)?;
@@ -131,6 +149,41 @@ impl IvfFlatIndex {
         self.nprobe
     }
 
+    /// Flatten IVF lists for resident GPU search, preserving slot order and original IDs.
+    #[cfg(any(feature = "cpu", feature = "cuda", feature = "wgpu"))]
+    pub(crate) fn packed_gpu_data(&self) -> Result<PackedGpuIndex, String> {
+        if self.total > u32::MAX as usize
+            || self.lists.len() > u32::MAX as usize
+            || self.dimension > u32::MAX as usize
+        {
+            return Err("FAISS index exceeds GPU u32 addressable limits".into());
+        }
+        let mut offsets = Vec::with_capacity(self.lists.len() + 1);
+        let code_capacity = self.total.checked_mul(self.dimension)
+            .ok_or("GPU IVF code allocation overflow")?;
+        let mut codes = Vec::with_capacity(code_capacity);
+        let mut ids = Vec::with_capacity(self.total);
+        let mut max_list = 0;
+        for list in &self.lists {
+            offsets.push(u32::try_from(ids.len()).map_err(|e| e.to_string())?);
+            max_list = max_list.max(list.ids.len());
+            codes.extend_from_slice(&list.codes);
+            for &id in &list.ids {
+                ids.push(u32::try_from(id).map_err(|e| e.to_string())?);
+            }
+        }
+        offsets.push(u32::try_from(ids.len()).map_err(|e| e.to_string())?);
+        Ok(PackedGpuIndex {
+            dimension: self.dimension,
+            nprobe: self.nprobe,
+            centroids: self.centroids.clone(),
+            codes,
+            ids,
+            offsets,
+            max_list,
+        })
+    }
+
     pub fn reconstruct(&self, id: usize) -> Option<&[f32]> {
         let &(list, slot) = self.id_locations.get(id)?;
         let start = slot * self.dimension;
@@ -153,16 +206,21 @@ impl IvfFlatIndex {
         if nprobe == 0 || nprobe > self.nlist() || k == 0 {
             return Err("FAISS search requires positive k and nprobe <= nlist".into());
         }
-        let mut centroids: Vec<(usize, f32)> = self
-            .centroids
-            .chunks_exact(self.dimension)
-            .enumerate()
-            .map(|(i, centroid)| (i, squared_l2(query, centroid)))
-            .collect();
-        centroids.select_nth_unstable_by(nprobe - 1, |a, b| order_by_distance(a.1, a.0, b.1, b.0));
+        let selected: Vec<usize> = if nprobe == 1 {
+            vec![self.nearest_centroid_exact(query)]
+        } else {
+            let mut centroids: Vec<(usize, f32)> = self
+                .centroids
+                .chunks_exact(self.dimension)
+                .enumerate()
+                .map(|(i, centroid)| (i, squared_l2(query, centroid)))
+                .collect();
+            centroids.select_nth_unstable_by(nprobe - 1, |a, b| order_by_distance(a.1, a.0, b.1, b.0));
+            centroids[..nprobe].iter().map(|(i, _)| *i).collect()
+        };
         let mut neighbors = Vec::new();
-        for (index, _) in &centroids[..nprobe] {
-            let list = &self.lists[*index];
+        for index in selected {
+            let list = &self.lists[index];
             for (slot, stored) in list.codes.chunks_exact(self.dimension).enumerate() {
                 neighbors.push(Neighbor {
                     id: list.ids[slot],
@@ -177,6 +235,20 @@ impl IvfFlatIndex {
         Ok(neighbors)
     }
 
+    fn nearest_centroid_exact(&self, query: &[f32]) -> usize {
+        let mut centroids = self.centroids.chunks_exact(self.dimension).enumerate();
+        let (_, first) = centroids.next().expect("nonempty IVF centroids");
+        let mut best = (0usize, squared_l2(query, first));
+        for (id, centroid) in centroids {
+            if let Some(distance) = squared_l2_bounded(query, centroid, best.1) {
+                if order_by_distance(distance, id, best.1, best.0).is_lt() {
+                    best = (id, distance);
+                }
+            }
+        }
+        best.0
+    }
+
     /// Apply the original RVC inverse-square-distance 8-NN retrieval blend in the
     /// source HuBERT feature space, before frame upsampling and TextEncoder.
     pub fn blend_features(&self, features: &mut [f32], index_rate: f32) -> Result<(), String> {
@@ -189,11 +261,21 @@ impl IvfFlatIndex {
         if index_rate == 0.0 {
             return Ok(());
         }
+        let rows = features.len() / self.dimension;
+        if rows >= 32 {
+            features.par_chunks_exact_mut(self.dimension)
+                .try_for_each(|query| self.blend_row(query, index_rate))
+        } else {
+            features.chunks_exact_mut(self.dimension)
+                .try_for_each(|query| self.blend_row(query, index_rate))
+        }
+    }
+
+    fn blend_row(&self, query: &mut [f32], index_rate: f32) -> Result<(), String> {
         let mut average = vec![0.0f32; self.dimension];
-        for query in features.chunks_exact_mut(self.dimension) {
             let neighbors = self.search(query, 8)?;
             if neighbors.len() != 8 {
-                continue;
+                return Ok(());
             }
             let zeros: Vec<_> = neighbors
                 .iter()
@@ -233,13 +315,25 @@ impl IvfFlatIndex {
             for (x, retrieved) in query.iter_mut().zip(average.iter()) {
                 *x = *x * (1.0 - index_rate) + retrieved * index_rate;
             }
-        }
         Ok(())
     }
 }
 
 fn squared_l2(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum()
+}
+
+fn squared_l2_bounded(a: &[f32], b: &[f32], bound: f32) -> Option<f32> {
+    let mut total = 0.0f32;
+    for (left, right) in a.chunks(32).zip(b.chunks(32)) {
+        for (&x, &y) in left.iter().zip(right) {
+            total += (x - y) * (x - y);
+        }
+        if total > bound {
+            return None;
+        }
+    }
+    Some(total)
 }
 
 fn order_by_distance(a: f32, a_id: usize, b: f32, b_id: usize) -> Ordering {
@@ -389,6 +483,142 @@ mod tests {
         assert_eq!(query, [3.4, 0.0]);
         index.blend_features(&mut query, 0.5).unwrap();
         assert!(query[0] > 3.0 && query[0] < 3.5);
+    }
+
+    #[test]
+    fn parallel_blend_matches_sequential_for_many_frames() {
+        let index = IvfFlatIndex::read(build_fixture().as_slice()).unwrap();
+        let mut serial = (0..64).flat_map(|i| [i as f32 / 20.0, 0.0]).collect::<Vec<_>>();
+        let mut parallel = serial.clone();
+        for row in serial.chunks_exact_mut(index.dimension()) {
+            index.blend_row(row, 0.75).unwrap();
+        }
+        index.blend_features(&mut parallel, 0.75).unwrap();
+        assert_eq!(serial, parallel);
+    }
+
+    #[test]
+    fn bounded_l2_preserves_exact_fp32_distances_when_not_pruned() {
+        for dimension in [1, 7, 31, 32, 33, 65, 768] {
+            for offset in [0, 1, 13, 41] {
+                let left: Vec<f32> = (0..dimension)
+                    .map(|i| ((i * 17 + offset * 7) % 89) as f32 / 91.0)
+                    .collect();
+                let right: Vec<f32> = (0..dimension)
+                    .map(|i| ((i * 29 + offset * 11) % 101) as f32 / 103.0)
+                    .collect();
+                let exact = squared_l2(&left, &right);
+                for bound in [0.0, exact / 2.0, exact, exact + 1.0, f32::INFINITY] {
+                    match squared_l2_bounded(&left, &right, bound) {
+                        Some(actual) => assert_eq!(actual.to_bits(), exact.to_bits()),
+                        None => assert!(exact > bound),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_centroid_selection_preserves_ties_and_full_scan() {
+        let index = IvfFlatIndex::read(build_fixture().as_slice()).unwrap();
+        for value in 0..1024 {
+            let query = [value as f32 / 10.0 - 10.0, (value % 13) as f32 / 10.0];
+            let exhaustive = index.centroids.chunks_exact(index.dimension).enumerate()
+                .map(|(id, centroid)| (id, squared_l2(&query, centroid)))
+                .min_by(|a, b| order_by_distance(a.1, a.0, b.1, b.0)).unwrap().0;
+            assert_eq!(index.nearest_centroid_exact(&query), exhaustive);
+        }
+        let identical_centroids = [0.0f32, 0.0, 0.0, 0.0];
+        let index = IvfFlatIndex { centroids: identical_centroids.to_vec(), ..index };
+        assert_eq!(index.nearest_centroid_exact(&[0.0, 0.0]), 0);
+    }
+
+    #[test]
+    fn real_index_centroids_match_full_scan_when_available() {
+        let Ok(path) = std::env::var("RVC_REAL_FAISS_INDEX") else { return; };
+        let index = IvfFlatIndex::open(path).unwrap();
+        for row in 0..24 {
+            let id = (row * 7_919 + 19) % index.len();
+            let query: Vec<f32> = index.reconstruct(id).unwrap().iter().enumerate()
+                .map(|(column, &value)| value + ((row * 17 + column * 13) % 11) as f32 * 0.0007)
+                .collect();
+            let expected = index.centroids.chunks_exact(index.dimension).enumerate()
+                .map(|(i, centroid)| (i, squared_l2(&query, centroid)))
+                .min_by(|a, b| order_by_distance(a.1, a.0, b.1, b.0)).unwrap().0;
+            assert_eq!(index.nearest_centroid_exact(&query), expected, "row={row}");
+        }
+    }
+
+    fn exhaustive_search(index: &IvfFlatIndex, query: &[f32], k: usize, nprobe: usize) -> Vec<Neighbor> {
+        let mut centroids: Vec<(usize, f32)> = index
+            .centroids
+            .chunks_exact(index.dimension)
+            .enumerate()
+            .map(|(id, centroid)| (id, squared_l2(query, centroid)))
+            .collect();
+        centroids.sort_unstable_by(|a, b| order_by_distance(a.1, a.0, b.1, b.0));
+        let mut result = Vec::new();
+        for &(list_id, _) in centroids.iter().take(nprobe) {
+            let list = &index.lists[list_id];
+            for (slot, vector) in list.codes.chunks_exact(index.dimension).enumerate() {
+                result.push(Neighbor {
+                    id: list.ids[slot],
+                    squared_distance: squared_l2(query, vector),
+                });
+            }
+        }
+        result.sort_unstable_by(|a, b| {
+            order_by_distance(a.squared_distance, a.id, b.squared_distance, b.id)
+        });
+        result.truncate(k);
+        result
+    }
+
+    fn assert_same_neighbors(actual: &[Neighbor], expected: &[Neighbor]) {
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert_eq!(actual.id, expected.id);
+            assert_eq!(actual.squared_distance.to_bits(), expected.squared_distance.to_bits());
+        }
+    }
+
+    #[test]
+    fn exact_top_k_preserves_exhaustive_order_distances_and_ties() {
+        let index = IvfFlatIndex::read(build_fixture().as_slice()).unwrap();
+        for x in 0..257 {
+            let query = [x as f32 / 12.0 - 4.0, (x % 19) as f32 / 30.0];
+            for nprobe in [1, 2] {
+                for k in [1, 2, 3, 8, 16] {
+                    let expected = exhaustive_search(&index, &query, k, nprobe);
+                    let actual = index.search_with_nprobe(&query, k, nprobe).unwrap();
+                    assert_same_neighbors(&actual, &expected);
+                }
+            }
+        }
+        for k in [1, 2, 3, 8] {
+            let query = [0.0, 0.0];
+            let expected = exhaustive_search(&index, &query, k, 1);
+            assert_same_neighbors(&index.search(&query, k).unwrap(), &expected);
+        }
+    }
+
+    #[test]
+    fn real_index_top_k_preserves_exhaustive_results_when_available() {
+        let Ok(path) = std::env::var("RVC_REAL_FAISS_INDEX") else { return; };
+        let index = IvfFlatIndex::open(path).unwrap();
+        for row in 0..28 {
+            let source = index.reconstruct((row * 7_919 + 19) % index.len()).unwrap();
+            let query: Vec<f32> = source.iter().enumerate().map(|(column, &x)| {
+                x + (((row * 17 + column * 13) % 11) as f32 - 5.0) * 0.0007
+            }).collect();
+            for nprobe in [1, 2, 4, 8] {
+                for k in [1, 4, 8, 16] {
+                    let actual = index.search_with_nprobe(&query, k, nprobe).unwrap();
+                    let expected = exhaustive_search(&index, &query, k, nprobe);
+                    assert_same_neighbors(&actual, &expected);
+                }
+            }
+        }
     }
 
     #[test]

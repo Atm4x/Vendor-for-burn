@@ -55,8 +55,22 @@ impl Conv2d {
     }
 
     fn forward(&self, input: Tensor<4>) -> Tensor<4> {
-        module::conv2d(input, self.weight.clone(), self.bias.clone(),
-            ConvOptions::new([1, 1], [self.padding, self.padding], [1, 1], 1))
+        let options = ConvOptions::new([1, 1], [self.padding, self.padding], [1, 1], 1);
+        if std::env::var("RVC_RMVPE_UNET_COMPENSATED_BATCH_TF32").as_deref() == Ok("1") {
+            crate::cubecl_conv::conv2d_compensated_tf32_batched(
+                input, self.weight.clone(), self.bias.clone(), options,
+            )
+        } else if std::env::var("RVC_RMVPE_UNET_COMPENSATED_TF32").as_deref() == Ok("1") {
+            crate::cubecl_conv::conv2d_compensated_tf32(
+                input, self.weight.clone(), self.bias.clone(), options,
+            )
+        } else if std::env::var("RVC_RMVPE_UNET_GEMM").as_deref() == Ok("1")
+            || std::env::var("RVC_RMVPE_UNET_CONV2D_GEMM").as_deref() == Ok("1")
+        {
+            crate::cubecl_conv::conv2d(input, self.weight.clone(), self.bias.clone(), options)
+        } else {
+            module::conv2d(input, self.weight.clone(), self.bias.clone(), options)
+        }
     }
 }
 
@@ -227,12 +241,16 @@ impl TransposedConv2d {
     }
 
     fn forward(&self, input: Tensor<4>) -> Tensor<4> {
-        let value = module::conv_transpose2d(
-            input, self.weight.clone(), None,
-            burn::tensor::ops::ConvTransposeOptions::new(
-                self.stride, [1, 1], self.padding_out, [1, 1], 1,
-            ),
+        let options = burn::tensor::ops::ConvTransposeOptions::new(
+            self.stride, [1, 1], self.padding_out, [1, 1], 1,
         );
+        let value = if std::env::var("RVC_RMVPE_UNET_GEMM").as_deref() == Ok("1")
+            || std::env::var("RVC_RMVPE_UNET_TRANSPOSE2D_GEMM").as_deref() == Ok("1")
+        {
+            crate::cubecl_conv::conv_transpose2d_gemm(input, self.weight.clone(), None, options)
+        } else {
+            module::conv_transpose2d(input, self.weight.clone(), None, options)
+        };
         activation::relu(self.norm.forward(value))
     }
 }

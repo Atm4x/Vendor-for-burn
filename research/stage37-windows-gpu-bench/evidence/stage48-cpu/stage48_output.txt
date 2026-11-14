@@ -1,0 +1,3 @@
+frames=4 output_elements=16 checksum_sum=0.186992665986
+frames=64 output_elements=256 checksum_sum=3.379754826427
+frames=256 output_elements=1024 checksum_sum=13.588609755039

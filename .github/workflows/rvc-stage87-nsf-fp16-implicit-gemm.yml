@@ -1,0 +1,83 @@
+name: RVC Stage87 experimental NSF mixed-FP16 Conv1d Windows gate
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - experiment/conv-kernel-rnd-stage33-20261110
+    paths:
+      - 'models/tts-with-rvc-rs/src/decoder.rs'
+      - 'models/tts-with-rvc-rs/src/nsf_precision.rs'
+      - 'models/tts-with-rvc-rs/src/lib.rs'
+      - 'models/tts-with-rvc-rs/src/main.rs'
+      - 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage87.ps1'
+      - '.github/workflows/rvc-stage87-nsf-fp16-implicit-gemm.yml'
+permissions:
+  contents: read
+jobs:
+  mixed-fp16-nsf-windows:
+    runs-on: windows-latest
+    timeout-minutes: 115
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cache/tracel
+          key: stage87-nsf-fp16-${{ hashFiles('Cargo.lock') }}
+      - name: Restore vendored checksums
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Vendored checksum restore failed' }
+      - name: Validate PowerShell benchmark syntax
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          $path = 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage87.ps1'
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $path).Path, [ref]$tokens, [ref]$errors)
+          if ($errors.Count -gt 0) { $errors | Format-List | Out-String | Write-Host; throw 'Invalid Stage87 runner syntax' }
+      - name: Verify precision dispatch policy
+        shell: pwsh
+        run: |
+          cargo test --offline --locked -p tts-with-rvc-rs --no-default-features --features 'cpu,flex' --lib nsf_precision::tests
+          if ($LASTEXITCODE -ne 0) { throw 'NSF precision policy tests failed' }
+      - name: Typecheck and build unified CPU CUDA WGPU executable
+        shell: pwsh
+        run: |
+          cargo check --offline --locked -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --lib --bin tts-with-rvc-rs
+          if ($LASTEXITCODE -ne 0) { throw 'Stage87 CPU CUDA WGPU check failed' }
+          cargo build --release --offline --locked -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs
+          if ($LASTEXITCODE -ne 0) { throw 'Stage87 release build failed' }
+          & target/release/tts-with-rvc-rs.exe doctor
+          if ($LASTEXITCODE -ne 0) { throw 'Stage87 doctor failed' }
+      - name: Package full-WAV ABBA benchmark
+        shell: pwsh
+        run: |
+          $folder = 'dist/stage87-nsf-fp16'
+          New-Item -ItemType Directory -Force -Path $folder | Out-Null
+          Copy-Item target/release/tts-with-rvc-rs.exe $folder
+          Copy-Item research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage87.ps1 $folder
+          @'
+          Stage87: experimental FP16 precision islands in NSF ResBlocks.
+          The original .pth contains FP16 weights; this mode rounds normalized weights to FP16 once at model load,
+          casts each ResBlock input once to FP16, runs all convolutions and residual additions in FP16,
+          and casts its branch output once to FP32 for stage aggregation.
+          Default -MinChannels 64 leaves final 32-channel stage FP32.
+          Run from this folder with private assets under .\embed\.
+          Compare full WAV, PCM16 RMSE, baseline drift and warm inference. No CUDA performance measurements in CI.
+          Experimental only, not production; waveform will generally differ from FP32 baseline.
+          '@ | Set-Content (Join-Path $folder 'README.txt')
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rvc-stage87-nsf-fp16-windows-x64
+          path: dist/stage87-nsf-fp16/
+          retention-days: 14
+          if-no-files-found: warn

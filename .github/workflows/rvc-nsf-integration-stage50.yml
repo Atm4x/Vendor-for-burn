@@ -1,0 +1,62 @@
+name: RVC NSF Stage50 integrated CUDA A/B
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - experiment/conv-kernel-rnd-stage33-20261110
+    paths:
+      - '.github/workflows/rvc-nsf-integration-stage50.yml'
+      - 'research/stage37-windows-gpu-bench/windows/Run-NSF-Integrated.ps1'
+      - 'models/tts-with-rvc-rs/src/decoder.rs'
+      - 'vendor/burn-cubecl-0.22.1/src/kernel/conv/direct.rs'
+
+permissions:
+  contents: read
+
+jobs:
+  windows-cuda-integrated:
+    runs-on: windows-latest
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cache/tracel
+          key: rvc-nsf-stage50-cuda-${{ hashFiles('Cargo.lock') }}
+      - name: Restore vendored checksums
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Vendor checksum verification failed' }
+      - name: Compile integrated NSF CUDA profiler
+        shell: pwsh
+        run: |
+          cargo build --locked --offline --release -p tts-with-rvc-rs --no-default-features --features cuda --bin profile_nsf_prepack_stage49
+          if ($LASTEXITCODE -ne 0) { throw 'Stage50 CUDA profiler compilation failed' }
+          New-Item -ItemType Directory -Force -Path dist/nsf-stage50 | Out-Null
+          Copy-Item target/release/profile_nsf_prepack_stage49.exe dist/nsf-stage50/
+          Copy-Item models/tts-with-rvc-rs/tests/fixtures/synthetic_nsf_decoder.pth dist/nsf-stage50/
+          Copy-Item research/stage37-windows-gpu-bench/windows/Run-NSF-Integrated.ps1 dist/nsf-stage50/
+          @'
+          Stage50 integrated NSF CUDA A/B on your GPU.
+          Run:
+            powershell -ExecutionPolicy Bypass -File .\Run-NSF-Integrated.ps1 -Iterations 20 -Warmup 5 -Frames "64,256,1024"
+          All variants are opt-in and use the same full synthetic NSF graph.
+          Each mode is run twice in reversed process order to reduce clock drift.
+          Supply NSF_INTEGRATED_STAGE50_RESULTS.zip for analysis.
+          '@ | Set-Content dist/nsf-stage50/README.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rvc-nsf-integrated-stage50-windows-x64
+          path: dist/nsf-stage50/
+          if-no-files-found: warn
+          retention-days: 14

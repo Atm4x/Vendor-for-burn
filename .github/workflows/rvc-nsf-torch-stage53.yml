@@ -1,0 +1,67 @@
+name: RVC NSF Stage53 matched PyTorch cuDNN vs CUDA Graph
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - experiment/conv-kernel-rnd-stage33-20261110
+    paths:
+      - '.github/workflows/rvc-nsf-torch-stage53.yml'
+      - 'models/tts-with-rvc-rs/src/bin/profile_nsf_graph_stage52.rs'
+      - 'research/stage37-windows-gpu-bench/windows/Run-NSF-Torch-Comparison.ps1'
+      - 'research/stage37-windows-gpu-bench/windows/torch_nsf_stage53.py'
+      - 'research/stage37-windows-gpu-bench/windows/compare_nsf_stage53.py'
+
+permissions:
+  contents: read
+
+jobs:
+  windows-cuda-stage53:
+    runs-on: windows-latest
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cache/tracel
+          key: rvc-nsf-stage53-cuda-${{ hashFiles('Cargo.lock') }}
+      - name: Restore vendored checksums
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Vendor checksum verification failed' }
+      - name: Compile dynamic CUDA Graph experiment with FP32 dumps
+        shell: pwsh
+        run: |
+          cargo build --locked --offline --release -p tts-with-rvc-rs --no-default-features --features cuda --bin profile_nsf_graph_stage52
+          if ($LASTEXITCODE -ne 0) { throw 'Stage53 CUDA compile failed' }
+          New-Item -ItemType Directory -Force -Path dist/nsf-stage53 | Out-Null
+          Copy-Item target/release/profile_nsf_graph_stage52.exe dist/nsf-stage53/
+          Copy-Item models/tts-with-rvc-rs/tests/fixtures/synthetic_nsf_decoder.pth dist/nsf-stage53/
+          Copy-Item models/tts-with-rvc-rs/tests/fixtures/nsf_decoder.json dist/nsf-stage53/
+          Copy-Item research/stage37-windows-gpu-bench/windows/Run-NSF-Torch-Comparison.ps1 dist/nsf-stage53/
+          Copy-Item research/stage37-windows-gpu-bench/windows/torch_nsf_stage53.py dist/nsf-stage53/
+          Copy-Item research/stage37-windows-gpu-bench/windows/compare_nsf_stage53.py dist/nsf-stage53/
+          @'
+          Stage53: same synthetic NSF decoder checkpoint on Burn/CubeCL and PyTorch/cuDNN.
+          Runs ordinary/eager and hardware CUDA Graph with changing input, source and conditioning.
+          All variants export full FP32 tensor dumps and compare against PyTorch strict FP32.
+          Run in a Python environment with CUDA-capable PyTorch already installed:
+            powershell -ExecutionPolicy Bypass -File .\Run-NSF-Torch-Comparison.ps1 -Python python -Iterations 16 -Warmup 5 -Frames "64,256,1024"
+          Output: NSF_TORCH_CUDNN_STAGE53_RESULTS.zip
+          This is SYNTHETIC NSF, not end-to-end RVC; avoid interpreting CPU-host timings as kernel-only GPU latency.
+          '@ | Set-Content dist/nsf-stage53/README.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rvc-nsf-stage53-pytorch-cudnn-vs-cubecl-windows-x64
+          path: dist/nsf-stage53/
+          if-no-files-found: warn
+          retention-days: 14

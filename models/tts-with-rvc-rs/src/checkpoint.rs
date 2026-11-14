@@ -70,13 +70,11 @@ impl RvcCheckpoint {
         Ok(Tensor::from_data(TensorData::new(data, dims), device))
     }
 
-    pub fn weight_norm_conv1d(&self, prefix: &str, device: &Device) -> Result<Tensor<3>, String> {
+    pub fn weight_norm_conv1d_values(&self, prefix: &str) -> Result<([usize; 3], Vec<f32>), String> {
         let (shape, mut weights) = self.tensor_f32(&format!("{prefix}.weight_v"))?;
-        if shape.len() != 3 {
-            return Err(format!("{prefix}: expected Conv1d rank 3, got {shape:?}"));
-        }
-        let out_channels = shape[0];
-        let channel_elements = shape[1] * shape[2];
+        let [out_channels, input_channels, kernel]: [usize; 3] = shape
+            .try_into().map_err(|shape: Vec<usize>| format!("{prefix}: expected Conv1d rank 3, got {shape:?}"))?;
+        let channel_elements = input_channels * kernel;
         let (g_shape, gains) = self.tensor_f32(&format!("{prefix}.weight_g"))?;
         if (g_shape != [out_channels, 1, 1] && g_shape != [out_channels]) || gains.len() != out_channels {
             return Err(format!("{prefix}: invalid weight_g shape {g_shape:?}"));
@@ -86,14 +84,17 @@ impl RvcCheckpoint {
             if norm == 0.0 || !norm.is_finite() {
                 return Err(format!("{prefix}: invalid weight_norm norm"));
             }
-            for weight in row {
-                *weight *= gain / norm;
-            }
+            for weight in row { *weight *= gain / norm; }
         }
-        Ok(Tensor::from_data(TensorData::new(weights, [shape[0], shape[1], shape[2]]), device))
+        Ok(([out_channels, input_channels, kernel], weights))
     }
 
-    pub fn weight_norm_conv1d_dim2(&self, prefix: &str, device: &Device) -> Result<Tensor<3>, String> {
+    pub fn weight_norm_conv1d(&self, prefix: &str, device: &Device) -> Result<Tensor<3>, String> {
+        let (shape, weights) = self.weight_norm_conv1d_values(prefix)?;
+        Ok(Tensor::from_data(TensorData::new(weights, shape), device))
+    }
+
+    pub fn weight_norm_conv1d_dim2_values(&self, prefix: &str) -> Result<([usize; 3], Vec<f32>), String> {
         let (shape, mut weights) = self.tensor_f32(&format!("{prefix}.weight_v"))?;
         if shape.len() != 3 || shape.contains(&0) {
             return Err(format!("{prefix}: expected nonempty rank-3 positional Conv1d, found {shape:?}"));
@@ -121,7 +122,12 @@ impl RvcCheckpoint {
                 *value *= gain;
             }
         }
-        Ok(Tensor::from_data(TensorData::new(weights, [out_channels, input_per_group, kernel]), device))
+        Ok(([out_channels, input_per_group, kernel], weights))
+    }
+
+    pub fn weight_norm_conv1d_dim2(&self, prefix: &str, device: &Device) -> Result<Tensor<3>, String> {
+        let (shape, weights) = self.weight_norm_conv1d_dim2_values(prefix)?;
+        Ok(Tensor::from_data(TensorData::new(weights, shape), device))
     }
 
 }

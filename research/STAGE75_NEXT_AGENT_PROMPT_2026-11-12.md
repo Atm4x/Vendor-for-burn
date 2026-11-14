@@ -1,0 +1,7 @@
+# Stage 75 — validate Stage74 hybrid NSF and plan real CUDA Graph capture
+
+Retrieve latest PR #2 Git Bridge; read `research/STAGE74_NSF_SPLIT_UPSAMPLE_RND_2026-11-12.md` and user-supplied `RVC_STAGE74_FULL_WAV_RESULTS.zip`.
+
+Stage73 real RTX4060 warm full-RVC NSF all-GEMM 12.0247s; QuadInterior+Direct transpose 18.3331s; Quad+Direct transpose 20.9660s; Prepacked Direct+Direct transpose 37.9637s. All three Direct/Quad WAVs match exactly; all-GEMM differing PCM16 RMSE1.526 max86. Crucially this conflated Conv1d and ConvTranspose1d. Stage74 adds independent `RVC_NSF_CONV1D_GEMM` and `RVC_NSF_TRANSPOSE_GEMM`. On real full WAV compare all-GEMM vs Prepacked/Packed/Quad/QuadInterior Conv1d with GEMM transpose; do not conclude algorithm choice by a synthetic NSF benchmark.
+
+Check stable mode metadata, per-mode warmed RTF, GPU workspace, SHA256 parity, and stderr; no CPU fallback. Choose winning per-family route only if numerically safe and repeatable. Preserve CPU-only CpuGemm from Stage71, persistent GRU and production Sequential NSF. Stage72 RMVPE UNet GEMM was unsafe (~991 PCM16 RMSE) and needs separate F0 salience data; do not enable it. Full pipeline CUDA Graph replay is still FALSE; design a shape-bounded, state-safe capture if GPU evidence warrants it. Avoid editing obsolete scripts.

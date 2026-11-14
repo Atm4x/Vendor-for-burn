@@ -1,0 +1,95 @@
+{
+  "kind": "NSF real synthetic checkpoint CPU execution",
+  "backend": "CubeCL CPU JIT (Burn)",
+  "semantics": "end-to-end NSF forward including eager dispatch and blocking output readback; detailed profile separately inserts a blocking readback at each operator boundary",
+  "iterations": 5,
+  "warmup": 2,
+  "cases": [
+    {
+      "frames": 4,
+      "zero_seeded_ms": 43.958424,
+      "first_branch_ms": 44.035588,
+      "relative_speedup": 0.9982476900274388,
+      "max_abs_error": 0.0,
+      "reference_max_error": 2.2351742e-8
+    },
+    {
+      "frames": 16,
+      "zero_seeded_ms": 43.960456,
+      "first_branch_ms": 43.9827,
+      "relative_speedup": 0.9994942556959896,
+      "max_abs_error": 0.0,
+      "reference_max_error": null
+    },
+    {
+      "frames": 64,
+      "zero_seeded_ms": 44.068036,
+      "first_branch_ms": 43.991903,
+      "relative_speedup": 1.00173061392684,
+      "max_abs_error": 0.0,
+      "reference_max_error": null
+    }
+  ],
+  "profile": [
+    {
+      "section": "pre_conv",
+      "milliseconds": 37.45546
+    },
+    {
+      "section": "conditioning",
+      "milliseconds": 0.385322
+    },
+    {
+      "section": "stage0.upsample",
+      "milliseconds": 0.40550200000000003
+    },
+    {
+      "section": "stage0.noise_conv",
+      "milliseconds": 0.036474
+    },
+    {
+      "section": "stage0.prepare_add",
+      "milliseconds": 0.013801
+    },
+    {
+      "section": "stage0.residual0",
+      "milliseconds": 5.79001
+    },
+    {
+      "section": "stage0.residual1",
+      "milliseconds": 3.870533
+    },
+    {
+      "section": "stage0.aggregate",
+      "milliseconds": 0.294717
+    },
+    {
+      "section": "stage1.upsample",
+      "milliseconds": 0.337151
+    },
+    {
+      "section": "stage1.noise_conv",
+      "milliseconds": 0.032449
+    },
+    {
+      "section": "stage1.prepare_add",
+      "milliseconds": 0.012669
+    },
+    {
+      "section": "stage1.residual0",
+      "milliseconds": 7.336785
+    },
+    {
+      "section": "stage1.residual1",
+      "milliseconds": 4.036368
+    },
+    {
+      "section": "stage1.aggregate",
+      "milliseconds": 0.24928
+    },
+    {
+      "section": "post_conv_activation",
+      "milliseconds": 0.16407300000000002
+    }
+  ]
+}

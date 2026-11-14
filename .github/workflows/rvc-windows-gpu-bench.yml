@@ -1,0 +1,81 @@
+name: RVC CubeCL Windows GPU benchmark package
+
+on:
+  push:
+    branches:
+      - experiment/conv-kernel-rnd-stage33-20261110
+    paths:
+      - 'research/stage37-windows-gpu-bench/**'
+      - 'vendor/cubek-convolution-0.3.1/**'
+      - '.github/workflows/rvc-windows-gpu-bench.yml'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'research/stage37-windows-gpu-bench/**'
+      - 'vendor/cubek-convolution-0.3.1/**'
+      - '.github/workflows/rvc-windows-gpu-bench.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-win-x64:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            research/stage37-windows-gpu-bench/target
+            ~\.cargo\registry
+            ~\.cache\tracel
+          key: stage37-windows-v1-${{ hashFiles('research/stage37-windows-gpu-bench/Cargo.lock') }}
+      - name: Repair vendor checksum metadata on Windows
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Vendored source verification failed' }
+      - name: Build WGPU EXE
+        shell: pwsh
+        run: |
+          cd research/stage37-windows-gpu-bench
+          cargo build --release --locked --offline --no-default-features --features wgpu
+          if ($LASTEXITCODE -ne 0) { throw 'WGPU build failed' }
+          New-Item -ItemType Directory -Force -Path ../../dist/rvc-gpu-bench | Out-Null
+          Copy-Item target/release/rvc-cubecl-gpu-bench.exe ../../dist/rvc-gpu-bench/rvc-cubecl-wgpu.exe
+          & ../../dist/rvc-gpu-bench/rvc-cubecl-wgpu.exe --help
+          if ($LASTEXITCODE -ne 0) { throw 'WGPU smoke test failed' }
+      - name: Build CUDA EXE (separate artifact, preserve WGPU on failure)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          cd research/stage37-windows-gpu-bench
+          cargo build --release --locked --offline --no-default-features --features cuda
+          if ($LASTEXITCODE -ne 0) { throw 'CUDA build failed; see Actions log' }
+          Copy-Item target/release/rvc-cubecl-gpu-bench.exe ../../dist/rvc-gpu-bench/rvc-cubecl-cuda.exe
+          & ../../dist/rvc-gpu-bench/rvc-cubecl-cuda.exe --help
+          if ($LASTEXITCODE -ne 0) { throw 'CUDA CLI smoke test failed' }
+      - name: Package and report build status
+        shell: pwsh
+        run: |
+          $dir = 'dist/rvc-gpu-bench'
+          Copy-Item research/stage37-windows-gpu-bench/windows/*.py $dir/
+          Copy-Item research/stage37-windows-gpu-bench/windows/*.ps1 $dir/
+          Copy-Item research/stage37-windows-gpu-bench/README.md $dir/README.md
+          $wgpu = Test-Path "$dir/rvc-cubecl-wgpu.exe"
+          $cuda = Test-Path "$dir/rvc-cubecl-cuda.exe"
+          "WGPU=$wgpu`nCUDA=$cuda`nNote: CUDA may fail without a Windows Tracel LLVM binary in CI; see Actions build log." | Set-Content "$dir/build-status.txt"
+          if (-not $wgpu) { throw 'WGPU artifact missing' }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rvc-cubecl-gpu-benchmark-windows-x64
+          path: dist/rvc-gpu-bench/
+          if-no-files-found: warn
+          retention-days: 14

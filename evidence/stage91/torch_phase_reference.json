@@ -1,0 +1,11 @@
+{
+  "backend": "PyTorch CPU",
+  "torch_version": "2.10.0+cpu",
+  "frames": 9000,
+  "segments": 9,
+  "samples_compared": 1080000,
+  "global_phase_max_abs": 4.1878665797412395e-05,
+  "global_phase_rmse": 1.423922611846992e-05,
+  "reset_phase_max_abs": 0.19960488379001617,
+  "reset_phase_rmse": 0.10905856647701334
+}

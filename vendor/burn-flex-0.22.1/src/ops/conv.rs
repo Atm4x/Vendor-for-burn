@@ -1,9 +1,7 @@
 //! Forward convolution operations using tiled im2col + gemm approach.
 //!
-//! All convolutions (1D, 2D, 3D) use a unified 3D implementation:
-//! - conv1d: adds two size-1 dimensions, calls conv3d, squeezes output
-//! - conv2d: adds one size-1 dimension, calls conv3d, squeezes output
-//! - conv3d: native implementation
+//! Conv1d uses dedicated native kernels, while Conv2d expands to Conv3d.
+//! Conv3d uses a native tiled implementation with specialized fast paths.
 //!
 //! Optimizations:
 //! - Tiled im2col: Process output in tiles for better cache usage and parallelism
@@ -33,7 +31,7 @@ use burn_std::{Bytes, Shape, f16};
 
 use crate::{FlexTensor, Layout};
 
-use super::conv_common::{add_bias, squeeze_3d_to_1d, squeeze_3d_to_2d};
+use super::conv_common::{add_bias, squeeze_3d_to_2d};
 
 // ============================================================================
 // Macros for forward conv
@@ -85,109 +83,608 @@ macro_rules! conv3d_typed {
 }
 
 // ============================================================================
-// Conv1d - delegates to conv3d
+// Conv1d - native depthwise and per-kernel GEMM implementation
 // ============================================================================
 
-conv_nd_via_3d!(
-    conv1d_f32,
-    conv3d_f32,
-    expand_1d_to_3d,
-    squeeze_3d_to_1d,
-    1,
-    ConvOptions
-);
-conv_nd_via_3d!(
-    conv1d_f64,
-    conv3d_f64,
-    expand_1d_to_3d,
-    squeeze_3d_to_1d,
-    1,
-    ConvOptions
-);
-conv_nd_via_3d!(
-    conv1d_f16,
-    conv3d_f16,
-    expand_1d_to_3d,
-    squeeze_3d_to_1d,
-    1,
-    ConvOptions
-);
+pub fn conv1d_f32(
+    x: FlexTensor,
+    weight: FlexTensor,
+    bias: Option<FlexTensor>,
+    options: &ConvOptions<1>,
+) -> FlexTensor {
+    conv1d_native::<f32>(x, weight, bias, options, DType::F32, 0.0, 1.0)
+}
+
+pub fn conv1d_f64(
+    x: FlexTensor,
+    weight: FlexTensor,
+    bias: Option<FlexTensor>,
+    options: &ConvOptions<1>,
+) -> FlexTensor {
+    conv1d_native::<f64>(x, weight, bias, options, DType::F64, 0.0, 1.0)
+}
+
+pub fn conv1d_f16(
+    x: FlexTensor,
+    weight: FlexTensor,
+    bias: Option<FlexTensor>,
+    options: &ConvOptions<1>,
+) -> FlexTensor {
+    let x = x.to_contiguous();
+    let weight = weight.to_contiguous();
+    let to_f32 = |tensor: &FlexTensor| {
+        let data: &[f16] = tensor.storage();
+        FlexTensor::new(
+            Bytes::from_elems(data.iter().map(|v| v.to_f32()).collect::<Vec<f32>>()),
+            Layout::contiguous(tensor.layout().shape().clone()),
+            DType::F32,
+        )
+    };
+    let result = conv1d_f32(
+        to_f32(&x),
+        to_f32(&weight),
+        bias.map(|b| to_f32(&b.to_contiguous())),
+        options,
+    );
+    let values: &[f32] = result.storage();
+    FlexTensor::new(
+        Bytes::from_elems(
+            values
+                .iter()
+                .map(|v| f16::from_f32(*v))
+                .collect::<Vec<f16>>(),
+        ),
+        Layout::contiguous(result.layout().shape().clone()),
+        DType::F16,
+    )
+}
+
 bf16_via_f32!(conv1d_bf16, conv1d_f32, 1, ConvOptions);
 
-fn expand_1d_to_3d(
-    x: &FlexTensor,
-    weight: &FlexTensor,
+fn conv1d_native<
+    T: num_traits::Float
+        + bytemuck::Pod
+        + Clone
+        + Copy
+        + burn_backend::Element
+        + burn_backend::ElementAdd
+        + Send
+        + Sync
+        + 'static,
+>(
+    x: FlexTensor,
+    weight: FlexTensor,
+    bias: Option<FlexTensor>,
     options: &ConvOptions<1>,
-) -> (FlexTensor, FlexTensor, ConvOptions<3>) {
-    let x_shape = x.layout().shape();
-    let x_3d = x.reshape(Shape::from(vec![x_shape[0], x_shape[1], 1, 1, x_shape[2]]));
-
-    let w_shape = weight.layout().shape();
-    let weight_3d = weight.reshape(Shape::from(vec![w_shape[0], w_shape[1], 1, 1, w_shape[2]]));
-
-    let options_3d = ConvOptions::new(
-        [1, 1, options.stride[0]],
-        [0, 0, options.padding_begin()[0]],
-        [1, 1, options.dilation[0]],
-        options.groups,
+    dtype: DType,
+    zero: T,
+    one: T,
+) -> FlexTensor {
+    let x = x.to_contiguous();
+    let weight = weight.to_contiguous();
+    let xs = x.layout().shape();
+    let ws = weight.layout().shape();
+    let batch = xs[0];
+    let channels_in = xs[1];
+    let input_len = xs[2];
+    let channels_out = ws[0];
+    let channels_in_group = ws[1];
+    let kernel_len = ws[2];
+    let groups = options.groups;
+    assert!(groups > 0, "conv1d requires positive groups");
+    assert_eq!(
+        channels_in % groups,
+        0,
+        "conv1d input channels must divide groups"
     );
+    assert_eq!(
+        channels_out % groups,
+        0,
+        "conv1d output channels must divide groups"
+    );
+    assert_eq!(channels_in / groups, channels_in_group);
 
-    (x_3d, weight_3d, options_3d)
+    let stride = options.stride[0];
+    let pad = options.padding_begin()[0];
+    let dilation = options.dilation[0];
+    let output_len = calculate_conv_output_size(kernel_len, stride, pad, dilation, input_len);
+    let elements = batch
+        .checked_mul(channels_out)
+        .and_then(|v| v.checked_mul(output_len))
+        .expect("conv1d output size overflow");
+    let mut output = vec![zero; elements];
+
+    if elements > 0 {
+        let x_data: &[T] = x.storage();
+        let w_data: &[T] = weight.storage();
+        let ranges: Vec<(usize, usize)> = (0..kernel_len)
+            .map(|k| valid_out_range(k, dilation, pad, stride, input_len, output_len))
+            .collect();
+        let output_per_group = channels_out / groups;
+        let depthwise = groups == channels_in && channels_in == channels_out;
+
+        if depthwise {
+            let compute = |bc: usize, dst: &mut [T]| {
+                let x_plane = &x_data[bc * input_len..][..input_len];
+                let weights = &w_data[bc % channels_out * kernel_len..][..kernel_len];
+                for (k, &(a, b)) in ranges.iter().enumerate() {
+                    let w = weights[k];
+                    if a < b {
+                        let offset = a * stride + k * dilation - pad;
+                        if stride == 1 {
+                            for (o, value) in dst[a..b]
+                                .iter_mut()
+                                .zip(x_plane[offset..offset + b - a].iter())
+                            {
+                                *o = *o + *value * w;
+                            }
+                        } else {
+                            for (j, value) in dst[a..b].iter_mut().enumerate() {
+                                *value = *value + x_plane[offset + j * stride] * w;
+                            }
+                        }
+                    }
+                    if !w.is_finite() {
+                        dst[..a].fill(T::nan());
+                        dst[b..].fill(T::nan());
+                    }
+                }
+            };
+            #[cfg(feature = "rayon")]
+            {
+                use rayon::prelude::*;
+                output
+                    .par_chunks_mut(output_len)
+                    .enumerate()
+                    .for_each(|(bc, dst)| compute(bc, dst));
+            }
+            #[cfg(not(feature = "rayon"))]
+            {
+                for (bc, dst) in output.chunks_mut(output_len).enumerate() {
+                    compute(bc, dst);
+                }
+            }
+        } else {
+            let lhs_rs = (channels_in_group * kernel_len) as isize;
+            let lhs_cs = kernel_len as isize;
+            let rhs_rs = input_len as isize;
+            let rhs_cs = stride as isize;
+            let out_rs = output_len as isize;
+            let out_cs = 1isize;
+            let m = output_per_group;
+            let gemm_k = channels_in_group;
+
+            #[cfg(feature = "rayon")]
+            let parallelism = if batch * groups == 1
+                && m.saturating_mul(output_len).saturating_mul(gemm_k) >= 192 * 192 * 192
+            {
+                gemm::Parallelism::Rayon(0)
+            } else {
+                gemm::Parallelism::None
+            };
+            #[cfg(not(feature = "rayon"))]
+            let parallelism = gemm::Parallelism::None;
+
+            let compute = |bg: usize, dst: &mut [T]| {
+                if gemm_k > 0 {
+                    let b = bg / groups;
+                    let g = bg % groups;
+                    let x_base = x_data.as_ptr();
+                    let w_base = w_data.as_ptr();
+                    for (k, &(a, z)) in ranges.iter().enumerate() {
+                        if a == z {
+                            continue;
+                        }
+                        let offset = a * stride + k * dilation - pad;
+                        unsafe {
+                            gemm::gemm(
+                                m,
+                                z - a,
+                                gemm_k,
+                                dst.as_mut_ptr().add(a),
+                                out_cs,
+                                out_rs,
+                                true,
+                                w_base
+                                    .add(g * output_per_group * channels_in_group * kernel_len + k),
+                                lhs_cs,
+                                lhs_rs,
+                                x_base.add(
+                                    (b * channels_in + g * channels_in_group) * input_len + offset,
+                                ),
+                                rhs_cs,
+                                rhs_rs,
+                                one,
+                                one,
+                                false,
+                                false,
+                                false,
+                                parallelism,
+                            );
+                        }
+                    }
+                }
+
+                let channel_start = bg % groups * output_per_group;
+                for local_c in 0..output_per_group {
+                    let dst_plane = &mut dst[local_c * output_len..][..output_len];
+                    let weights_start = (channel_start + local_c) * channels_in_group * kernel_len;
+                    for (k, &(a, z)) in ranges.iter().enumerate() {
+                        let nonfinite = (0..channels_in_group)
+                            .any(|ci| !w_data[weights_start + ci * kernel_len + k].is_finite());
+                        if nonfinite {
+                            dst_plane[..a].fill(T::nan());
+                            dst_plane[z..].fill(T::nan());
+                        }
+                    }
+                }
+            };
+            #[cfg(feature = "rayon")]
+            {
+                use rayon::prelude::*;
+                output
+                    .par_chunks_mut(output_per_group * output_len)
+                    .enumerate()
+                    .for_each(|(bg, dst)| compute(bg, dst));
+            }
+            #[cfg(not(feature = "rayon"))]
+            {
+                for (bg, dst) in output.chunks_mut(output_per_group * output_len).enumerate() {
+                    compute(bg, dst);
+                }
+            }
+        }
+
+        if let Some(bias) = bias {
+            let bias = bias.to_contiguous();
+            add_bias(&mut output, bias.storage(), batch, channels_out, output_len);
+        }
+    }
+
+    FlexTensor::new(
+        Bytes::from_elems(output),
+        Layout::contiguous(Shape::new([batch, channels_out, output_len])),
+        dtype,
+    )
 }
 
 // ============================================================================
-// Conv2d - delegates to conv3d
+// Conv2d - universal NCHW tiled GEMM
 // ============================================================================
 
-conv_nd_via_3d!(
-    conv2d_f32,
-    conv3d_f32,
-    expand_2d_to_3d,
-    squeeze_3d_to_2d,
-    2,
-    ConvOptions
-);
-conv_nd_via_3d!(
-    conv2d_f64,
-    conv3d_f64,
-    expand_2d_to_3d,
-    squeeze_3d_to_2d,
-    2,
-    ConvOptions
-);
-conv_nd_via_3d!(
+macro_rules! conv2d_typed {
+    ($fn_name:ident, $T:ty, $dtype:expr, $zero:expr, $one:expr) => {
+        pub fn $fn_name(
+            x: FlexTensor,
+            weight: FlexTensor,
+            bias: Option<FlexTensor>,
+            options: &ConvOptions<2>,
+        ) -> FlexTensor {
+            conv2d_nchw_tiled_gemm::<$T>(x, weight, bias, options, $dtype, $zero, $one)
+        }
+    };
+}
+
+conv2d_typed!(conv2d_f32, f32, DType::F32, 0.0f32, 1.0f32);
+conv2d_typed!(conv2d_f64, f64, DType::F64, 0.0f64, 1.0f64);
+conv2d_typed!(
     conv2d_f16,
-    conv3d_f16,
-    expand_2d_to_3d,
-    squeeze_3d_to_2d,
-    2,
-    ConvOptions
+    f16,
+    DType::F16,
+    f16::from_f32(0.0),
+    f16::from_f32(1.0)
 );
 bf16_via_f32!(conv2d_bf16, conv2d_f32, 2, ConvOptions);
 
-fn expand_2d_to_3d(
-    x: &FlexTensor,
-    weight: &FlexTensor,
+fn conv2d_nchw_tiled_gemm<
+    T: num_traits::Float
+        + bytemuck::Pod
+        + Clone
+        + Copy
+        + burn_backend::Element
+        + burn_backend::ElementAdd
+        + Send
+        + Sync
+        + 'static,
+>(
+    x: FlexTensor,
+    weight: FlexTensor,
+    bias: Option<FlexTensor>,
     options: &ConvOptions<2>,
-) -> (FlexTensor, FlexTensor, ConvOptions<3>) {
-    let x_shape = x.layout().shape();
-    let x_3d = x.reshape(Shape::from(vec![
-        x_shape[0], x_shape[1], 1, x_shape[2], x_shape[3],
-    ]));
+    dtype: DType,
+    zero: T,
+    one: T,
+) -> FlexTensor {
+    let x = x.to_contiguous();
+    let weight = weight.to_contiguous();
+    let shape = x.layout().shape();
+    let kernel = weight.layout().shape();
 
-    let w_shape = weight.layout().shape();
-    let weight_3d = weight.reshape(Shape::from(vec![
-        w_shape[0], w_shape[1], 1, w_shape[2], w_shape[3],
-    ]));
+    let [batch, channels_in, in_h, in_w] = [shape[0], shape[1], shape[2], shape[3]];
+    let [channels_out, channels_per_group, kh, kw] =
+        [kernel[0], kernel[1], kernel[2], kernel[3]];
+    let groups = options.groups;
+    assert!(groups > 0 && channels_in == groups * channels_per_group && channels_out % groups == 0);
+    let channels_out_group = channels_out / groups;
+    let [stride_h, stride_w] = options.stride;
+    let [pad_h, pad_w] = options.padding_begin();
+    let [dilation_h, dilation_w] = options.dilation;
+    let out_h = calculate_conv_output_size(kh, stride_h, pad_h, dilation_h, in_h);
+    let out_w = calculate_conv_output_size(kw, stride_w, pad_w, dilation_w, in_w);
+    let out_spatial = out_h.checked_mul(out_w).expect("conv2d: output spatial overflow");
+    let out_group_len = channels_out_group.checked_mul(out_spatial).expect("conv2d: output group overflow");
+    let total = batch.checked_mul(channels_out).and_then(|x| x.checked_mul(out_spatial)).expect("conv2d: output tensor overflow");
+    let k_spatial = kh.checked_mul(kw).expect("conv2d: kernel spatial overflow");
+    let k = channels_per_group.checked_mul(k_spatial).expect("conv2d: reduction dimension overflow");
+    let in_spatial = in_h.checked_mul(in_w).expect("conv2d: input spatial overflow");
+    let x_data: &[T] = x.storage();
+    let w_data: &[T] = weight.storage();
+    let mut output = vec![zero; total];
 
-    let options_3d = ConvOptions::new(
-        [1, options.stride[0], options.stride[1]],
-        [0, options.padding_begin()[0], options.padding_begin()[1]],
-        [1, options.dilation[0], options.dilation[1]],
-        options.groups,
-    );
+    if out_spatial > 0 && channels_out_group > 0 && batch > 0 && k > 0 {
+        const MAX_PACKED_ELEMENTS: usize = 128 * 1024;
+        // The analytic microkernel does not allocate an im2col panel. Give it
+        // complete output planes so its row spans remain contiguous, including
+        // when the spatial size would exceed the packed-GEMM tile budget.
+        let small_gemm = channels_out_group <= 2 && k <= 32 && dtype != DType::F16;
+        let tile = if small_gemm {
+            out_spatial
+        } else {
+            (MAX_PACKED_ELEMENTS / k).clamp(1, out_spatial)
+        };
+        let tiles_per_group = out_spatial.div_ceil(tile);
+        let total_tasks = batch
+            .checked_mul(groups)
+            .and_then(|tasks| tasks.checked_mul(tiles_per_group))
+            .expect("conv2d: task count overflow");
 
-    (x_3d, weight_3d, options_3d)
+        // The sampling geometry is independent of batch and channel group.
+        // Reusing a bounded plan avoids repeating div/mod and padding checks for
+        // every group, without changing the universal im2col/GEMM computation.
+        let fill_indices = |indices: &mut [usize], pitch: usize, global_start: usize, n: usize| {
+            for tap_h in 0..kh {
+                for tap_w in 0..kw {
+                    let tap = tap_h * kw + tap_w;
+                    let dst_start = if pitch == out_spatial { global_start } else { 0 };
+                    let row = &mut indices[tap * pitch + dst_start..tap * pitch + dst_start + n];
+                    for (i, pos) in (global_start..global_start + n).enumerate() {
+                        let oh = pos / out_w;
+                        let ow = pos % out_w;
+                        let ih = oh as i64 * stride_h as i64
+                            + tap_h as i64 * dilation_h as i64 - pad_h as i64;
+                        let iw = ow as i64 * stride_w as i64
+                            + tap_w as i64 * dilation_w as i64 - pad_w as i64;
+                        row[i] = if ih >= 0 && ih < in_h as i64
+                            && iw >= 0 && iw < in_w as i64
+                        {
+                            ih as usize * in_w + iw as usize
+                        } else {
+                            usize::MAX
+                        };
+                    }
+                }
+            }
+        };
+        let h_ranges: Vec<_> = if small_gemm {
+            (0..kh).map(|tap| valid_out_range(tap, dilation_h, pad_h, stride_h, in_h, out_h)).collect()
+        } else { Vec::new() };
+        let w_ranges: Vec<_> = if small_gemm {
+            (0..kw).map(|tap| valid_out_range(tap, dilation_w, pad_w, stride_w, in_w, out_w)).collect()
+        } else { Vec::new() };
+        const MAX_SHARED_PLAN_ENTRIES: usize = 1 << 20;
+        let shared_indices = if !small_gemm && batch.saturating_mul(groups) > 1
+            && k_spatial
+                .checked_mul(out_spatial)
+                .is_some_and(|entries| entries <= MAX_SHARED_PLAN_ENTRIES)
+        {
+            let mut plan = vec![usize::MAX; k_spatial * out_spatial];
+            fill_indices(&mut plan, out_spatial, 0, out_spatial);
+            Some(plan)
+        } else {
+            None
+        };
+
+        let execute_tile = |task: usize, packed: &mut [T], indices: &mut [usize], dst_base: *mut T| {
+            let group_index = task / tiles_per_group;
+            let tile_index = task % tiles_per_group;
+            let b = group_index / groups;
+            let g = group_index % groups;
+            let start = tile_index * tile;
+            let n = (out_spatial - start).min(tile);
+            let x_base = (b * channels_in + g * channels_per_group) * in_spatial;
+            let w_base = g * channels_out_group * k;
+            if small_gemm {
+                debug_assert_eq!(start, 0);
+                debug_assert_eq!(n, out_spatial);
+                for co in 0..channels_out_group {
+                    let dst = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            dst_base.add(co * out_spatial), out_spatial,
+                        )
+                    };
+                    for ci in 0..channels_per_group {
+                        let src = &x_data[x_base + ci * in_spatial..][..in_spatial];
+                        let weight_start = w_base + co * k + ci * k_spatial;
+                        let weights = &w_data[weight_start..weight_start + k_spatial];
+                        let has_non_finite = (pad_h != 0 || pad_w != 0)
+                            && weights.iter().any(|weight| !weight.is_finite());
+                        // This row-plan accumulator is a microkernel inside the
+                        // universal Conv2d engine, not a Conv3d dispatch/fallback.
+                        conv_plane_accumulate(
+                            dst,
+                            src,
+                            weights,
+                            kh,
+                            kw,
+                            in_w,
+                            out_w,
+                            stride_h,
+                            stride_w,
+                            pad_h,
+                            pad_w,
+                            dilation_h,
+                            dilation_w,
+                            has_non_finite,
+                            &h_ranges,
+                            &w_ranges,
+                        );
+                    }
+                }
+                return;
+            }
+            if shared_indices.is_none() {
+                fill_indices(indices, tile, start, n);
+            }
+            for ci in 0..channels_per_group {
+                let src = &x_data[x_base + ci * in_spatial..][..in_spatial];
+                for tap in 0..k_spatial {
+                    let dst = &mut packed[(ci * k_spatial + tap) * n..][..n];
+                    let index_row = if let Some(plan) = &shared_indices {
+                        &plan[tap * out_spatial + start..tap * out_spatial + start + n]
+                    } else {
+                        &indices[tap * tile..tap * tile + n]
+                    };
+                    for (value, &index) in dst.iter_mut().zip(index_row.iter()) {
+                        *value = if index == usize::MAX { zero } else { src[index] };
+                    }
+                }
+            }
+
+            #[cfg(feature = "rayon")]
+            let parallelism = if total_tasks == 1
+                && channels_out_group.saturating_mul(n).saturating_mul(k) >= 192 * 192 * 192
+            {
+                gemm::Parallelism::Rayon(0)
+            } else {
+                gemm::Parallelism::None
+            };
+            #[cfg(not(feature = "rayon"))]
+            let parallelism = gemm::Parallelism::None;
+
+            // Each task owns a distinct spatial interval in one batch/group's output channels.
+            unsafe {
+                gemm::gemm(
+                    channels_out_group,
+                    n,
+                    k,
+                    dst_base.add(start),
+                    1,
+                    out_spatial as isize,
+                    false,
+                    w_data.as_ptr().add(w_base),
+                    1,
+                    k as isize,
+                    packed.as_ptr(),
+                    1,
+                    n as isize,
+                    zero,
+                    one,
+                    false,
+                    false,
+                    false,
+                    parallelism,
+                );
+            }
+        };
+
+        #[cfg(feature = "rayon")]
+        let parallel_tasks = {
+            let work_per_tile = channels_out_group.saturating_mul(k).saturating_mul(tile);
+            let total_work = channels_out_group
+                .saturating_mul(k)
+                .saturating_mul(out_spatial)
+                .saturating_mul(batch)
+                .saturating_mul(groups);
+            let threads = rayon::current_num_threads();
+            total_tasks > 1
+                && (work_per_tile >= 250_000
+                    || (total_tasks >= threads.saturating_mul(2)
+                        && total_work >= 24_000))
+        };
+
+        // Small analytic contractions have no packed panel: do not create a
+        // Rayon per-worker state or two empty Vec allocations for each task.
+        #[cfg(feature = "rayon")]
+        if parallel_tasks {
+            use rayon::prelude::*;
+            let dst = crate::ops::SendMutPtr::new(output.as_mut_ptr());
+            if small_gemm {
+                (0..total_tasks).into_par_iter().for_each(|task| {
+                    let group_index = task / tiles_per_group;
+                    let b = group_index / groups;
+                    let g = group_index % groups;
+                    let offset = (b * channels_out + g * channels_out_group) * out_spatial;
+                    let group_dst = unsafe { dst.ptr_add(offset) };
+                    execute_tile(task, &mut [], &mut [], group_dst);
+                });
+            } else {
+                (0..total_tasks).into_par_iter().for_each_init(
+                    || (vec![zero; k * tile], vec![usize::MAX; k_spatial * tile]),
+                    |(packed, indices), task| {
+                        let group_index = task / tiles_per_group;
+                        let b = group_index / groups;
+                        let g = group_index % groups;
+                        let offset = (b * channels_out + g * channels_out_group) * out_spatial;
+                        let group_dst = unsafe { dst.ptr_add(offset) };
+                        execute_tile(task, packed, indices, group_dst);
+                    },
+                );
+            }
+        }
+        #[cfg(feature = "rayon")]
+        if !parallel_tasks {
+            if small_gemm {
+                for task in 0..total_tasks {
+                    let group_index = task / tiles_per_group;
+                    let b = group_index / groups;
+                    let g = group_index % groups;
+                    let offset = (b * channels_out + g * channels_out_group) * out_spatial;
+                    let group_dst = unsafe { output.as_mut_ptr().add(offset) };
+                    execute_tile(task, &mut [], &mut [], group_dst);
+                }
+            } else {
+                let mut packed = vec![zero; k * tile];
+                let mut indices = vec![usize::MAX; k_spatial * tile];
+                for task in 0..total_tasks {
+                    let group_index = task / tiles_per_group;
+                    let b = group_index / groups;
+                    let g = group_index % groups;
+                    let offset = (b * channels_out + g * channels_out_group) * out_spatial;
+                    let group_dst = unsafe { output.as_mut_ptr().add(offset) };
+                    execute_tile(task, &mut packed, &mut indices, group_dst);
+                }
+            }
+        }
+        #[cfg(not(feature = "rayon"))]
+        {
+            if small_gemm {
+                for task in 0..total_tasks {
+                    let group_index = task / tiles_per_group;
+                    let b = group_index / groups;
+                    let g = group_index % groups;
+                    let offset = (b * channels_out + g * channels_out_group) * out_spatial;
+                    let group_dst = unsafe { output.as_mut_ptr().add(offset) };
+                    execute_tile(task, &mut [], &mut [], group_dst);
+                }
+            } else {
+                let mut packed = vec![zero; k * tile];
+                let mut indices = vec![usize::MAX; k_spatial * tile];
+                for task in 0..total_tasks {
+                    let group_index = task / tiles_per_group;
+                    let b = group_index / groups;
+                    let g = group_index % groups;
+                    let offset = (b * channels_out + g * channels_out_group) * out_spatial;
+                    let group_dst = unsafe { output.as_mut_ptr().add(offset) };
+                    execute_tile(task, &mut packed, &mut indices, group_dst);
+                }
+            }
+        }
+    }
+    if let Some(bias) = bias {
+        let bias = bias.to_contiguous();
+        add_bias(&mut output, bias.storage(), batch, channels_out, out_spatial);
+    }
+    FlexTensor::new(Bytes::from_elems(output), Layout::contiguous(Shape::new([batch, channels_out, out_h, out_w])), dtype)
 }
 
 // ============================================================================

@@ -1,6 +1,6 @@
 use burn::tensor::{activation, module, ops::ConvOptions, Device, Tensor};
 
-use crate::checkpoint::RvcCheckpoint;
+use crate::{checkpoint::RvcCheckpoint, conv1d_layout::{default_conv1d_layout, load_conv1d_weight}};
 
 /// The first HuBERT Base feature-extractor layer: Conv1d -> GroupNorm -> GELU.
 /// This is not yet the seven-layer feature extractor or the transformer encoder.
@@ -12,7 +12,9 @@ pub struct HubertFirstConv {
 
 impl HubertFirstConv {
     pub fn load(checkpoint: &RvcCheckpoint, device: &Device) -> Result<Self, String> {
-        let weight = checkpoint.tensor::<3>("feature_extractor.conv_layers.0.0.weight", device)?;
+        let weight = load_conv1d_weight(
+            checkpoint, "feature_extractor.conv_layers.0.0", false,
+            default_conv1d_layout(), device)?;
         let norm_weight = checkpoint.tensor::<1>("feature_extractor.conv_layers.0.2.weight", device)?;
         let norm_bias = checkpoint.tensor::<1>("feature_extractor.conv_layers.0.2.bias", device)?;
         let [channels, input_channels, kernel] = weight.dims();
@@ -27,12 +29,12 @@ impl HubertFirstConv {
 
     pub fn forward(&self, waveform: Tensor<3>) -> Tensor<3> {
         assert_eq!(waveform.dims()[1], 1);
-        let x = module::conv1d(
-            waveform,
-            self.weight.clone(),
-            None,
-            ConvOptions::new_with_padding([5], [(0, 0)], [1], 1),
-        );
+        let options = ConvOptions::new_with_padding([5], [(0, 0)], [1], 1);
+        let x = if std::env::var("RVC_HUBERT_FRONTEND_GEMM").as_deref() == Ok("1") {
+            crate::cubecl_conv::conv1d(waveform, self.weight.clone(), None, options)
+        } else {
+            module::conv1d(waveform, self.weight.clone(), None, options)
+        };
         let mean = x.clone().mean_dim(2);
         let centered = x - mean;
         let variance = centered.clone().powf_scalar(2.0).mean_dim(2);
@@ -62,7 +64,9 @@ impl HubertFrontend {
         let channels = first.norm_weight.dims()[0];
         let mut rest = Vec::with_capacity(6);
         for layer in 1..=6 {
-            let weight = checkpoint.tensor::<3>(&format!("feature_extractor.conv_layers.{layer}.0.weight"), device)?;
+            let weight = load_conv1d_weight(
+                checkpoint, &format!("feature_extractor.conv_layers.{layer}.0"), false,
+                default_conv1d_layout(), device)?;
             let kernel = if layer <= 4 { 3 } else { 2 };
             if weight.dims() != [channels, channels, kernel] {
                 return Err(format!("HuBERT conv layer {layer}: invalid channels or kernel"));
@@ -86,10 +90,13 @@ impl HubertFrontend {
     pub fn conv_features(&self, waveform: Tensor<3>) -> Tensor<3> {
         let mut x = self.first.forward(waveform);
         for weight in &self.rest {
-            x = activation::gelu(module::conv1d(
-                x, weight.clone(), None,
-                ConvOptions::new_with_padding([2], [(0, 0)], [1], 1),
-            ));
+            let options = ConvOptions::new_with_padding([2], [(0, 0)], [1], 1);
+            let conv = if std::env::var("RVC_HUBERT_FRONTEND_GEMM").as_deref() == Ok("1") {
+                crate::cubecl_conv::conv1d(x, weight.clone(), None, options)
+            } else {
+                module::conv1d(x, weight.clone(), None, options)
+            };
+            x = activation::gelu(conv);
         }
         x
     }

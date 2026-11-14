@@ -36,6 +36,12 @@ pub fn untile(tensor: CubeTensor) -> CubeTensor {
 pub fn into_contiguous(tensor: CubeTensor) -> CubeTensor {
     // A tiled buffer's strides order its tiles, not a matrix's rows: contiguous says nothing.
     let tensor = untile(tensor);
+    if std::env::var_os("CUBECL_CONV_LAYOUT_TRACE").is_some() {
+        eprintln!(
+            "CUBECL_CONTIGUOUS shape={:?} strides={:?} materialize={}",
+            tensor.meta.shape().as_slice(), tensor.meta.strides(), !tensor.is_contiguous(),
+        );
+    }
     if tensor.is_contiguous() {
         return tensor;
     }
@@ -69,10 +75,16 @@ pub fn into_contiguous(tensor: CubeTensor) -> CubeTensor {
 )]
 pub fn into_contiguous_aligned(tensor: CubeTensor) -> CubeTensor {
     let tensor = untile(tensor);
-    if tensor
+    let readable = tensor
         .device
-        .can_read_tensor(tensor.meta.shape(), tensor.meta.strides())
-    {
+        .can_read_tensor(tensor.meta.shape(), tensor.meta.strides());
+    if std::env::var_os("CUBECL_CONV_LAYOUT_TRACE").is_some() {
+        eprintln!(
+            "CUBECL_ALIGN shape={:?} strides={:?} materialize={}",
+            tensor.meta.shape().as_slice(), tensor.meta.strides(), !readable,
+        );
+    }
+    if readable {
         return tensor;
     }
 

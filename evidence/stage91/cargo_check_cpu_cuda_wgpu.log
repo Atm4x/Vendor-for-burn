@@ -1,0 +1,108 @@
+warning: unused build dependency `burn-onnx`
+  --> Cargo.toml:68:1
+   |
+68 | burn-onnx = "=0.22.0"
+   | ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `cargo::unused_dependencies` is set to `warn` by default
+help: consider removing the dependency on `burn-onnx`
+warning: `neuromita-inference-vendor` (manifest) generated 1 warning
+   Compiling tracel-llvm-bundler v23.1.0-4
+   Compiling llvm-sys v231.0.2
+    Checking hi_sparse_bitset v0.9.0
+    Checking dlib v0.5.3
+   Compiling wgpu-hal v30.0.1
+    Checking presser v0.3.1
+   Compiling cudarc v0.19.10
+    Checking gpu-allocator v0.28.0
+    Checking cubecl-opt v0.11.3
+    Checking wayland-sys v0.31.11
+    Checking wgpu-naga-bridge v30.0.1
+    Checking khronos-egl v6.0.0
+    Checking ordered-float v5.5.1
+   Compiling cubecl-server v0.11.3
+    Checking glow v0.17.0
+    Checking profiling v1.0.18
+    Checking renderdoc-sys v1.1.0
+   Compiling cubecl-llvm v0.11.3
+   Compiling libloading v0.9.0
+   Compiling wgpu-core v30.0.1
+   Compiling litrs v1.0.1
+   Compiling document-features v0.2.12
+    Checking wgpu-core-deps-windows-linux-android v30.0.1
+    Checking pliron-llvm v0.19.0
+    Checking sanitize-filename v0.6.0
+   Compiling wgpu v30.0.1
+   Compiling cubecl-cpp v0.11.3
+   Compiling cubecl-cuda v0.11.3
+   Compiling cubecl-wgpu v0.11.3
+    Checking cubecl-std v0.11.3
+    Checking sysinfo v0.39.6
+   Compiling cubecl v0.11.3
+    Checking cubecl-cpu v0.11.3
+   Compiling ahash v0.8.12
+   Compiling darling_core v0.21.3
+    Checking cubek-tile v0.3.1
+   Compiling darling_macro v0.21.3
+   Compiling darling v0.21.3
+    Checking rand_distr v0.6.0
+    Checking data-encoding v2.11.1
+    Checking uuid v1.29.1
+    Checking burn-std v0.22.1
+   Compiling enumset_derive v0.15.1
+    Checking enumset v1.1.15
+    Checking burn-backend v0.22.1
+    Checking cubek-pool v0.3.1
+    Checking hashbrown v0.13.2
+    Checking text_placeholder v0.5.1
+    Checking burn-ir v0.22.1
+    Checking cubek-std v0.3.1
+    Checking cubek-matmul v0.3.1
+    Checking cubek-reduce v0.3.1
+    Checking cubek-random v0.3.1
+    Checking cubek-quant v0.3.1
+    Checking cubek-interpolate v0.3.1
+   Compiling burn-dispatch v0.22.1
+   Compiling rustversion v1.0.23
+   Compiling burn-backend-extension v0.22.1
+    Checking byteorder v1.5.0
+   Compiling burn-einsum v0.22.1
+   Compiling burn-derive v0.22.1
+    Checking cubek-convolution v0.3.1
+    Checking cubek-attention v0.3.1
+    Checking colored v3.1.1
+   Compiling crossbeam-epoch v0.9.21
+   Compiling constant_time_eq v0.6.1
+    Checking burn-pack v0.22.1
+    Checking linux-raw-sys v0.12.1
+   Compiling crossbeam-deque v0.8.8
+   Compiling crc32fast v1.5.4
+    Checking rustix v1.1.6
+    Checking cubek v0.3.1
+    Checking burn-cubecl v0.22.1
+   Compiling zeroize_derive v1.5.0
+   Compiling rayon-core v1.13.0
+    Checking zlib-rs v0.6.8
+    Checking flate2 v1.1.11
+    Checking zeroize v1.9.1
+    Checking xattr v1.7.0
+    Checking filetime v0.2.29
+    Checking strength_reduce v0.2.4
+    Checking typed-path v0.13.0
+    Checking zip v9.4.2
+    Checking burn-cuda v0.22.1
+    Checking burn-wgpu v0.22.1
+    Checking burn-cpu v0.22.1
+    Checking transpose v0.2.3
+    Checking tar v0.4.46
+    Checking primal-check v0.3.4
+    Checking rustfft v6.4.1
+    Checking rayon v1.12.0
+    Checking pytorch-reader v0.22.1
+    Checking burn-tensor v0.22.1
+    Checking burn-core v0.22.1
+    Checking burn-linalg v0.22.1
+    Checking burn-nn v0.22.1
+    Checking burn v0.22.1
+    Checking tts-with-rvc-rs v0.1.0 (/mnt/data/stage91_work/repo/models/tts-with-rvc-rs)
+    Finished `dev` profile [unoptimized] target(s) in 45.34s

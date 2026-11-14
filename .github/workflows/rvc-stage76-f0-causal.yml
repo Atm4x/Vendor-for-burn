@@ -1,0 +1,106 @@
+name: RVC Stage76 causal F0 voicing-restoration full-RVC gate
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - experiment/conv-kernel-rnd-stage33-20261110
+    paths:
+      - 'models/tts-with-rvc-rs/src/lib.rs'
+      - 'models/tts-with-rvc-rs/src/rvc_inference.rs'
+      - 'models/tts-with-rvc-rs/src/f0_audit.rs'
+      - 'research/stage37-windows-gpu-bench/windows/Run-RVC-F0-Causal-Stage76.ps1'
+      - '.github/workflows/rvc-stage76-f0-causal.yml'
+permissions:
+  contents: read
+jobs:
+  full-wav-single-executable:
+    runs-on: windows-latest
+    timeout-minutes: 115
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cache/tracel
+          key: stage76-f0-causal-${{ hashFiles('Cargo.lock') }}
+      - name: Restore vendored checksums
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Vendored checksum restore failed' }
+      - name: Check PowerShell runner syntax
+        shell: pwsh
+        run: |
+          $script = 'research/stage37-windows-gpu-bench/windows/Run-RVC-F0-Causal-Stage76.ps1'
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $script).Path, [ref]$tokens, [ref]$errors)
+          if ($errors.Count -ne 0) { $errors | Format-List | Out-String | Write-Host; throw 'Invalid Stage76 PowerShell runner syntax' }
+      - name: Compile unified CPU CUDA WGPU full-WAV EXE
+        shell: pwsh
+        run: |
+          cargo build --release --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs
+          if ($LASTEXITCODE -ne 0) { throw 'Unified native build failed' }
+      - name: Verify production Sequential policy
+        shell: pwsh
+        run: |
+          $decoder = Get-Content 'models/tts-with-rvc-rs/src/decoder.rs' -Raw
+          $inference = Get-Content 'models/tts-with-rvc-rs/src/rvc_inference.rs' -Raw
+          if ($decoder -notmatch 'pub const PRODUCTION: Self = Self::Sequential;') { throw 'NSF production default must be Sequential' }
+          if ($inference -notmatch 'ResidualExecution::PRODUCTION') { throw 'RVC inference must specify production policy' }
+          if (-not (Select-String -Path 'models/tts-with-rvc-rs/src/rmvpe_gru.rs' -Pattern 'RVC_RMVPE_GRU_PERSISTENT' -Quiet)) { throw 'Persistent BiGRU not wired' }
+          if (-not (Select-String -Path 'models/tts-with-rvc-rs/src/decoder.rs' -Pattern 'RVC_NSF_IMPLICIT_GEMM' -Quiet)) { throw 'NSF GEMM not wired' }
+          if (-not (Select-String -Path 'models/tts-with-rvc-rs/src/decoder.rs' -Pattern 'RVC_NSF_CONV1D_GEMM' -Quiet)) { throw 'NSF Conv1d split not wired' }
+          if (-not (Select-String -Path 'models/tts-with-rvc-rs/src/decoder.rs' -Pattern 'RVC_NSF_TRANSPOSE_GEMM' -Quiet)) { throw 'NSF Transpose split not wired' }
+          if (-not (Select-String -Path 'models/tts-with-rvc-rs/src/hubert.rs' -Pattern 'RVC_HUBERT_FRONTEND_GEMM' -Quiet)) { throw 'HuBERT GEMM not wired' }
+          if (-not (Select-String -Path 'models/tts-with-rvc-rs/src/rmvpe_unet.rs' -Pattern 'RVC_RMVPE_UNET_GEMM' -Quiet)) { throw 'RMVPE UNet GEMM not wired' }
+          if ($inference -notmatch 'RVC_F0_AUDIT_DIR') { throw 'Exact RVC F0 audit not wired' }
+          if (-not (Test-Path 'models/tts-with-rvc-rs/src/f0_audit.rs')) { throw 'Exact F0 writer missing' }
+          cargo test --offline --locked -p tts-with-rvc-rs --no-default-features --features cpu --lib production_residuals_are_sequential
+          if ($LASTEXITCODE -ne 0) { throw 'Sequential production regression test failed' }
+          cargo test --offline --locked -p tts-with-rvc-rs --no-default-features --features cpu --lib shared_f0_
+          if ($LASTEXITCODE -ne 0) { throw 'Production policy regression test failed' }
+          cargo test --offline --locked -p tts-with-rvc-rs --no-default-features --features cpu --lib writes_exact_f0_and_pitch_rows
+          if ($LASTEXITCODE -ne 0) { throw 'F0 audit file parity test failed' }
+          cargo test --offline --locked -p tts-with-rvc-rs --no-default-features --features cpu --lib reference_ablation_only_restores_voicing_or_all_values
+          if ($LASTEXITCODE -ne 0) { throw 'F0 voicing-reference ablation unit test failed' }
+          if ($inference -notmatch 'RVC_F0_REFERENCE_DIR') { throw 'F0 reference ablation is not connected to RVC' }
+      - name: Verify unified CLI metadata
+        shell: pwsh
+        run: |
+          & target/release/tts-with-rvc-rs.exe doctor
+          if ($LASTEXITCODE -ne 0) { throw 'Doctor failed' }
+      - name: Package full-WAV release gate
+        shell: pwsh
+        run: |
+          $folder = 'dist/stage76-f0-causal'
+          New-Item -ItemType Directory -Force -Path $folder | Out-Null
+          Copy-Item target/release/tts-with-rvc-rs.exe $folder
+          Copy-Item research/stage37-windows-gpu-bench/windows/Run-RVC-F0-Causal-Stage76.ps1 $folder
+          @'
+          Stage76 causal F0 voicing-restoration experiment on actual full RVC.
+          Four modes: Direct U-Net baseline, Conv2d GEMM raw,
+          Conv2d GEMM with only changed voiced/unvoiced frames taken from baseline,
+          Conv2d GEMM with the entire baseline F0 restored.
+          All reference F0 files are recorded from the original WAV and exact chunk geometry
+          in the first baseline process; reference replay is diagnostic-only.
+          Benchmark exports per-chunk F0 and coarse pitch, WAVs, PCM16 RMSE, SNR, SHA256,
+          and number of overridden F0 frames in RVC_STAGE76_F0_CAUSAL_RESULTS.zip.
+          Run Run-RVC-F0-Causal-Stage76.ps1 -Modes all.
+          This ablation is NOT a standalone production algorithm and depends on a Direct
+          reference from the same input WAV. Do not use for regular real-time TTS.
+          NSF ImplicitGemm and persistent BiGRU unchanged; CUDA Graph replay disabled.
+          '@ | Set-Content "$folder/README.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rvc-stage76-f0-causal-windows-x64
+          path: dist/stage76-f0-causal/
+          retention-days: 14
+          if-no-files-found: warn

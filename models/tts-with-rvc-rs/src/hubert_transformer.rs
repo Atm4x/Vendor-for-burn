@@ -106,21 +106,43 @@ impl HubertTransformerLayer {
         let split = |tensor: Tensor<3>| {
             tensor.reshape([batch, time, self.heads, depth]).permute([0, 2, 1, 3])
         };
-        let q = split(self.q_proj.forward(x.clone())) * (1.0 / (depth as f64).sqrt());
+        let q_unscaled = split(self.q_proj.forward(x.clone()));
         let k = split(self.k_proj.forward(x.clone()));
         let v = split(self.v_proj.forward(x.clone()));
-        let mut scores = q.matmul(k.transpose());
-        if let Some(mask) = valid_keys {
-            assert_eq!(mask.dims(), [batch, time]);
-            scores = scores.mask_fill(
-                mask.reshape([batch, 1, 1, time])
-                    .expand([batch, self.heads, time, time])
-                    .equal_elem(0.0),
-                -1e4,
-            );
-        }
-        let attention = activation::softmax(scores, 3)
-            .matmul(v)
+        let attended = if std::env::var("RVC_HUBERT_ATTENTION_FLASH").as_deref() == Ok("1") {
+            assert!(valid_keys.is_none(), "HuBERT experimental Flash kernel currently requires no padding mask");
+            let query = q_unscaled.try_into_primitive::<burn_cubecl::Cube>()
+                .expect("Flash kernel requires CubeCL query tensor");
+            let key = k.try_into_primitive::<burn_cubecl::Cube>()
+                .expect("Flash kernel requires CubeCL key tensor");
+            let value = v.try_into_primitive::<burn_cubecl::Cube>()
+                .expect("Flash kernel requires CubeCL value tensor");
+            let result = burn_cubecl::kernel::attention::flash_attention(
+                query, key, value, None, None, Default::default(),
+                cubek::attention::forward::launch::Strategy::Unit(
+                    cubek::attention::forward::launch::BlueprintStrategy::Inferred(())
+                ),
+            ).expect("CubeCL FlashAttention cannot execute this shape without fallback");
+            Tensor::from_primitive::<burn_cubecl::Cube>(result)
+        } else {
+            let q = q_unscaled * (1.0 / (depth as f64).sqrt());
+            if std::env::var("RVC_ATTENTION_ONLINE").as_deref() == Ok("1") {
+                crate::online_attention::forward(q, k, v, valid_keys, None, None, 32, 64)
+            } else {
+            let mut scores = q.matmul(k.transpose());
+            if let Some(mask) = valid_keys {
+                assert_eq!(mask.dims(), [batch, time]);
+                scores = scores.mask_fill(
+                    mask.reshape([batch, 1, 1, time])
+                        .expand([batch, self.heads, time, time])
+                        .equal_elem(0.0),
+                    -1e4,
+                );
+            }
+            activation::softmax(scores, 3).matmul(v)
+            }
+        };
+        let attention = attended
             .permute([0, 2, 1, 3])
             .reshape([batch, time, channels]);
         let after_attention = self.attention_norm.forward(x + self.out_proj.forward(attention));

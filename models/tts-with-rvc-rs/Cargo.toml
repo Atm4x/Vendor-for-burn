@@ -6,17 +6,20 @@ edition = "2024"
 rust-version = "1.98"
 
 [features]
-default = ["flex"]
+default = ["cpu", "cuda", "wgpu"]
 flex = ["burn/flex", "dep:burn-flex"]
 cpu = ["burn/cpu"]
 cuda = ["burn/cuda"]
 wgpu = ["burn/wgpu"]
 
 [dependencies]
-burn = { version = "=0.22.1", default-features = false, features = ["std"] }
+burn = { version = "=0.22.1", default-features = false, features = ["std", "extension", "cubecl"] }
+burn-cubecl = { version = "=0.22.1", default-features = false }
+cubek = { version = "=0.3.1", default-features = false, features = ["attention", "std"] }
 burn-flex = { version = "=0.22.1", default-features = false, features = ["std", "simd", "rayon"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 pytorch-reader = "=0.22.1"
 half = "=2.7.1"
 rustfft = "=6.4.1"
+rayon = "=1.12.0"

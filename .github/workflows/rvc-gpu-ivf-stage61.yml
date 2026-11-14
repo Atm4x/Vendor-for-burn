@@ -1,0 +1,83 @@
+name: RVC Stage61 resident GPU IVF Windows CUDA and WGPU
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - experiment/conv-kernel-rnd-stage33-20261110
+    paths:
+      - 'models/tts-with-rvc-rs/src/faiss_gpu.rs'
+      - 'models/tts-with-rvc-rs/src/faiss_index.rs'
+      - 'models/tts-with-rvc-rs/src/rvc_inference.rs'
+      - 'models/tts-with-rvc-rs/Cargo.toml'
+      - 'Cargo.lock'
+      - 'research/stage37-windows-gpu-bench/windows/Run-RVC-GPU-FAISS-Stage61.ps1'
+      - '.github/workflows/rvc-gpu-ivf-stage61.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  resident-ivf:
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [cuda, wgpu]
+    runs-on: windows-latest
+    timeout-minutes: 105
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cache/tracel
+          key: stage61-${{ matrix.backend }}-${{ hashFiles('Cargo.lock') }}
+      - name: Restore vendored checksums
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Vendored checksum restore failed' }
+      - name: Verify PowerShell runner parses
+        shell: pwsh
+        run: |
+          $script = 'research/stage37-windows-gpu-bench/windows/Run-RVC-GPU-FAISS-Stage61.ps1'
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $script).Path, [ref]$tokens, [ref]$errors)
+          if ($errors.Count -ne 0) { $errors | Format-List | Out-String | Write-Host; throw 'Invalid Stage61 PowerShell syntax' }
+      - name: Build native Rust RVC ${{ matrix.backend }}
+        shell: pwsh
+        run: |
+          cargo build --release --locked --offline -p tts-with-rvc-rs --no-default-features --features '${{ matrix.backend }}' --bin tts-with-rvc-rs
+          if ($LASTEXITCODE -ne 0) { throw 'Native RVC build failed' }
+      - name: Package standalone experimental runner
+        shell: pwsh
+        run: |
+          $exe = 'target/release/tts-with-rvc-rs.exe'
+          & $exe --help
+          if ($LASTEXITCODE -ne 0) { throw 'Native CLI help failed' }
+          $folder = 'dist/stage61-${{ matrix.backend }}'
+          New-Item -ItemType Directory -Force -Path $folder | Out-Null
+          Copy-Item $exe "$folder/"
+          Copy-Item research/stage37-windows-gpu-bench/windows/Run-RVC-GPU-FAISS-Stage61.ps1 "$folder/"
+          @'
+          Stage61 native RVC resident IVF prototype. Set RVC_GPU_FAISS=1 to explicitly select.
+          Supports IndexIVFFlat with nprobe=1, exact top-8 ordering in the chosen list.
+          Host HuBERT features remain on GPU. The baseline uses the unchanged CPU FAISS.
+          Report output hash, max PCM16 error and timing: GPU arithmetic may differ at near-ties.
+          Native RVC requires no Python or PyTorch. This CI builds only; real hardware runtime is unverified.
+          Copy your OWN .pth/.pt/.index/WAV into .\embed\; run the included PowerShell script.
+          '@ | Set-Content "$folder/README.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rvc-stage61-gpu-ivf-${{ matrix.backend }}-windows-x64
+          path: dist/stage61-${{ matrix.backend }}/
+          retention-days: 14
+          if-no-files-found: warn

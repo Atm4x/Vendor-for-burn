@@ -1,7 +1,7 @@
 use burn::tensor::{Device, Tensor, activation, module, ops::ConvOptions};
 use serde::Deserialize;
 
-use crate::checkpoint::RvcCheckpoint;
+use crate::{checkpoint::RvcCheckpoint, conv1d_layout::{default_conv1d_layout, load_conv1d_weight}};
 
 struct Conv1d {
     weight: Tensor<3>,
@@ -11,11 +11,8 @@ struct Conv1d {
 
 impl Conv1d {
     fn load(checkpoint: &RvcCheckpoint, prefix: &str, dilation: usize, device: &Device) -> Result<Self, String> {
-        let weight = if checkpoint.contains(&format!("{prefix}.weight_v")) {
-            checkpoint.weight_norm_conv1d(prefix, device)?
-        } else {
-            checkpoint.tensor::<3>(&format!("{prefix}.weight"), device)?
-        };
+        let normalized = checkpoint.contains(&format!("{prefix}.weight_v"));
+        let weight = load_conv1d_weight(checkpoint, prefix, normalized, default_conv1d_layout(), device)?;
         let bias = checkpoint.tensor::<1>(&format!("{prefix}.bias"), device)?;
         if weight.dims()[0] != bias.dims()[0] || dilation == 0 {
             return Err(format!("{prefix}: invalid convolution dimensions"));

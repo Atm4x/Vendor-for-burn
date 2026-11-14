@@ -158,6 +158,13 @@ impl CpuStream {
                 // No unit cap: the threadpool grows to fit any cube_dim, one
                 // worker per unit for barrier kernels.
                 let units = cube_dim.num_elems();
+                let inline_single_unit = std::env::var_os("CUBECL_CPU_INLINE_SINGLE_UNIT")
+                    .is_some()
+                    && units == 1
+                    && !pliron_engine.requirements().needs_parallelism;
+                if inline_single_unit {
+                    self.submit();
+                }
                 self.threadpool.lock().execute_data(
                     pliron_engine,
                     bindings,
@@ -167,6 +174,7 @@ impl CpuStream {
                     failures,
                     self.next_counter_step,
                     &self.atomic_counter,
+                    inline_single_unit,
                 );
                 self.next_counter_step += units as u64;
             }

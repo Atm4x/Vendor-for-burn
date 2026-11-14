@@ -1,0 +1,82 @@
+name: RVC Stage86 experimental NSF shared-tile-pair Windows gate
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - experiment/conv-kernel-rnd-stage33-20261110
+    paths:
+      - 'models/tts-with-rvc-rs/src/nsf_pair_tile.rs'
+      - 'models/tts-with-rvc-rs/src/decoder.rs'
+      - 'models/tts-with-rvc-rs/src/lib.rs'
+      - 'models/tts-with-rvc-rs/src/main.rs'
+      - 'models/tts-with-rvc-rs/tests/nsf_pair_tile_math.rs'
+      - 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage86.ps1'
+      - '.github/workflows/rvc-stage86-shared-tile-nsf.yml'
+permissions:
+  contents: read
+jobs:
+  shared-tile-nsf-experimental:
+    runs-on: windows-latest
+    timeout-minutes: 115
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cache/tracel
+          key: stage86-nsf-fused-${{ hashFiles('Cargo.lock') }}
+      - name: Restore vendored checksums
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Vendored checksum restore failed' }
+      - name: Validate PowerShell runner
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          $runner = 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage86.ps1'
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $runner).Path, [ref]$tokens, [ref]$errors)
+          if ($errors.Count -gt 0) { $errors | Out-String | Write-Host; throw 'Invalid Stage86 script' }
+      - name: Verify mathematical residual-pair parity
+        shell: pwsh
+        run: |
+          cargo test --offline --locked -p tts-with-rvc-rs --no-default-features --features 'cpu,flex' --test nsf_fused_pair_math
+          if ($LASTEXITCODE -ne 0) { throw 'Shared tile two-convolution math mismatch' }
+      - name: Typecheck CUDA and build Windows benchmark executable
+        shell: pwsh
+        run: |
+          cargo check --offline --locked -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --lib --bin tts-with-rvc-rs
+          if ($LASTEXITCODE -ne 0) { throw 'CUDA source typecheck failed' }
+          cargo build --release --offline --locked -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs
+          if ($LASTEXITCODE -ne 0) { throw 'Windows CUDA build failed' }
+          & target/release/tts-with-rvc-rs.exe doctor
+          if ($LASTEXITCODE -ne 0) { throw 'Doctor failed' }
+      - name: Package Windows A/B benchmark
+        shell: pwsh
+        run: |
+          $folder = 'dist/stage86-shared-tile-nsf'
+          New-Item -ItemType Directory -Force -Path $folder | Out-Null
+          Copy-Item target/release/tts-with-rvc-rs.exe $folder
+          Copy-Item research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage86.ps1 $folder
+          @'
+          Stage86: experimental single-kernel time-tiled nonlinear two-convolution NSF ResBlock.
+          Run the PowerShell script from this folder with private assets under .\embed\.
+          RVC_NSF_PAIR_SHARED_TILE=1 computes eligible low-channel two-convolution pairs with one shared-memory tile kernel.
+          Baseline uses implicit GEMM; candidate uses shared-memory intermediate features on supported channels and retains GEMM for wide layers.
+          CUDA JIT and actual throughput have NOT been validated by GitHub Actions.
+          Do not enable as a production default until numerical and speed gates pass.
+          '@ | Set-Content "$folder/README.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rvc-stage86-shared-tile-nsf-windows-x64
+          path: dist/stage86-shared-tile-nsf/
+          retention-days: 14
+          if-no-files-found: warn

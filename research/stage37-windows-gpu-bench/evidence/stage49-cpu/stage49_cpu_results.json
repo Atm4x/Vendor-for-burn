@@ -1,0 +1,66 @@
+{
+  "stage": 49,
+  "CPU_5_vCPU_batch32_sequential": [
+    {
+      "frames": 4,
+      "baseline_ms": 16.159485,
+      "prepacked_ms": 12.025463,
+      "speedup": 1.3437723769970438,
+      "raw_ms": {
+        "baseline": [
+          16.035923,
+          17.338718999999998,
+          16.159485
+        ],
+        "packed": [
+          12.069888,
+          12.025463,
+          11.986514999999999
+        ]
+      },
+      "full_f32_bitwise_parity": true
+    },
+    {
+      "frames": 64,
+      "baseline_ms": 16.019038,
+      "prepacked_ms": 12.052402,
+      "speedup": 1.3291158061272763,
+      "raw_ms": {
+        "baseline": [
+          16.165535000000002,
+          16.019038,
+          15.925431
+        ],
+        "packed": [
+          12.052402,
+          12.103098,
+          11.994778
+        ]
+      },
+      "full_f32_bitwise_parity": true
+    },
+    {
+      "frames": 256,
+      "baseline_ms": 16.268477,
+      "prepacked_ms": 12.070648,
+      "speedup": 1.3477716357895617,
+      "raw_ms": {
+        "baseline": [
+          16.268477,
+          17.327163,
+          16.179336
+        ],
+        "packed": [
+          12.007165,
+          13.734079,
+          12.070648
+        ]
+      },
+      "full_f32_bitwise_parity": true
+    }
+  ],
+  "trace_materializations_64frames": {
+    "baseline": 40,
+    "packed": 13
+  }
+}

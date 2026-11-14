@@ -1,8 +1,44 @@
-use burn::tensor::{activation, module, ops::{ConvOptions, ConvTransposeOptions}, Device, Tensor, TensorData};
+use burn::tensor::{activation, module, ops::{ConvOptions, ConvTransposeOptions}, DType, Device, Tensor, TensorData};
 use serde::Deserialize;
+use rayon::prelude::*;
+use std::time::Instant;
 
-use crate::checkpoint::RvcCheckpoint;
+use crate::{checkpoint::RvcCheckpoint, conv1d_layout::{Conv1dWeightLayout, default_conv1d_layout, load_conv1d_weight}};
 use crate::nsf_source::SourceModuleHnNSF;
+use crate::nsf_tiling::{ConvGeometry, NsfTileGeometry, StageGeometry};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResidualExecution {
+    Sequential,
+    Parallel,
+}
+
+impl ResidualExecution {
+    pub const PRODUCTION: Self = Self::Sequential;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResidualAggregation {
+    ZeroSeeded,
+    FirstBranch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NsfScheduling {
+    Default,
+    FlushPerBranch,
+    FlushPerStage,
+    SyncPerBranch,
+    FlushPerPair,
+    FlushPerConv,
+    SyncPerPair,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct NsfProfileStep {
+    pub section: String,
+    pub milliseconds: f64,
+}
 
 struct Conv1d {
     weight: Tensor<3>,
@@ -10,6 +46,7 @@ struct Conv1d {
     stride: usize,
     dilation: usize,
     padding: usize,
+    fp16_resblock: bool,
 }
 
 impl Conv1d {
@@ -17,12 +54,15 @@ impl Conv1d {
         if stride == 0 || dilation == 0 {
             return Err(format!("{prefix}: stride/dilation must be positive"));
         }
-        let weight = if checkpoint.contains(&format!("{prefix}.weight_v")) {
-            checkpoint.weight_norm_conv1d(prefix, device)?
+        let normalized = checkpoint.contains(&format!("{prefix}.weight_v"));
+        let kernel_mode = std::env::var("RVC_NSF_CONV_KERNEL").unwrap_or_default();
+        let layout = if matches!(kernel_mode.as_str(), "packed" | "quad" | "quad_interior") {
+            Conv1dWeightLayout::Temporal
         } else {
-            checkpoint.tensor::<3>(&format!("{prefix}.weight"), device)?
+            default_conv1d_layout()
         };
-        let bias = checkpoint.contains(&format!("{prefix}.bias"))
+        let mut weight = load_conv1d_weight(checkpoint, prefix, normalized, layout, device)?;
+        let mut bias = checkpoint.contains(&format!("{prefix}.bias"))
             .then(|| checkpoint.tensor::<1>(&format!("{prefix}.bias"), device))
             .transpose()?;
         if let Some(bias) = &bias {
@@ -30,12 +70,29 @@ impl Conv1d {
                 return Err(format!("{prefix}: bias and weight output channels differ"));
             }
         }
-        Ok(Self {weight, bias, stride, dilation, padding})
+        let fp16_resblock = crate::nsf_precision::NsfConvPrecision::from_env()?
+            .applies_to(prefix, weight.dims()[0]);
+        if fp16_resblock {
+            weight = weight.cast(DType::F16);
+            bias = bias.map(|tensor| tensor.cast(DType::F16));
+        }
+        Ok(Self {weight, bias, stride, dilation, padding, fp16_resblock})
     }
 
     fn forward(&self, input: Tensor<3>) -> Tensor<3> {
-        module::conv1d(input, self.weight.clone(), self.bias.clone(),
-            ConvOptions::new_with_padding([self.stride], [(self.padding, self.padding)], [self.dilation], 1))
+        let options = ConvOptions::new_with_padding([self.stride], [(self.padding, self.padding)], [self.dilation], 1);
+        if self.fp16_resblock {
+            return crate::cubecl_conv::conv1d(
+                input.cast(DType::F16), self.weight.clone(), self.bias.clone(), options,
+            );
+        }
+        if std::env::var("RVC_NSF_IMPLICIT_GEMM").as_deref() == Ok("1")
+            || std::env::var("RVC_NSF_CONV1D_GEMM").as_deref() == Ok("1")
+        {
+            crate::cubecl_conv::conv1d(input, self.weight.clone(), self.bias.clone(), options)
+        } else {
+            module::conv1d(input, self.weight.clone(), self.bias.clone(), options)
+        }
     }
 }
 
@@ -59,8 +116,14 @@ impl TransposedConv1d {
     }
 
     fn forward(&self, input: Tensor<3>) -> Tensor<3> {
-        module::conv_transpose1d(input, self.weight.clone(), Some(self.bias.clone()),
-            ConvTransposeOptions::new([self.stride], [self.padding], [0], [1], 1))
+        if std::env::var("RVC_NSF_IMPLICIT_GEMM").as_deref() == Ok("1")
+            || std::env::var("RVC_NSF_TRANSPOSE_GEMM").as_deref() == Ok("1")
+        {
+            crate::cubecl_conv::conv_transpose1d(input, self.weight.clone(), self.bias.clone(), self.stride, self.padding)
+        } else {
+            module::conv_transpose1d(input, self.weight.clone(), Some(self.bias.clone()),
+                ConvTransposeOptions::new([self.stride], [self.padding], [0], [1], 1))
+        }
     }
 }
 
@@ -92,13 +155,99 @@ impl ResBlock1 {
         Ok(Self {first, second, channels: channels.unwrap()})
     }
 
-    pub fn forward(&self, mut x: Tensor<3>) -> Tensor<3> {
+    pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
+        self.forward_with_scheduling(x, NsfScheduling::Default)
+    }
+
+    fn forward_with_scheduling(&self, mut x: Tensor<3>, scheduling: NsfScheduling) -> Tensor<3> {
         assert_eq!(x.dims()[1], self.channels);
-        for (first, second) in self.first.iter().zip(&self.second) {
-            let h = second.forward(activation::leaky_relu(first.forward(activation::leaky_relu(x.clone(), 0.1)), 0.1));
-            x = x + h;
+        let fp16 = self.first.iter().any(|conv| conv.fp16_resblock);
+        if fp16 && (std::env::var("RVC_NSF_PAIR_SHARED_TILE").as_deref() == Ok("1")
+            || std::env::var("RVC_NSF_FUSED_PAIR_MAX_CHANNELS").is_ok()) {
+            panic!("RVC_NSF_RESBLOCK_FP16 is incompatible with direct fused NSF pair experiments");
         }
-        x
+        let fused_limit = std::env::var("RVC_NSF_FUSED_PAIR_MAX_CHANNELS").ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|limit| *limit > 0);
+        let shared_tile = std::env::var("RVC_NSF_PAIR_SHARED_TILE").as_deref() == Ok("1")
+            && scheduling == NsfScheduling::Default;
+        if fp16 {
+            x = x.cast(DType::F16);
+        }
+        for (first, second) in self.first.iter().zip(&self.second) {
+            if shared_tile && crate::nsf_pair_tile::supports(self.channels, second.weight.dims()[2], second.dilation) {
+                x = crate::nsf_pair_tile::forward(
+                    x, first.weight.clone(), first.bias.clone(), first.dilation, first.padding,
+                    second.weight.clone(), second.bias.clone(), second.dilation, second.padding,
+                ).expect("NSF shared-tile two-convolution kernel failed");
+                continue;
+            }
+            if scheduling == NsfScheduling::Default && fused_limit.is_some_and(|limit| self.channels <= limit) {
+                let h = crate::nsf_fused_pair::preact_conv(
+                    x.clone(), first.weight.clone(), first.bias.clone(), None,
+                    first.dilation, first.padding,
+                ).expect("NSF experimental first fused convolution failed");
+                x = crate::nsf_fused_pair::preact_conv(
+                    h, second.weight.clone(), second.bias.clone(), Some(x),
+                    second.dilation, second.padding,
+                ).expect("NSF experimental second fused convolution failed");
+                continue;
+            }
+            let h = activation::leaky_relu(x.clone(), 0.1);
+            let h = first.forward(h);
+            if scheduling == NsfScheduling::FlushPerConv {
+                h.device().flush().expect("NSF first Conv flush failed");
+            }
+            let h = activation::leaky_relu(h, 0.1);
+            let h = second.forward(h);
+            if scheduling == NsfScheduling::FlushPerConv {
+                h.device().flush().expect("NSF second Conv flush failed");
+            }
+            x = x + h;
+            match scheduling {
+                NsfScheduling::FlushPerPair => x.device().flush().expect("NSF pair flush failed"),
+                NsfScheduling::SyncPerPair => x.device().sync().expect("NSF pair sync failed"),
+                _ => {},
+            }
+        }
+        if fp16 { x.cast(DType::F32) } else { x }
+    }
+
+    fn profile_cpu(
+        &self,
+        mut x: Tensor<3>,
+        steps: &mut Vec<NsfProfileStep>,
+        stage_index: usize,
+        block_index: usize,
+    ) -> Tensor<3> {
+        let prefix = format!("stage{stage_index}.residual{block_index}");
+        let fp16 = self.first.iter().any(|conv| conv.fp16_resblock);
+        if fp16 { x = x.cast(DType::F16); }
+        for (index, (first, second)) in self.first.iter().zip(&self.second).enumerate() {
+            let mut record = |section: &str, tensor: &Tensor<3>, start: Instant| {
+                let _ = tensor.clone().into_data();
+                steps.push(NsfProfileStep {
+                    section: format!("{prefix}.pair{index}.{section}"),
+                    milliseconds: start.elapsed().as_secs_f64() * 1000.0,
+                });
+            };
+            let start = Instant::now();
+            let h = activation::leaky_relu(x.clone(), 0.1);
+            record("first_activation", &h, start);
+            let start = Instant::now();
+            let h = first.forward(h);
+            record("first_conv", &h, start);
+            let start = Instant::now();
+            let h = activation::leaky_relu(h, 0.1);
+            record("second_activation", &h, start);
+            let start = Instant::now();
+            let h = second.forward(h);
+            record("second_conv", &h, start);
+            let start = Instant::now();
+            x = x + h;
+            record("residual_add", &x, start);
+        }
+        if fp16 { x.cast(DType::F32) } else { x }
     }
 }
 
@@ -136,15 +285,148 @@ impl DecoderStage {
     }
 
     pub fn forward(&self, input: Tensor<3>, harmonic_source: Tensor<3>) -> Tensor<3> {
+        self.forward_with_execution(input, harmonic_source, ResidualExecution::PRODUCTION)
+    }
+
+    fn forward_with_execution(
+        &self,
+        input: Tensor<3>,
+        harmonic_source: Tensor<3>,
+        execution: ResidualExecution,
+    ) -> Tensor<3> {
+        self.forward_with_aggregation(input, harmonic_source, execution, ResidualAggregation::ZeroSeeded)
+    }
+
+    fn forward_with_aggregation(
+        &self,
+        input: Tensor<3>,
+        harmonic_source: Tensor<3>,
+        execution: ResidualExecution,
+        aggregation: ResidualAggregation,
+    ) -> Tensor<3> {
+        self.forward_with_scheduling(input, harmonic_source, execution, aggregation, NsfScheduling::Default, None)
+    }
+
+    fn forward_with_scheduling(
+        &self,
+        input: Tensor<3>,
+        harmonic_source: Tensor<3>,
+        execution: ResidualExecution,
+        aggregation: ResidualAggregation,
+        scheduling: NsfScheduling,
+        diagnostic_stage: Option<usize>,
+    ) -> Tensor<3> {
+        let trace = diagnostic_stage.filter(|_| crate::diagnostic::enabled());
+        let device = trace.map(|_| input.device());
+        let started = trace.map(|_| Instant::now());
         let upsampled = self.upsample_only(input);
-        let source = self.noise.forward(harmonic_source);
-        assert_eq!(upsampled.dims(), source.dims(), "harmonic source must align with upsampled features");
-        let mut result = Tensor::<3>::zeros(upsampled.dims(), &upsampled.device());
-        let prepared = upsampled + source;
-        for block in &self.residual {
-            result = result + block.forward(prepared.clone());
+        if let (Some(stage), Some(device), Some(started)) = (trace, &device, started) {
+            crate::diagnostic::measure(device, "nsf.stage_upsample", started,
+                serde_json::json!({"stage": stage, "shape": upsampled.dims()}));
         }
-        result / self.residual.len() as f32
+        let started = trace.map(|_| Instant::now());
+        let source = self.noise.forward(harmonic_source);
+        if let (Some(stage), Some(device), Some(started)) = (trace, &device, started) {
+            crate::diagnostic::measure(device, "nsf.stage_noise_conv", started,
+                serde_json::json!({"stage": stage, "shape": source.dims()}));
+        }
+        assert_eq!(upsampled.dims(), source.dims(), "harmonic source must align with upsampled features");
+        let prepared = upsampled + source;
+        let residual_started = trace.map(|_| Instant::now());
+        let mut result = match aggregation {
+            ResidualAggregation::ZeroSeeded => Some(Tensor::<3>::zeros(prepared.dims(), &prepared.device())),
+            ResidualAggregation::FirstBranch => None,
+        };
+        let mut accumulate = |branch: Tensor<3>| {
+            result = Some(match result.take() {
+                Some(current) => current + branch,
+                None => branch,
+            });
+        };
+        match execution {
+            ResidualExecution::Sequential => {
+                for block in &self.residual {
+                    let branch = block.forward_with_scheduling(prepared.clone(), scheduling);
+                    match scheduling {
+                        NsfScheduling::FlushPerBranch => branch.device().flush().expect("NSF branch flush failed"),
+                        NsfScheduling::SyncPerBranch => branch.device().sync().expect("NSF branch sync failed"),
+                        _ => {},
+                    }
+                    accumulate(branch);
+                }
+            }
+            ResidualExecution::Parallel => {
+                let branches: Vec<Tensor<3>> = self.residual.par_iter()
+                    .map(|block| block.forward_with_scheduling(prepared.clone(), scheduling)).collect();
+                for branch in branches {
+                    match scheduling {
+                        NsfScheduling::FlushPerBranch => branch.device().flush().expect("NSF branch flush failed"),
+                        NsfScheduling::SyncPerBranch => branch.device().sync().expect("NSF branch sync failed"),
+                        _ => {},
+                    }
+                    accumulate(branch);
+                }
+            }
+        }
+        let result = result.expect("decoder stage must contain residual blocks") / self.residual.len() as f32;
+        if scheduling == NsfScheduling::FlushPerStage {
+            result.device().flush().expect("NSF stage flush failed");
+        }
+        if let (Some(stage), Some(device), Some(started)) = (trace, &device, residual_started) {
+            crate::diagnostic::measure(device, "nsf.stage_residuals_aggregate", started,
+                serde_json::json!({"stage": stage, "residual_count": self.residual.len(), "shape": result.dims()}));
+        }
+        result
+    }
+
+    fn profile_cpu(
+        &self,
+        input: Tensor<3>,
+        harmonic_source: Tensor<3>,
+        steps: &mut Vec<NsfProfileStep>,
+        stage_index: usize,
+        aggregation: ResidualAggregation,
+    ) -> Tensor<3> {
+        fn record(steps: &mut Vec<NsfProfileStep>, stage_index: usize, label: &str, tensor: &Tensor<3>, start: Instant) {
+            let _ = tensor.clone().into_data();
+            steps.push(NsfProfileStep {
+                section: format!("stage{stage_index}.{label}"),
+                milliseconds: start.elapsed().as_secs_f64() * 1000.0,
+            });
+        }
+        let start = Instant::now();
+        let upsampled = self.upsample_only(input);
+        record(steps, stage_index, "upsample", &upsampled, start);
+        let start = Instant::now();
+        let source = self.noise.forward(harmonic_source);
+        record(steps, stage_index, "noise_conv", &source, start);
+        let start = Instant::now();
+        let prepared = upsampled + source;
+        record(steps, stage_index, "prepare_add", &prepared, start);
+        let mut branches = Vec::with_capacity(self.residual.len());
+        for (index, block) in self.residual.iter().enumerate() {
+            let start = Instant::now();
+            let branch = block.profile_cpu(prepared.clone(), steps, stage_index, index);
+            steps.push(NsfProfileStep {
+                section: format!("stage{stage_index}.residual{index}.total"),
+                milliseconds: start.elapsed().as_secs_f64() * 1000.0,
+            });
+            branches.push(branch);
+        }
+        let start = Instant::now();
+        let mut acc = match aggregation {
+            ResidualAggregation::ZeroSeeded => Some(Tensor::<3>::zeros(prepared.dims(), &prepared.device())),
+            ResidualAggregation::FirstBranch => None,
+        };
+        for branch in branches {
+            acc = Some(match acc.take() {
+                Some(prev) => prev + branch,
+                None => branch,
+            });
+        }
+        let result = acc.expect("decoder stage must contain residual blocks") / self.residual.len() as f32;
+        record(steps, stage_index, "aggregate", &result, start);
+        result
     }
 
     pub fn residual_count(&self) -> usize { self.residual.len() }
@@ -227,18 +509,94 @@ impl NsfWaveformDecoder {
     }
 
     pub fn forward(&self, input: Tensor<3>, harmonic_source: Tensor<3>, g: Option<Tensor<3>>) -> Tensor<3> {
+        self.forward_with_execution(input, harmonic_source, g, ResidualExecution::PRODUCTION)
+    }
+
+    pub fn forward_with_execution(
+        &self,
+        input: Tensor<3>,
+        harmonic_source: Tensor<3>,
+        g: Option<Tensor<3>>,
+        execution: ResidualExecution,
+    ) -> Tensor<3> {
+        self.forward_with_aggregation(input, harmonic_source, g, execution, ResidualAggregation::ZeroSeeded)
+    }
+
+    pub fn forward_with_aggregation(
+        &self,
+        input: Tensor<3>,
+        harmonic_source: Tensor<3>,
+        g: Option<Tensor<3>>,
+        execution: ResidualExecution,
+        aggregation: ResidualAggregation,
+    ) -> Tensor<3> {
+        self.forward_with_scheduling(input, harmonic_source, g, execution, aggregation, NsfScheduling::Default)
+    }
+
+    pub fn forward_with_scheduling(
+        &self,
+        input: Tensor<3>,
+        harmonic_source: Tensor<3>,
+        g: Option<Tensor<3>>,
+        execution: ResidualExecution,
+        aggregation: ResidualAggregation,
+        scheduling: NsfScheduling,
+    ) -> Tensor<3> {
         let [batch, _, time] = input.dims();
         assert_eq!(harmonic_source.dims(), [batch, 1, time * self.total_upsample]);
+        let device = input.device();
+        let pre_started = std::time::Instant::now();
         let mut x = self.pre.forward(input);
         match (&self.condition, g) {
             (Some(conv), Some(condition)) => x = x + conv.forward(condition),
             (None, None) => {},
             _ => panic!("NSF decoder conditioning does not match checkpoint"),
         }
-        for stage in &self.stages {
-            x = stage.forward(x, harmonic_source.clone());
+        crate::diagnostic::measure(&device, "nsf.conv_pre_condition", pre_started, serde_json::json!({"shape":x.dims()}));
+        for (stage_idx, stage) in self.stages.iter().enumerate() {
+            let started = std::time::Instant::now();
+            x = stage.forward_with_scheduling(x, harmonic_source.clone(), execution, aggregation, scheduling, Some(stage_idx));
+            crate::diagnostic::measure(&device, "nsf.upsample_resblocks", started,
+                serde_json::json!({"stage":stage_idx,"shape":x.dims()}));
         }
-        activation::tanh(self.post.forward(activation::leaky_relu(x, 0.01)))
+        let started = std::time::Instant::now();
+        let output = activation::tanh(self.post.forward(activation::leaky_relu(x, 0.01)));
+        crate::diagnostic::measure(&device, "nsf.conv_post", started, serde_json::json!({"shape":output.dims()}));
+        output
+    }
+
+    pub fn profile_cpu(
+        &self,
+        input: Tensor<3>,
+        harmonic_source: Tensor<3>,
+        g: Option<Tensor<3>>,
+        aggregation: ResidualAggregation,
+    ) -> (Tensor<3>, Vec<NsfProfileStep>) {
+        let [batch, _, time] = input.dims();
+        assert_eq!(harmonic_source.dims(), [batch, 1, time * self.total_upsample]);
+        let mut steps = Vec::new();
+        let start = Instant::now();
+        let mut x = self.pre.forward(input);
+        let _ = x.clone().into_data();
+        steps.push(NsfProfileStep { section: "pre_conv".into(), milliseconds: start.elapsed().as_secs_f64() * 1000.0 });
+        match (&self.condition, g) {
+            (Some(conv), Some(condition)) => {
+                let start = Instant::now();
+                x = x + conv.forward(condition);
+                let _ = x.clone().into_data();
+                steps.push(NsfProfileStep { section: "conditioning".into(), milliseconds: start.elapsed().as_secs_f64() * 1000.0 });
+            }
+            (None, None) => {},
+            _ => panic!("NSF decoder conditioning does not match checkpoint"),
+        }
+        for (index, stage) in self.stages.iter().enumerate() {
+            x = stage.profile_cpu(x, harmonic_source.clone(), &mut steps, index, aggregation);
+        }
+        let start = Instant::now();
+        let out = activation::tanh(self.post.forward(activation::leaky_relu(x, 0.01)));
+        let _ = out.clone().into_data();
+        steps.push(NsfProfileStep { section: "post_conv_activation".into(), milliseconds: start.elapsed().as_secs_f64() * 1000.0 });
+        (out, steps)
     }
 
     pub fn forward_from_f0(
@@ -250,12 +608,140 @@ impl NsfWaveformDecoder {
         initial_phases: Tensor<3>,
         gaussian_noise: Tensor<3>,
     ) -> Result<Tensor<3>, String> {
+        self.forward_from_f0_with_execution(
+            input, f0, condition, source, initial_phases, gaussian_noise, ResidualExecution::PRODUCTION,
+        )
+    }
+
+    pub fn forward_from_f0_with_execution(
+        &self,
+        input: Tensor<3>,
+        f0: Tensor<2>,
+        condition: Option<Tensor<3>>,
+        source: &SourceModuleHnNSF,
+        initial_phases: Tensor<3>,
+        gaussian_noise: Tensor<3>,
+        execution: ResidualExecution,
+    ) -> Result<Tensor<3>, String> {
+        self.forward_from_f0_with_execution_and_phase(
+            input, f0, condition, source, initial_phases, gaussian_noise, None, execution,
+        )
+    }
+
+    pub fn forward_from_f0_with_execution_and_phase(
+        &self,
+        input: Tensor<3>,
+        f0: Tensor<2>,
+        condition: Option<Tensor<3>>,
+        source: &SourceModuleHnNSF,
+        initial_phases: Tensor<3>,
+        gaussian_noise: Tensor<3>,
+        global_phase: Option<Tensor<3>>,
+        execution: ResidualExecution,
+    ) -> Result<Tensor<3>, String> {
         let [batch, _, frames] = input.dims();
         if f0.dims() != [batch, frames] {
             return Err("NSF decoder F0 shape must match input frames".into());
         }
-        let (harmonic, _) = source.forward_with_random(f0, self.total_upsample, initial_phases, gaussian_noise)?;
-        Ok(self.forward(input, harmonic.permute([0, 2, 1]), condition))
+        let device = f0.device();
+        let started = std::time::Instant::now();
+        let (harmonic, _) = source.forward_with_random_and_global_phase(
+            f0, self.total_upsample, initial_phases, gaussian_noise, global_phase,
+        )?;
+        crate::diagnostic::measure(&device, "nsf.source_generation", started, serde_json::json!({"harmonic_shape":harmonic.dims()}));
+        let started = std::time::Instant::now();
+        let harmonic = harmonic.permute([0, 2, 1]);
+        let output = match std::env::var("RVC_NSF_TILE_CORE_FRAMES") {
+            Ok(frames) if !frames.is_empty() => {
+                let core = frames.parse::<usize>()
+                    .map_err(|_| "RVC_NSF_TILE_CORE_FRAMES must be a positive integer".to_string())?;
+                if execution != ResidualExecution::PRODUCTION {
+                    return Err("NSF tiling requires sequential production residual execution".into());
+                }
+                self.forward_tiled(input, harmonic, condition, core)?
+            }
+            _ => self.forward_with_execution(input, harmonic, condition, execution),
+        };
+        crate::diagnostic::measure(&device, "nsf.decoder_all", started, serde_json::json!({"output_shape":output.dims()}));
+        Ok(output)
+    }
+
+    pub fn tiling_geometry(&self) -> NsfTileGeometry {
+        let conv_geometry = |conv: &Conv1d| ConvGeometry {
+            kernel: conv.weight.dims()[2],
+            stride: conv.stride,
+            dilation: conv.dilation,
+            padding: conv.padding,
+        };
+        NsfTileGeometry {
+            pre: conv_geometry(&self.pre),
+            post: conv_geometry(&self.post),
+            stages: self.stages.iter().map(|stage| {
+                let max_residual_radius = stage.residual.iter().map(|block| {
+                    block.first.iter().zip(&block.second).map(|(first, second)| {
+                        (first.weight.dims()[2] - 1) * first.dilation / 2
+                            + (second.weight.dims()[2] - 1) * second.dilation / 2
+                    }).sum::<usize>()
+                }).max().unwrap_or(0);
+                StageGeometry {
+                    upsample: ConvGeometry {
+                        kernel: stage.upsample.weight.dims()[2],
+                        stride: stage.upsample.stride,
+                        dilation: 1,
+                        padding: stage.upsample.padding,
+                    },
+                    noise: conv_geometry(&stage.noise),
+                    max_residual_radius,
+                }
+            }).collect(),
+            total_upsample: self.total_upsample,
+        }
+    }
+
+    pub fn forward_tiled(
+        &self,
+        input: Tensor<3>,
+        harmonic_source: Tensor<3>,
+        condition: Option<Tensor<3>>,
+        core_frames: usize,
+    ) -> Result<Tensor<3>, String> {
+        let [batch, channels, frames] = input.dims();
+        let total_samples = frames.checked_mul(self.total_upsample)
+            .ok_or("NSF tiled sample count overflow")?;
+        if harmonic_source.dims() != [batch, 1, total_samples] {
+            return Err("NSF tiled harmonic input has unexpected shape".into());
+        }
+        if core_frames == 0 {
+            return Err("NSF tiled core frames must be positive".into());
+        }
+        let plan = self.tiling_geometry().plan(frames, core_frames)?;
+        let mut parts = Vec::with_capacity(plan.len());
+        for part in plan {
+            let latent = input.clone().slice([0..batch, 0..channels, part.input_start..part.input_end]);
+            let source_start = part.input_start * self.total_upsample;
+            let source_end = part.input_end * self.total_upsample;
+            let harmonic = harmonic_source.clone().slice([0..batch, 0..1, source_start..source_end]);
+            let tile_condition = match &condition {
+                Some(g) if g.dims()[0] != batch => {
+                    return Err("NSF tiled conditioning batch dimensions differ".into());
+                }
+                Some(g) if g.dims()[2] == 1 => Some(g.clone()),
+                Some(g) if g.dims()[2] == frames => Some(g.clone().slice([
+                    0..batch, 0..g.dims()[1], part.input_start..part.input_end,
+                ])),
+                Some(_) => return Err("NSF tiled conditioning must be broadcast or time-aligned".into()),
+                None => None,
+            };
+            let full_tile = self.forward_with_execution(
+                latent, harmonic, tile_condition, ResidualExecution::PRODUCTION,
+            );
+            let samples = (part.input_end - part.input_start) * self.total_upsample;
+            if full_tile.dims() != [batch, 1, samples] {
+                return Err("NSF tiled decoder output has unexpected shape".into());
+            }
+            parts.push(full_tile.slice([0..batch, 0..1, part.output_start..part.output_end]));
+        }
+        Ok(Tensor::cat(parts, 2))
     }
 
     pub fn stage_count(&self) -> usize { self.stages.len() }
@@ -287,5 +773,15 @@ impl NsfDecoderFixture {
 
     pub fn load(&self, checkpoint: &RvcCheckpoint, device: &Device) -> Result<NsfWaveformDecoder, String> {
         NsfWaveformDecoder::load(checkpoint, &self.upsample_rates, self.kernels_per_stage, self.dilations, device)
+    }
+}
+
+#[cfg(test)]
+mod production_execution_tests {
+    use super::ResidualExecution;
+
+    #[test]
+    fn production_residuals_are_sequential() {
+        assert_eq!(ResidualExecution::PRODUCTION, ResidualExecution::Sequential);
     }
 }

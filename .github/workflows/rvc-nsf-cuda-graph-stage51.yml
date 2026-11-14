@@ -1,0 +1,73 @@
+name: RVC NSF Stage51 CUDA Graph A/B package
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - experiment/conv-kernel-rnd-stage33-20261110
+    paths:
+      - '.github/workflows/rvc-nsf-cuda-graph-stage51.yml'
+      - 'models/tts-with-rvc-rs/src/bin/profile_nsf_graph_stage51.rs'
+      - 'research/stage37-windows-gpu-bench/windows/Run-NSF-Graph.ps1'
+      - 'research/stage37-windows-gpu-bench/windows/Run-NSF-Streams.ps1'
+
+permissions:
+  contents: read
+
+jobs:
+  windows-cuda-graph:
+    runs-on: windows-latest
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cache/tracel
+          key: rvc-nsf-stage51-cuda-${{ hashFiles('Cargo.lock') }}
+      - name: Restore vendored checksums
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Vendor checksum verification failed' }
+      - name: Compile CUDA Graph profiler
+        shell: pwsh
+        run: |
+          cargo build --locked --offline --release -p tts-with-rvc-rs --no-default-features --features cuda --bin profile_nsf_graph_stage51 --bin profile_nsf_prepack_stage49
+          if ($LASTEXITCODE -ne 0) { throw 'Stage51 CUDA Graph profiler compilation failed' }
+          New-Item -ItemType Directory -Force -Path dist/nsf-stage51 | Out-Null
+          Copy-Item target/release/profile_nsf_graph_stage51.exe dist/nsf-stage51/
+          Copy-Item target/release/profile_nsf_prepack_stage49.exe dist/nsf-stage51/
+          Copy-Item models/tts-with-rvc-rs/tests/fixtures/synthetic_nsf_decoder.pth dist/nsf-stage51/
+          Copy-Item research/stage37-windows-gpu-bench/windows/Run-NSF-Graph.ps1 dist/nsf-stage51/
+          Copy-Item research/stage37-windows-gpu-bench/windows/Run-NSF-Streams.ps1 dist/nsf-stage51/
+          @'
+          Stage51: full NSF, native CUDA Graph capture/replay versus ordinary forward.
+          
+          Run:
+            powershell -ExecutionPolicy Bypass -File .\Run-NSF-Graph.ps1 -Iterations 20 -Warmup 5 -Frames "64,256,1024"
+          
+          Each configuration executes normal forward and graph replay interleaved in ONE process.
+          Reports CUDA Graph is_hardware() status and full FP32 parity.
+          A non-hardware graph is NOT a valid CUDA Graph performance measurement.
+          Captured inputs are fixed for this benchmark; changing input buffers is NOT validated.
+          Output: NSF_CUDA_GRAPH_STAGE51_RESULTS.zip
+
+          Optional native CUDA streams scheduling test:
+            powershell -ExecutionPolicy Bypass -File .\Run-NSF-Streams.ps1 -Iterations 20 -Warmup 5 -Frames "64,256,1024"
+          This compares per-thread vs single CUDA streams with Sequential/Parallel NSF.
+          Output: NSF_CUDA_STREAMS_STAGE51_RESULTS.zip
+          '@ | Set-Content dist/nsf-stage51/README.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rvc-nsf-cuda-graph-stage51-windows-x64
+          path: dist/nsf-stage51/
+          if-no-files-found: warn
+          retention-days: 14
