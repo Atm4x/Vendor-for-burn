@@ -425,6 +425,11 @@ fn run() -> Result<(), String> {
             "attention_execution": if std::env::var("RVC_HUBERT_ATTENTION_FLASH").as_deref() == Ok("1") {"hubert_flash_unit"} else if std::env::var("RVC_ATTENTION_ONLINE").as_deref() == Ok("1") {"streaming_online_softmax"} else {"dense"},
             "text_encoder_attention_execution": if std::env::var("RVC_ATTENTION_ONLINE").as_deref() == Ok("1") {"streaming_relative_online_softmax"} else {"dense_relative"},
             "rmvpe_unet_conv_execution": if std::env::var("RVC_RMVPE_UNET_COMPENSATED_BATCH_TF32").as_deref() == Ok("1") {"compensated_tf32x2_batched"} else if std::env::var("RVC_RMVPE_UNET_COMPENSATED_TF32").as_deref() == Ok("1") {"compensated_tf32x2"} else if std::env::var("RVC_RMVPE_UNET_GEMM").as_deref() == Ok("1") {"implicit_gemm"} else if std::env::var("RVC_RMVPE_UNET_CONV2D_GEMM").as_deref() == Ok("1") && std::env::var("RVC_RMVPE_UNET_TRANSPOSE2D_GEMM").as_deref() == Ok("1") {"implicit_gemm"} else if std::env::var("RVC_RMVPE_UNET_CONV2D_GEMM").as_deref() == Ok("1") {"conv2d_implicit_gemm"} else if std::env::var("RVC_RMVPE_UNET_TRANSPOSE2D_GEMM").as_deref() == Ok("1") {"transpose2d_gemm"} else {"direct"},
+            "nsf_resblock_precision": if std::env::var("RVC_NSF_RESBLOCK_FP16").as_deref() == Ok("1") {"fp16_island_fp32_stage"} else {"fp32"},
+            "nsf_resblock_fp16_min_channels": if std::env::var("RVC_NSF_RESBLOCK_FP16").as_deref() == Ok("1") {
+                Some(std::env::var("RVC_NSF_RESBLOCK_FP16_MIN_CHANNELS").ok()
+                    .and_then(|value| value.parse::<usize>().ok()).unwrap_or(64))
+            } else { None },
             "nsf_temporal_conv_kernel": std::env::var("RVC_NSF_CONV_KERNEL").unwrap_or_default(),
             "nsf_tile_core_frames": std::env::var("RVC_NSF_TILE_CORE_FRAMES").ok()
                 .filter(|value| !value.is_empty()).and_then(|value| value.parse::<usize>().ok()),

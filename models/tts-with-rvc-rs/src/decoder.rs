@@ -1,4 +1,4 @@
-use burn::tensor::{activation, module, ops::{ConvOptions, ConvTransposeOptions}, Device, Tensor, TensorData};
+use burn::tensor::{activation, module, ops::{ConvOptions, ConvTransposeOptions}, DType, Device, Tensor, TensorData};
 use serde::Deserialize;
 use rayon::prelude::*;
 use std::time::Instant;
@@ -46,6 +46,7 @@ struct Conv1d {
     stride: usize,
     dilation: usize,
     padding: usize,
+    fp16_resblock: bool,
 }
 
 impl Conv1d {
@@ -60,8 +61,8 @@ impl Conv1d {
         } else {
             default_conv1d_layout()
         };
-        let weight = load_conv1d_weight(checkpoint, prefix, normalized, layout, device)?;
-        let bias = checkpoint.contains(&format!("{prefix}.bias"))
+        let mut weight = load_conv1d_weight(checkpoint, prefix, normalized, layout, device)?;
+        let mut bias = checkpoint.contains(&format!("{prefix}.bias"))
             .then(|| checkpoint.tensor::<1>(&format!("{prefix}.bias"), device))
             .transpose()?;
         if let Some(bias) = &bias {
@@ -69,11 +70,22 @@ impl Conv1d {
                 return Err(format!("{prefix}: bias and weight output channels differ"));
             }
         }
-        Ok(Self {weight, bias, stride, dilation, padding})
+        let fp16_resblock = crate::nsf_precision::NsfConvPrecision::from_env()?
+            .applies_to(prefix, weight.dims()[0]);
+        if fp16_resblock {
+            weight = weight.cast(DType::F16);
+            bias = bias.map(|tensor| tensor.cast(DType::F16));
+        }
+        Ok(Self {weight, bias, stride, dilation, padding, fp16_resblock})
     }
 
     fn forward(&self, input: Tensor<3>) -> Tensor<3> {
         let options = ConvOptions::new_with_padding([self.stride], [(self.padding, self.padding)], [self.dilation], 1);
+        if self.fp16_resblock {
+            return crate::cubecl_conv::conv1d(
+                input.cast(DType::F16), self.weight.clone(), self.bias.clone(), options,
+            );
+        }
         if std::env::var("RVC_NSF_IMPLICIT_GEMM").as_deref() == Ok("1")
             || std::env::var("RVC_NSF_CONV1D_GEMM").as_deref() == Ok("1")
         {
@@ -149,11 +161,19 @@ impl ResBlock1 {
 
     fn forward_with_scheduling(&self, mut x: Tensor<3>, scheduling: NsfScheduling) -> Tensor<3> {
         assert_eq!(x.dims()[1], self.channels);
+        let fp16 = self.first.iter().any(|conv| conv.fp16_resblock);
+        if fp16 && (std::env::var("RVC_NSF_PAIR_SHARED_TILE").as_deref() == Ok("1")
+            || std::env::var("RVC_NSF_FUSED_PAIR_MAX_CHANNELS").is_ok()) {
+            panic!("RVC_NSF_RESBLOCK_FP16 is incompatible with direct fused NSF pair experiments");
+        }
         let fused_limit = std::env::var("RVC_NSF_FUSED_PAIR_MAX_CHANNELS").ok()
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|limit| *limit > 0);
         let shared_tile = std::env::var("RVC_NSF_PAIR_SHARED_TILE").as_deref() == Ok("1")
             && scheduling == NsfScheduling::Default;
+        if fp16 {
+            x = x.cast(DType::F16);
+        }
         for (first, second) in self.first.iter().zip(&self.second) {
             if shared_tile && crate::nsf_pair_tile::supports(self.channels, second.weight.dims()[2], second.dilation) {
                 x = crate::nsf_pair_tile::forward(
@@ -190,7 +210,7 @@ impl ResBlock1 {
                 _ => {},
             }
         }
-        x
+        if fp16 { x.cast(DType::F32) } else { x }
     }
 
     fn profile_cpu(
@@ -201,6 +221,8 @@ impl ResBlock1 {
         block_index: usize,
     ) -> Tensor<3> {
         let prefix = format!("stage{stage_index}.residual{block_index}");
+        let fp16 = self.first.iter().any(|conv| conv.fp16_resblock);
+        if fp16 { x = x.cast(DType::F16); }
         for (index, (first, second)) in self.first.iter().zip(&self.second).enumerate() {
             let mut record = |section: &str, tensor: &Tensor<3>, start: Instant| {
                 let _ = tensor.clone().into_data();
@@ -225,7 +247,7 @@ impl ResBlock1 {
             x = x + h;
             record("residual_add", &x, start);
         }
-        x
+        if fp16 { x.cast(DType::F32) } else { x }
     }
 }
 
