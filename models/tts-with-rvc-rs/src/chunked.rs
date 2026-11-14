@@ -100,6 +100,8 @@ pub fn planned_chunk_ranges(
         ChunkStrategy::FixedOverlap => Ok(chunk_ranges(pcm.len().div_ceil(HOP), config)),
         ChunkStrategy::QuietSplice { extra_chunks } =>
             plan_quiet_splices_with_extra(pcm, config.core_frames, extra_chunks),
+        ChunkStrategy::CostAware(model) =>
+            crate::chunk_plan::plan_cost_aware(pcm, config.core_frames, config.context_frames, config.trailing_frames, model),
     }
 }
 
@@ -128,7 +130,7 @@ pub fn infer_chunked_batched_with_plan(
     for (i, &(start, end)) in chunks.iter().enumerate() {
         if start >= end || end > total_frames || end - start > config.core_frames
             || i > 0 && (start > chunks[i-1].1
-                || matches!(strategy, ChunkStrategy::QuietSplice { .. }) && start != chunks[i-1].1)
+                || strategy.requires_contiguous_splice() && start != chunks[i-1].1)
         {
             return Err(format!("RVC chunk plan contains invalid range at {i}"));
         }
@@ -173,7 +175,7 @@ pub fn infer_chunked_batched_with_plan(
             if rendered.len() < crop_end {
                 return Err(format!("RVC chunk {i} generated {} samples, requires {crop_end} including context", rendered.len()));
             }
-            let overlap = if matches!(strategy, ChunkStrategy::QuietSplice { .. }) {
+            let overlap = if strategy.requires_contiguous_splice() {
                 0
             } else {
                 config.overlap_frames * OUTPUT_HOP
@@ -240,6 +242,23 @@ mod tests {
         Ok((0..samples.len() * 5 / 2)
             .map(|i| samples[i * 2 / 5])
             .collect())
+    }
+
+    #[test]
+    fn cost_aware_full_audio_assembly_has_no_gaps_or_overlaps() {
+        let config = ChunkConfig { core_frames: 90, overlap_frames: 12, context_frames: 20, trailing_frames: 4 };
+        let pcm = (0..31_113).map(|i| (i % 251) as f32 / 251.0).collect::<Vec<_>>();
+        let strategy = ChunkStrategy::CostAware(crate::chunk_plan::CostModel::default());
+        let ranges = planned_chunk_ranges(&pcm, config, strategy).unwrap();
+        let result = infer_chunked_batched_with_plan(
+            &pcm, config, 3, &ranges, strategy,
+            |segments, _| segments.iter().map(|segment| mock_audio(segment,0)).collect(),
+            |_| {},
+        ).unwrap();
+        assert_eq!(result.len(), pcm.len()*5/2);
+        for (i, &sample) in result.iter().enumerate() {
+            assert!((sample-pcm[i*2/5]).abs()<2e-6, "output position {i}");
+        }
     }
 
     #[test]
