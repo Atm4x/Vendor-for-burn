@@ -1,3 +1,4 @@
+pub mod chunk_plan;
 pub mod diagnostic;
 mod online_attention;
 mod f0_audit;

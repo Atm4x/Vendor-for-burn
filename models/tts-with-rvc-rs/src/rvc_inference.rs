@@ -1,10 +1,13 @@
+#[cfg(test)]
+use crate::chunked::chunk_ranges;
 #[cfg(any(feature = "cpu", feature = "cuda", feature = "wgpu"))]
 use crate::faiss_gpu::GpuIvfIndex;
 use burn::tensor::{Device, Int, Tensor, TensorData};
 
 use crate::{
     checkpoint::RvcCheckpoint,
-    chunked::{ChunkConfig, ChunkProgress, chunk_ranges, infer_chunked_batched_with_progress, reflect_index},
+    chunked::{ChunkConfig, ChunkProgress, planned_chunk_ranges, infer_chunked_batched_with_plan, reflect_index},
+    chunk_plan::ChunkStrategy,
     decoder::NsfWaveformDecoder,
     faiss_index::IvfFlatIndex,
     flow::ResidualCouplingBlock,
@@ -177,6 +180,8 @@ impl RvcV2Inferencer {
             return Err("shared F0 requires CPU-decoded RMVPE F0; RVC_GPU_F0=1 is incompatible".into());
         }
         config.validate()?;
+        let strategy = ChunkStrategy::from_env()?;
+        let ranges = planned_chunk_ranges(filtered_pcm, config, strategy)?;
         let cached_f0 = if shared_f0 {
             let started = std::time::Instant::now();
             let timeline = self.rmvpe.infer_f0_long_windowed(
@@ -199,12 +204,12 @@ impl RvcV2Inferencer {
         } else {
             None
         };
-        let chunks = (cached_f0.is_some() || mel_cache.is_some())
-            .then(|| chunk_ranges(filtered_pcm.len().div_ceil(160), config));
-        infer_chunked_batched_with_progress(
+        infer_chunked_batched_with_plan(
             filtered_pcm,
             config,
             batch_size,
+            &ranges,
+            strategy,
             |segments, indices| {
                 let settings: Vec<_> = indices
                     .iter()
@@ -217,14 +222,12 @@ impl RvcV2Inferencer {
                     })
                     .collect();
                 let pitch = cached_f0.as_ref().map(|timeline| {
-                    let chunks = chunks.as_ref().expect("cached F0 has chunk ranges");
                     indices.iter().zip(segments).map(|(&i, segment)| {
-                        let (start, _) = chunks[i];
+                        let (start, _) = ranges[i];
                         aligned_f0_slice(timeline, start, config.context_frames, segment.len() / 160)
                     }).collect::<Vec<_>>()
                 });
                 let offsets = mel_cache.as_ref().map(|_| {
-                    let ranges = chunks.as_ref().expect("cached Mel requires chunk ranges");
                     indices.iter().map(|&index| {
                         (ranges[index].0 as i64 - config.context_frames as i64) * 160
                     }).collect::<Vec<_>>()

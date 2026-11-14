@@ -1,0 +1,87 @@
+name: RVC Stage90 global silence-aware chunk scheduler Windows gate
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - experiment/conv-kernel-rnd-stage33-20261110
+    paths:
+      - 'models/tts-with-rvc-rs/src/chunk_plan.rs'
+      - 'models/tts-with-rvc-rs/src/chunked.rs'
+      - 'models/tts-with-rvc-rs/src/rvc_inference.rs'
+      - 'models/tts-with-rvc-rs/src/main.rs'
+      - 'models/tts-with-rvc-rs/src/lib.rs'
+      - 'research/stage90-global-chunks/**'
+      - 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage90.ps1'
+      - '.github/workflows/rvc-stage90-global-chunk-scheduler.yml'
+permissions:
+  contents: read
+jobs:
+  global-chunks-windows:
+    runs-on: windows-latest
+    timeout-minutes: 115
+    env:
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cache/tracel
+          key: stage90-global-chunks-${{ hashFiles('Cargo.lock') }}
+      - name: Restore vendored checksums
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Vendored checksum restore failed' }
+      - name: Check Stage90 PowerShell syntax
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          $path = 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage90.ps1'
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $path).Path, [ref]$tokens, [ref]$errors)
+          if ($errors.Count -gt 0) { $errors | Format-List | Out-String | Write-Host; throw 'Invalid Stage90 runner' }
+      - name: Test global scheduler and exact output coverage
+        shell: pwsh
+        run: |
+          rustc --edition=2024 --test research/stage90-global-chunks/chunk_test_harness.rs -o stage90_chunk_tests.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Stage90 test compilation failed' }
+          & ./stage90_chunk_tests.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Stage90 tests failed' }
+      - name: Build unified CPU CUDA WGPU Windows executable
+        shell: pwsh
+        run: |
+          cargo check --offline --locked -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --lib --bin tts-with-rvc-rs
+          if ($LASTEXITCODE -ne 0) { throw 'Stage90 check failed' }
+          cargo build --release --offline --locked -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs
+          if ($LASTEXITCODE -ne 0) { throw 'Stage90 release build failed' }
+          & target/release/tts-with-rvc-rs.exe doctor
+          if ($LASTEXITCODE -ne 0) { throw 'Stage90 doctor failed' }
+      - name: Package Stage90 global chunk comparison
+        shell: pwsh
+        run: |
+          $folder = 'dist/stage90-global-chunks'
+          New-Item -ItemType Directory -Force -Path $folder | Out-Null
+          Copy-Item target/release/tts-with-rvc-rs.exe $folder
+          Copy-Item research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage90.ps1 $folder
+          @'
+          Stage90: global silence-aware dynamic-programming chunk scheduler.
+          Put private .pth/.pt/.index/.wav under .\embed\.
+          Run Run-RVC-Full-Stage90.ps1 with the same Voice, Hubert, Rmvpe, Index and InputWav arguments.
+          Runs fixed-300 / fixed-900 / quiet-splice-900+1 A-B-C-C-B-A comparison.
+          This changes inference context; WAV parity with fixed-300 is not expected.
+          Windows CI has no CUDA GPU and cannot establish RVC performance or audio quality.
+          '@ | Set-Content (Join-Path $folder 'README.txt')
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rvc-stage90-global-chunks-windows-x64
+          path: dist/stage90-global-chunks/
+          retention-days: 14
+          if-no-files-found: warn

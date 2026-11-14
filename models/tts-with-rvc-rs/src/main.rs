@@ -333,6 +333,13 @@ fn run() -> Result<(), String> {
         if filtered.len() < 3_200 {
             return Err("full benchmark requires at least 0.2 seconds of source audio".into());
         }
+        let strategy = tts_with_rvc_rs::chunk_plan::ChunkStrategy::from_env()?;
+        let plan = tts_with_rvc_rs::chunked::planned_chunk_ranges(&filtered, config, strategy)?;
+        let plan_forwarded_frames: usize = plan.iter().map(|&(start, end)| {
+            end - start + 2 * config.context_frames + config.trailing_frames
+        }).sum();
+        let plan_cuts = plan.iter().take(plan.len().saturating_sub(1))
+            .map(|&(_, end)| end).collect::<Vec<_>>();
         let expected_samples = filtered.len().checked_mul(5)
             .ok_or("full benchmark output size overflow")? / 2;
         let prepare_ms = prepare_start.elapsed().as_secs_f64() * 1000.0;
@@ -400,7 +407,12 @@ fn run() -> Result<(), String> {
             "iterations_exact_f32": exact_iterations,
             "max_abs_iteration_delta": max_iteration_delta,
             "chunk_counts": chunk_counts,
+            "planned_chunk_count": plan.len(),
+            "planned_model_input_seconds": plan_forwarded_frames as f64 / 100.0,
+            "planned_cut_frames": plan_cuts,
             "core_frames": config.core_frames,
+            "chunk_strategy": std::env::var("RVC_CHUNK_STRATEGY").unwrap_or_else(|_| "fixed".to_owned()),
+            "quiet_extra_chunks": std::env::var("RVC_QUIET_EXTRA_CHUNKS").ok(),
             "overlap_frames": config.overlap_frames,
             "context_frames": config.context_frames,
             "tensor_batch_size": tensor_batch_size,
