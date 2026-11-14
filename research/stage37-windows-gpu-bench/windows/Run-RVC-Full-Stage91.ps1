@@ -28,7 +28,7 @@ $zip = Join-Path $PSScriptRoot 'RVC_STAGE91_FULL_WAV_RESULTS.zip'
 if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
 [void](New-Item -ItemType Directory -Path $root -Force)
 $changes = @(
-    'RVC_CHUNK_STRATEGY', 'RVC_QUIET_EXTRA_CHUNKS', 'RVC_NSF_GLOBAL_PHASE',
+    'RVC_CHUNK_STRATEGY', 'RVC_QUIET_EXTRA_CHUNKS', 'RVC_NSF_GLOBAL_PHASE', 'RVC_NSF_GLOBAL_NOISE',
     'RVC_NSF_RESBLOCK_FP16', 'RVC_NSF_RESBLOCK_FP16_MIN_CHANNELS',
     'RVC_NSF_PAIR_SHARED_TILE', 'RVC_NSF_TILE_CORE_FRAMES',
     'RVC_NSF_IMPLICIT_GEMM', 'RVC_RMVPE_GRU_PERSISTENT',
@@ -131,7 +131,7 @@ try {
     foreach ($group in @('baseline','phase')) {
         $pair = @($results | Where-Object { $_.group -eq $group })
         if ($pair.Count -eq 2 -and $pair[0].sha256 -ne $pair[1].sha256) {
-            $failures += "Non-deterministic Stage91 pair $group: WAV SHA256 differs"
+            $failures += "Non-deterministic Stage91 pair ${group}: WAV SHA256 differs"
         }
     }
     if ($results.Count -ne $selected.Count) {

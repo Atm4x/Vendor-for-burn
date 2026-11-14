@@ -1,0 +1,90 @@
+name: RVC Stage92 global NSF counter-Gaussian noise Windows gate
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - experiment/conv-kernel-rnd-stage33-20261110
+    paths:
+      - 'models/tts-with-rvc-rs/src/nsf_noise_field.rs'
+      - 'models/tts-with-rvc-rs/src/nsf_source.rs'
+      - 'models/tts-with-rvc-rs/src/decoder.rs'
+      - 'models/tts-with-rvc-rs/src/chunked.rs'
+      - 'models/tts-with-rvc-rs/src/rvc_inference.rs'
+      - 'models/tts-with-rvc-rs/src/main.rs'
+      - 'models/tts-with-rvc-rs/src/lib.rs'
+      - 'research/stage92-nsf-noise/**'
+      - 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage92.ps1'
+      - '.github/workflows/rvc-stage92-nsf-global-noise.yml'
+permissions:
+  contents: read
+jobs:
+  global-noise-windows:
+    runs-on: windows-latest
+    timeout-minutes: 115
+    env:
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cache/tracel
+          key: stage92-nsf-noise-${{ hashFiles('Cargo.lock') }}
+      - name: Restore vendored checksums
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Vendored checksum restore failed' }
+      - name: Check Stage92 PowerShell syntax
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          $path = 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage92.ps1'
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $path).Path, [ref]$tokens, [ref]$errors)
+          if ($errors.Count -gt 0) { $errors | Format-List | Out-String | Write-Host; throw 'Invalid Stage92 runner' }
+      - name: Verify partition-invariant Gaussian source and chunking regressions
+        shell: pwsh
+        run: |
+          rustc --edition=2024 --test research/stage92-nsf-noise/noise_test_harness.rs -o stage92_noise_tests.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Stage92 test compilation failed' }
+          & ./stage92_noise_tests.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Stage92 tests failed' }
+      - name: Build unified CPU CUDA WGPU Windows executable
+        shell: pwsh
+        run: |
+          cargo check --offline --locked -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --lib --bin tts-with-rvc-rs
+          if ($LASTEXITCODE -ne 0) { throw 'Stage92 check failed' }
+          cargo build --release --offline --locked -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs
+          if ($LASTEXITCODE -ne 0) { throw 'Stage92 release build failed' }
+          & target/release/tts-with-rvc-rs.exe doctor
+          if ($LASTEXITCODE -ne 0) { throw 'Stage92 doctor failed' }
+      - name: Package Stage92 global Gaussian A/B comparison
+        shell: pwsh
+        run: |
+          $folder = 'dist/stage92-nsf-noise'
+          New-Item -ItemType Directory -Force -Path $folder | Out-Null
+          Copy-Item target/release/tts-with-rvc-rs.exe $folder
+          Copy-Item research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage92.ps1 $folder
+          @'
+          Stage92: partition-invariant counter-based Gaussian NSF and latent sources.
+          Put private .pth/.pt/.index/.wav under .\embed\.
+          Run Run-RVC-Full-Stage92.ps1 with the same Voice, Hubert, Rmvpe, Index and InputWav arguments.
+          Runs old per-chunk Gaussian / global counter Gaussian A-B-B-A at quiet-splice 900+1.
+          RVC_GLOBAL_F0=1 is required; RVC_RMVPE_MEL_REUSE must be unset.
+          Global phase is enabled in both modes; source noise is partition-invariant in the experimental mode.
+          Windows CI has no CUDA GPU and cannot establish RVC performance or audio quality.
+          '@ | Set-Content (Join-Path $folder 'README.txt')
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rvc-stage92-nsf-noise-windows-x64
+          path: dist/stage92-nsf-noise/
+          retention-days: 14
+          if-no-files-found: warn

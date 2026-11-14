@@ -14,6 +14,7 @@ use crate::{
     hubert_model::HubertFeatureModel,
     nsf_source::SourceModuleHnNSF,
     nsf_phase::GlobalNsfPhase,
+    nsf_noise_field::GlobalGaussianField,
     phone_features::upsample_without_retrieval,
     preprocess::highpass_48hz_zero_phase,
     rmvpe_mel::{MelReuseCache, RmvpeAudioModel},
@@ -174,6 +175,10 @@ impl RvcV2Inferencer {
     ) -> Result<Vec<f32>, String> {
         let shared_f0 = std::env::var_os("RVC_GLOBAL_F0").is_some_and(|value| value == "1");
         let global_nsf_phase = std::env::var_os("RVC_NSF_GLOBAL_PHASE").is_some_and(|value| value == "1");
+        let global_nsf_noise = std::env::var_os("RVC_NSF_GLOBAL_NOISE").is_some_and(|value| value == "1");
+        if global_nsf_noise && !shared_f0 {
+            return Err("RVC_NSF_GLOBAL_NOISE=1 requires RVC_GLOBAL_F0=1".into());
+        }
         if global_nsf_phase && !shared_f0 {
             return Err("RVC_NSF_GLOBAL_PHASE=1 requires RVC_GLOBAL_F0=1".into());
         }
@@ -229,9 +234,9 @@ impl RvcV2Inferencer {
                     .iter()
                     .map(|&i| {
                         let mut settings = options.clone();
-                        settings.seed = options
-                            .seed
-                            .wrapping_add((i as u64).wrapping_mul(0x9e3779b97f4a7c15));
+                        settings.seed = if global_nsf_noise { options.seed } else {
+                            options.seed.wrapping_add((i as u64).wrapping_mul(0x9e3779b97f4a7c15))
+                        };
                         settings
                     })
                     .collect();
@@ -253,9 +258,15 @@ impl RvcV2Inferencer {
                         timeline.phase_at(first)
                     }).collect::<Result<Vec<_>, _>>()
                 }).transpose()?;
+                let noise_starts = global_nsf_noise.then(|| indices.iter().map(|&index| {
+                    ranges[index].0 as i64 - config.context_frames as i64
+                }).collect::<Vec<_>>());
+                let noise_coordinates = noise_starts.as_deref().map(|starts| (
+                    starts, filtered_pcm.len().div_ceil(160),
+                ));
                 self.infer_16khz_batch_with_f0(
                     segments, &settings, pitch.as_deref(), Some(indices), mel,
-                    phase_offsets.as_deref(),
+                    phase_offsets.as_deref(), noise_coordinates,
                 )
             },
             progress,
@@ -274,7 +285,7 @@ impl RvcV2Inferencer {
         audios: &[Vec<f32>],
         options: &[InferenceOptions],
     ) -> Result<Vec<Vec<f32>>, String> {
-        self.infer_16khz_batch_with_f0(audios, options, None, None, None, None)
+        self.infer_16khz_batch_with_f0(audios, options, None, None, None, None, None)
     }
 
     fn infer_16khz_batch_with_f0(
@@ -285,10 +296,16 @@ impl RvcV2Inferencer {
         chunk_indices: Option<&[usize]>,
         mel_reuse: Option<(&MelReuseCache, &[i64])>,
         global_phase_offsets: Option<&[f32]>,
+        global_noise_coordinates: Option<(&[i64], usize)>,
     ) -> Result<Vec<Vec<f32>>, String> {
         let batch = audios.len();
         if batch == 0 || batch != options.len() || batch > 32 {
             return Err("RVC batch inputs/options must match and size must be 1..=32".into());
+        }
+        if let Some((starts, total_frames)) = global_noise_coordinates {
+            if starts.len() != batch || total_frames == 0 {
+                return Err("global Gaussian noise requires one chunk start per batch member and a nonempty global timeline".into());
+            }
         }
         let audio_len = audios[0].len();
         if !(3_200..=160_000).contains(&audio_len)
@@ -614,11 +631,16 @@ impl RvcV2Inferencer {
         let started = std::time::Instant::now();
         let [_, latent_channels, latent_frames] = encoded.mean.dims();
         let mut noise = Vec::with_capacity(batch * latent_channels * latent_frames);
-        for (random, setting) in random_sources.iter_mut().zip(options) {
-            noise.extend(
-                (0..latent_channels * latent_frames)
-                    .map(|_| random.sample() * setting.latent_noise_scale),
-            );
+        for (batch_index, (random, setting)) in random_sources.iter_mut().zip(options).enumerate() {
+            if let Some((starts, total_frames)) = global_noise_coordinates {
+                let field = GlobalGaussianField::new(setting.seed, total_frames, RVC_HOP)?;
+                noise.extend(field.fill_latent(
+                    latent_channels, latent_frames, starts[batch_index], setting.latent_noise_scale,
+                )?);
+            } else {
+                noise.extend((0..latent_channels * latent_frames)
+                    .map(|_| random.sample() * setting.latent_noise_scale));
+            }
         }
         let latent_noise = Tensor::from_data(
             TensorData::new(noise, [batch, latent_channels, latent_frames]),
@@ -661,8 +683,13 @@ impl RvcV2Inferencer {
             ))
         }).transpose()?;
         let mut gaussian_noise = Vec::with_capacity(batch * frames * RVC_HOP);
-        for random in &mut random_sources {
-            gaussian_noise.extend((0..frames * RVC_HOP).map(|_| random.sample()));
+        for (batch_index, random) in random_sources.iter_mut().enumerate() {
+            if let Some((starts, total_frames)) = global_noise_coordinates {
+                let field = GlobalGaussianField::new(options[batch_index].seed, total_frames, RVC_HOP)?;
+                gaussian_noise.extend(field.fill_excitation(frames, starts[batch_index])?);
+            } else {
+                gaussian_noise.extend((0..frames * RVC_HOP).map(|_| random.sample()));
+            }
         }
         let sine_noise = Tensor::from_data(
             TensorData::new(gaussian_noise, [batch, frames * RVC_HOP, 1]),
