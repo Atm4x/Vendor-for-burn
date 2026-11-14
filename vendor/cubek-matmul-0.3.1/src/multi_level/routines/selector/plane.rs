@@ -13,7 +13,7 @@ use cubek_std::{
 
 use crate::{
     definition::{
-        MatmulAvailabilityError, MatmulElems, MatmulProblem, MatmulSetupError, MatmulVectorSizes,
+        AccumulatorOperand, MatmulAvailabilityError, MatmulElems, MatmulProblem, MatmulSetupError, MatmulVectorSizes,
     },
     multi_level::{
         PartitionSize, StageSize, TileSize,
@@ -129,7 +129,7 @@ pub fn infer_blueprint_plane(
         ));
     }
 
-    let (rows_per_plane, mut stage_size_m, mut partition_shape_n) = select_size(
+    let (mut rows_per_plane, mut stage_size_m, mut partition_shape_n) = select_size(
         options.multi_row_strategy,
         row_count as usize,
         tile_size.m() as usize,
@@ -171,6 +171,19 @@ pub fn infer_blueprint_plane(
             }
         }
     }
+
+    let stage = fit_plane_tiling_to_smem(
+        (rows_per_plane as u32, stage_size_m as u32, partition_shape_n as u32, partition_shape_k),
+        (tile_size.m(), tile_size.n(), tile_size.k()),
+        &dtypes,
+        options.stage_buffering,
+        problem.accumulator,
+        client.properties().hardware.max_shared_memory_size,
+    )?;
+    rows_per_plane = stage.0 as usize;
+    stage_size_m = stage.1 as usize;
+    partition_shape_n = stage.2 as usize;
+    partition_shape_k = stage.3;
 
     let tiles_per_partition = PartitionSize::new(
         rows_per_plane as u32,
@@ -241,6 +254,72 @@ pub fn infer_blueprint_plane(
     }
 
     Ok((builder.build(), dtypes))
+}
+
+/// Computes the exact stage footprint charged by the partitioned matmul
+/// validator: two operand stages, one writer tile per M-stage partition, and
+/// an additional accumulator reader stage when bias or residual is present.
+/// Stage axes are (rows_per_plane, stages_m, partition_n, partition_k).
+fn plane_tiling_smem_bytes(
+    stage: (u32, u32, u32, u32),
+    tile: (u32, u32, u32),
+    dtypes: &MatmulElems,
+    stage_buffering: u32,
+    accumulator: AccumulatorOperand,
+) -> usize {
+    let m = stage.0 as usize * stage.1 as usize * tile.0 as usize;
+    let n = stage.2 as usize * tile.1 as usize;
+    let k = stage.3 as usize * tile.2 as usize;
+    let buffering = stage_buffering as usize;
+    let writer = stage.1 as usize * tile.0 as usize * tile.1 as usize;
+    let accumulator_reader = match accumulator {
+        AccumulatorOperand::Absent => 0,
+        AccumulatorOperand::Present => m * n * dtypes.acc_stage.size(),
+    };
+    m * k * buffering * dtypes.lhs_stage.size()
+        + k * n * buffering * dtypes.rhs_stage.size()
+        + writer * dtypes.acc_stage.size()
+        + accumulator_reader
+}
+
+/// Select a tensor-core tiling plan that fits the real device's shared-memory
+/// budget. Shrink the most memory-expensive stage axis, preserving the MMA tile
+/// itself and the algorithm. No direct-convolution fallback is introduced.
+fn fit_plane_tiling_to_smem(
+    mut stage: (u32, u32, u32, u32),
+    tile: (u32, u32, u32),
+    dtypes: &MatmulElems,
+    stage_buffering: u32,
+    accumulator: AccumulatorOperand,
+    available: usize,
+) -> Result<(u32, u32, u32, u32), MatmulAvailabilityError> {
+    loop {
+        let requested = plane_tiling_smem_bytes(stage, tile, dtypes, stage_buffering, accumulator);
+        if requested <= available {
+            return Ok(stage);
+        }
+
+        let candidates = [
+            (stage.0.div_ceil(2), stage.1, stage.2, stage.3),
+            (stage.0, stage.1.div_ceil(2), stage.2, stage.3),
+            (stage.0, stage.1, stage.2.div_ceil(2), stage.3),
+            (stage.0, stage.1, stage.2, stage.3.div_ceil(2)),
+        ];
+        let next = candidates.into_iter()
+            .filter(|candidate| *candidate != stage)
+            .min_by_key(|candidate| {
+                plane_tiling_smem_bytes(*candidate, tile, dtypes, stage_buffering, accumulator)
+            });
+        match next {
+            Some(candidate) => stage = candidate,
+            None => {
+                return Err(MatmulAvailabilityError::SharedMemoryTooBig {
+                    requested,
+                    available,
+                });
+            }
+        }
+    }
 }
 
 /// All modes currently use atom size 16
@@ -384,6 +463,69 @@ mod tests {
     /// propagate into a degenerate `TilingScheme` (`stage_size.m == 0`) and panic
     /// with "attempt to divide by zero" in `BatchMatmulBlueprint::cube_launch_info`.
     /// Reproduces the rf-detr crash on the `m=1024, n=4, k=256` matmul.
+    fn float_elems(kind: cubecl::ir::FloatKind) -> MatmulElems {
+        let ty = ElemType::Float(kind);
+        MatmulElems {
+            lhs_global: ty, rhs_global: ty, acc_global: ty,
+            lhs_stage: ty, rhs_stage: ty, acc_stage: ty,
+            lhs_register: ty, rhs_register: ty, acc_register: ty,
+        }
+    }
+
+    #[test]
+    fn fp16_with_bias_is_capped_for_rtx_4060() {
+        use cubecl::ir::FloatKind;
+        let d = float_elems(FloatKind::F16);
+        let large = (1, 16, 16, 2);
+        let tile = (16, 16, 16);
+        let budget = 101_376;
+        assert!(plane_tiling_smem_bytes(large, tile, &d, 1, AccumulatorOperand::Present) > budget);
+        let selected = fit_plane_tiling_to_smem(large, tile, &d, 1, AccumulatorOperand::Present, budget).unwrap();
+        assert!(plane_tiling_smem_bytes(selected, tile, &d, 1, AccumulatorOperand::Present) <= budget);
+    }
+
+    #[test]
+    fn bias_requires_more_memory_than_biasless() {
+        use cubecl::ir::FloatKind;
+        let d = float_elems(FloatKind::F16);
+        let stage = (1, 4, 4, 2);
+        let tile = (16, 16, 16);
+        assert!(plane_tiling_smem_bytes(stage, tile, &d, 1, AccumulatorOperand::Present)
+            > plane_tiling_smem_bytes(stage, tile, &d, 1, AccumulatorOperand::Absent));
+    }
+
+    #[test]
+    fn already_valid_stage_unchanged() {
+        use cubecl::ir::FloatKind;
+        let d = float_elems(FloatKind::F32);
+        let stage = (1, 2, 2, 2);
+        assert!(matches!(fit_plane_tiling_to_smem(stage, (16, 16, 16), &d, 1, AccumulatorOperand::Absent, 101_376), Ok(got) if got == stage));
+    }
+
+    #[test]
+    fn reject_when_smallest_tile_itself_exceeds_budget() {
+        use cubecl::ir::FloatKind;
+        let d = float_elems(FloatKind::F16);
+        assert!(matches!(
+            fit_plane_tiling_to_smem((1, 8, 8, 4), (16, 16, 16), &d, 1, AccumulatorOperand::Present, 1),
+            Err(MatmulAvailabilityError::SharedMemoryTooBig { .. })
+        ));
+    }
+
+    #[test]
+    fn multiple_device_budgets_and_double_buffering() {
+        use cubecl::ir::FloatKind;
+        for kind in [FloatKind::F16, FloatKind::F32] {
+            let d = float_elems(kind);
+            for budget in [24_576usize, 32_768, 49_152, 65_536, 101_376, 163_840] {
+                for buffering in [1, 2] {
+                    let stage = fit_plane_tiling_to_smem((2, 8, 8, 4), (16, 16, 16), &d, buffering, AccumulatorOperand::Present, budget).unwrap();
+                    assert!(plane_tiling_smem_bytes(stage, (16, 16, 16), &d, buffering, AccumulatorOperand::Present) <= budget);
+                }
+            }
+        }
+    }
+
     #[test]
     fn select_size_never_yields_zero_stage_size_m() {
         let plane_count = 1;

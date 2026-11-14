@@ -1,0 +1,80 @@
+name: RVC Stage88 FP16 shared-memory-aware MMA Windows gate
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - experiment/conv-kernel-rnd-stage33-20261110
+    paths:
+      - 'vendor/cubek-matmul-0.3.1/src/multi_level/routines/selector/plane.rs'
+      - 'vendor/cubek-matmul-0.3.1/.cargo-checksum.json'
+      - 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage88.ps1'
+      - '.github/workflows/rvc-stage88-fp16-smem-aware-matmul.yml'
+permissions:
+  contents: read
+jobs:
+  fp16-smem-aware-mma-windows:
+    runs-on: windows-latest
+    timeout-minutes: 115
+    env:
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cache/tracel
+          key: stage88-fp16-smem-${{ hashFiles('Cargo.lock') }}
+      - name: Restore vendored checksums
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Vendored checksum restore failed' }
+      - name: Validate Stage88 PowerShell syntax
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          $path = 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage88.ps1'
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $path).Path, [ref]$tokens, [ref]$errors)
+          if ($errors.Count -gt 0) { $errors | Format-List | Out-String | Write-Host; throw 'Invalid Stage88 script' }
+      - name: Test exact vendored selector functions in isolated Rust harness
+        shell: pwsh
+        run: |
+          python research/stage88_smem_selection_test.py
+          if ($LASTEXITCODE -ne 0) { throw 'Matmul shared-memory selector tests failed' }
+      - name: Build unified CPU CUDA WGPU release executable
+        shell: pwsh
+        run: |
+          cargo check --offline --locked -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --lib --bin tts-with-rvc-rs
+          if ($LASTEXITCODE -ne 0) { throw 'Stage88 check failed' }
+          cargo build --release --offline --locked -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs
+          if ($LASTEXITCODE -ne 0) { throw 'Stage88 release build failed' }
+          & target/release/tts-with-rvc-rs.exe doctor
+          if ($LASTEXITCODE -ne 0) { throw 'Stage88 doctor failed' }
+      - name: Package Stage88 full WAV comparison
+        shell: pwsh
+        run: |
+          $folder = 'dist/stage88-smem-aware-fp16'
+          New-Item -ItemType Directory -Force -Path $folder | Out-Null
+          Copy-Item target/release/tts-with-rvc-rs.exe $folder
+          Copy-Item research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage88.ps1 $folder
+          @'
+          Stage88: device-budgeted tensor-core matmul tile selector for NSF FP16.
+          Addresses Stage87 SharedMemoryTooBig (319488 > 101376) without using direct convolution.
+          Put private .pth/.pt/.index/.wav under .\embed\, then execute Run-RVC-Full-Stage88.ps1.
+          Performs FP32/FP16/FP16/FP32 A/B/B/A, checks determinism, PCM16 RMSE and warm latency.
+          Experimental; Windows CI has no GPU and cannot establish performance or WAV quality.
+          '@ | Set-Content (Join-Path $folder 'README.txt')
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rvc-stage88-smem-aware-fp16-windows-x64
+          path: dist/stage88-smem-aware-fp16/
+          retention-days: 14
+          if-no-files-found: warn
