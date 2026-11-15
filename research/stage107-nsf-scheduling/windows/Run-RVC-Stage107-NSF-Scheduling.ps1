@@ -61,7 +61,7 @@ if ($Profiler -eq 'ncu') {
     foreach ($exe in @($transpose,$noise)) {
         $nvtx = & $exe nvtx-status
         if ($LASTEXITCODE -ne 0 -or @($nvtx) -notcontains 'nvtx_available=true') {
-            throw "NVTX initialization failed in $exe: $nvtx"
+            throw "NVTX initialization failed in ${exe}: $nvtx"
         }
     }
 }
