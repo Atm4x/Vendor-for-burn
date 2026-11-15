@@ -5,7 +5,7 @@ use burn_backend::cubecl::dtype_to_storage_type;
 use burn_backend::ops::{ConvOptions, conv::calculate_conv_output_sizes};
 use cubek::convolution::{
     ConvolutionArgs, DirectTensors, components::ConvSetupError, launch_direct,
-    forward::{launch_spatial_quad, launch_spatial_reuse},
+    forward::{launch_spatial_quad, launch_spatial_reuse, launch_spatial_pair},
     forward::{launch_prepacked_temporal_pair, launch_prepacked_temporal_quad,
         launch_prepacked_temporal_quad_interior},
 };
@@ -22,14 +22,21 @@ pub fn conv_direct<const N: usize>(
     bias: Option<CubeTensor>,
     options: ConvOptions<N>,
 ) -> Result<CubeTensor, ConvSetupError> {
-    conv_direct_impl(input, weight, bias, options, false, false)
+    conv_direct_impl(input, weight, bias, options, false, false, false)
 }
 
 pub fn conv_spatial_reuse(
     input: CubeTensor, weight: CubeTensor, bias: Option<CubeTensor>,
     options: ConvOptions<2>,
 ) -> Result<CubeTensor, ConvSetupError> {
-    conv_direct_impl(input, weight, bias, options, false, true)
+    conv_direct_impl(input, weight, bias, options, false, true, false)
+}
+
+pub fn conv_spatial_pair(
+    input: CubeTensor, weight: CubeTensor, bias: Option<CubeTensor>,
+    options: ConvOptions<2>,
+) -> Result<CubeTensor, ConvSetupError> {
+    conv_direct_impl(input, weight, bias, options, false, false, true)
 }
 
 pub fn conv_spatial_quad(
@@ -38,7 +45,7 @@ pub fn conv_spatial_quad(
     bias: Option<CubeTensor>,
     options: ConvOptions<2>,
 ) -> Result<CubeTensor, ConvSetupError> {
-    conv_direct_impl(input, weight, bias, options, true, false)
+    conv_direct_impl(input, weight, bias, options, true, false, false)
 }
 
 fn conv_direct_impl<const N: usize>(
@@ -48,6 +55,7 @@ fn conv_direct_impl<const N: usize>(
     options: ConvOptions<N>,
     spatial_quad: bool,
     spatial_reuse: bool,
+    spatial_pair: bool,
 ) -> Result<CubeTensor, ConvSetupError> {
     let out_dtype = input.dtype;
     let rank = input.meta.shape().num_dims();
@@ -136,7 +144,9 @@ fn conv_direct_impl<const N: usize>(
             bias: bias.map(|bias| bias.binding()),
             out: out.clone().binding(),
         };
-        if spatial_reuse {
+        if spatial_pair {
+            launch_spatial_pair::<N>(&client, tensors, args, options.groups, dtype)?;
+        } else if spatial_reuse {
             launch_spatial_reuse::<N>(&client, tensors, args, options.groups, dtype)?;
         } else if spatial_quad {
             launch_spatial_quad::<N>(&client, tensors, args, options.groups, dtype)?;

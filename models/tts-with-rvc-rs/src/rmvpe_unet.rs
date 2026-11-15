@@ -87,6 +87,14 @@ impl Conv2d {
             crate::cubecl_conv::conv2d_winograd(
                 input, packed.clone(), self.bias.clone(), self.weight.dims()[0],
             )
+        } else if std::env::var("RVC_RMVPE_UNET_SPATIAL_PAIR").as_deref() == Ok("1")
+            && self.padding == 1
+            && self.weight.dims()[2] == 3
+            && self.weight.dims()[3] == 3
+        {
+            crate::cubecl_conv::conv2d_spatial_pair(
+                input, self.weight.clone(), self.bias.clone(), options,
+            )
         } else if std::env::var("RVC_RMVPE_UNET_SPATIAL_REUSE").as_deref() == Ok("1")
             && self.padding == 1
         {

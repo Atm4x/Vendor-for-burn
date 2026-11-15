@@ -5,8 +5,8 @@ import json
 from pathlib import Path
 
 CASES = ("dense3x3", "dense3x3_wide", "pointwise1x1", "depthwise3x3")
-MICRO_STRATEGIES = ("direct", "reuse")
-PIPELINE_STRATEGIES = ("direct", "reuse", "quad", "gemm", "tf32_batched", "winograd")
+MICRO_STRATEGIES = ("direct", "reuse", "pair")
+PIPELINE_STRATEGIES = ("direct", "reuse", "pair", "quad", "gemm", "tf32_batched", "winograd")
 BLOCKS = {
     "audio_h2d": "stage104_rust_audio_h2d",
     "hubert": "stage102_rust_hubert",
@@ -43,7 +43,7 @@ def chosen(values, valid, label):
 
 
 def make_plan(scope="micro", cases="dense3x3,dense3x3_wide,pointwise1x1,depthwise3x3",
-              micro_strategies="direct,reuse", blocks=",".join(BLOCKS),
+              micro_strategies=",".join(MICRO_STRATEGIES), blocks=",".join(BLOCKS),
               pipeline_strategies="direct", families="all", include_torch=True,
               include_torch_full=False, max_targets=80):
     if scope not in ("micro", "pipeline", "all"):

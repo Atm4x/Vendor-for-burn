@@ -7,8 +7,8 @@ from stage104_matrix import make_plan, BLOCKS, CASES, MICRO_STRATEGIES
 class Stage104PlanTests(unittest.TestCase):
     def test_micro_all_cases_all_engines(self):
         p = make_plan()
-        self.assertEqual(p['target_count'], 12)
-        self.assertEqual(len(set(t['id'] for t in p['targets'])), 12)
+        self.assertEqual(p['target_count'], 16)
+        self.assertEqual(len(set(t['id'] for t in p['targets'])), 16)
         self.assertTrue(all(t['nvtx'].endswith('/') for t in p['targets']))
 
     def test_full_all_blocks(self):
@@ -20,7 +20,7 @@ class Stage104PlanTests(unittest.TestCase):
     def test_both_and_expanded_categories(self):
         p = make_plan(scope='all', blocks='rmvpe,nsf', families='all,conv,gemm',
                       pipeline_strategies='direct,reuse', include_torch_full=True)
-        self.assertEqual(p['target_count'], 12 + 2 * 2 * 3 + 3)
+        self.assertEqual(p['target_count'], 16 + 2 * 2 * 3 + 3)
         self.assertEqual(p['targets'][-1]['nvtx'], 'stage102_torch_measured/')
 
     def test_invalid_or_duplicate_name_rejected(self):
@@ -55,7 +55,7 @@ class Stage104PlanTests(unittest.TestCase):
 
     def test_no_torch(self):
         p = make_plan(scope='micro', include_torch=False)
-        self.assertEqual(p['target_count'], 8)
+        self.assertEqual(p['target_count'], 12)
 
 
 if __name__ == '__main__':

@@ -14,7 +14,7 @@ use crate::{
     tensor::CubeTensor,
 };
 
-use super::{conv_direct, direct::{conv_spatial_quad, conv_spatial_reuse}};
+use super::{conv_direct, direct::{conv_spatial_quad, conv_spatial_reuse, conv_spatial_pair}};
 #[cfg(feature = "autotune")]
 use super::forward::conv_autotune;
 
@@ -51,6 +51,16 @@ pub fn conv_forward_spatial_reuse(
     let input = permute_nchw_to_nhwc(input);
     let weight = permute_nchw_to_nhwc(weight);
     let output = conv_spatial_reuse(input, weight, bias, options)?;
+    Ok(permute_nhwc_to_nchw(output))
+}
+
+pub fn conv_forward_spatial_pair(
+    input: CubeTensor, weight: CubeTensor, bias: Option<CubeTensor>,
+    options: ConvOptions<2>,
+) -> Result<CubeTensor, ConvSetupError> {
+    let input = permute_nchw_to_nhwc(input);
+    let weight = permute_nchw_to_nhwc(weight);
+    let output = conv_spatial_pair(input, weight, bias, options)?;
     Ok(permute_nhwc_to_nchw(output))
 }
 

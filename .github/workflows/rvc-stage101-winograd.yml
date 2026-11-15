@@ -1,4 +1,4 @@
-name: RVC Stage104 comprehensive NCU profiling Windows package
+name: RVC Stage105 Conv2d register-budget and NCU matrix
 
 on:
   workflow_dispatch:
@@ -14,13 +14,14 @@ on:
       - 'research/stage102-cuda-profile/**'
       - 'research/stage103-l1-reuse/**'
       - 'research/stage104-ncu-matrix/**'
+      - 'research/stage105-register-budget/**'
       - '.github/workflows/rvc-stage101-winograd.yml'
 
 permissions:
   contents: read
 
 concurrency:
-  group: rvc-stage104-profiling-${{ github.ref }}
+  group: rvc-stage105-register-budget-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -64,6 +65,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Stage103 compare contract tests failed' }
           python research/stage104-ncu-matrix/windows/test_stage104.py
           if ($LASTEXITCODE -ne 0) { throw 'Stage104 plan tests failed' }
+          python research/stage105-register-budget/windows/test_stage105.py
+          if ($LASTEXITCODE -ne 0) { throw 'Stage105 pair contract tests failed' }
+          $referenceTest = Join-Path $env:RUNNER_TEMP 'stage105-reference-test.exe'
+          rustc --edition=2021 --test research/stage105-register-budget/reference.rs -o $referenceTest
+          if ($LASTEXITCODE -ne 0) { throw 'Stage105 math tests failed to compile' }
+          & $referenceTest
+          if ($LASTEXITCODE -ne 0) { throw 'Stage105 math parity failed' }
+          python -m compileall -q research/stage105-register-budget/windows
+          if ($LASTEXITCODE -ne 0) { throw 'Stage105 Python parse failed' }
           python -m compileall -q research/stage104-ncu-matrix/windows
           if ($LASTEXITCODE -ne 0) { throw 'Stage104 Python parse failed' }
           $stage104 = 'research/stage104-ncu-matrix/windows/Run-RVC-Stage104-NCU-Matrix.ps1'
@@ -113,6 +123,7 @@ jobs:
           Copy-Item target/release/stage103_conv2d_probe.exe (Join-Path $folder 'stage103-conv2d-probe.exe')
           Copy-Item research/stage104-ncu-matrix/windows/*.ps1 $folder
           Copy-Item research/stage104-ncu-matrix/windows/*.py $folder
+          Copy-Item research/stage105-register-budget/windows/compare_stage105_pair.py $folder
           Copy-Item research/stage104-ncu-matrix/README.md (Join-Path $folder 'STAGE104_README.md')
           Copy-Item research/stage103-l1-reuse/windows/*.ps1 $folder
           Copy-Item research/stage103-l1-reuse/windows/compare_stage103.py $folder
@@ -140,7 +151,7 @@ jobs:
           '@ | Set-Content (Join-Path $folder 'README.txt')
       - uses: actions/upload-artifact@v4
         with:
-          name: rvc-stage104-ncu-matrix-windows-x64
+          name: rvc-stage105-register-budget-ncu-windows-x64
           path: dist/stage104-ncu-matrix/
           retention-days: 14
           if-no-files-found: error

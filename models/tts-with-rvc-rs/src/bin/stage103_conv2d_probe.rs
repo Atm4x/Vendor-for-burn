@@ -1,5 +1,5 @@
 use burn::tensor::{module, ops::ConvOptions, Device, Tensor, TensorData};
-use burn_cubecl::{Cube, kernel::conv::conv_forward_spatial_reuse};
+use burn_cubecl::{Cube, kernel::conv::conv_forward_spatial_reuse, conv_forward_spatial_pair};
 use serde_json::json;
 use std::time::Instant;
 
@@ -43,8 +43,8 @@ fn main() -> Result<(), String> {
     };
     let strategy = std::env::var("RVC_STAGE103_STRATEGY")
         .unwrap_or_else(|_| "direct".to_string());
-    if strategy != "direct" && strategy != "reuse" {
-        return Err("RVC_STAGE103_STRATEGY must be direct or reuse".into());
+    if strategy != "direct" && strategy != "reuse" && strategy != "pair" {
+        return Err("RVC_STAGE103_STRATEGY must be direct, reuse, or pair".into());
     }
     let mut cases = Vec::new();
     for c in CASES {
@@ -67,7 +67,13 @@ fn main() -> Result<(), String> {
             };
             let _nvtx = (iteration > 0).then(|| tts_with_rvc_rs::nvtx::Range::new(&nvtx_label));
             let started = Instant::now();
-            let output = if strategy == "reuse" && c.groups == 1 && c.kernel == 3 && c.padding == 1 {
+            let output = if strategy == "pair" && c.groups == 1 && c.kernel == 3 && c.padding == 1 {
+                let input = input.clone().try_into_primitive::<Cube>().expect("CubeCL input");
+                let weight = weight.clone().try_into_primitive::<Cube>().expect("CubeCL weight");
+                Tensor::from_primitive::<Cube>(
+                    conv_forward_spatial_pair(input, weight, None, opts.clone())
+                        .expect("Stage105 spatial pair kernel"))
+            } else if strategy == "reuse" && c.groups == 1 && c.kernel == 3 && c.padding == 1 {
                 let input = input.clone().try_into_primitive::<Cube>()
                     .expect("CubeCL input");
                 let weight = weight.clone().try_into_primitive::<Cube>()
@@ -88,7 +94,7 @@ fn main() -> Result<(), String> {
         let median = timings[timings.len()/2];
         let values: Vec<f32> = last.unwrap().into_data().try_into_vec::<f32>().map_err(|e| e.to_string())?;
         let samples = [0, values.len()/3, values.len()/2, values.len()-1].map(|i| values[i]);
-        let full_parity = if strategy == "reuse" && c.groups == 1 && c.kernel == 3 {
+        let full_parity = if (strategy == "reuse" || strategy == "pair") && c.groups == 1 && c.kernel == 3 {
             let reference = module::conv2d(input.clone(),weight.clone(),None,opts.clone());
             let expected: Vec<f32> = reference.into_data().try_into_vec::<f32>().map_err(|e| e.to_string())?;
             let mut max_abs = 0.0f32;

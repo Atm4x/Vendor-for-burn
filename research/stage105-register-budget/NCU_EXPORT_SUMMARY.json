@@ -1,0 +1,90 @@
+{
+  "source": "exports.zip",
+  "scope": "micro NCU per CUDA kernel; some CSV exports are compact",
+  "profiles": [
+    {
+      "file": "icro-rust-dense3x3_wide-direct.csv",
+      "rows": 668,
+      "format": "full",
+      "kernel": "direct_conv2d_kernel_e_f32_nin_4_nout_4_f5492bda",
+      "duration_us": 578.72,
+      "compute_pct": 7.38,
+      "memory_pct": 83.89,
+      "l1tex_lsu_pct": 83.89,
+      "register_count": 48.0,
+      "occupancy_pct": 67.9,
+      "eligible_warps": 0.13,
+      "tensor_cycles_pct": 0.0
+    },
+    {
+      "file": "micro-rust-dense3x3-direct.csv",
+      "rows": 668,
+      "format": "full",
+      "kernel": "direct_conv2d_kernel_e_f32_nin_4_nout_4_f5492bda",
+      "duration_us": 456.38,
+      "compute_pct": 9.04,
+      "memory_pct": 95.33,
+      "l1tex_lsu_pct": 95.33,
+      "register_count": 48.0,
+      "occupancy_pct": 72.88,
+      "eligible_warps": 0.14,
+      "tensor_cycles_pct": 0.0
+    },
+    {
+      "file": "micro-rust-dense3x3-reuse.csv",
+      "rows": 4,
+      "format": "compact",
+      "kernel": "spatial_reuse_3x3_kernel_e_f32_nin_4_nout_4_d7f82abe",
+      "duration_us": 138.18,
+      "compute_pct": 16.45,
+      "memory_pct": 85.51,
+      "l1tex_lsu_pct": null,
+      "register_count": 118.0,
+      "occupancy_pct": null,
+      "eligible_warps": null,
+      "tensor_cycles_pct": null
+    },
+    {
+      "file": "micro-rust-dense3x3_wide-reuse.csv",
+      "rows": 668,
+      "format": "full",
+      "kernel": "spatial_reuse_3x3_kernel_e_f32_nin_4_nout_4_d7f82abe",
+      "duration_us": 185.41,
+      "compute_pct": 13.58,
+      "memory_pct": 71.56,
+      "l1tex_lsu_pct": 71.56,
+      "register_count": 118.0,
+      "occupancy_pct": 26.49,
+      "eligible_warps": 0.23,
+      "tensor_cycles_pct": 0.0
+    },
+    {
+      "file": "micro-torch-dense3x3.csv",
+      "rows": 4,
+      "format": "compact",
+      "kernel": "_5x_cudnn_ampere_scudnn_winograd_128x128_ldg1_ldg4_relu_tile148n_nt_v1",
+      "duration_us": 27.65,
+      "compute_pct": 43.39,
+      "memory_pct": 43.39,
+      "l1tex_lsu_pct": null,
+      "register_count": 130.0,
+      "occupancy_pct": null,
+      "eligible_warps": null,
+      "tensor_cycles_pct": null
+    },
+    {
+      "file": "micro-torch-dense3x3_wide.csv",
+      "rows": 4,
+      "format": "compact",
+      "kernel": "_5x_cudnn_ampere_scudnn_winograd_128x128_ldg1_ldg4_relu_tile148n_nt_v1",
+      "duration_us": 27.9,
+      "compute_pct": 38.11,
+      "memory_pct": 41.16,
+      "l1tex_lsu_pct": null,
+      "register_count": 130.0,
+      "occupancy_pct": null,
+      "eligible_warps": null,
+      "tensor_cycles_pct": null
+    }
+  ]
+}

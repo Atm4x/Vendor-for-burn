@@ -2,7 +2,7 @@ param(
     [ValidateSet('micro','pipeline','all')][string]$Scope = 'micro',
     [ValidateSet('balanced','full')][string]$MetricSet = 'balanced',
     [string]$Cases = 'dense3x3,dense3x3_wide,pointwise1x1,depthwise3x3',
-    [string]$MicroStrategies = 'direct,reuse',
+    [string]$MicroStrategies = 'direct,reuse,pair',
     [string]$Blocks = 'audio_h2d,hubert,hubert_readback,rmvpe,retrieval_pitch,encoder,latent,flow,nsf_prepare,nsf,nsf_readback,rmvpe_unet,rmvpe_gru,rmvpe_head,nsf_upsample,nsf_noise_conv,nsf_residuals',
     [string]$PipelineStrategies = 'direct',
     [string]$Families = 'all',
@@ -45,7 +45,7 @@ $compare = Join-Path $base 'compare_stage103.py'
 $planFile = Join-Path $reports 'capture-plan.json'
 $manifestFile = Join-Path $reports 'manifest.json'
 $oldEnv = @{}
-$envNames = @('RVC_NVTX','RVC_STAGE103_STRATEGY','RVC_RMVPE_UNET_SPATIAL_REUSE',
+$envNames = @('RVC_NVTX','RVC_STAGE103_STRATEGY','RVC_RMVPE_UNET_SPATIAL_PAIR','RVC_RMVPE_UNET_SPATIAL_REUSE',
     'RVC_RMVPE_UNET_SPATIAL_QUAD','RVC_RMVPE_UNET_GEMM',
     'RVC_RMVPE_UNET_CONV2D_GEMM','RVC_RMVPE_UNET_COMPENSATED_BATCH_TF32',
     'RVC_RMVPE_UNET_COMPENSATED_TF32','RVC_RMVPE_UNET_WINOGRAD','RVC_RMVPE_BN_FOLD',
@@ -73,13 +73,14 @@ function Invoke-Logged([string]$Command, [string[]]$Arguments, [string]$Log) {
 }
 
 function Set-PipelineMode([string]$Strategy) {
-    foreach ($key in @('RVC_RMVPE_UNET_SPATIAL_REUSE','RVC_RMVPE_UNET_SPATIAL_QUAD',
+    foreach ($key in @('RVC_RMVPE_UNET_SPATIAL_PAIR','RVC_RMVPE_UNET_SPATIAL_REUSE','RVC_RMVPE_UNET_SPATIAL_QUAD',
              'RVC_RMVPE_UNET_GEMM','RVC_RMVPE_UNET_CONV2D_GEMM',
              'RVC_RMVPE_UNET_COMPENSATED_BATCH_TF32','RVC_RMVPE_UNET_COMPENSATED_TF32',
              'RVC_RMVPE_UNET_WINOGRAD')) {
         [Environment]::SetEnvironmentVariable($key,$null,'Process')
     }
     $flags = @{
+        pair = 'RVC_RMVPE_UNET_SPATIAL_PAIR'
         reuse = 'RVC_RMVPE_UNET_SPATIAL_REUSE'
         quad = 'RVC_RMVPE_UNET_SPATIAL_QUAD'
         gemm = 'RVC_RMVPE_UNET_GEMM'
@@ -130,12 +131,22 @@ try {
         $rustProbePath = (Resolve-Path -LiteralPath $RustProbe).Path
         $probeNvtx = & $rustProbePath nvtx-status
         if ($LASTEXITCODE -ne 0 -or $probeNvtx -ne 'nvtx_available=true') { throw 'Stage104 Rust probe NVTX unavailable (nvToolsExt64_1.dll)' }
-        foreach ($strategy in @('direct','reuse')) {
+        $selectedStrategies = @($plan.targets | Where-Object { $_.kind -eq 'micro_rust' } |
+            ForEach-Object { $_.strategy } | Select-Object -Unique)
+        foreach ($strategy in $selectedStrategies) {
             $env:RVC_STAGE103_STRATEGY = $strategy
             Invoke-Logged $rustProbePath @('cuda',"$MicroRuns") (Join-Path $reports "micro-$strategy.json")
         }
-        Invoke-Logged $python @($compare,'--direct',(Join-Path $reports 'micro-direct.json'),
-            '--reuse',(Join-Path $reports 'micro-reuse.json'),'--output',(Join-Path $reports 'micro-parity.json')) (Join-Path $reports 'micro-parity.log')
+        if ($selectedStrategies -contains 'direct' -and $selectedStrategies -contains 'reuse') {
+            Invoke-Logged $python @($compare,'--direct',(Join-Path $reports 'micro-direct.json'),
+                '--reuse',(Join-Path $reports 'micro-reuse.json'),'--output',(Join-Path $reports 'micro-parity.json')) (Join-Path $reports 'micro-parity.log')
+        }
+        if ($selectedStrategies -contains 'direct' -and $selectedStrategies -contains 'pair') {
+            Invoke-Logged $python @((Join-Path $base 'compare_stage105_pair.py'),
+                '--direct',(Join-Path $reports 'micro-direct.json'),
+                '--pair',(Join-Path $reports 'micro-pair.json'),
+                '--output',(Join-Path $reports 'micro-pair-parity.json')) (Join-Path $reports 'micro-pair-parity.log')
+        }
         if (-not $NoTorch) {
             Invoke-Logged $python @($torchMicro,'--backend','cuda','--dtype','fp32',
                 '--layout','nchw','--repeats',"$MicroRuns",'--output',(Join-Path $reports 'micro-torch.json')) (Join-Path $reports 'micro-torch.log')

@@ -4,7 +4,7 @@ use burn::tensor::{
 };
 use burn_cubecl::{
     Cube,
-    kernel::conv::{ConvStrategy, ConvTranspose2dStrategy, conv_forward, conv_forward_spatial_quad, conv_forward_spatial_reuse, conv_transpose2d, prepack_winograd_weights, transform_winograd_input, inverse_winograd_output},
+    kernel::conv::{ConvStrategy, ConvTranspose2dStrategy, conv_forward, conv_forward_spatial_quad, conv_forward_spatial_reuse, conv_forward_spatial_pair, conv_transpose2d, prepack_winograd_weights, transform_winograd_input, inverse_winograd_output},
 };
 
 pub(crate) fn conv1d(
@@ -62,6 +62,17 @@ pub(crate) fn conv_transpose1d(
     Tensor::<4>::from_primitive::<Cube>(output).reshape([batch, output_channels, output_time])
 }
 
+
+pub(crate) fn conv2d_spatial_pair(
+    input: Tensor<4>, weight: Tensor<4>, bias: Option<Tensor<1>>,
+    options: ConvOptions<2>,
+) -> Tensor<4> {
+    let input = input.try_into_primitive::<Cube>().expect("CubeCL spatial pair requires CubeCL input");
+    let weight = weight.try_into_primitive::<Cube>().expect("CubeCL spatial pair requires CubeCL weight");
+    let bias = bias.map(|v| v.try_into_primitive::<Cube>().expect("CubeCL spatial pair requires CubeCL bias"));
+    Tensor::from_primitive::<Cube>(conv_forward_spatial_pair(input, weight, bias, options)
+        .expect("Stage105 spatial pair unsupported on this shape"))
+}
 
 pub(crate) fn conv2d_spatial_reuse(
     input: Tensor<4>, weight: Tensor<4>, bias: Option<Tensor<1>>,
