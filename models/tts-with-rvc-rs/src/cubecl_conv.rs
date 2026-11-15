@@ -4,8 +4,26 @@ use burn::tensor::{
 };
 use burn_cubecl::{
     Cube,
-    kernel::conv::{ConvStrategy, ConvTranspose2dStrategy, conv_forward, conv_forward_spatial_quad, conv_forward_spatial_reuse, conv_forward_spatial_pair, conv_transpose2d, prepack_winograd_weights, transform_winograd_input, inverse_winograd_output},
+    kernel::conv::{ConvStrategy, ConvTranspose2dStrategy, conv1d_single_input_packed, conv1d_single_input_prepack_weight, conv_transpose1d_polyphase, conv_transpose1d_polyphase_packed, conv_transpose1d_prepack_weight, conv_forward, conv_forward_spatial_quad, conv_forward_spatial_reuse, conv_forward_spatial_pair, conv_transpose2d, prepack_winograd_weights, transform_winograd_input, inverse_winograd_output},
 };
+
+pub(crate) fn prepack_single_input_conv1d_weight(weight: Tensor<3>) -> Tensor<3> {
+    let raw = weight.try_into_primitive::<Cube>().expect("NSF noise prepack requires CubeCL");
+    Tensor::from_primitive::<Cube>(conv1d_single_input_prepack_weight(raw))
+}
+
+pub(crate) fn conv1d_single_input(
+    input: Tensor<3>, packed_weight: Tensor<3>, bias: Option<Tensor<1>>,
+    options: ConvOptions<1>,
+) -> Tensor<3> {
+    let raw_input = input.try_into_primitive::<Cube>().expect("NSF noise requires CubeCL input");
+    let raw_weight = packed_weight.try_into_primitive::<Cube>().expect("NSF noise requires packed CubeCL weight");
+    let raw_bias = bias.map(|v| v.try_into_primitive::<Cube>().expect("NSF noise requires CubeCL bias"));
+    Tensor::from_primitive::<Cube>(
+        conv1d_single_input_packed(raw_input, raw_weight, raw_bias, options)
+            .expect("NSF single-input-channel Conv1d unsupported shape")
+    )
+}
 
 pub(crate) fn conv1d(
     input: Tensor<3>,
@@ -27,6 +45,37 @@ pub(crate) fn conv1d(
     let output = conv_forward::<1>(input, weight, bias, options, ConvStrategy::ImplicitGemm)
         .expect("CubeCL GEMM convolution is unsupported on this backend or shape");
     Tensor::from_primitive::<Cube>(output)
+}
+
+pub(crate) fn prepack_transpose1d_weight(weight: Tensor<3>) -> Tensor<3> {
+    let weight = weight.try_into_primitive::<Cube>().expect("polyphase prepack requires CubeCL");
+    Tensor::from_primitive::<Cube>(conv_transpose1d_prepack_weight(weight))
+}
+
+pub(crate) fn conv_transpose1d_phase_packed(
+    input: Tensor<3>, packed_weight: Tensor<3>, bias: Tensor<1>,
+    stride: usize, padding: usize,
+) -> Tensor<3> {
+    let input = input.try_into_primitive::<Cube>().expect("polyphase input requires CubeCL");
+    let weight = packed_weight.try_into_primitive::<Cube>().expect("polyphase packed weight requires CubeCL");
+    let bias = bias.try_into_primitive::<Cube>().expect("polyphase bias requires CubeCL");
+    Tensor::from_primitive::<Cube>(
+        conv_transpose1d_polyphase_packed(input, weight, Some(bias), stride, padding, 1, 0, 1)
+            .expect("packed polyphase convolution unsupported on this shape")
+    )
+}
+
+pub(crate) fn conv_transpose1d_phase(
+    input: Tensor<3>, weight: Tensor<3>, bias: Tensor<1>,
+    stride: usize, padding: usize,
+) -> Tensor<3> {
+    let input = input.try_into_primitive::<Cube>().expect("polyphase input requires CubeCL");
+    let weight = weight.try_into_primitive::<Cube>().expect("polyphase weight requires CubeCL");
+    let bias = bias.try_into_primitive::<Cube>().expect("polyphase bias requires CubeCL");
+    Tensor::from_primitive::<Cube>(
+        conv_transpose1d_polyphase(input, weight, Some(bias), stride, padding, 1, 0, 1)
+            .expect("polyphase transposed convolution unsupported on this shape")
+    )
 }
 
 pub(crate) fn conv_transpose1d(
@@ -245,6 +294,91 @@ mod winograd_tests {
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0f32, f32::max);
             assert!(max_abs < 0.0005, "shape {n} {cin} {cout} {h} {w}: max_abs={max_abs}");
+        }
+    }
+}
+
+#[cfg(all(test, feature = "cpu"))]
+mod polyphase_tests {
+    use super::*;
+    use burn::tensor::{module, Device, TensorData};
+
+    #[test]
+    fn noise_single_input_tiled_matches_burn_cpu_reference() {
+        for (batch, cout, time, kernel, stride, dilation, pad) in [
+            (1, 1, 10, 3, 1, 1, 1),
+            (1, 5, 33, 8, 4, 1, 3),
+            (2, 7, 101, 16, 8, 1, 8),
+            (1, 16, 39, 5, 1, 2, 4),
+            (2, 32, 77, 20, 10, 1, 10),
+        ] {
+            let device = Device::cpu();
+            let input = Tensor::<3>::from_data(TensorData::new(
+                (0..batch * time).map(|i| (i as f32 * 0.17).cos() * 0.21).collect::<Vec<_>>(),
+                [batch, 1, time],
+            ), &device);
+            let weight = Tensor::<3>::from_data(TensorData::new(
+                (0..cout * kernel).map(|i| (i as f32 * 0.19).sin() * 0.13).collect::<Vec<_>>(),
+                [cout, 1, kernel],
+            ), &device);
+            let bias = Tensor::<1>::from_data(TensorData::new(
+                (0..cout).map(|i| i as f32 * 0.003).collect::<Vec<_>>(),
+                [cout],
+            ), &device);
+            let options = ConvOptions::new_with_padding(
+                [stride], [(pad, pad)], [dilation], 1,
+            );
+            let reference = module::conv1d(
+                input.clone(), weight.clone(), Some(bias.clone()), options.clone(),
+            );
+            let packed = prepack_single_input_conv1d_weight(weight);
+            let result = conv1d_single_input(input, packed, Some(bias), options);
+            assert_eq!(result.dims(), reference.dims());
+            let actual: Vec<f32> = result.into_data().try_into_vec::<f32>().unwrap();
+            let expected: Vec<f32> = reference.into_data().try_into_vec::<f32>().unwrap();
+            let max_abs = actual.iter().zip(expected.iter())
+                .map(|(x,y)| (*x-*y).abs()).fold(0f32, f32::max);
+            assert!(max_abs < 3e-5, "noise stride={stride} dilation={dilation} K={kernel} error={max_abs}");
+        }
+    }
+
+    #[test]
+    fn polyphase_transpose1d_matches_burn_cpu_reference() {
+        for (batch, cin, cout, time, kernel, stride, padding) in [
+            (1, 1, 1, 1, 2, 1, 0),
+            (1, 3, 5, 9, 6, 2, 2),
+            (2, 4, 7, 8, 8, 4, 2),
+            (1, 5, 8, 3, 16, 8, 4),
+            (1, 8, 16, 14, 3, 1, 1),
+            (2, 1, 3, 2, 10, 5, 3),
+        ] {
+            let device = Device::default();
+            let xs = (0..batch * cin * time)
+                .map(|i| (i as f32 * 0.173).sin() * 0.4)
+                .collect::<Vec<_>>();
+            let ws = (0..cin * cout * kernel)
+                .map(|i| (i as f32 * 0.137).cos() * 0.2)
+                .collect::<Vec<_>>();
+            let bs = (0..cout).map(|i| i as f32 * 0.01).collect::<Vec<_>>();
+            let x = Tensor::<3>::from_data(
+                TensorData::new(xs, [batch, cin, time]), &device,
+            );
+            let w = Tensor::<3>::from_data(
+                TensorData::new(ws, [cin, cout, kernel]), &device,
+            );
+            let b = Tensor::<1>::from_data(TensorData::new(bs, [cout]), &device);
+            let expected = module::conv_transpose1d(
+                x.clone(), w.clone(), Some(b.clone()),
+                ConvTransposeOptions::new([stride], [padding], [0], [1], 1),
+            );
+            let actual = conv_transpose1d_phase(x, w, b, stride, padding);
+            assert_eq!(actual.dims(), expected.dims());
+            let a: Vec<f32> = actual.into_data().to_vec().unwrap();
+            let e: Vec<f32> = expected.into_data().to_vec().unwrap();
+            let max_abs = a.iter().zip(e.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(max_abs < 3e-5, "N={batch} Cin={cin} Cout={cout} K={kernel} stride={stride}: error {max_abs}");
         }
     }
 }

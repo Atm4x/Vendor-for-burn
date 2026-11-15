@@ -42,6 +42,7 @@ pub struct NsfProfileStep {
 
 struct Conv1d {
     weight: Tensor<3>,
+    packed_noise_weight: Option<Tensor<3>>,
     bias: Option<Tensor<1>>,
     stride: usize,
     dilation: usize,
@@ -76,11 +77,24 @@ impl Conv1d {
             weight = weight.cast(DType::F16);
             bias = bias.map(|tensor| tensor.cast(DType::F16));
         }
-        Ok(Self {weight, bias, stride, dilation, padding, fp16_resblock})
+        let packed_noise_weight = if prefix.contains(".noise_convs.")
+            && std::env::var("RVC_NSF_NOISE_TILED").as_deref() == Ok("1")
+            && weight.dims()[1] == 1
+        {
+            Some(crate::cubecl_conv::prepack_single_input_conv1d_weight(weight.clone()))
+        } else {
+            None
+        };
+        Ok(Self {weight, packed_noise_weight, bias, stride, dilation, padding, fp16_resblock})
     }
 
     fn forward(&self, input: Tensor<3>) -> Tensor<3> {
         let options = ConvOptions::new_with_padding([self.stride], [(self.padding, self.padding)], [self.dilation], 1);
+        if let Some(packed_weight) = self.packed_noise_weight.as_ref() {
+            return crate::cubecl_conv::conv1d_single_input(
+                input, packed_weight.clone(), self.bias.clone(), options,
+            );
+        }
         if self.fp16_resblock {
             return crate::cubecl_conv::conv1d(
                 input.cast(DType::F16), self.weight.clone(), self.bias.clone(), options,
@@ -98,6 +112,7 @@ impl Conv1d {
 
 struct TransposedConv1d {
     weight: Tensor<3>,
+    packed_weight: Option<Tensor<3>>,
     bias: Tensor<1>,
     stride: usize,
     padding: usize,
@@ -112,10 +127,25 @@ impl TransposedConv1d {
         if kernel < stride || (kernel - stride) % 2 != 0 || bias.dims()[0] != output_channels {
             return Err(format!("{prefix}: unsupported ConvTranspose1d geometry"));
         }
-        Ok(Self {weight, bias, stride, padding: (kernel - stride) / 2})
+        let packed_weight = if std::env::var("RVC_NSF_POLYPHASE").as_deref() == Ok("1") {
+            Some(crate::cubecl_conv::prepack_transpose1d_weight(weight.clone()))
+        } else {
+            None
+        };
+        Ok(Self {weight, packed_weight, bias, stride, padding: (kernel - stride) / 2})
     }
 
     fn forward(&self, input: Tensor<3>) -> Tensor<3> {
+        if std::env::var("RVC_NSF_POLYPHASE").as_deref() == Ok("1") {
+            if let Some(packed) = self.packed_weight.as_ref() {
+                return crate::cubecl_conv::conv_transpose1d_phase_packed(
+                    input, packed.clone(), self.bias.clone(), self.stride, self.padding,
+                );
+            }
+            return crate::cubecl_conv::conv_transpose1d_phase(
+                input, self.weight.clone(), self.bias.clone(), self.stride, self.padding,
+            );
+        }
         if std::env::var("RVC_NSF_IMPLICIT_GEMM").as_deref() == Ok("1")
             || std::env::var("RVC_NSF_TRANSPOSE_GEMM").as_deref() == Ok("1")
         {
