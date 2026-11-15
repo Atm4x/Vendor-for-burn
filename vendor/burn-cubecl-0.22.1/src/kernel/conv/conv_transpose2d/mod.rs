@@ -3,6 +3,7 @@ mod col2im;
 
 mod transpose_direct;
 mod polyphase1d;
+mod phase_gemm1d;
 
 #[cfg(feature = "autotune")]
 mod tune;
@@ -15,3 +16,5 @@ pub use polyphase1d::{conv_transpose1d_polyphase, conv_transpose1d_polyphase_pac
 
 #[cfg(feature = "autotune")]
 pub use tune::*;
+
+pub use phase_gemm1d::{prepack_conv_transpose1d_phase_gemm_weight, conv_transpose1d_phase_gemm_packed};

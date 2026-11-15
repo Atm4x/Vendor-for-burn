@@ -114,6 +114,8 @@ struct TransposedConv1d {
     weight: Tensor<3>,
     packed_weight: Option<Tensor<3>>,
     kic_mode: Option<bool>,
+    phase_gemm_weight: Option<Tensor<4>>,
+    phase_gemm_half: bool,
     bias: Tensor<1>,
     stride: usize,
     padding: usize,
@@ -128,6 +130,15 @@ impl TransposedConv1d {
         if kernel < stride || (kernel - stride) % 2 != 0 || bias.dims()[0] != output_channels {
             return Err(format!("{prefix}: unsupported ConvTranspose1d geometry"));
         }
+        let phase_gemm_mode = std::env::var("RVC_NSF_PHASE_GEMM").unwrap_or_default();
+        let phase_gemm_half = phase_gemm_mode == "f16";
+        let phase_gemm_weight = if phase_gemm_half || phase_gemm_mode == "f32" {
+            Some(crate::cubecl_conv::prepack_transpose1d_phase_gemm(
+                weight.clone(), stride, (kernel - stride) / 2, phase_gemm_half,
+            ))
+        } else {
+            None
+        };
         let polyphase_enabled = std::env::var("RVC_NSF_POLYPHASE").as_deref() == Ok("1");
         let kic_mode = if polyphase_enabled {
             match std::env::var("RVC_NSF_POLYPHASE_KIC").as_deref() {
@@ -145,10 +156,16 @@ impl TransposedConv1d {
                 crate::cubecl_conv::prepack_transpose1d_weight(weight.clone())
             })
         } else { None };
-        Ok(Self {weight, packed_weight, kic_mode, bias, stride, padding: (kernel - stride) / 2})
+        Ok(Self {weight, packed_weight, kic_mode, phase_gemm_weight, phase_gemm_half, bias, stride, padding: (kernel - stride) / 2})
     }
 
     fn forward(&self, input: Tensor<3>) -> Tensor<3> {
+        if let Some(weight) = self.phase_gemm_weight.as_ref() {
+            return crate::cubecl_conv::conv_transpose1d_phase_gemm(
+                input, weight.clone(), self.bias.clone(), self.stride, self.padding,
+                self.weight.dims()[2], self.phase_gemm_half,
+            );
+        }
         if std::env::var("RVC_NSF_POLYPHASE").as_deref() == Ok("1") {
             if let Some(packed) = self.packed_weight.as_ref() {
                 if let Some(contiguous_ntc) = self.kic_mode {

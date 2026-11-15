@@ -4,7 +4,7 @@ use burn::tensor::{
 };
 use burn_cubecl::{
     Cube,
-    kernel::conv::{ConvStrategy, ConvTranspose2dStrategy, conv1d_single_input_packed, conv1d_single_input_prepack_weight, conv_transpose1d_polyphase, conv_transpose1d_polyphase_packed, conv_transpose1d_prepack_weight, conv_transpose1d_prepack_weight_kic, conv_transpose1d_polyphase_single_packed_kic, conv_forward, conv_forward_spatial_quad, conv_forward_spatial_reuse, conv_forward_spatial_pair, conv_transpose2d, prepack_winograd_weights, transform_winograd_input, inverse_winograd_output},
+    kernel::conv::{ConvStrategy, ConvTranspose2dStrategy, conv1d_single_input_packed, conv1d_single_input_prepack_weight, conv_transpose1d_polyphase, conv_transpose1d_polyphase_packed, conv_transpose1d_prepack_weight, conv_transpose1d_prepack_weight_kic, conv_transpose1d_polyphase_single_packed_kic, prepack_conv_transpose1d_phase_gemm_weight, conv_transpose1d_phase_gemm_packed, conv_forward, conv_forward_spatial_quad, conv_forward_spatial_reuse, conv_forward_spatial_pair, conv_transpose2d, prepack_winograd_weights, transform_winograd_input, inverse_winograd_output},
 };
 
 pub(crate) fn prepack_single_input_conv1d_weight(weight: Tensor<3>) -> Tensor<3> {
@@ -45,6 +45,35 @@ pub(crate) fn conv1d(
     let output = conv_forward::<1>(input, weight, bias, options, ConvStrategy::ImplicitGemm)
         .expect("CubeCL GEMM convolution is unsupported on this backend or shape");
     Tensor::from_primitive::<Cube>(output)
+}
+
+
+pub(crate) fn prepack_transpose1d_phase_gemm(
+    weight: Tensor<3>, stride: usize, padding: usize, half: bool,
+) -> Tensor<4> {
+    let weight = if half { weight.cast(burn::tensor::DType::F16) } else { weight };
+    let raw = weight.try_into_primitive::<Cube>().expect("phase GEMM weight requires CubeCL");
+    Tensor::from_primitive::<Cube>(
+        prepack_conv_transpose1d_phase_gemm_weight(raw, stride, padding, 1)
+            .expect("phase GEMM prepack requires supported geometry"),
+    )
+}
+
+pub(crate) fn conv_transpose1d_phase_gemm(
+    input: Tensor<3>, weight: Tensor<4>, bias: Tensor<1>,
+    stride: usize, padding: usize, kernel: usize, half: bool,
+) -> Tensor<3> {
+    let input = if half { input.cast(burn::tensor::DType::F16) } else { input };
+    let bias = if half { bias.cast(burn::tensor::DType::F16) } else { bias };
+    let raw_input = input.try_into_primitive::<Cube>().expect("phase GEMM input requires CubeCL");
+    let raw_weight = weight.try_into_primitive::<Cube>().expect("phase GEMM weight requires CubeCL");
+    let raw_bias = bias.try_into_primitive::<Cube>().expect("phase GEMM bias requires CubeCL");
+    let result = Tensor::<3>::from_primitive::<Cube>(
+        conv_transpose1d_phase_gemm_packed(
+            raw_input, raw_weight, Some(raw_bias), stride, padding, kernel, 1, 0, 1,
+        ).expect("phase GEMM unsupported geometry or backend"),
+    );
+    if half { result.cast(burn::tensor::DType::F32) } else { result }
 }
 
 pub(crate) fn prepack_transpose1d_weight(weight: Tensor<3>) -> Tensor<3> {
