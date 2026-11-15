@@ -182,6 +182,9 @@ pub fn conv_transpose1d_fused_two_tap_packed(
         kernel, stride, padding, padding_out, dilation, in_length,
     );
     if out_length == 0 { return Err(ConvSetupError::Unknown); }
+    if input.client.properties().hardware.max_units_per_cube < THREADS as u32 {
+        return Err(ConvSetupError::Unknown);
+    }
     let cout = cout_group * groups;
     let input = permute_nchw_to_nhwc(input);
     let output = empty_device_dtype(

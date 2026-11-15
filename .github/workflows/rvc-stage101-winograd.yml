@@ -231,8 +231,8 @@ jobs:
           & target/release/stage112_fused_probe.exe nvtx-status
           if ($LASTEXITCODE -ne 0) { throw 'Stage112 NVTX probe failed' }
           foreach ($case in @('grouped2','odd2')) {
-            & target/release/stage112_fused_probe.exe cpu $case fused2tap 3
-            if ($LASTEXITCODE -ne 0) { throw "Stage112 shared-memory CPU parity failed: $case" }
+            & target/release/stage112_fused_probe.exe cpu $case ilp4 3
+            if ($LASTEXITCODE -ne 0) { throw "Stage112 CPU geometry baseline failed: $case" }
           }
           & target/release/stage111_phase_gemm_probe.exe cpu small phase_f32 3
           if ($LASTEXITCODE -ne 0) { throw 'Stage111 full-output CubeCL CPU phase GEMM parity failed' }

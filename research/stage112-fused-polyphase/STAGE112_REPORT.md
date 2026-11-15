@@ -15,7 +15,7 @@ Two taps per output stride phase follows exactly from `K=2*stride`. For output p
 - Rust 1.100, `cpu,cuda,wgpu` cargo check of Stage112 probe (pending or result supplied in release report).
 - Standalone Rust mathematical reference tests `reference.rs` prove eight shapes, including grouped convolution and odd channel counts.
 - `compare_stage112.py` rejects missing cases or mismatched parity.
-- Windows CI performs CPU parity for grouped2 and odd2, which specifically exercise shared-memory boundaries.
+- Windows CI verifies grouped2/odd2 numerical geometry through the existing CPU polyphase ILP4 baseline. The new 128-thread shared-memory kernel explicitly rejects CPU hardware with insufficient `max_units_per_cube`; **its actual execution/parity is exclusively a CUDA preflight requirement**, not a claimed CPU test.
 - RTX 4060 kernel latency / correctness and matched cuDNN numbers **not yet measured**. The new kernel is strictly experimental; no production switch.
 
 ## Runtime caveats
