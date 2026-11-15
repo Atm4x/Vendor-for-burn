@@ -350,6 +350,154 @@ fn polyphase_pipeline4_kernel<E: Numeric, N: Size>(
     output.write(out_base + time * vectors_per_time, sum);
 }
 
+#[cube(launch, address_type = "dynamic")]
+fn polyphase_channel_tile2_kernel<E: Numeric, N: Size>(
+    input: &Tensor<E>,
+    weight: &Tensor<Vector<E, N>>,
+    bias: ComptimeOption<&[Vector<E, N>]>,
+    mut output: LinearViewMut<'_, Vector<E, N>>,
+    args: PolyphaseSingleArgs,
+    #[comptime] split_acc: bool,
+    #[define(E)] _dtype: ElemType,
+) {
+    let line = weight.vector_size();
+    let cout_group = weight.shape(2);
+    let vectors_per_group = cout_group / line;
+    let pairs_per_group = (vectors_per_group + 1) / 2;
+    let pairs_per_time = args.groups * pairs_per_group;
+    let channel_pair = ABSOLUTE_POS % pairs_per_time;
+    let temporal_index = ABSOLUTE_POS / pairs_per_time;
+    let phase_time = temporal_index % args.samples_per_phase;
+    let batch_phase = temporal_index / args.samples_per_phase;
+    let phase = batch_phase % args.stride;
+    let batch = batch_phase / args.stride;
+    let time = phase + phase_time * args.stride;
+    if batch >= input.shape(0) || time >= args.out_length {
+        terminate!();
+    }
+
+    let group = channel_pair / pairs_per_group;
+    let local_vector = (channel_pair % pairs_per_group) * 2;
+    let two_vectors = local_vector + 1 < vectors_per_group;
+    let global_vector = group * vectors_per_group + local_vector;
+    let cin_group = input.shape(2) / args.groups;
+    let cin_begin = group * cin_group;
+    let input_length = input.shape(1);
+    let kernel = weight.shape(1);
+    let base = time + args.padding;
+    let filter_phase = base % args.stride;
+    let source_time = base / args.stride;
+    let taps = (kernel + args.stride - 1 - filter_phase) / args.stride;
+    let input_stride0 = input.stride(0);
+    let input_stride1 = input.stride(1);
+    let input_stride2 = input.stride(2);
+    let weight_stride0 = weight.stride(0);
+    let weight_stride1 = weight.stride(1);
+    let input_channel_base = batch * input_stride0 + cin_begin * input_stride2;
+    let weight_channel_base = cin_begin * weight_stride0 + local_vector * line;
+    let bias0_opt: ComptimeOption<Vector<E, N>> = bias.map(|b| b[global_vector]);
+    let bias0: Vector<E, N> = bias0_opt.unwrap_or_else(|| Vector::zero());
+    let mut bias1: Vector<E, N> = Vector::zero();
+    if two_vectors {
+        let bias1_opt: ComptimeOption<Vector<E, N>> = bias.map(|b| b[global_vector + 1]);
+        bias1 = bias1_opt.unwrap_or_else(|| Vector::zero());
+    }
+    let mut acc0 = if comptime!(split_acc) { Vector::zero() } else { bias0 };
+    let mut acc1 = if comptime!(split_acc) { Vector::zero() } else { bias1 };
+    let mut acc0b = Vector::zero();
+    let mut acc1b = Vector::zero();
+    let pairs = cin_group / 2;
+    let valid_interior = if taps > 0 { source_time >= taps - 1 } else { false };
+
+    if valid_interior && source_time < input_length {
+        for tap in 0..taps {
+            let xbase = input_channel_base + (source_time - tap) * input_stride1;
+            let wbase = weight_channel_base + (filter_phase + tap * args.stride) * weight_stride1;
+            for pair in 0..pairs {
+                let ci = pair * 2;
+                let w00 = weight[(wbase + ci * weight_stride0) / line];
+                let w01 = weight[(wbase + (ci + 1) * weight_stride0) / line];
+                let x0 = input[xbase + ci * input_stride2];
+                let x1 = input[xbase + (ci + 1) * input_stride2];
+                acc0 += Vector::broadcast(x0) * w00;
+                if comptime!(split_acc) {
+                    acc0b += Vector::broadcast(x1) * w01;
+                } else {
+                    acc0 += Vector::broadcast(x1) * w01;
+                }
+                if two_vectors {
+                    let w10 = weight[(wbase + ci * weight_stride0 + line) / line];
+                    let w11 = weight[(wbase + (ci + 1) * weight_stride0 + line) / line];
+                    acc1 += Vector::broadcast(x0) * w10;
+                    if comptime!(split_acc) {
+                        acc1b += Vector::broadcast(x1) * w11;
+                    } else {
+                        acc1 += Vector::broadcast(x1) * w11;
+                    }
+                }
+            }
+            if cin_group % 2 != 0 {
+                let ci = pairs * 2;
+                let x = input[xbase + ci * input_stride2];
+                let w0 = weight[(wbase + ci * weight_stride0) / line];
+                acc0 += Vector::broadcast(x) * w0;
+                if two_vectors {
+                    let w1 = weight[(wbase + ci * weight_stride0 + line) / line];
+                    acc1 += Vector::broadcast(x) * w1;
+                }
+            }
+        }
+    } else {
+        for tap in 0..taps {
+            if source_time >= tap && source_time - tap < input_length {
+                let xbase = input_channel_base + (source_time - tap) * input_stride1;
+                let wbase = weight_channel_base + (filter_phase + tap * args.stride) * weight_stride1;
+                for pair in 0..pairs {
+                    let ci = pair * 2;
+                    let w00 = weight[(wbase + ci * weight_stride0) / line];
+                    let w01 = weight[(wbase + (ci + 1) * weight_stride0) / line];
+                    let x0 = input[xbase + ci * input_stride2];
+                    let x1 = input[xbase + (ci + 1) * input_stride2];
+                    acc0 += Vector::broadcast(x0) * w00;
+                    if comptime!(split_acc) {
+                        acc0b += Vector::broadcast(x1) * w01;
+                    } else {
+                        acc0 += Vector::broadcast(x1) * w01;
+                    }
+                    if two_vectors {
+                        let w10 = weight[(wbase + ci * weight_stride0 + line) / line];
+                        let w11 = weight[(wbase + (ci + 1) * weight_stride0 + line) / line];
+                        acc1 += Vector::broadcast(x0) * w10;
+                        if comptime!(split_acc) {
+                            acc1b += Vector::broadcast(x1) * w11;
+                        } else {
+                            acc1 += Vector::broadcast(x1) * w11;
+                        }
+                    }
+                }
+                if cin_group % 2 != 0 {
+                    let ci = pairs * 2;
+                    let x = input[xbase + ci * input_stride2];
+                    let w0 = weight[(wbase + ci * weight_stride0) / line];
+                    acc0 += Vector::broadcast(x) * w0;
+                    if two_vectors {
+                        let w1 = weight[(wbase + ci * weight_stride0 + line) / line];
+                        acc1 += Vector::broadcast(x) * w1;
+                    }
+                }
+            }
+        }
+    }
+    let sum0 = if comptime!(split_acc) { acc0 + acc0b + bias0 } else { acc0 };
+    let sum1 = if comptime!(split_acc) { acc1 + acc1b + bias1 } else { acc1 };
+    let vectors_per_time = vectors_per_group * args.groups;
+    let out_index = batch * args.out_length * vectors_per_time + time * vectors_per_time + global_vector;
+    output.write(out_index, sum0);
+    if two_vectors {
+        output.write(out_index + 1, sum1);
+    }
+}
+
 /// Alternative full-output FP32 polyphase kernel, specializing in maximum warp
 /// availability rather than cross-time weight reuse. Uses already packed weights.
 pub fn conv_transpose1d_polyphase_single_packed(
@@ -363,7 +511,7 @@ pub fn conv_transpose1d_polyphase_single_packed(
     groups: usize,
 ) -> Result<CubeTensor, ConvSetupError> {
     conv_transpose1d_polyphase_single_packed_mode(
-        input, weight, bias, stride, padding, dilation, padding_out, groups, false, false, None,
+        input, weight, bias, stride, padding, dilation, padding_out, groups, false, false, None, None,
     )
 }
 
@@ -388,7 +536,7 @@ pub fn conv_transpose1d_polyphase_single_packed_kic(
     contiguous_ntc: bool,
 ) -> Result<CubeTensor, ConvSetupError> {
     conv_transpose1d_polyphase_single_packed_mode(
-        input, weight, bias, stride, padding, dilation, padding_out, groups, true, contiguous_ntc, None,
+        input, weight, bias, stride, padding, dilation, padding_out, groups, true, contiguous_ntc, None, None,
     )
 }
 
@@ -409,7 +557,24 @@ pub fn conv_transpose1d_polyphase_pipeline4_packed(
 ) -> Result<CubeTensor, ConvSetupError> {
     conv_transpose1d_polyphase_single_packed_mode(
         input, weight, bias, stride, padding, dilation, padding_out, groups,
-        weight_kic, false, Some(independent_acc),
+        weight_kic, false, Some(independent_acc), None,
+    )
+}
+
+pub fn conv_transpose1d_polyphase_channel_tile2_packed(
+    input: CubeTensor,
+    weight: CubeTensor,
+    bias: Option<CubeTensor>,
+    stride: usize,
+    padding: usize,
+    dilation: usize,
+    padding_out: usize,
+    groups: usize,
+    split_acc: bool,
+) -> Result<CubeTensor, ConvSetupError> {
+    conv_transpose1d_polyphase_single_packed_mode(
+        input, weight, bias, stride, padding, dilation, padding_out, groups,
+        false, false, None, Some(split_acc),
     )
 }
 
@@ -425,6 +590,7 @@ fn conv_transpose1d_polyphase_single_packed_mode(
     weight_kic: bool,
     contiguous_ntc: bool,
     pipeline4: Option<bool>,
+    channel_tile2: Option<bool>,
 ) -> Result<CubeTensor, ConvSetupError> {
     if groups == 0 || stride == 0 || dilation != 1 {
         return Err(ConvSetupError::Unknown);
@@ -460,12 +626,26 @@ fn conv_transpose1d_polyphase_single_packed_mode(
         None => VectorSize::MAX,
     });
     let samples_per_phase = out_len.div_ceil(stride);
-    let work_items = batch * stride * samples_per_phase * (cout / line);
+    let work_items = if channel_tile2.is_some() {
+        batch * stride * samples_per_phase * groups * (cout_group / line).div_ceil(2)
+    } else {
+        batch * stride * samples_per_phase * (cout / line)
+    };
     let dim = CubeDim::new(&input.client, work_items);
     let count = calculate_cube_count_elemwise(&input.client, work_items, dim);
     let dtype = input.dtype;
     let client = input.client.clone();
-    if let Some(independent_acc) = pipeline4 {
+    if let Some(split_acc) = channel_tile2 {
+        polyphase_channel_tile2_kernel::launch(
+            &client, count, dim,
+            address_type!(input, weight, bias, out), line,
+            input.into_tensor_arg(), weight.into_tensor_arg(),
+            bias.map(|b| b.into_buffer_arg()).into(),
+            out.clone().into_linear_view(),
+            PolyphaseSingleArgsLaunch::new(out_len, stride, padding, groups, samples_per_phase),
+            split_acc, dtype_to_storage_type(dtype),
+        );
+    } else if let Some(independent_acc) = pipeline4 {
         polyphase_pipeline4_kernel::launch(
             &client,
             count,

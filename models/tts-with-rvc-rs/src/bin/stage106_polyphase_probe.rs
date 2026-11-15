@@ -3,6 +3,7 @@ use burn_cubecl::{
     Cube,
     kernel::conv::{
         conv_transpose1d_polyphase_packed, conv_transpose1d_polyphase_pipeline4_packed,
+        conv_transpose1d_polyphase_channel_tile2_packed,
         conv_transpose1d_polyphase_single_packed, conv_transpose1d_polyphase_single_packed_kic,
         conv_transpose1d_prepack_weight, conv_transpose1d_prepack_weight_kic,
     },
@@ -16,18 +17,20 @@ struct Case {
     n: usize,
     ci: usize,
     co: usize,
+    groups: usize,
     t: usize,
     k: usize,
     stride: usize,
     pad: usize,
 }
 
-const CASES: [Case; 6] = [
+const CASES: [Case; 8] = [
     Case {
         name: "small",
         n: 1,
         ci: 3,
         co: 5,
+        groups: 1,
         t: 25,
         k: 6,
         stride: 2,
@@ -38,6 +41,7 @@ const CASES: [Case; 6] = [
         n: 2,
         ci: 64,
         co: 32,
+        groups: 1,
         t: 512,
         k: 16,
         stride: 8,
@@ -48,6 +52,7 @@ const CASES: [Case; 6] = [
         n: 2,
         ci: 128,
         co: 64,
+        groups: 1,
         t: 256,
         k: 20,
         stride: 10,
@@ -58,6 +63,7 @@ const CASES: [Case; 6] = [
         n: 2,
         ci: 32,
         co: 16,
+        groups: 1,
         t: 1024,
         k: 8,
         stride: 4,
@@ -68,6 +74,7 @@ const CASES: [Case; 6] = [
         n: 2,
         ci: 16,
         co: 8,
+        groups: 1,
         t: 4096,
         k: 4,
         stride: 2,
@@ -78,10 +85,33 @@ const CASES: [Case; 6] = [
         n: 1,
         ci: 16,
         co: 16,
+        groups: 1,
         t: 128,
         k: 3,
         stride: 1,
         pad: 1,
+    },
+    Case {
+        name: "grouped",
+        n: 1,
+        ci: 12,
+        co: 20,
+        groups: 4,
+        t: 23,
+        k: 7,
+        stride: 3,
+        pad: 2,
+    },
+    Case {
+        name: "odd_cin",
+        n: 1,
+        ci: 7,
+        co: 13,
+        groups: 1,
+        t: 17,
+        k: 9,
+        stride: 4,
+        pad: 3,
     },
 ];
 
@@ -111,10 +141,12 @@ fn main() -> Result<(), String> {
                 | "pipe4_kic"
                 | "ilp4"
                 | "ilp4_kic"
+                | "tile2"
+                | "tile2_split"
         )
     {
         return Err(
-            "usage: stage106_polyphase_probe [cuda|cpu] [case] [direct|polyphase|single|kic|kic_ntc|pipe4|pipe4_kic|ilp4|ilp4_kic] [repetitions=8]"
+            "usage: stage106_polyphase_probe [cuda|cpu] [case] [direct|polyphase|single|kic|kic_ntc|pipe4|pipe4_kic|ilp4|ilp4_kic|tile2|tile2_split] [repetitions=8]"
                 .into(),
         );
     }
@@ -149,10 +181,10 @@ fn main() -> Result<(), String> {
     );
     let w = Tensor::<3>::from_data(
         TensorData::new(
-            (0..c.ci * c.co * c.k)
+            (0..c.ci * (c.co / c.groups) * c.k)
                 .map(|i| (i as f32 * 0.027).cos() * 0.1)
                 .collect::<Vec<_>>(),
-            [c.ci, c.co, c.k],
+            [c.ci, c.co / c.groups, c.k],
         ),
         &device,
     );
@@ -163,7 +195,7 @@ fn main() -> Result<(), String> {
         ),
         &device,
     );
-    let opts = ConvTransposeOptions::new([c.stride], [c.pad], [0], [1], 1);
+    let opts = ConvTransposeOptions::new([c.stride], [c.pad], [0], [1], c.groups);
     let packed_weight = conv_transpose1d_prepack_weight(
         w.clone()
             .try_into_primitive::<Cube>()
@@ -192,7 +224,11 @@ fn main() -> Result<(), String> {
             }
             .expect("CubeCL packed weight");
             let bias = b.clone().try_into_primitive::<Cube>().expect("CubeCL bias");
-            let forward = if matches!(mode.as_str(), "pipe4" | "pipe4_kic" | "ilp4" | "ilp4_kic") {
+            let forward = if matches!(mode.as_str(), "tile2" | "tile2_split") {
+                conv_transpose1d_polyphase_channel_tile2_packed(
+                    x, pw, Some(bias), c.stride, c.pad, 1, 0, c.groups, mode == "tile2_split",
+                )
+            } else if matches!(mode.as_str(), "pipe4" | "pipe4_kic" | "ilp4" | "ilp4_kic") {
                 conv_transpose1d_polyphase_pipeline4_packed(
                     x,
                     pw,
@@ -201,7 +237,7 @@ fn main() -> Result<(), String> {
                     c.pad,
                     1,
                     0,
-                    1,
+                    c.groups,
                     mode.ends_with("_kic"),
                     mode.starts_with("ilp4"),
                 )
@@ -214,7 +250,7 @@ fn main() -> Result<(), String> {
                     c.pad,
                     1,
                     0,
-                    1,
+                    c.groups,
                     mode == "kic_ntc",
                 )
             } else if mode == "single" {
@@ -226,10 +262,10 @@ fn main() -> Result<(), String> {
                     c.pad,
                     1,
                     0,
-                    1,
+                    c.groups,
                 )
             } else {
-                conv_transpose1d_polyphase_packed(x, pw, Some(bias), c.stride, c.pad, 1, 0, 1)
+                conv_transpose1d_polyphase_packed(x, pw, Some(bias), c.stride, c.pad, 1, 0, c.groups)
             };
             Tensor::from_primitive::<Cube>(forward.expect("CubeCL polyphase kernel"))
         }
@@ -283,7 +319,7 @@ fn main() -> Result<(), String> {
         "{}",
         json!({
             "stage":106,"backend":backend,"case":c.name,"mode":mode,"repetitions":repetitions,
-            "input_shape":[c.n,c.ci,c.t],"weight_shape":[c.ci,c.co,c.k],
+            "input_shape":[c.n,c.ci,c.t],"weight_shape":[c.ci,c.co/c.groups,c.k],"groups":c.groups,
             "stride":c.stride,"padding":c.pad,"output_elements":actual.len(),
             "median_ms":times[times.len()/2],"max_abs":max_abs,
             "snr_db":snr_db,"full_output_parity":true,

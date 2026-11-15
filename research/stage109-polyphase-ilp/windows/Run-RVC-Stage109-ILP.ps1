@@ -68,7 +68,7 @@ foreach ($item in $plan) {
         $arguments = @(
             '--target-processes','all',
             '--nvtx','--nvtx-push-pop-scope','process','--nvtx-include',$nvtxRange,
-            '--kernel-name','regex:polyphase_(single|pipeline4)_kernel',
+            '--kernel-name','regex:polyphase_',
             '--launch-count',"$NcuLaunchCount",
             '--section','SpeedOfLight',
             '--section','LaunchStats',

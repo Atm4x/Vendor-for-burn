@@ -1,4 +1,4 @@
-name: RVC Stage109 polyphase software pipeline and FMA ILP Windows profiler package
+name: RVC Stage110 polyphase channel-tile2 memory-reuse Windows profiler package
 
 on:
   workflow_dispatch:
@@ -19,13 +19,14 @@ on:
       - 'research/stage107-nsf-scheduling/**'
       - 'research/stage108-polyphase-transport/**'
       - 'research/stage109-polyphase-ilp/**'
+      - 'research/stage110-channel-tile2/**'
       - '.github/workflows/rvc-stage101-winograd.yml'
 
 permissions:
   contents: read
 
 concurrency:
-  group: rvc-stage109-nsf-ilp-${{ github.ref }}
+  group: rvc-stage110-channel-tile2-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -53,7 +54,7 @@ jobs:
           Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
           python tools/restore_vendor_checksums.py --zerocopy-archive $archive
           if ($LASTEXITCODE -ne 0) { throw 'Vendor checksum repair failed' }
-      - name: Validate Stage101-109 analyzers, references, and PowerShell runners
+      - name: Validate Stage101-110 analyzers, references, and PowerShell runners
         shell: pwsh
         run: |
           python research/stage101-winograd/windows/test_stage101_analyzer.py
@@ -73,6 +74,19 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Stage105 pair contract tests failed' }
           python research/stage106-nsf-polyphase/windows/test_stage106.py
           if ($LASTEXITCODE -ne 0) { throw 'Stage106 source contract failed' }
+          python research/stage110-channel-tile2/windows/test_stage110.py
+          if ($LASTEXITCODE -ne 0) { throw 'Stage110 Python analyzer contract failed' }
+          $stage110Ref = Join-Path $env:RUNNER_TEMP 'stage110-reference.exe'
+          rustc --edition=2024 --test research/stage110-channel-tile2/reference.rs -o $stage110Ref
+          if ($LASTEXITCODE -ne 0) { throw 'Stage110 math reference compilation failed' }
+          & $stage110Ref
+          if ($LASTEXITCODE -ne 0) { throw 'Stage110 math reference parity failed' }
+          $stage110 = 'research/stage110-channel-tile2/windows/Run-RVC-Stage110-Channel-Tile2.ps1'
+          $stage110Tokens = $null
+          $stage110Errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $stage110).Path,[ref]$stage110Tokens,[ref]$stage110Errors)
+          if ($stage110Errors.Count -gt 0) { $stage110Errors | Format-List | Out-String | Write-Host; throw 'Stage110 PowerShell invalid' }
+          & $stage110 -DryRun -Profiler ncu
           python research/stage109-polyphase-ilp/windows/test_stage109.py
           if ($LASTEXITCODE -ne 0) { throw 'Stage109 analyzer contracts failed' }
           $stage109Ref = Join-Path $env:RUNNER_TEMP 'stage109-reference.exe'
@@ -162,7 +176,7 @@ jobs:
             [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path "research/stage102-cuda-profile/windows/$script").Path,[ref]$tokens,[ref]$errors)
             if ($errors.Count -gt 0) { $errors | Format-List | Out-String | Write-Host; throw "Invalid PowerShell: $script" }
           }
-      - name: Build Stage109 unified CPU CUDA WGPU and probes
+      - name: Build Stage110 unified CPU CUDA WGPU and probes
         shell: pwsh
         run: |
           cargo build --release --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs --bin stage102_conv2d_probe --bin stage103_conv2d_probe --bin stage106_polyphase_probe --bin stage106_noise_probe
@@ -191,13 +205,19 @@ jobs:
             & target/release/stage106_polyphase_probe.exe cpu small $mode 3
             if ($LASTEXITCODE -ne 0) { throw "Stage109 CPU parity failed: $mode" }
           }
+          foreach ($case in @('small','grouped','odd_cin','upsample8')) {
+            foreach ($mode in @('tile2','tile2_split')) {
+              & target/release/stage106_polyphase_probe.exe cpu $case $mode 3
+              if ($LASTEXITCODE -ne 0) { throw "Stage110 CubeCL CPU parity failed: $case/$mode" }
+            }
+          }
           & target/release/stage106_noise_probe.exe cpu small tiled 3
           if ($LASTEXITCODE -ne 0) { throw 'Stage106 noise CPU parity failed' }
           & target/release/stage106_noise_probe.exe cpu small interior 3
           if ($LASTEXITCODE -ne 0) { throw 'Stage107 noise interior CPU parity failed' }
           & target/release/tts-with-rvc-rs.exe --help
           if ($LASTEXITCODE -ne 0) { throw 'Stage101 help failed' }
-      - name: Package Stage109 NCU software-pipeline profiler package
+      - name: Package Stage110 NCU channel tile2 profiler package
         shell: pwsh
         run: |
           $folder = 'dist/stage104-ncu-matrix'
@@ -215,6 +235,9 @@ jobs:
           Copy-Item research/stage108-polyphase-transport/windows/Run-RVC-Stage108-Transport.ps1 $folder
           Copy-Item research/stage108-polyphase-transport/windows/compare_stage108.py $folder
           Copy-Item research/stage108-polyphase-transport/README.md (Join-Path $folder 'STAGE108_README.md')
+          Copy-Item research/stage110-channel-tile2/windows/Run-RVC-Stage110-Channel-Tile2.ps1 $folder
+          Copy-Item research/stage110-channel-tile2/windows/compare_stage110.py $folder
+          Copy-Item research/stage110-channel-tile2/README.md (Join-Path $folder 'STAGE110_README.md')
           Copy-Item research/stage109-polyphase-ilp/windows/Run-RVC-Stage109-ILP.ps1 $folder
           Copy-Item research/stage109-polyphase-ilp/windows/compare_stage109.py $folder
           Copy-Item research/stage109-polyphase-ilp/README.md (Join-Path $folder 'STAGE109_README.md')
@@ -249,7 +272,7 @@ jobs:
           '@ | Set-Content (Join-Path $folder 'README.txt')
       - uses: actions/upload-artifact@v4
         with:
-          name: rvc-stage109-polyphase-ilp-windows-x64
+          name: rvc-stage110-channel-tile2-windows-x64
           path: dist/stage104-ncu-matrix/
           retention-days: 14
           if-no-files-found: error
