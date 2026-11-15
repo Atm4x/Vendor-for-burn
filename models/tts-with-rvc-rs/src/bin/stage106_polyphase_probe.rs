@@ -1,7 +1,10 @@
 use burn::tensor::{Device, Tensor, TensorData, module, ops::ConvTransposeOptions};
 use burn_cubecl::{
     Cube,
-    kernel::conv::{conv_transpose1d_polyphase_packed, conv_transpose1d_prepack_weight},
+    kernel::conv::{
+        conv_transpose1d_polyphase_packed, conv_transpose1d_polyphase_single_packed,
+        conv_transpose1d_prepack_weight,
+    },
 };
 use serde_json::json;
 use std::time::Instant;
@@ -95,9 +98,11 @@ fn main() -> Result<(), String> {
         .unwrap_or_else(|| "8".into())
         .parse()
         .map_err(|_| "repetitions must be integer")?;
-    if !(2..=40).contains(&repetitions) || !matches!(mode.as_str(), "direct" | "polyphase") {
+    if !(2..=40).contains(&repetitions)
+        || !matches!(mode.as_str(), "direct" | "polyphase" | "single")
+    {
         return Err(
-            "usage: stage106_polyphase_probe [cuda|cpu] [case] [direct|polyphase] [repetitions=8]"
+            "usage: stage106_polyphase_probe [cuda|cpu] [case] [direct|polyphase|single] [repetitions=8]"
                 .into(),
         );
     }
@@ -168,10 +173,21 @@ fn main() -> Result<(), String> {
                 .try_into_primitive::<Cube>()
                 .expect("CubeCL packed weight");
             let bias = b.clone().try_into_primitive::<Cube>().expect("CubeCL bias");
-            Tensor::from_primitive::<Cube>(
+            let forward = if mode == "single" {
+                conv_transpose1d_polyphase_single_packed(
+                    x,
+                    pw,
+                    Some(bias),
+                    c.stride,
+                    c.pad,
+                    1,
+                    0,
+                    1,
+                )
+            } else {
                 conv_transpose1d_polyphase_packed(x, pw, Some(bias), c.stride, c.pad, 1, 0, 1)
-                    .expect("CubeCL polyphase kernel"),
-            )
+            };
+            Tensor::from_primitive::<Cube>(forward.expect("CubeCL polyphase kernel"))
         }
     };
     let mut times = Vec::new();

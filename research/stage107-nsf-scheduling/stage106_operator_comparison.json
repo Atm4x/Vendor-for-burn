@@ -1,0 +1,38 @@
+[
+  {
+    "operator": "conv_transpose1d",
+    "case": "upsample10",
+    "direct_ms": 0.1531,
+    "candidate_ms": 0.1091,
+    "speedup": 1.403299725022915,
+    "candidate_max_abs": 1.4156103134155273e-07,
+    "candidate_snr_db": 128.27378885779015
+  },
+  {
+    "operator": "conv_transpose1d",
+    "case": "upsample8",
+    "direct_ms": 0.1375,
+    "candidate_ms": 0.09079999999999999,
+    "speedup": 1.5143171806167404,
+    "candidate_max_abs": 5.960464477539063e-08,
+    "candidate_snr_db": 131.05976802966802
+  },
+  {
+    "operator": "single_input_conv1d",
+    "case": "noise40",
+    "direct_ms": 0.5351,
+    "candidate_ms": 0.0639,
+    "speedup": 8.374021909233177,
+    "candidate_max_abs": 0.0,
+    "candidate_snr_db": null
+  },
+  {
+    "operator": "single_input_conv1d",
+    "case": "noise8",
+    "direct_ms": 0.077,
+    "candidate_ms": 0.0444,
+    "speedup": 1.734234234234234,
+    "candidate_max_abs": 0.0,
+    "candidate_snr_db": null
+  }
+]

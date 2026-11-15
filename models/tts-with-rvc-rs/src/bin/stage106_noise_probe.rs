@@ -1,7 +1,10 @@
 use burn::tensor::{Device, Tensor, TensorData, module, ops::ConvOptions};
 use burn_cubecl::{
     Cube,
-    kernel::conv::{conv1d_single_input_packed, conv1d_single_input_prepack_weight},
+    kernel::conv::{
+        conv1d_single_input_packed, conv1d_single_input_packed_interior,
+        conv1d_single_input_prepack_weight,
+    },
 };
 use serde_json::json;
 use std::time::Instant;
@@ -85,9 +88,11 @@ fn main() -> Result<(), String> {
         .unwrap_or_else(|| "8".into())
         .parse()
         .map_err(|_| "repetitions must be integer")?;
-    if !(2..=40).contains(&repetitions) || !matches!(mode.as_str(), "direct" | "tiled") {
+    if !(2..=40).contains(&repetitions) || !matches!(mode.as_str(), "direct" | "tiled" | "interior")
+    {
         return Err(
-            "usage: stage106_noise_probe [cuda|cpu] [case] [direct|tiled] [repetitions=8]".into(),
+            "usage: stage106_noise_probe [cuda|cpu] [case] [direct|tiled|interior] [repetitions=8]"
+                .into(),
         );
     }
     let c = CASES
@@ -153,10 +158,12 @@ fn main() -> Result<(), String> {
                 .try_into_primitive::<Cube>()
                 .expect("CubeCL packed weight");
             let raw_b = b.clone().try_into_primitive::<Cube>().expect("CubeCL bias");
-            Tensor::from_primitive::<Cube>(
+            let forward = if mode == "interior" {
+                conv1d_single_input_packed_interior(raw_x, raw_w, Some(raw_b), opts.clone())
+            } else {
                 conv1d_single_input_packed(raw_x, raw_w, Some(raw_b), opts.clone())
-                    .expect("CubeCL tiled noise convolution"),
-            )
+            };
+            Tensor::from_primitive::<Cube>(forward.expect("CubeCL tiled noise convolution"))
         }
     };
     let mut times = Vec::new();

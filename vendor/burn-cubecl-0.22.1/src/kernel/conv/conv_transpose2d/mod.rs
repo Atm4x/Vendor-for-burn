@@ -11,7 +11,7 @@ pub use base::*;
 pub use col2im::*;
 
 pub use transpose_direct::*;
-pub use polyphase1d::{conv_transpose1d_polyphase, conv_transpose1d_polyphase_packed, conv_transpose1d_prepack_weight};
+pub use polyphase1d::{conv_transpose1d_polyphase, conv_transpose1d_polyphase_packed, conv_transpose1d_polyphase_single_packed, conv_transpose1d_prepack_weight};
 
 #[cfg(feature = "autotune")]
 pub use tune::*;

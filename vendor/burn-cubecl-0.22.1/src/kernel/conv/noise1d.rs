@@ -34,6 +34,7 @@ fn noise_temporal_pair_kernel<E: Numeric, N: Size>(
     bias: ComptimeOption<&[Vector<E, N>]>,
     mut output: LinearViewMut<'_, Vector<E, N>>,
     args: NoiseArgs,
+    #[comptime] fast_interior: bool,
     #[define(E)] _dtype: ElemType,
 ) {
     let line = weight.vector_size();
@@ -59,20 +60,53 @@ fn noise_temporal_pair_kernel<E: Numeric, N: Size>(
     let base1 = base0 + args.stride as i32;
     let batch_base = batch * input.stride(0);
     let oc = channel_vector * line;
-    for k in 0..kernel {
-        let x0 = base0 + (k * args.dilation) as i32;
-        let x1 = base1 + (k * args.dilation) as i32;
-        let valid0 = x0 >= 0 && x0 < in_len;
-        let valid1 = t1 < args.out_length && x1 >= 0 && x1 < in_len;
-        if valid0 || valid1 {
-            let w = weight[(k * weight.stride(1) + oc) / line];
-            if valid0 {
-                let a = input[batch_base + x0 as usize * input.stride(2)];
-                sum0 += Vector::broadcast(a) * w;
+    if comptime!(fast_interior) {
+        let last1 = base1 + ((kernel - 1) * args.dilation) as i32;
+        if t1 < args.out_length && base0 >= 0 && last1 < in_len {
+            for k in 0..kernel {
+                let w = weight[(k * weight.stride(1) + oc) / line];
+                let x0 = base0 + (k * args.dilation) as i32;
+                let x1 = x0 + args.stride as i32;
+                let a0 = input[batch_base + x0 as usize * input.stride(2)];
+                let a1 = input[batch_base + x1 as usize * input.stride(2)];
+                sum0 += Vector::broadcast(a0) * w;
+                sum1 += Vector::broadcast(a1) * w;
             }
-            if valid1 {
-                let a = input[batch_base + x1 as usize * input.stride(2)];
-                sum1 += Vector::broadcast(a) * w;
+        } else {
+            for k in 0..kernel {
+                let x0 = base0 + (k * args.dilation) as i32;
+                let x1 = base1 + (k * args.dilation) as i32;
+                let valid0 = x0 >= 0 && x0 < in_len;
+                let valid1 = t1 < args.out_length && x1 >= 0 && x1 < in_len;
+                if valid0 || valid1 {
+                    let w = weight[(k * weight.stride(1) + oc) / line];
+                    if valid0 {
+                        let a = input[batch_base + x0 as usize * input.stride(2)];
+                        sum0 += Vector::broadcast(a) * w;
+                    }
+                    if valid1 {
+                        let a = input[batch_base + x1 as usize * input.stride(2)];
+                        sum1 += Vector::broadcast(a) * w;
+                    }
+                }
+            }
+        }
+    } else {
+        for k in 0..kernel {
+            let x0 = base0 + (k * args.dilation) as i32;
+            let x1 = base1 + (k * args.dilation) as i32;
+            let valid0 = x0 >= 0 && x0 < in_len;
+            let valid1 = t1 < args.out_length && x1 >= 0 && x1 < in_len;
+            if valid0 || valid1 {
+                let w = weight[(k * weight.stride(1) + oc) / line];
+                if valid0 {
+                    let a = input[batch_base + x0 as usize * input.stride(2)];
+                    sum0 += Vector::broadcast(a) * w;
+                }
+                if valid1 {
+                    let a = input[batch_base + x1 as usize * input.stride(2)];
+                    sum1 += Vector::broadcast(a) * w;
+                }
             }
         }
     }
@@ -95,6 +129,25 @@ pub fn conv1d_single_input_packed(
     weight: CubeTensor,
     bias: Option<CubeTensor>,
     options: ConvOptions<1>,
+) -> Result<CubeTensor, ConvSetupError> {
+    conv1d_single_input_packed_mode(input, weight, bias, options, false)
+}
+
+pub fn conv1d_single_input_packed_interior(
+    input: CubeTensor,
+    weight: CubeTensor,
+    bias: Option<CubeTensor>,
+    options: ConvOptions<1>,
+) -> Result<CubeTensor, ConvSetupError> {
+    conv1d_single_input_packed_mode(input, weight, bias, options, true)
+}
+
+fn conv1d_single_input_packed_mode(
+    input: CubeTensor,
+    weight: CubeTensor,
+    bias: Option<CubeTensor>,
+    options: ConvOptions<1>,
+    fast_interior: bool,
 ) -> Result<CubeTensor, ConvSetupError> {
     let [batch, cin, time] = input.meta.shape().dims();
     let [packed_cin, kernel, cout] = weight.meta.shape().dims();
@@ -150,6 +203,7 @@ pub fn conv1d_single_input_packed(
             options.dilation[0],
             options.padding_begin()[0] as i32,
         ),
+        fast_interior,
         dtype_to_storage_type(dtype),
     );
     Ok(permute_nhwc_to_nchw(out))
