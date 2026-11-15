@@ -117,7 +117,13 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Stage101 analyzer failed' }
     $zip = Join-Path $PSScriptRoot 'RVC_STAGE101_WINOGRAD_CUDA_RESULTS.zip'
     if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
-    Compress-Archive -Path (Join-Path $root '*') -DestinationPath $zip -CompressionLevel Optimal
+    $resultPaths = @(
+        (Join-Path $root 'manifest.json'),
+        (Join-Path $root 'analysis'),
+        (Join-Path $root '*.log'),
+        (Join-Path $root '*.benchmark.json')
+    )
+    Compress-Archive -Path $resultPaths -DestinationPath $zip -CompressionLevel Optimal
     Write-Host "Stage101 results: $zip"
 } finally {
     foreach ($key in $previous.Keys) { [Environment]::SetEnvironmentVariable($key,$previous[$key],'Process') }

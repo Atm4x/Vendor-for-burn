@@ -11,6 +11,10 @@ fn run() -> Result<(), String> {
     if matches!(command.as_str(), "convert" | "convert-batch" | "doctor" | "help" | "--help" | "-h") {
         return user_cli::run_named(&command, args);
     }
+    if command == "nvtx-status" {
+        println!("nvtx_available={}", tts_with_rvc_rs::nvtx::available());
+        return Ok(());
+    }
     if command == "inspect-pth" {
         let path = args.next().ok_or("missing checkpoint path")?;
         let checkpoint = tts_with_rvc_rs::checkpoint::RvcCheckpoint::open(&path)?;
@@ -359,6 +363,7 @@ fn run() -> Result<(), String> {
             device.sync().map_err(|e| format!("pre-inference sync failed: {e}"))?;
             let start = std::time::Instant::now();
             let mut count = 0_usize;
+            let _nvtx = (iteration > 0).then(|| tts_with_rvc_rs::nvtx::Range::new("stage102_rust_measured"));
             converted = inferencer.infer_long_filtered_16khz_batched(
                 &filtered, &opts, config, tensor_batch_size,
                 |progress| {
@@ -368,6 +373,7 @@ fn run() -> Result<(), String> {
                 },
             )?;
             device.sync().map_err(|e| format!("post-inference sync failed: {e}"))?;
+            drop(_nvtx);
             let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
             if converted.len() != expected_samples || converted.iter().any(|x| !x.is_finite()) {
                 return Err(format!("full RVC output is invalid: got {} samples, expected {expected_samples}", converted.len()));

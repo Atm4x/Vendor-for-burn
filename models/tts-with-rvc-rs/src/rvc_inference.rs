@@ -342,7 +342,9 @@ impl RvcV2Inferencer {
         crate::diagnostic::measure(&self.device, "rvc.audio_h2d", started,
             serde_json::json!({"bytes_h2d_estimate":batch * audio_len * 4}));
         let started = std::time::Instant::now();
+        let _hubert_nvtx = crate::nvtx::Range::new("stage102_rust_hubert");
         let content = self.hubert.forward(waveform, None);
+        drop(_hubert_nvtx);
         crate::diagnostic::measure(&self.device, "rvc.hubert_total", started,
             serde_json::json!({"tensor_shape":content.dims()}));
         let [result_batch, content_time, channels] = content.dims();
@@ -384,6 +386,7 @@ impl RvcV2Inferencer {
             phase = std::time::Instant::now();
         }
         let started = std::time::Instant::now();
+        let _rmvpe_nvtx = crate::nvtx::Range::new("stage102_rust_rmvpe");
         let thresholds: Vec<f32> = options.iter().map(|x| x.rmvpe_threshold).collect();
         let gpu_f0 = std::env::var_os("RVC_GPU_F0").is_some_and(|v| v == "1");
         if gpu_f0 && retrieval_enabled && !gpu_retrieval {
@@ -415,6 +418,7 @@ impl RvcV2Inferencer {
         } else {
             Some(self.rmvpe.infer_f0_batch_thresholds_with_cache(audios, &self.device, &thresholds, mel_reuse)?)
         };
+        drop(_rmvpe_nvtx);
         crate::diagnostic::measure(&self.device, "rvc.rmvpe_total", started,
             serde_json::json!({"batch":batch,"mode":if provided_f0.is_some() {"shared_cpu_f0"} else if gpu_f0 {"resident_gpu_f0"} else {"dense_cpu_f0"}}));
         if profile {
@@ -701,6 +705,7 @@ impl RvcV2Inferencer {
         crate::diagnostic::measure(&self.device, "rvc.nsf_inputs", started,
             serde_json::json!({"sine_h2d_bytes_estimate":batch*frames*RVC_HOP*4,"f0_h2d_bytes_estimate":if gpu_f0 {0} else {batch*frames*4}}));
         let started = std::time::Instant::now();
+        let _nsf_nvtx = crate::nvtx::Range::new("stage102_rust_nsf");
         let output = self.decoder.forward_from_f0_with_execution_and_phase(
             latent,
             f0_tensor,
@@ -711,6 +716,7 @@ impl RvcV2Inferencer {
             phase_offsets,
             crate::decoder::ResidualExecution::PRODUCTION,
         )?;
+        drop(_nsf_nvtx);
         crate::diagnostic::measure(&self.device, "rvc.nsf_compute", started,
             serde_json::json!({"output_shape":output.dims()}));
         let [wave_batch, channel_count, sample_count] = output.dims();

@@ -1,4 +1,4 @@
-name: RVC Stage101 Winograd Windows CUDA executable
+name: RVC Stage102 Nsight Windows CUDA profiler package
 
 on:
   workflow_dispatch:
@@ -11,17 +11,18 @@ on:
       - 'vendor/burn-cubecl-0.22.1/src/kernel/conv/**'
       - 'vendor/cubek-convolution-0.3.1/src/kernels/forward/**'
       - 'research/stage101-winograd/**'
+      - 'research/stage102-cuda-profile/**'
       - '.github/workflows/rvc-stage101-winograd.yml'
 
 permissions:
   contents: read
 
 concurrency:
-  group: rvc-stage101-winograd-${{ github.ref }}
+  group: rvc-stage102-nsight-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  stage101-windows:
+  stage102-windows:
     runs-on: windows-latest
     timeout-minutes: 120
     steps:
@@ -55,36 +56,55 @@ jobs:
           $errors = $null
           [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $script).Path, [ref]$tokens, [ref]$errors)
           if ($errors.Count -gt 0) { $errors | Format-List | Out-String | Write-Host; throw 'Stage101 PowerShell syntax invalid' }
+          python research/stage102-cuda-profile/windows/test_stage102_profiler.py
+          if ($LASTEXITCODE -ne 0) { throw 'Stage102 profile contract tests failed' }
+          python -m compileall -q research/stage102-cuda-profile/windows
+          if ($LASTEXITCODE -ne 0) { throw 'Stage102 Python parse failed' }
+          foreach ($script in @('Run-RVC-Stage102-Nsight.ps1','Run-RVC-Stage102-Matched-Conv2d.ps1')) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path "research/stage102-cuda-profile/windows/$script").Path,[ref]$tokens,[ref]$errors)
+            if ($errors.Count -gt 0) { $errors | Format-List | Out-String | Write-Host; throw "Invalid PowerShell: $script" }
+          }
       - name: Build unified CPU CUDA WGPU candidate
         shell: pwsh
         run: |
-          cargo build --release --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs
-          if ($LASTEXITCODE -ne 0) { throw 'Stage101 unified build failed' }
+          cargo build --release --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs --bin stage102_conv2d_probe
+          if ($LASTEXITCODE -ne 0) { throw 'Stage102 unified build failed' }
           & target/release/tts-with-rvc-rs.exe doctor
           if ($LASTEXITCODE -ne 0) { throw 'Stage101 doctor failed' }
+          & target/release/tts-with-rvc-rs.exe nvtx-status
+          if ($LASTEXITCODE -ne 0) { throw 'Stage102 NVTX status failed' }
+          & target/release/stage102_conv2d_probe.exe nvtx-status
+          if ($LASTEXITCODE -ne 0) { throw 'Stage102 probe NVTX status failed' }
           & target/release/tts-with-rvc-rs.exe --help
           if ($LASTEXITCODE -ne 0) { throw 'Stage101 help failed' }
       - name: Package full-WAV Winograd A/B runner
         shell: pwsh
         run: |
-          $folder = 'dist/stage101-winograd'
+          $folder = 'dist/stage102-nsight'
           New-Item -ItemType Directory -Force -Path $folder | Out-Null
-          Copy-Item target/release/tts-with-rvc-rs.exe (Join-Path $folder 'tts-with-rvc-rs-stage101.exe')
+          Copy-Item target/release/tts-with-rvc-rs.exe (Join-Path $folder 'tts-with-rvc-rs-stage102.exe')
+          Copy-Item target/release/stage102_conv2d_probe.exe (Join-Path $folder 'stage102-conv2d-probe.exe')
           Copy-Item research/stage101-winograd/windows/Run-RVC-Stage101-Winograd-CUDA.ps1 $folder
           Copy-Item research/stage101-winograd/windows/Analyze-Stage101-Winograd-CUDA.py $folder
+          Copy-Item research/stage102-cuda-profile/windows/*.ps1 $folder
+          Copy-Item research/stage102-cuda-profile/windows/*.py $folder
           @'
-          STAGE 101: Winograd F(2x2,3x3) experimental Windows CUDA package.
-          The CI runner compiles but has no RTX GPU and does NOT validate kernel runtime accuracy/performance.
-          Place your private voice, Hubert, RMVPE, index and >=60-second WAV under .\embed\.
-          Run Run-RVC-Stage101-Winograd-CUDA.ps1 from this directory, supplying -PythonExe if needed.
-          By default reference_direct uses the SAME Stage101 exe in direct mode for controlled A/B.
-          To compare an older Stage94 binary, supply -ReferenceExe path to that separate executable.
-          Use -IndexRate 0 to run without a retrieved index.
-          The script requires a locally working Python interpreter for duration checks and analysis.
+          STAGE 102: matched Conv2d GPU microbench + targeted NSYS/NCU profiling.
+          CI compiles and checks CLI only: Windows CI has no CUDA GPU.
+          Requires nsys, ncu, CUDA PyTorch, and nvToolsExt64_1.dll on PATH on your RTX machine.
+          First run Run-RVC-Stage102-Matched-Conv2d.ps1 -PythonExe <python>.
+          For full RVC profiles run Run-RVC-Stage102-Nsight.ps1 -PythonExe <python> -OriginalRoot <upstream-source-root>.
+          The full RVC profiler requires embed/ with voice, HuBERT, RMVPE, index, and WAV.
+          NSYS/NCU outputs can be large, but result archives exclude all WAVs and weights.
+          For strict comparison use FP32 NCHW in matched microbench; FP16 and NHWC are diagnostics.
+          Stage101 A/B runner remains available; pass -ReferenceExe and -CandidateExe pointing to tts-with-rvc-rs-stage102.exe.
+          Stage101 A/B archive also excludes WAVs.
           '@ | Set-Content (Join-Path $folder 'README.txt')
       - uses: actions/upload-artifact@v4
         with:
-          name: rvc-stage101-winograd-windows-x64
-          path: dist/stage101-winograd/
+          name: rvc-stage102-nsight-windows-x64
+          path: dist/stage102-nsight/
           retention-days: 14
           if-no-files-found: error

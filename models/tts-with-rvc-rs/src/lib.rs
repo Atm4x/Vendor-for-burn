@@ -1,5 +1,6 @@
 pub mod chunk_plan;
 pub mod diagnostic;
+pub mod nvtx;
 mod online_attention;
 mod f0_audit;
 mod conv1d_layout;
