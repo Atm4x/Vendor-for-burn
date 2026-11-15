@@ -8,7 +8,7 @@
 use crate::{
     kernel::{into_contiguous_aligned, utils::address_type},
     ops::{
-        max_vector_size_many, numeric::empty_device_dtype, permute_nchw_to_nhwc,
+        max_vector_size_many, numeric::empty_device_dtype, permute, permute_nchw_to_nhwc,
         permute_nhwc_to_nchw,
     },
     tensor::CubeTensor,
@@ -125,6 +125,7 @@ fn polyphase_single_kernel<E: Numeric, N: Size>(
     bias: ComptimeOption<&[Vector<E, N>]>,
     mut output: LinearViewMut<'_, Vector<E, N>>,
     args: PolyphaseSingleArgs,
+    #[comptime] weight_kic: bool,
     #[define(E)] _dtype: ElemType,
 ) {
     let line = weight.vector_size();
@@ -148,7 +149,7 @@ fn polyphase_single_kernel<E: Numeric, N: Size>(
     let cin_group = input.shape(2) / args.groups;
     let cin_begin = group * cin_group;
     let input_length = input.shape(1);
-    let kernel = weight.shape(1);
+    let kernel = if comptime!(weight_kic) { weight.shape(0) } else { weight.shape(1) };
     let base = time + args.padding;
     let filter_phase = base % args.stride;
     let source_time = base / args.stride;
@@ -160,7 +161,11 @@ fn polyphase_single_kernel<E: Numeric, N: Size>(
     let input_stride0 = input.stride(0);
     let input_stride1 = input.stride(1);
     let input_stride2 = input.stride(2);
-    let weight_channel_base = cin_begin * weight_stride0 + local_oc;
+    let weight_channel_base = if comptime!(weight_kic) {
+        cin_begin * weight_stride1 + local_oc
+    } else {
+        cin_begin * weight_stride0 + local_oc
+    };
     let input_channel_base = batch * input_stride0 + cin_begin * input_stride2;
 
     let enough_source = if taps > 0 {
@@ -172,9 +177,11 @@ fn polyphase_single_kernel<E: Numeric, N: Size>(
         for tap in 0..taps {
             let source_index = source_time - tap;
             let xbase = input_channel_base + source_index * input_stride1;
-            let wbase = weight_channel_base + (filter_phase + tap * args.stride) * weight_stride1;
+            let wbase = weight_channel_base + (filter_phase + tap * args.stride) *
+                if comptime!(weight_kic) { weight_stride0 } else { weight_stride1 };
+            let weight_ci_stride = if comptime!(weight_kic) { weight_stride1 } else { weight_stride0 };
             for ci in 0..cin_group {
-                let w = weight[(wbase + ci * weight_stride0) / line];
+                let w = weight[(wbase + ci * weight_ci_stride) / line];
                 let x = input[xbase + ci * input_stride2];
                 sum += Vector::broadcast(x) * w;
             }
@@ -183,10 +190,11 @@ fn polyphase_single_kernel<E: Numeric, N: Size>(
         for tap in 0..taps {
             if source_time >= tap && source_time - tap < input_length {
                 let xbase = input_channel_base + (source_time - tap) * input_stride1;
-                let wbase =
-                    weight_channel_base + (filter_phase + tap * args.stride) * weight_stride1;
+                let wbase = weight_channel_base + (filter_phase + tap * args.stride) *
+                    if comptime!(weight_kic) { weight_stride0 } else { weight_stride1 };
+                let weight_ci_stride = if comptime!(weight_kic) { weight_stride1 } else { weight_stride0 };
                 for ci in 0..cin_group {
-                    let w = weight[(wbase + ci * weight_stride0) / line];
+                    let w = weight[(wbase + ci * weight_ci_stride) / line];
                     let x = input[xbase + ci * input_stride2];
                     sum += Vector::broadcast(x) * w;
                 }
@@ -209,11 +217,54 @@ pub fn conv_transpose1d_polyphase_single_packed(
     padding_out: usize,
     groups: usize,
 ) -> Result<CubeTensor, ConvSetupError> {
+    conv_transpose1d_polyphase_single_packed_mode(
+        input, weight, bias, stride, padding, dilation, padding_out, groups, false, false,
+    )
+}
+
+/// Prepack static [Cin, Cout/groups, K] weights into [K, Cin, Cout/groups].
+/// The new order makes the inner input-channel reduction contiguous in memory.
+/// Weights are prepared once at model initialization, not on each inference.
+pub fn conv_transpose1d_prepack_weight_kic(weight: CubeTensor) -> CubeTensor {
+    into_contiguous_aligned(permute(weight, &[2, 0, 1]))
+}
+
+/// Single-output polyphase path with KIC packed weights and optional contiguous NTC input.
+/// Contiguous NTC is a measured opt-in: it incurs a real copy per invocation.
+pub fn conv_transpose1d_polyphase_single_packed_kic(
+    input: CubeTensor,
+    weight: CubeTensor,
+    bias: Option<CubeTensor>,
+    stride: usize,
+    padding: usize,
+    dilation: usize,
+    padding_out: usize,
+    groups: usize,
+    contiguous_ntc: bool,
+) -> Result<CubeTensor, ConvSetupError> {
+    conv_transpose1d_polyphase_single_packed_mode(
+        input, weight, bias, stride, padding, dilation, padding_out, groups, true, contiguous_ntc,
+    )
+}
+
+fn conv_transpose1d_polyphase_single_packed_mode(
+    input: CubeTensor,
+    weight: CubeTensor,
+    bias: Option<CubeTensor>,
+    stride: usize,
+    padding: usize,
+    dilation: usize,
+    padding_out: usize,
+    groups: usize,
+    weight_kic: bool,
+    contiguous_ntc: bool,
+) -> Result<CubeTensor, ConvSetupError> {
     if groups == 0 || stride == 0 || dilation != 1 {
         return Err(ConvSetupError::Unknown);
     }
     let [batch, cin, in_len] = input.meta.shape().dims();
-    let [weight_cin, kernel, cout_group] = weight.meta.shape().dims();
+    let [a, b, cout_group] = weight.meta.shape().dims();
+    let (weight_cin, kernel) = if weight_kic { (b, a) } else { (a, b) };
     if cin != weight_cin || cin % groups != 0 || cout_group == 0 || kernel == 0 {
         return Err(ConvSetupError::Unknown);
     }
@@ -230,6 +281,7 @@ pub fn conv_transpose1d_polyphase_single_packed(
     }
     let cout = cout_group * groups;
     let input = permute_nchw_to_nhwc(input);
+    let input = if contiguous_ntc { into_contiguous_aligned(input) } else { input };
     let out = empty_device_dtype(
         input.client.clone(),
         input.device.clone(),
@@ -257,6 +309,7 @@ pub fn conv_transpose1d_polyphase_single_packed(
         bias.map(|b| b.into_buffer_arg()).into(),
         out.clone().into_linear_view(),
         PolyphaseSingleArgsLaunch::new(out_len, stride, padding, groups, samples_per_phase),
+        weight_kic,
         dtype_to_storage_type(dtype),
     );
     Ok(permute_nhwc_to_nchw(out))

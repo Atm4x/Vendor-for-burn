@@ -1,4 +1,4 @@
-name: RVC Stage107 NSF scheduling and interior fastpath Windows profiling package
+name: RVC Stage108 NSF KIC transport Windows profiling package
 
 on:
   workflow_dispatch:
@@ -17,13 +17,14 @@ on:
       - 'research/stage105-register-budget/**'
       - 'research/stage106-nsf-polyphase/**'
       - 'research/stage107-nsf-scheduling/**'
+      - 'research/stage108-polyphase-transport/**'
       - '.github/workflows/rvc-stage101-winograd.yml'
 
 permissions:
   contents: read
 
 concurrency:
-  group: rvc-stage107-nsf-scheduling-${{ github.ref }}
+  group: rvc-stage108-nsf-transport-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -51,7 +52,7 @@ jobs:
           Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
           python tools/restore_vendor_checksums.py --zerocopy-archive $archive
           if ($LASTEXITCODE -ne 0) { throw 'Vendor checksum repair failed' }
-      - name: Validate Stage101-107 analyzers, references, and PowerShell runners
+      - name: Validate Stage101-108 analyzers, references, and PowerShell runners
         shell: pwsh
         run: |
           python research/stage101-winograd/windows/test_stage101_analyzer.py
@@ -71,6 +72,19 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Stage105 pair contract tests failed' }
           python research/stage106-nsf-polyphase/windows/test_stage106.py
           if ($LASTEXITCODE -ne 0) { throw 'Stage106 source contract failed' }
+          python research/stage108-polyphase-transport/windows/test_stage108.py
+          if ($LASTEXITCODE -ne 0) { throw 'Stage108 analyzer tests failed' }
+          $stage108Ref = Join-Path $env:RUNNER_TEMP 'stage108-reference.exe'
+          rustc --edition=2024 --test research/stage108-polyphase-transport/reference.rs -o $stage108Ref
+          if ($LASTEXITCODE -ne 0) { throw 'Stage108 reference compile failed' }
+          & $stage108Ref
+          if ($LASTEXITCODE -ne 0) { throw 'Stage108 reference failed' }
+          $stage108 = 'research/stage108-polyphase-transport/windows/Run-RVC-Stage108-Transport.ps1'
+          $stage108Tokens = $null
+          $stage108Errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $stage108).Path,[ref]$stage108Tokens,[ref]$stage108Errors)
+          if ($stage108Errors.Count -gt 0) { $stage108Errors | Format-List | Out-String | Write-Host; throw 'Stage108 PowerShell invalid' }
+          & $stage108 -DryRun -Profiler ncu
           python research/stage107-nsf-scheduling/windows/test_stage107.py
           if ($LASTEXITCODE -ne 0) { throw 'Stage107 analyzer contracts failed' }
           python -m compileall -q research/stage107-nsf-scheduling/windows
@@ -134,7 +148,7 @@ jobs:
             [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path "research/stage102-cuda-profile/windows/$script").Path,[ref]$tokens,[ref]$errors)
             if ($errors.Count -gt 0) { $errors | Format-List | Out-String | Write-Host; throw "Invalid PowerShell: $script" }
           }
-      - name: Build Stage107 unified CPU CUDA WGPU and probes
+      - name: Build Stage108 unified CPU CUDA WGPU and probes
         shell: pwsh
         run: |
           cargo build --release --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs --bin stage102_conv2d_probe --bin stage103_conv2d_probe --bin stage106_polyphase_probe --bin stage106_noise_probe
@@ -155,13 +169,17 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Stage106 polyphase CPU parity failed' }
           & target/release/stage106_polyphase_probe.exe cpu small single 3
           if ($LASTEXITCODE -ne 0) { throw 'Stage107 polyphase single CPU parity failed' }
+          & target/release/stage106_polyphase_probe.exe cpu small kic 3
+          if ($LASTEXITCODE -ne 0) { throw 'Stage108 KIC CPU parity failed' }
+          & target/release/stage106_polyphase_probe.exe cpu small kic_ntc 3
+          if ($LASTEXITCODE -ne 0) { throw 'Stage108 KIC NTC CPU parity failed' }
           & target/release/stage106_noise_probe.exe cpu small tiled 3
           if ($LASTEXITCODE -ne 0) { throw 'Stage106 noise CPU parity failed' }
           & target/release/stage106_noise_probe.exe cpu small interior 3
           if ($LASTEXITCODE -ne 0) { throw 'Stage107 noise interior CPU parity failed' }
           & target/release/tts-with-rvc-rs.exe --help
           if ($LASTEXITCODE -ne 0) { throw 'Stage101 help failed' }
-      - name: Package Stage107 multi-block NCU profiling suite
+      - name: Package Stage108 multi-block NCU profiling suite
         shell: pwsh
         run: |
           $folder = 'dist/stage104-ncu-matrix'
@@ -176,6 +194,9 @@ jobs:
           Copy-Item research/stage107-nsf-scheduling/windows/*.ps1 $folder
           Copy-Item research/stage107-nsf-scheduling/windows/compare_stage107.py $folder
           Copy-Item research/stage107-nsf-scheduling/README.md (Join-Path $folder 'STAGE107_README.md')
+          Copy-Item research/stage108-polyphase-transport/windows/Run-RVC-Stage108-Transport.ps1 $folder
+          Copy-Item research/stage108-polyphase-transport/windows/compare_stage108.py $folder
+          Copy-Item research/stage108-polyphase-transport/README.md (Join-Path $folder 'STAGE108_README.md')
           Copy-Item research/stage106-nsf-polyphase/README.md (Join-Path $folder 'STAGE106_README.md')
           Copy-Item research/stage104-ncu-matrix/windows/*.ps1 $folder
           Copy-Item research/stage104-ncu-matrix/windows/*.py $folder
@@ -207,7 +228,7 @@ jobs:
           '@ | Set-Content (Join-Path $folder 'README.txt')
       - uses: actions/upload-artifact@v4
         with:
-          name: rvc-stage107-nsf-scheduling-windows-x64
+          name: rvc-stage108-nsf-transport-windows-x64
           path: dist/stage104-ncu-matrix/
           retention-days: 14
           if-no-files-found: error

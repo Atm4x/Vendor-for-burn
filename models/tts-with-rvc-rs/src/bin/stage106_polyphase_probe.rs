@@ -3,7 +3,8 @@ use burn_cubecl::{
     Cube,
     kernel::conv::{
         conv_transpose1d_polyphase_packed, conv_transpose1d_polyphase_single_packed,
-        conv_transpose1d_prepack_weight,
+        conv_transpose1d_prepack_weight, conv_transpose1d_prepack_weight_kic,
+        conv_transpose1d_polyphase_single_packed_kic,
     },
 };
 use serde_json::json;
@@ -99,10 +100,10 @@ fn main() -> Result<(), String> {
         .parse()
         .map_err(|_| "repetitions must be integer")?;
     if !(2..=40).contains(&repetitions)
-        || !matches!(mode.as_str(), "direct" | "polyphase" | "single")
+        || !matches!(mode.as_str(), "direct" | "polyphase" | "single" | "kic" | "kic_ntc")
     {
         return Err(
-            "usage: stage106_polyphase_probe [cuda|cpu] [case] [direct|polyphase|single] [repetitions=8]"
+            "usage: stage106_polyphase_probe [cuda|cpu] [case] [direct|polyphase|single|kic|kic_ntc] [repetitions=8]"
                 .into(),
         );
     }
@@ -158,6 +159,9 @@ fn main() -> Result<(), String> {
             .expect("CubeCL weight"),
     );
     let packed_weight = Tensor::<3>::from_primitive::<Cube>(packed_weight);
+    let packed_kic = Tensor::<3>::from_primitive::<Cube>(conv_transpose1d_prepack_weight_kic(
+        w.clone().try_into_primitive::<Cube>().expect("CubeCL weight"),
+    ));
     device.sync().map_err(|e| e.to_string())?;
 
     let execute = || -> Tensor<3> {
@@ -168,12 +172,17 @@ fn main() -> Result<(), String> {
                 .clone()
                 .try_into_primitive::<Cube>()
                 .expect("CubeCL input");
-            let pw = packed_weight
-                .clone()
-                .try_into_primitive::<Cube>()
-                .expect("CubeCL packed weight");
+            let pw = if matches!(mode.as_str(), "kic" | "kic_ntc") {
+                packed_kic.clone().try_into_primitive::<Cube>()
+            } else {
+                packed_weight.clone().try_into_primitive::<Cube>()
+            }.expect("CubeCL packed weight");
             let bias = b.clone().try_into_primitive::<Cube>().expect("CubeCL bias");
-            let forward = if mode == "single" {
+            let forward = if matches!(mode.as_str(), "kic" | "kic_ntc") {
+                conv_transpose1d_polyphase_single_packed_kic(
+                    x, pw, Some(bias), c.stride, c.pad, 1, 0, 1, mode == "kic_ntc",
+                )
+            } else if mode == "single" {
                 conv_transpose1d_polyphase_single_packed(
                     x,
                     pw,

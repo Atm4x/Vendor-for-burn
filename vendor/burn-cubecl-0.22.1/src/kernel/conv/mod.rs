@@ -24,6 +24,6 @@ pub(crate) use im2col::*;
 pub use base::*;
 pub use winograd::{prepack_winograd_weights, transform_winograd_input, inverse_winograd_output};
 pub use noise1d::{conv1d_single_input_packed, conv1d_single_input_packed_interior, conv1d_single_input_prepack_weight};
-pub use conv_transpose2d::{ConvTranspose2dStrategy, conv_transpose2d, conv_transpose1d_polyphase, conv_transpose1d_polyphase_packed, conv_transpose1d_polyphase_single_packed, conv_transpose1d_prepack_weight};
+pub use conv_transpose2d::{ConvTranspose2dStrategy, conv_transpose2d, conv_transpose1d_polyphase, conv_transpose1d_polyphase_packed, conv_transpose1d_polyphase_single_packed, conv_transpose1d_prepack_weight, conv_transpose1d_prepack_weight_kic, conv_transpose1d_polyphase_single_packed_kic};
 
 pub(crate) use tune_key::*;

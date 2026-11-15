@@ -113,6 +113,7 @@ impl Conv1d {
 struct TransposedConv1d {
     weight: Tensor<3>,
     packed_weight: Option<Tensor<3>>,
+    kic_mode: Option<bool>,
     bias: Tensor<1>,
     stride: usize,
     padding: usize,
@@ -127,17 +128,35 @@ impl TransposedConv1d {
         if kernel < stride || (kernel - stride) % 2 != 0 || bias.dims()[0] != output_channels {
             return Err(format!("{prefix}: unsupported ConvTranspose1d geometry"));
         }
-        let packed_weight = if std::env::var("RVC_NSF_POLYPHASE").as_deref() == Ok("1") {
-            Some(crate::cubecl_conv::prepack_transpose1d_weight(weight.clone()))
+        let polyphase_enabled = std::env::var("RVC_NSF_POLYPHASE").as_deref() == Ok("1");
+        let kic_mode = if polyphase_enabled {
+            match std::env::var("RVC_NSF_POLYPHASE_KIC").as_deref() {
+                Ok("1") => Some(false),
+                Ok("ntc") => Some(true),
+                _ => None,
+            }
         } else {
             None
         };
-        Ok(Self {weight, packed_weight, bias, stride, padding: (kernel - stride) / 2})
+        let packed_weight = if polyphase_enabled {
+            Some(if kic_mode.is_some() {
+                crate::cubecl_conv::prepack_transpose1d_weight_kic(weight.clone())
+            } else {
+                crate::cubecl_conv::prepack_transpose1d_weight(weight.clone())
+            })
+        } else { None };
+        Ok(Self {weight, packed_weight, kic_mode, bias, stride, padding: (kernel - stride) / 2})
     }
 
     fn forward(&self, input: Tensor<3>) -> Tensor<3> {
         if std::env::var("RVC_NSF_POLYPHASE").as_deref() == Ok("1") {
             if let Some(packed) = self.packed_weight.as_ref() {
+                if let Some(contiguous_ntc) = self.kic_mode {
+                    return crate::cubecl_conv::conv_transpose1d_phase_packed_kic(
+                        input, packed.clone(), self.bias.clone(), self.stride, self.padding,
+                        contiguous_ntc,
+                    );
+                }
                 return crate::cubecl_conv::conv_transpose1d_phase_packed(
                     input, packed.clone(), self.bias.clone(), self.stride, self.padding,
                 );

@@ -4,7 +4,7 @@ use burn::tensor::{
 };
 use burn_cubecl::{
     Cube,
-    kernel::conv::{ConvStrategy, ConvTranspose2dStrategy, conv1d_single_input_packed, conv1d_single_input_prepack_weight, conv_transpose1d_polyphase, conv_transpose1d_polyphase_packed, conv_transpose1d_prepack_weight, conv_forward, conv_forward_spatial_quad, conv_forward_spatial_reuse, conv_forward_spatial_pair, conv_transpose2d, prepack_winograd_weights, transform_winograd_input, inverse_winograd_output},
+    kernel::conv::{ConvStrategy, ConvTranspose2dStrategy, conv1d_single_input_packed, conv1d_single_input_prepack_weight, conv_transpose1d_polyphase, conv_transpose1d_polyphase_packed, conv_transpose1d_prepack_weight, conv_transpose1d_prepack_weight_kic, conv_transpose1d_polyphase_single_packed_kic, conv_forward, conv_forward_spatial_quad, conv_forward_spatial_reuse, conv_forward_spatial_pair, conv_transpose2d, prepack_winograd_weights, transform_winograd_input, inverse_winograd_output},
 };
 
 pub(crate) fn prepack_single_input_conv1d_weight(weight: Tensor<3>) -> Tensor<3> {
@@ -50,6 +50,25 @@ pub(crate) fn conv1d(
 pub(crate) fn prepack_transpose1d_weight(weight: Tensor<3>) -> Tensor<3> {
     let weight = weight.try_into_primitive::<Cube>().expect("polyphase prepack requires CubeCL");
     Tensor::from_primitive::<Cube>(conv_transpose1d_prepack_weight(weight))
+}
+
+pub(crate) fn prepack_transpose1d_weight_kic(weight: Tensor<3>) -> Tensor<3> {
+    let weight = weight.try_into_primitive::<Cube>().expect("KIC prepack requires CubeCL");
+    Tensor::from_primitive::<Cube>(conv_transpose1d_prepack_weight_kic(weight))
+}
+
+pub(crate) fn conv_transpose1d_phase_packed_kic(
+    input: Tensor<3>, packed_weight: Tensor<3>, bias: Tensor<1>,
+    stride: usize, padding: usize, contiguous_ntc: bool,
+) -> Tensor<3> {
+    let input = input.try_into_primitive::<Cube>().expect("KIC input requires CubeCL");
+    let weight = packed_weight.try_into_primitive::<Cube>().expect("KIC packed weight requires CubeCL");
+    let bias = bias.try_into_primitive::<Cube>().expect("KIC bias requires CubeCL");
+    Tensor::from_primitive::<Cube>(
+        conv_transpose1d_polyphase_single_packed_kic(
+            input, weight, Some(bias), stride, padding, 1, 0, 1, contiguous_ntc,
+        ).expect("KIC polyphase convolution unsupported on this shape")
+    )
 }
 
 pub(crate) fn conv_transpose1d_phase_packed(
