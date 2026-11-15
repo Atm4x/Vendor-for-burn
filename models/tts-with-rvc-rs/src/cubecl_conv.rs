@@ -4,7 +4,7 @@ use burn::tensor::{
 };
 use burn_cubecl::{
     Cube,
-    kernel::conv::{ConvStrategy, ConvTranspose2dStrategy, conv_forward, conv_transpose2d},
+    kernel::conv::{ConvStrategy, ConvTranspose2dStrategy, conv_forward, conv_forward_spatial_quad, conv_transpose2d, prepack_winograd_weights, transform_winograd_input, inverse_winograd_output},
 };
 
 pub(crate) fn conv1d(
@@ -62,6 +62,23 @@ pub(crate) fn conv_transpose1d(
     Tensor::<4>::from_primitive::<Cube>(output).reshape([batch, output_channels, output_time])
 }
 
+
+pub(crate) fn conv2d_spatial_quad(
+    input: Tensor<4>,
+    weight: Tensor<4>,
+    bias: Option<Tensor<1>>,
+    options: ConvOptions<2>,
+) -> Tensor<4> {
+    let input = input.try_into_primitive::<Cube>()
+        .expect("CubeCL spatial quad requires a CubeCL input");
+    let weight = weight.try_into_primitive::<Cube>()
+        .expect("CubeCL spatial quad requires a CubeCL weight");
+    let bias = bias.map(|tensor| tensor.try_into_primitive::<Cube>()
+        .expect("CubeCL spatial quad requires a CubeCL bias"));
+    let result = conv_forward_spatial_quad(input, weight, bias, options)
+        .expect("CubeCL spatial quad kernel is unsupported on this shape");
+    Tensor::from_primitive::<Cube>(result)
+}
 
 pub(crate) fn conv2d(
     input: Tensor<4>,
@@ -140,4 +157,68 @@ pub(crate) fn conv2d_compensated_tf32_batched(
         None => high,
     };
     high + low
+}
+
+
+pub(crate) fn prepack_winograd(weight: Tensor<4>) -> Tensor<3> {
+    let primitive = weight.try_into_primitive::<Cube>()
+        .expect("Winograd requires direct CubeCL weights");
+    Tensor::from_primitive::<Cube>(prepack_winograd_weights(primitive, 1))
+}
+
+pub(crate) fn conv2d_winograd(
+    input: Tensor<4>,
+    packed_weights: Tensor<3>,
+    bias: Option<Tensor<1>>,
+    out_channels: usize,
+) -> Tensor<4> {
+    let [batch, _, h, w] = input.dims();
+    let input = input.try_into_primitive::<Cube>()
+        .expect("Winograd requires direct CubeCL input");
+    let transformed = Tensor::<3>::from_primitive::<Cube>(transform_winograd_input(input, 1));
+    let multiplied = transformed.matmul(packed_weights);
+    let primitive = multiplied.try_into_primitive::<Cube>()
+        .expect("Winograd product requires a direct CubeCL tensor");
+    let bias = bias.map(|tensor| tensor.try_into_primitive::<Cube>()
+        .expect("Winograd bias requires a direct CubeCL tensor"));
+    Tensor::from_primitive::<Cube>(inverse_winograd_output(primitive, bias, [batch, out_channels, h, w], 1))
+}
+
+#[cfg(all(test, feature = "cpu"))]
+mod winograd_tests {
+    use super::*;
+    use burn::tensor::{Device, TensorData, module};
+
+    #[test]
+    fn winograd_f2x2_3x3_matches_direct_on_odd_and_even_shapes() {
+        for (n, cin, cout, h, w) in [
+            (1, 1, 1, 1, 1),
+            (1, 3, 7, 2, 3),
+            (2, 4, 5, 7, 9),
+            (1, 8, 8, 8, 6),
+            (1, 16, 32, 13, 15),
+        ] {
+            let device = Device::default();
+            let x: Vec<f32> = (0..n * cin * h * w)
+                .map(|i| (i as f32 * 0.379).sin() * 0.21)
+                .collect();
+            let weight: Vec<f32> = (0..cout * cin * 9)
+                .map(|i| (i as f32 * 0.317).cos() * 0.11)
+                .collect();
+            let bias: Vec<f32> = (0..cout).map(|i| i as f32 * 0.007).collect();
+            let input = Tensor::<4>::from_data(TensorData::new(x, [n, cin, h, w]), &device);
+            let weight = Tensor::<4>::from_data(TensorData::new(weight, [cout, cin, 3, 3]), &device);
+            let bias = Tensor::<1>::from_data(TensorData::new(bias, [cout]), &device);
+            let options = ConvOptions::new([1, 1], [1, 1], [1, 1], 1);
+            let expected = module::conv2d(input.clone(), weight.clone(), Some(bias.clone()), options);
+            let packed = prepack_winograd(weight);
+            let output = conv2d_winograd(input, packed, Some(bias), cout);
+            let actual: Vec<f32> = output.into_data().to_vec().unwrap();
+            let reference: Vec<f32> = expected.into_data().to_vec().unwrap();
+            let max_abs = actual.iter().zip(&reference)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(max_abs < 0.0005, "shape {n} {cin} {cout} {h} {w}: max_abs={max_abs}");
+        }
+    }
 }

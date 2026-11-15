@@ -10,6 +10,7 @@ mod forward;
 mod im2col;
 
 mod tune_key;
+mod winograd;
 
 pub(crate) use backward_data::*;
 pub(crate) use conv_transpose2d::*;
@@ -20,6 +21,7 @@ pub(crate) use direct::*;
 pub(crate) use im2col::*;
 
 pub use base::*;
+pub use winograd::{prepack_winograd_weights, transform_winograd_input, inverse_winograd_output};
 pub use conv_transpose2d::{ConvTranspose2dStrategy, conv_transpose2d};
 
 pub(crate) use tune_key::*;

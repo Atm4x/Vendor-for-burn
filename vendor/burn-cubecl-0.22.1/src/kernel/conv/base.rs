@@ -14,7 +14,7 @@ use crate::{
     tensor::CubeTensor,
 };
 
-use super::conv_direct;
+use super::{conv_direct, direct::conv_spatial_quad};
 #[cfg(feature = "autotune")]
 use super::forward::conv_autotune;
 
@@ -40,6 +40,19 @@ impl Default for ConvStrategy {
         #[cfg(not(feature = "autotune"))]
         ConvStrategy::Direct
     }
+}
+
+/// Run the experimental 2x2 spatial direct convolution, preserving NCHW API layout.
+pub fn conv_forward_spatial_quad(
+    input: CubeTensor,
+    weight: CubeTensor,
+    bias: Option<CubeTensor>,
+    options: ConvOptions<2>,
+) -> Result<CubeTensor, ConvSetupError> {
+    let input = permute_nchw_to_nhwc(input);
+    let weight = permute_nchw_to_nhwc(weight);
+    let output = conv_spatial_quad(input, weight, bias, options)?;
+    Ok(permute_nhwc_to_nchw(output))
 }
 
 /// Performs an N-dimensional convolution with the given strategy
