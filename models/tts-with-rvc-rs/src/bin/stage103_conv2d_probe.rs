@@ -1,5 +1,5 @@
 use burn::tensor::{module, ops::ConvOptions, Device, Tensor, TensorData};
-use burn_cubecl::{Cube, kernel::conv::conv_forward_spatial_reuse, conv_forward_spatial_pair};
+use burn_cubecl::{Cube, kernel::conv::{conv_forward_spatial_reuse, conv_forward_spatial_pair}};
 use serde_json::json;
 use std::time::Instant;
 
