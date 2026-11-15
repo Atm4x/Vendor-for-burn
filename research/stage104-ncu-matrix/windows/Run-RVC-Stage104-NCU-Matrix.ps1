@@ -35,7 +35,7 @@ $ErrorActionPreference = 'Stop'
 $base = $PSScriptRoot
 $runId = (Get-Date).ToUniversalTime().ToString('yyyyMMdd_HHmmss_ffff')
 $reports = Join-Path $base "stage104_runs\$runId\reports"
-$scratch = Join-Path $base "stage104_runs\$runId\scratch
+$scratch = Join-Path $base "stage104_runs\$runId\scratch"
 New-Item -ItemType Directory -Force -Path $reports,$scratch | Out-Null
 $planScript = Join-Path $base 'stage104_matrix.py'
 $trimScript = Join-Path $base 'trim_stage104_wav.py'
@@ -256,8 +256,9 @@ try {
         } else {
             throw "NCU did not produce a valid report for $id; inspect $log"
         }
+        $reportName = if ($profiled) { "$id.ncu-rep" } else { $null }
         $statuses.Add([pscustomobject]@{id=$id;state=$state;nvtx=$nvtxInclude;
-            family=$target.family;kernel_filter=$target.kernel_filter;report=if ($profiled) { "$id.ncu-rep" } else { $null }})
+            family=$target.family;kernel_filter=$target.kernel_filter;report=$reportName})
         Write-Host "NCU $id : $state"
         if ($target.kind -eq 'pipeline_rust') {
             $benchmark = "$wavOutput.benchmark.json"
