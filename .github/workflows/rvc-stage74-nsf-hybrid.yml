@@ -1,20 +1,7 @@
 name: RVC Stage74 isolated NSF Conv1d and ConvTranspose1d CUDA A-B
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - experiment/conv-kernel-rnd-stage33-20261110
-    paths:
-      - 'models/tts-with-rvc-rs/src/decoder.rs'
-      - 'models/tts-with-rvc-rs/src/cubecl_conv.rs'
-      - 'models/tts-with-rvc-rs/src/hubert.rs'
-      - 'models/tts-with-rvc-rs/src/rmvpe_unet.rs'
-      - 'models/tts-with-rvc-rs/src/rmvpe_gru.rs'
-      - 'models/tts-with-rvc-rs/src/rmvpe_persistent.rs'
-      - 'models/tts-with-rvc-rs/src/lib.rs'
-      - 'models/tts-with-rvc-rs/src/main.rs'
-      - 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage74.ps1'
-      - '.github/workflows/rvc-stage74-nsf-hybrid.yml'
+
 permissions:
   contents: read
 jobs:

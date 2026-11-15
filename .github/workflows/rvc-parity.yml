@@ -10,6 +10,7 @@ on:
       - 'tools/restore_vendor_checksums.py'
       - '.github/workflows/rvc-parity.yml'
   pull_request:
+    branches: [main]
     paths:
       - 'models/tts-with-rvc-rs/**'
       - 'Cargo.toml'

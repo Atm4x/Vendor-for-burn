@@ -1,18 +1,7 @@
 name: RVC Stage94 batch-aware execution Windows gate
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - experiment/conv-kernel-rnd-stage33-20261110
-    paths:
-      - 'models/tts-with-rvc-rs/src/chunk_plan.rs'
-      - 'models/tts-with-rvc-rs/src/chunked.rs'
-      - 'models/tts-with-rvc-rs/src/main.rs'
-      - 'models/tts-with-rvc-rs/src/rvc_inference.rs'
-      - 'research/stage94-batch-dag/**'
-      - 'research/STAGE94_BATCH_AWARE_GLOBAL_EXECUTION_RND_2026-11-14.md'
-      - 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage94.ps1'
-      - '.github/workflows/rvc-stage94-global-batch-dag.yml'
+
 permissions:
   contents: read
 jobs:

@@ -1,16 +1,7 @@
 name: RVC Stage93 global compute-cost chunk planning Windows gate
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - experiment/conv-kernel-rnd-stage33-20261110
-    paths:
-      - 'models/tts-with-rvc-rs/src/chunk_plan.rs'
-      - 'models/tts-with-rvc-rs/src/chunked.rs'
-      - 'research/stage93-cost-aware/**'
-      - 'research/STAGE93_COST_AWARE_GLOBAL_CHUNK_RND_2026-11-14.md'
-      - 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage93.ps1'
-      - '.github/workflows/rvc-stage93-global-compute-plan.yml'
+
 permissions:
   contents: read
 jobs:

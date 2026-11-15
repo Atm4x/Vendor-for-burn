@@ -1,20 +1,7 @@
 name: RVC Stage92 global NSF counter-Gaussian noise Windows gate
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - experiment/conv-kernel-rnd-stage33-20261110
-    paths:
-      - 'models/tts-with-rvc-rs/src/nsf_noise_field.rs'
-      - 'models/tts-with-rvc-rs/src/nsf_source.rs'
-      - 'models/tts-with-rvc-rs/src/decoder.rs'
-      - 'models/tts-with-rvc-rs/src/chunked.rs'
-      - 'models/tts-with-rvc-rs/src/rvc_inference.rs'
-      - 'models/tts-with-rvc-rs/src/main.rs'
-      - 'models/tts-with-rvc-rs/src/lib.rs'
-      - 'research/stage92-nsf-noise/**'
-      - 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage92.ps1'
-      - '.github/workflows/rvc-stage92-nsf-global-noise.yml'
+
 permissions:
   contents: read
 jobs:

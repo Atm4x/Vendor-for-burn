@@ -1,5 +1,5 @@
 param(
-    [string]$ReferenceExe = '.\tts-with-rvc-rs-stage94.exe',
+    [string]$ReferenceExe = '.\tts-with-rvc-rs-stage101.exe',
     [string]$CandidateExe = '.\tts-with-rvc-rs-stage101.exe',
     [string]$Voice = '.\embed\CrazyMita.pth',
     [string]$Hubert = '.\embed\hubert_base.pt',
@@ -16,7 +16,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = Join-Path $PSScriptRoot 'stage101_long_cuda'
 New-Item -ItemType Directory -Force -Path $root | Out-Null
-$analyzer = Join-Path $PSScriptRoot 'Analyze-Stage101-Long-CUDA.py'
+$analyzer = Join-Path $PSScriptRoot 'Analyze-Stage101-Winograd-CUDA.py'
 $required = @($ReferenceExe, $CandidateExe, $Voice, $Hubert, $Rmvpe, $InputWav, $PythonExe, $analyzer)
 if ($IndexRate -gt 0) { $required += $Index }
 foreach ($file in $required) {
@@ -115,7 +115,7 @@ try {
     }
     & $PythonExe $analyzer --input $root --output (Join-Path $root 'analysis')
     if ($LASTEXITCODE -ne 0) { throw 'Stage101 analyzer failed' }
-    $zip = Join-Path $PSScriptRoot 'RVC_STAGE100_LONG_CUDA_RESULTS.zip'
+    $zip = Join-Path $PSScriptRoot 'RVC_STAGE101_WINOGRAD_CUDA_RESULTS.zip'
     if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
     Compress-Archive -Path (Join-Path $root '*') -DestinationPath $zip -CompressionLevel Optimal
     Write-Host "Stage101 results: $zip"

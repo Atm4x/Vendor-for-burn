@@ -1,18 +1,7 @@
 name: RVC Stage68 full-WAV CUDA diagnostic profiling gate
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - experiment/conv-kernel-rnd-stage33-20261110
-    paths:
-      - 'models/tts-with-rvc-rs/src/decoder.rs'
-      - 'models/tts-with-rvc-rs/src/nsf_gemm.rs'
-      - 'models/tts-with-rvc-rs/src/rmvpe_gru.rs'
-      - 'models/tts-with-rvc-rs/src/rmvpe_persistent.rs'
-      - 'models/tts-with-rvc-rs/src/lib.rs'
-      - 'models/tts-with-rvc-rs/src/main.rs'
-      - 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Profile-Stage68.ps1'
-      - '.github/workflows/rvc-stage68-full-profiling.yml'
+
 permissions:
   contents: read
 jobs:

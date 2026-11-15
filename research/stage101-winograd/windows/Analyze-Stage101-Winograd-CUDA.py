@@ -130,8 +130,8 @@ def analyze(root: Path) -> dict:
         "baseline_warm_median_ms":baseline_ms,
         "modes":modes, "runs":measurements,
         "provisional_1_2x_goal_met": (
-            torch_ms is not None and modes["fused_spatial"]["median_ms"] <= 1.2 * torch_ms
-        ) if "fused_spatial" in modes else False,
+            torch_ms is not None and modes["fused_winograd"]["median_ms"] <= 1.2 * torch_ms
+        ) if "fused_winograd" in modes else False,
         "warning": "Historical PyTorch FP16 baseline is not a paired comparison; only matched PyTorch and Rust runs can confirm the 1.2x goal. GPU measurements only.",
     }
 

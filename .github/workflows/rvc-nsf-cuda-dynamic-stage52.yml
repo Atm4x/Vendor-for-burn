@@ -2,14 +2,6 @@ name: RVC NSF Stage52 dynamic CUDA Graph proof package
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - experiment/conv-kernel-rnd-stage33-20261110
-    paths:
-      - '.github/workflows/rvc-nsf-cuda-dynamic-stage52.yml'
-      - 'models/tts-with-rvc-rs/Cargo.toml'
-      - 'models/tts-with-rvc-rs/src/bin/profile_nsf_graph_stage52.rs'
-      - 'research/stage37-windows-gpu-bench/windows/Run-NSF-Dynamic-Graph.ps1'
 
 permissions:
   contents: read

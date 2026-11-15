@@ -1,16 +1,7 @@
 name: RVC Stage87 experimental NSF mixed-FP16 Conv1d Windows gate
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - experiment/conv-kernel-rnd-stage33-20261110
-    paths:
-      - 'models/tts-with-rvc-rs/src/decoder.rs'
-      - 'models/tts-with-rvc-rs/src/nsf_precision.rs'
-      - 'models/tts-with-rvc-rs/src/lib.rs'
-      - 'models/tts-with-rvc-rs/src/main.rs'
-      - 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage87.ps1'
-      - '.github/workflows/rvc-stage87-nsf-fp16-implicit-gemm.yml'
+
 permissions:
   contents: read
 jobs:

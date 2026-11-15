@@ -2,14 +2,6 @@ name: RVC NSF Stage50 integrated CUDA A/B
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - experiment/conv-kernel-rnd-stage33-20261110
-    paths:
-      - '.github/workflows/rvc-nsf-integration-stage50.yml'
-      - 'research/stage37-windows-gpu-bench/windows/Run-NSF-Integrated.ps1'
-      - 'models/tts-with-rvc-rs/src/decoder.rs'
-      - 'vendor/burn-cubecl-0.22.1/src/kernel/conv/direct.rs'
 
 permissions:
   contents: read

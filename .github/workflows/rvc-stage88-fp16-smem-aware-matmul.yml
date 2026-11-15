@@ -1,14 +1,7 @@
 name: RVC Stage88 FP16 shared-memory-aware MMA Windows gate
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - experiment/conv-kernel-rnd-stage33-20261110
-    paths:
-      - 'vendor/cubek-matmul-0.3.1/src/multi_level/routines/selector/plane.rs'
-      - 'vendor/cubek-matmul-0.3.1/.cargo-checksum.json'
-      - 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage88.ps1'
-      - '.github/workflows/rvc-stage88-fp16-smem-aware-matmul.yml'
+
 permissions:
   contents: read
 jobs:

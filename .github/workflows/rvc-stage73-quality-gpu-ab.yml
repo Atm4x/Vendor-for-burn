@@ -1,22 +1,7 @@
 name: RVC Stage73 RMVPE F0 parity and NSF Quad full-WAV gate
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - experiment/conv-kernel-rnd-stage33-20261110
-    paths:
-      - 'models/tts-with-rvc-rs/src/decoder.rs'
-      - 'models/tts-with-rvc-rs/src/cubecl_conv.rs'
-      - 'models/tts-with-rvc-rs/src/hubert.rs'
-      - 'models/tts-with-rvc-rs/src/rmvpe_unet.rs'
-      - 'models/tts-with-rvc-rs/src/bin/profile_rmvpe_f0_stage73.rs'
-      - 'research/stage37-windows-gpu-bench/windows/Run-RVC-RMVPE-F0-Stage73.ps1'
-      - 'models/tts-with-rvc-rs/src/rmvpe_gru.rs'
-      - 'models/tts-with-rvc-rs/src/rmvpe_persistent.rs'
-      - 'models/tts-with-rvc-rs/src/lib.rs'
-      - 'models/tts-with-rvc-rs/src/main.rs'
-      - 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage73.ps1'
-      - '.github/workflows/rvc-stage73-quality-gpu-ab.yml'
+
 permissions:
   contents: read
 jobs:

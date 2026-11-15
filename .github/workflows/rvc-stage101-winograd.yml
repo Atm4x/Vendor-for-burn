@@ -1,0 +1,90 @@
+name: RVC Stage101 Winograd Windows CUDA executable
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - experiment/conv-kernel-rnd-stage33-20261110
+    paths:
+      - 'models/tts-with-rvc-rs/src/**'
+      - 'models/tts-with-rvc-rs/Cargo.toml'
+      - 'vendor/burn-cubecl-0.22.1/src/kernel/conv/**'
+      - 'vendor/cubek-convolution-0.3.1/src/kernels/forward/**'
+      - 'research/stage101-winograd/**'
+      - '.github/workflows/rvc-stage101-winograd.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rvc-stage101-winograd-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  stage101-windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cache/tracel
+          key: stage101-winograd-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            stage94-batch-aware-
+            stage62-unified-
+      - name: Restore vendored crates
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Vendor checksum repair failed' }
+      - name: Validate Stage101 analyzer and PowerShell runner
+        shell: pwsh
+        run: |
+          python research/stage101-winograd/windows/test_stage101_analyzer.py
+          if ($LASTEXITCODE -ne 0) { throw 'Analyzer tests failed' }
+          $script = 'research/stage101-winograd/windows/Run-RVC-Stage101-Winograd-CUDA.ps1'
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $script).Path, [ref]$tokens, [ref]$errors)
+          if ($errors.Count -gt 0) { $errors | Format-List | Out-String | Write-Host; throw 'Stage101 PowerShell syntax invalid' }
+      - name: Build unified CPU CUDA WGPU candidate
+        shell: pwsh
+        run: |
+          cargo build --release --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs
+          if ($LASTEXITCODE -ne 0) { throw 'Stage101 unified build failed' }
+          & target/release/tts-with-rvc-rs.exe doctor
+          if ($LASTEXITCODE -ne 0) { throw 'Stage101 doctor failed' }
+          & target/release/tts-with-rvc-rs.exe --help
+          if ($LASTEXITCODE -ne 0) { throw 'Stage101 help failed' }
+      - name: Package full-WAV Winograd A/B runner
+        shell: pwsh
+        run: |
+          $folder = 'dist/stage101-winograd'
+          New-Item -ItemType Directory -Force -Path $folder | Out-Null
+          Copy-Item target/release/tts-with-rvc-rs.exe (Join-Path $folder 'tts-with-rvc-rs-stage101.exe')
+          Copy-Item research/stage101-winograd/windows/Run-RVC-Stage101-Winograd-CUDA.ps1 $folder
+          Copy-Item research/stage101-winograd/windows/Analyze-Stage101-Winograd-CUDA.py $folder
+          @'
+          STAGE 101: Winograd F(2x2,3x3) experimental Windows CUDA package.
+          The CI runner compiles but has no RTX GPU and does NOT validate kernel runtime accuracy/performance.
+          Place your private voice, Hubert, RMVPE, index and >=60-second WAV under .\embed\.
+          Run Run-RVC-Stage101-Winograd-CUDA.ps1 from this directory, supplying -PythonExe if needed.
+          By default reference_direct uses the SAME Stage101 exe in direct mode for controlled A/B.
+          To compare an older Stage94 binary, supply -ReferenceExe path to that separate executable.
+          Use -IndexRate 0 to run without a retrieved index.
+          The script requires a locally working Python interpreter for duration checks and analysis.
+          '@ | Set-Content (Join-Path $folder 'README.txt')
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rvc-stage101-winograd-windows-x64
+          path: dist/stage101-winograd/
+          retention-days: 14
+          if-no-files-found: error

@@ -1,15 +1,9 @@
 name: RVC CubeCL Windows GPU benchmark package
 
 on:
-  push:
-    branches:
-      - experiment/conv-kernel-rnd-stage33-20261110
-    paths:
-      - 'research/stage37-windows-gpu-bench/**'
-      - 'vendor/cubek-convolution-0.3.1/**'
-      - '.github/workflows/rvc-windows-gpu-bench.yml'
   workflow_dispatch:
   pull_request:
+    branches: [main]
     paths:
       - 'research/stage37-windows-gpu-bench/**'
       - 'vendor/cubek-convolution-0.3.1/**'

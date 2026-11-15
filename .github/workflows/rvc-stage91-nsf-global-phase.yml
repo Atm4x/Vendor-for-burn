@@ -1,20 +1,7 @@
 name: RVC Stage91 global NSF fundamental phase continuity Windows gate
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - experiment/conv-kernel-rnd-stage33-20261110
-    paths:
-      - 'models/tts-with-rvc-rs/src/nsf_phase.rs'
-      - 'models/tts-with-rvc-rs/src/nsf_source.rs'
-      - 'models/tts-with-rvc-rs/src/decoder.rs'
-      - 'models/tts-with-rvc-rs/src/chunked.rs'
-      - 'models/tts-with-rvc-rs/src/rvc_inference.rs'
-      - 'models/tts-with-rvc-rs/src/main.rs'
-      - 'models/tts-with-rvc-rs/src/lib.rs'
-      - 'research/stage91-nsf-phase/**'
-      - 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage91.ps1'
-      - '.github/workflows/rvc-stage91-nsf-global-phase.yml'
+
 permissions:
   contents: read
 jobs:
