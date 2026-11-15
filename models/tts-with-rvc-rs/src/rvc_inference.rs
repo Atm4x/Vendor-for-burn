@@ -335,10 +335,12 @@ impl RvcV2Inferencer {
         let mut phase = std::time::Instant::now();
         let started = std::time::Instant::now();
         let samples: Vec<f32> = audios.iter().flat_map(|pcm| pcm.iter().copied()).collect();
+        let _audio_h2d_nvtx = crate::nvtx::Range::new("stage104_rust_audio_h2d");
         let waveform = Tensor::from_data(
             TensorData::new(samples, [batch, 1, audio_len]),
             &self.device,
         );
+        drop(_audio_h2d_nvtx);
         crate::diagnostic::measure(&self.device, "rvc.audio_h2d", started,
             serde_json::json!({"bytes_h2d_estimate":batch * audio_len * 4}));
         let started = std::time::Instant::now();
@@ -360,6 +362,7 @@ impl RvcV2Inferencer {
         #[cfg(not(any(feature = "cpu", feature = "cuda", feature = "wgpu")))]
         let gpu_retrieval = false;
         let started = std::time::Instant::now();
+        let _hubert_readback_nvtx = crate::nvtx::Range::new("stage104_rust_hubert_readback");
         let raw = if retrieval_enabled && !gpu_retrieval {
             Some(
                 content
@@ -371,6 +374,7 @@ impl RvcV2Inferencer {
         } else {
             None
         };
+        drop(_hubert_readback_nvtx);
         crate::diagnostic::measure(&self.device, "rvc.hubert_d2h", started,
             serde_json::json!({"bytes_d2h":raw.as_ref().map_or(0, |v| v.len()*4),"content_frames":content_time,"channels":channels}));
         if profile {
@@ -541,6 +545,7 @@ impl RvcV2Inferencer {
         }
         phase = std::time::Instant::now();
         let started = std::time::Instant::now();
+        let _retrieval_nvtx = crate::nvtx::Range::new("stage104_rust_retrieval_pitch");
         let phone = if gpu_retrieval {
             #[cfg(any(feature = "cpu", feature = "cuda", feature = "wgpu"))]
             {
@@ -617,12 +622,15 @@ impl RvcV2Inferencer {
         } else {
             Tensor::<2, Int>::from_data(TensorData::new(all_pitch, [batch, frames]), &self.device)
         };
+        drop(_retrieval_nvtx);
         crate::diagnostic::measure(&self.device, "rvc.phone_pitch_h2d", started,
             serde_json::json!({"feature_h2d_bytes_estimate":if gpu_retrieval {0} else {batch*frames*channels*4},"pitch_h2d_bytes_estimate":if gpu_f0 {0} else {batch*frames*8}}));
         let started = std::time::Instant::now();
+        let _encoder_nvtx = crate::nvtx::Range::new("stage104_rust_encoder");
         let encoded = self
             .encoder
             .forward(phone, Some(pitch_tensor), &vec![frames; batch], None);
+        drop(_encoder_nvtx);
         crate::diagnostic::measure(&self.device, "rvc.text_encoder", started,
             serde_json::json!({"mean_shape":encoded.mean.dims()}));
         if profile {
@@ -646,6 +654,7 @@ impl RvcV2Inferencer {
                     .map(|_| random.sample() * setting.latent_noise_scale));
             }
         }
+        let _latent_nvtx = crate::nvtx::Range::new("stage104_rust_latent");
         let latent_noise = Tensor::from_data(
             TensorData::new(noise, [batch, latent_channels, latent_frames]),
             &self.device,
@@ -661,12 +670,15 @@ impl RvcV2Inferencer {
             TensorData::new(speaker_embeddings, [batch, self.speaker_channels, 1]),
             &self.device,
         );
+        drop(_latent_nvtx);
         crate::diagnostic::measure(&self.device, "rvc.latent_noise_speaker_h2d", started,
             serde_json::json!({"noise_h2d_bytes_estimate":batch*latent_channels*latent_frames*4,"speaker_h2d_bytes_estimate":batch*self.speaker_channels*4,"latent_frames":latent_frames}));
         let started = std::time::Instant::now();
+        let _flow_nvtx = crate::nvtx::Range::new("stage104_rust_flow");
         let latent = self
             .flow
             .forward(latent, encoded.mask, Some(speaker.clone()), true);
+        drop(_flow_nvtx);
         crate::diagnostic::measure(&self.device, "rvc.flow", started,
             serde_json::json!({"output_shape":latent.dims()}));
         if profile {
@@ -677,6 +689,7 @@ impl RvcV2Inferencer {
             phase = std::time::Instant::now();
         }
         let started = std::time::Instant::now();
+        let _nsf_prepare_nvtx = crate::nvtx::Range::new("stage104_rust_nsf_prepare");
         let initial_phase = Tensor::zeros([1, 1, 1], &self.device);
         let phase_offsets = global_phase_offsets.map(|offsets| {
             if offsets.len() != batch || offsets.iter().any(|offset| !offset.is_finite()) {
@@ -702,6 +715,7 @@ impl RvcV2Inferencer {
         let f0_tensor = resident_final_f0.unwrap_or_else(|| {
             Tensor::from_data(TensorData::new(all_f0, [batch, frames]), &self.device)
         });
+        drop(_nsf_prepare_nvtx);
         crate::diagnostic::measure(&self.device, "rvc.nsf_inputs", started,
             serde_json::json!({"sine_h2d_bytes_estimate":batch*frames*RVC_HOP*4,"f0_h2d_bytes_estimate":if gpu_f0 {0} else {batch*frames*4}}));
         let started = std::time::Instant::now();
@@ -727,10 +741,12 @@ impl RvcV2Inferencer {
             ));
         }
         let started = std::time::Instant::now();
+        let _nsf_readback_nvtx = crate::nvtx::Range::new("stage104_rust_nsf_readback");
         let samples = output
             .into_data()
             .try_into_vec::<f32>()
             .map_err(|e| e.to_string())?;
+        drop(_nsf_readback_nvtx);
         crate::diagnostic::measure(&self.device, "rvc.nsf_d2h", started,
             serde_json::json!({"bytes_d2h":samples.len()*4,"output_samples_per_item":sample_count}));
         crate::diagnostic::batch_end(diag_id, diag_total_start);

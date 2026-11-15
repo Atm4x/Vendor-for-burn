@@ -1,4 +1,4 @@
-name: RVC Stage103 Conv2d L1 reuse Windows CUDA profiler package
+name: RVC Stage104 comprehensive NCU profiling Windows package
 
 on:
   workflow_dispatch:
@@ -13,17 +13,18 @@ on:
       - 'research/stage101-winograd/**'
       - 'research/stage102-cuda-profile/**'
       - 'research/stage103-l1-reuse/**'
+      - 'research/stage104-ncu-matrix/**'
       - '.github/workflows/rvc-stage101-winograd.yml'
 
 permissions:
   contents: read
 
 concurrency:
-  group: rvc-stage103-conv2d-${{ github.ref }}
+  group: rvc-stage104-profiling-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  stage102-windows:
+  stage104-windows:
     runs-on: windows-latest
     timeout-minutes: 120
     steps:
@@ -47,7 +48,7 @@ jobs:
           Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
           python tools/restore_vendor_checksums.py --zerocopy-archive $archive
           if ($LASTEXITCODE -ne 0) { throw 'Vendor checksum repair failed' }
-      - name: Validate Stage101 analyzer and PowerShell runner
+      - name: Validate Stage101-104 analyzer and PowerShell runners
         shell: pwsh
         run: |
           python research/stage101-winograd/windows/test_stage101_analyzer.py
@@ -61,6 +62,17 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Stage102 profile contract tests failed' }
           python research/stage103-l1-reuse/windows/test_stage103.py
           if ($LASTEXITCODE -ne 0) { throw 'Stage103 compare contract tests failed' }
+          python research/stage104-ncu-matrix/windows/test_stage104.py
+          if ($LASTEXITCODE -ne 0) { throw 'Stage104 plan tests failed' }
+          python -m compileall -q research/stage104-ncu-matrix/windows
+          if ($LASTEXITCODE -ne 0) { throw 'Stage104 Python parse failed' }
+          $stage104 = 'research/stage104-ncu-matrix/windows/Run-RVC-Stage104-NCU-Matrix.ps1'
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $stage104).Path,[ref]$tokens,[ref]$errors)
+          if ($errors.Count -gt 0) { $errors | Format-List | Out-String | Write-Host; throw 'Stage104 PowerShell syntax invalid' }
+          & $stage104 -DryRun -Scope all -NoTorch -PythonExe (Get-Command python).Source
+          if ($LASTEXITCODE -ne 0) { throw 'Stage104 dry run failed' }
           python -m compileall -q research/stage103-l1-reuse/windows
           if ($LASTEXITCODE -ne 0) { throw 'Stage103 Python parse failed' }
           python -m compileall -q research/stage102-cuda-profile/windows
@@ -76,7 +88,7 @@ jobs:
             [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path "research/stage102-cuda-profile/windows/$script").Path,[ref]$tokens,[ref]$errors)
             if ($errors.Count -gt 0) { $errors | Format-List | Out-String | Write-Host; throw "Invalid PowerShell: $script" }
           }
-      - name: Build unified CPU CUDA WGPU candidate
+      - name: Build Stage104 unified CPU CUDA WGPU and probes
         shell: pwsh
         run: |
           cargo build --release --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs --bin stage102_conv2d_probe --bin stage103_conv2d_probe
@@ -91,14 +103,17 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Stage102 probe NVTX status failed' }
           & target/release/tts-with-rvc-rs.exe --help
           if ($LASTEXITCODE -ne 0) { throw 'Stage101 help failed' }
-      - name: Package full-WAV Winograd A/B runner
+      - name: Package Stage104 multi-block NCU profiling suite
         shell: pwsh
         run: |
-          $folder = 'dist/stage102-nsight'
+          $folder = 'dist/stage104-ncu-matrix'
           New-Item -ItemType Directory -Force -Path $folder | Out-Null
-          Copy-Item target/release/tts-with-rvc-rs.exe (Join-Path $folder 'tts-with-rvc-rs-stage102.exe')
+          Copy-Item target/release/tts-with-rvc-rs.exe (Join-Path $folder 'tts-with-rvc-rs-stage104.exe')
           Copy-Item target/release/stage102_conv2d_probe.exe (Join-Path $folder 'stage102-conv2d-probe.exe')
           Copy-Item target/release/stage103_conv2d_probe.exe (Join-Path $folder 'stage103-conv2d-probe.exe')
+          Copy-Item research/stage104-ncu-matrix/windows/*.ps1 $folder
+          Copy-Item research/stage104-ncu-matrix/windows/*.py $folder
+          Copy-Item research/stage104-ncu-matrix/README.md (Join-Path $folder 'STAGE104_README.md')
           Copy-Item research/stage103-l1-reuse/windows/*.ps1 $folder
           Copy-Item research/stage103-l1-reuse/windows/compare_stage103.py $folder
           Copy-Item research/stage101-winograd/windows/Run-RVC-Stage101-Winograd-CUDA.ps1 $folder
@@ -106,20 +121,26 @@ jobs:
           Copy-Item research/stage102-cuda-profile/windows/*.ps1 $folder
           Copy-Item research/stage102-cuda-profile/windows/*.py $folder
           @'
-          STAGE 102: matched Conv2d GPU microbench + targeted NSYS/NCU profiling.
+          STAGE 104: complete NCU matrix for Conv2d kernels and 17 Rust full-RVC blocks.
           CI compiles and checks CLI only: Windows CI has no CUDA GPU.
           Requires nsys, ncu, CUDA PyTorch, and nvToolsExt64_1.dll on PATH on your RTX machine.
-          First run Run-RVC-Stage102-Matched-Conv2d.ps1 -PythonExe <python>.
+          First run Run-RVC-Stage104-NCU-Matrix.ps1 -Scope micro -PythonExe <python>.
+          For all RVC stages: Run-RVC-Stage104-NCU-Matrix.ps1 -Scope all -PythonExe <python>.
+          Profile compact 12-second WAV by default; -ProfileSeconds 0 uses original full WAV.
+          NCU 2025.1 process-scope NVTX, bounded captures, no unstable CLI CSV export.
+          Use -MetricSet full for deep metrics, optional -Families conv,gemm,recurrent,elementwise.
+          Run PowerShell as Administrator if ERR_NVGPUCTRPERM blocks counters.
+          The Stage104 ZIP excludes WAV, pth/pt, index and other audio/model artifacts.
           For full RVC profiles run Run-RVC-Stage102-Nsight.ps1 -PythonExe <python> -OriginalRoot <upstream-source-root>.
           The full RVC profiler requires embed/ with voice, HuBERT, RMVPE, index, and WAV.
           NSYS/NCU outputs can be large, but result archives exclude all WAVs and weights.
           For strict comparison use FP32 NCHW in matched microbench; FP16 and NHWC are diagnostics.
-          Stage101 A/B runner remains available; pass -ReferenceExe and -CandidateExe pointing to tts-with-rvc-rs-stage102.exe.
+          Stage101 A/B runner remains available; pass -ReferenceExe and -CandidateExe pointing to tts-with-rvc-rs-stage104.exe.
           Stage101 A/B archive also excludes WAVs.
           '@ | Set-Content (Join-Path $folder 'README.txt')
       - uses: actions/upload-artifact@v4
         with:
-          name: rvc-stage103-l1-reuse-windows-x64
-          path: dist/stage102-nsight/
+          name: rvc-stage104-ncu-matrix-windows-x64
+          path: dist/stage104-ncu-matrix/
           retention-days: 14
           if-no-files-found: error

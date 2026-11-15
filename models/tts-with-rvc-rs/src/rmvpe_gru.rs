@@ -212,13 +212,19 @@ impl RmvpeNetwork {
         let device = mel.device();
         let input = mel.swap_dims(1, 2).reshape([batch, 1, frames, bins]);
         let started = std::time::Instant::now();
+        let _nvtx = crate::nvtx::Range::new("stage104_rmvpe_unet");
         let unet = self.unet.forward_gru_features(input);
+        drop(_nvtx);
         crate::diagnostic::measure(&device, "rmvpe.unet", started, serde_json::json!({"output_shape":unet.dims()}));
         let started = std::time::Instant::now();
+        let _nvtx = crate::nvtx::Range::new("stage104_rmvpe_gru");
         let gru = self.gru.forward(unet);
+        drop(_nvtx);
         crate::diagnostic::measure(&device, "rmvpe.bidirectional_gru", started, serde_json::json!({"output_shape":gru.dims()}));
         let started = std::time::Instant::now();
+        let _nvtx = crate::nvtx::Range::new("stage104_rmvpe_head");
         let out = self.head.forward(gru);
+        drop(_nvtx);
         crate::diagnostic::measure(&device, "rmvpe.f0_head", started, serde_json::json!({"output_shape":out.dims()}));
         out
     }

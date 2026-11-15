@@ -25,7 +25,12 @@ fn main() -> Result<(), String> {
         return Ok(());
     }
     let repeats: usize = args.next().unwrap_or_else(|| "8".to_owned()).parse().map_err(|_| "repeats must be an integer")?;
-    if !(2..=64).contains(&repeats) || args.next().is_some() { return Err("repeats must be 2..64".into()); }
+    if !(2..=64).contains(&repeats) { return Err("repeats must be 2..64".into()); }
+    let selected_case = args.next().unwrap_or_else(|| "all".to_owned());
+    if selected_case != "all" && !CASES.iter().any(|c| c.name == selected_case) {
+        return Err(format!("unknown case: {selected_case}"));
+    }
+    if args.next().is_some() { return Err("expected [backend] [repeats] [case|all]".into()); }
     let device = match backend.as_str() {
         "cuda" => {
             #[cfg(feature = "cuda")]
@@ -43,6 +48,7 @@ fn main() -> Result<(), String> {
     }
     let mut cases = Vec::new();
     for c in CASES {
+        if selected_case != "all" && c.name != selected_case { continue; }
         let n_input = c.batch * c.cin * c.height * c.width;
         let n_weight = c.cout * (c.cin / c.groups) * c.kernel * c.kernel;
         let x: Vec<f32> = (0..n_input).map(|i| ((i * 37 % 149) as f32 - 70.0) * 0.005).collect();
@@ -54,7 +60,12 @@ fn main() -> Result<(), String> {
         let mut last = None;
         for iteration in 0..repeats {
             device.sync().map_err(|e| e.to_string())?;
-            let _nvtx = (iteration > 0).then(|| tts_with_rvc_rs::nvtx::Range::new("stage102_conv2d_matched"));
+            let nvtx_label = if selected_case == "all" {
+                "stage102_conv2d_matched".to_owned()
+            } else {
+                format!("stage104_conv2d_{}", c.name)
+            };
+            let _nvtx = (iteration > 0).then(|| tts_with_rvc_rs::nvtx::Range::new(&nvtx_label));
             let started = Instant::now();
             let output = if strategy == "reuse" && c.groups == 1 && c.kernel == 3 && c.padding == 1 {
                 let input = input.clone().try_into_primitive::<Cube>()

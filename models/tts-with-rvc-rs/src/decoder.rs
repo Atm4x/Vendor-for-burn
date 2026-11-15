@@ -319,13 +319,17 @@ impl DecoderStage {
         let trace = diagnostic_stage.filter(|_| crate::diagnostic::enabled());
         let device = trace.map(|_| input.device());
         let started = trace.map(|_| Instant::now());
+        let _nvtx_upsample = crate::nvtx::Range::new("stage104_nsf_upsample");
         let upsampled = self.upsample_only(input);
+        drop(_nvtx_upsample);
         if let (Some(stage), Some(device), Some(started)) = (trace, &device, started) {
             crate::diagnostic::measure(device, "nsf.stage_upsample", started,
                 serde_json::json!({"stage": stage, "shape": upsampled.dims()}));
         }
         let started = trace.map(|_| Instant::now());
+        let _nvtx_noise = crate::nvtx::Range::new("stage104_nsf_noise_conv");
         let source = self.noise.forward(harmonic_source);
+        drop(_nvtx_noise);
         if let (Some(stage), Some(device), Some(started)) = (trace, &device, started) {
             crate::diagnostic::measure(device, "nsf.stage_noise_conv", started,
                 serde_json::json!({"stage": stage, "shape": source.dims()}));
@@ -343,6 +347,7 @@ impl DecoderStage {
                 None => branch,
             });
         };
+        let _nvtx_residual = crate::nvtx::Range::new("stage104_nsf_residuals");
         match execution {
             ResidualExecution::Sequential => {
                 for block in &self.residual {
@@ -368,6 +373,7 @@ impl DecoderStage {
                 }
             }
         }
+        drop(_nvtx_residual);
         let result = result.expect("decoder stage must contain residual blocks") / self.residual.len() as f32;
         if scheduling == NsfScheduling::FlushPerStage {
             result.device().flush().expect("NSF stage flush failed");
