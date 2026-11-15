@@ -1,4 +1,4 @@
-name: RVC Stage102 Nsight Windows CUDA profiler package
+name: RVC Stage103 Conv2d L1 reuse Windows CUDA profiler package
 
 on:
   workflow_dispatch:
@@ -12,13 +12,14 @@ on:
       - 'vendor/cubek-convolution-0.3.1/src/kernels/forward/**'
       - 'research/stage101-winograd/**'
       - 'research/stage102-cuda-profile/**'
+      - 'research/stage103-l1-reuse/**'
       - '.github/workflows/rvc-stage101-winograd.yml'
 
 permissions:
   contents: read
 
 concurrency:
-  group: rvc-stage102-nsight-${{ github.ref }}
+  group: rvc-stage103-conv2d-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -58,8 +59,17 @@ jobs:
           if ($errors.Count -gt 0) { $errors | Format-List | Out-String | Write-Host; throw 'Stage101 PowerShell syntax invalid' }
           python research/stage102-cuda-profile/windows/test_stage102_profiler.py
           if ($LASTEXITCODE -ne 0) { throw 'Stage102 profile contract tests failed' }
+          python research/stage103-l1-reuse/windows/test_stage103.py
+          if ($LASTEXITCODE -ne 0) { throw 'Stage103 compare contract tests failed' }
+          python -m compileall -q research/stage103-l1-reuse/windows
+          if ($LASTEXITCODE -ne 0) { throw 'Stage103 Python parse failed' }
           python -m compileall -q research/stage102-cuda-profile/windows
           if ($LASTEXITCODE -ne 0) { throw 'Stage102 Python parse failed' }
+          $stage103 = 'research/stage103-l1-reuse/windows/Run-RVC-Stage103-Conv2d-Reuse.ps1'
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $stage103).Path,[ref]$tokens,[ref]$errors)
+          if ($errors.Count -gt 0) { $errors | Format-List | Out-String | Write-Host; throw 'Stage103 PowerShell syntax invalid' }
           foreach ($script in @('Run-RVC-Stage102-Nsight.ps1','Run-RVC-Stage102-Matched-Conv2d.ps1')) {
             $tokens = $null
             $errors = $null
@@ -69,12 +79,14 @@ jobs:
       - name: Build unified CPU CUDA WGPU candidate
         shell: pwsh
         run: |
-          cargo build --release --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs --bin stage102_conv2d_probe
+          cargo build --release --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs --bin stage102_conv2d_probe --bin stage103_conv2d_probe
           if ($LASTEXITCODE -ne 0) { throw 'Stage102 unified build failed' }
           & target/release/tts-with-rvc-rs.exe doctor
           if ($LASTEXITCODE -ne 0) { throw 'Stage101 doctor failed' }
           & target/release/tts-with-rvc-rs.exe nvtx-status
           if ($LASTEXITCODE -ne 0) { throw 'Stage102 NVTX status failed' }
+          & target/release/stage103_conv2d_probe.exe nvtx-status
+          if ($LASTEXITCODE -ne 0) { throw 'Stage103 probe NVTX status failed' }
           & target/release/stage102_conv2d_probe.exe nvtx-status
           if ($LASTEXITCODE -ne 0) { throw 'Stage102 probe NVTX status failed' }
           & target/release/tts-with-rvc-rs.exe --help
@@ -86,6 +98,9 @@ jobs:
           New-Item -ItemType Directory -Force -Path $folder | Out-Null
           Copy-Item target/release/tts-with-rvc-rs.exe (Join-Path $folder 'tts-with-rvc-rs-stage102.exe')
           Copy-Item target/release/stage102_conv2d_probe.exe (Join-Path $folder 'stage102-conv2d-probe.exe')
+          Copy-Item target/release/stage103_conv2d_probe.exe (Join-Path $folder 'stage103-conv2d-probe.exe')
+          Copy-Item research/stage103-l1-reuse/windows/*.ps1 $folder
+          Copy-Item research/stage103-l1-reuse/windows/compare_stage103.py $folder
           Copy-Item research/stage101-winograd/windows/Run-RVC-Stage101-Winograd-CUDA.ps1 $folder
           Copy-Item research/stage101-winograd/windows/Analyze-Stage101-Winograd-CUDA.py $folder
           Copy-Item research/stage102-cuda-profile/windows/*.ps1 $folder
@@ -104,7 +119,7 @@ jobs:
           '@ | Set-Content (Join-Path $folder 'README.txt')
       - uses: actions/upload-artifact@v4
         with:
-          name: rvc-stage102-nsight-windows-x64
+          name: rvc-stage103-l1-reuse-windows-x64
           path: dist/stage102-nsight/
           retention-days: 14
           if-no-files-found: error

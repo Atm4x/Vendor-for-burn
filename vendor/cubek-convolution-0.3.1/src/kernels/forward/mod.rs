@@ -4,6 +4,7 @@ pub mod direct;
 pub mod direct_prepacked;
 pub mod direct_prepacked_quad;
 pub mod direct_spatial_quad;
+pub mod direct_spatial_reuse;
 pub mod direct_temporal_pair;
 pub mod direct_temporal_pair_vector;
 pub mod launch;
@@ -13,6 +14,7 @@ pub mod selector;
 pub use depthwise::{DepthwiseStrategy, DepthwiseTensors, DepthwiseTiling, launch_depthwise};
 pub use direct::{DirectTensors, launch_direct};
 pub use direct_spatial_quad::launch_spatial_quad;
+pub use direct_spatial_reuse::launch_spatial_reuse;
 pub use launch::launch_kernel;
 
 pub use direct_prepacked::{

@@ -87,6 +87,12 @@ impl Conv2d {
             crate::cubecl_conv::conv2d_winograd(
                 input, packed.clone(), self.bias.clone(), self.weight.dims()[0],
             )
+        } else if std::env::var("RVC_RMVPE_UNET_SPATIAL_REUSE").as_deref() == Ok("1")
+            && self.padding == 1
+        {
+            crate::cubecl_conv::conv2d_spatial_reuse(
+                input, self.weight.clone(), self.bias.clone(), options,
+            )
         } else if std::env::var("RVC_RMVPE_UNET_SPATIAL_QUAD").as_deref() == Ok("1") {
             crate::cubecl_conv::conv2d_spatial_quad(
                 input, self.weight.clone(), self.bias.clone(), options,
