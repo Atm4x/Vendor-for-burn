@@ -72,6 +72,45 @@ fn pack_phase_weight<E: Numeric>(
 }
 
 #[cube(launch, address_type = "dynamic")]
+fn split_tf32_matrix(
+    input: &Tensor<f32>,
+    mut high: LinearViewMut<'_, f32>,
+    mut low: LinearViewMut<'_, f32>,
+    length: usize,
+) {
+    let p = ABSOLUTE_POS;
+    if p >= length {
+        terminate!();
+    }
+    let value = input[p];
+    let bits = u32::reinterpret(value);
+    let rounded_bits = (bits + 0x0000_0fff_u32 + ((bits >> 13) & 1_u32)) & 0xffff_e000_u32;
+    let rounded = f32::reinterpret(rounded_bits);
+    high.write(p, rounded);
+    low.write(p, value - rounded);
+}
+
+fn split_tf32_tensor(input: CubeTensor) -> (CubeTensor, CubeTensor) {
+    let shape = input.meta.shape().clone();
+    let elements = shape.iter().product();
+    let high = empty_device_dtype(
+        input.client.clone(), input.device.clone(), shape.clone(), input.dtype,
+    );
+    let low = empty_device_dtype(
+        input.client.clone(), input.device.clone(), shape, input.dtype,
+    );
+    let dim = CubeDim::new(&input.client, elements);
+    let count = calculate_cube_count_elemwise(&input.client, elements, dim);
+    let client = input.client.clone();
+    split_tf32_matrix::launch(
+        &client, count, dim, address_type!(input, high, low),
+        input.into_tensor_arg(), high.clone().into_linear_view(),
+        low.clone().into_linear_view(), elements,
+    );
+    (high, low)
+}
+
+#[cube(launch, address_type = "dynamic")]
 fn gather_phases<E: Numeric>(
     input: &Tensor<E>,
     mut columns: LinearViewMut<'_, E>,
@@ -107,6 +146,8 @@ fn gather_phases<E: Numeric>(
 #[cube(launch, address_type = "dynamic")]
 fn scatter_phases<E: Numeric>(
     matrix: &Tensor<E>,
+    correction_a: ComptimeOption<&Tensor<E>>,
+    correction_b: ComptimeOption<&Tensor<E>>,
     bias: ComptimeOption<&Tensor<E>>,
     mut output: LinearViewMut<'_, E>,
     args: Geometry,
@@ -129,7 +170,17 @@ fn scatter_phases<E: Numeric>(
         + (group * args.stride + phase) * matrix.stride(1)
         + phase_time * matrix.stride(2)
         + local_oc * matrix.stride(3);
-    let value = matrix[idx];
+    let mut value = matrix[idx];
+    #[comptime]
+    match correction_a {
+        ComptimeOption::Some(correction) => value += correction[idx],
+        ComptimeOption::None => {}
+    }
+    #[comptime]
+    match correction_b {
+        ComptimeOption::Some(correction) => value += correction[idx],
+        ComptimeOption::None => {}
+    }
     #[comptime]
     match bias {
         ComptimeOption::Some(bias) => output.write(p, value + bias[oc]),
@@ -202,9 +253,65 @@ pub fn prepack_conv_transpose1d_phase_gemm_weight(
     Ok(out)
 }
 
+pub fn prepack_conv_transpose1d_phase_gemm_weight_compensated(
+    weight: CubeTensor,
+    stride: usize,
+    padding: usize,
+    groups: usize,
+) -> Result<(CubeTensor, CubeTensor), ConvSetupError> {
+    if weight.dtype != burn_backend::DType::F32 {
+        return Err(ConvSetupError::Unknown);
+    }
+    let packed = prepack_conv_transpose1d_phase_gemm_weight(weight, stride, padding, groups)?;
+    Ok(split_tf32_tensor(packed))
+}
+
 pub fn conv_transpose1d_phase_gemm_packed(
     input: CubeTensor,
     packed_weight: CubeTensor,
+    bias: Option<CubeTensor>,
+    stride: usize,
+    padding: usize,
+    kernel: usize,
+    dilation: usize,
+    output_padding: usize,
+    groups: usize,
+) -> Result<CubeTensor, ConvSetupError> {
+    conv_transpose1d_phase_gemm_impl(
+        input, packed_weight, None, bias, stride, padding,
+        kernel, dilation, output_padding, groups,
+    )
+}
+
+pub fn conv_transpose1d_phase_gemm_packed_compensated(
+    input: CubeTensor,
+    packed_weight_high: CubeTensor,
+    packed_weight_low: CubeTensor,
+    bias: Option<CubeTensor>,
+    stride: usize,
+    padding: usize,
+    kernel: usize,
+    dilation: usize,
+    output_padding: usize,
+    groups: usize,
+) -> Result<CubeTensor, ConvSetupError> {
+    if input.dtype != burn_backend::DType::F32
+        || packed_weight_high.dtype != burn_backend::DType::F32
+        || packed_weight_low.dtype != burn_backend::DType::F32
+        || packed_weight_high.meta.shape() != packed_weight_low.meta.shape()
+    {
+        return Err(ConvSetupError::Unknown);
+    }
+    conv_transpose1d_phase_gemm_impl(
+        input, packed_weight_high, Some(packed_weight_low), bias,
+        stride, padding, kernel, dilation, output_padding, groups,
+    )
+}
+
+fn conv_transpose1d_phase_gemm_impl(
+    input: CubeTensor,
+    packed_weight: CubeTensor,
+    packed_weight_low: Option<CubeTensor>,
     bias: Option<CubeTensor>,
     stride: usize,
     padding: usize,
@@ -286,14 +393,28 @@ pub fn conv_transpose1d_phase_gemm_packed(
         ),
         dtype_to_storage_type(columns.dtype),
     );
-    let matrix = matmul(
-        columns,
-        packed_weight,
-        None,
-        MatmulStrategy::default(),
-        input_dtype,
-    )
-    .map_err(|_| ConvSetupError::Unknown)?;
+    let (matrix, correction_a, correction_b) = if let Some(weight_low) = packed_weight_low {
+        let (columns_high, columns_low) = split_tf32_tensor(columns);
+        let matrix = matmul(
+            columns_high.clone(), packed_weight.clone(), None,
+            MatmulStrategy::default(), input_dtype,
+        ).map_err(|_| ConvSetupError::Unknown)?;
+        let correction_a = matmul(
+            columns_high, weight_low, None,
+            MatmulStrategy::default(), input_dtype,
+        ).map_err(|_| ConvSetupError::Unknown)?;
+        let correction_b = matmul(
+            columns_low, packed_weight, None,
+            MatmulStrategy::default(), input_dtype,
+        ).map_err(|_| ConvSetupError::Unknown)?;
+        (matrix, Some(correction_a), Some(correction_b))
+    } else {
+        let matrix = matmul(
+            columns, packed_weight, None,
+            MatmulStrategy::default(), input_dtype,
+        ).map_err(|_| ConvSetupError::Unknown)?;
+        (matrix, None, None)
+    };
     let cout = groups * cout_group;
     let output = empty_device_dtype(
         matrix.client.clone(),
@@ -309,8 +430,10 @@ pub fn conv_transpose1d_phase_gemm_packed(
         &client,
         count,
         dim,
-        address_type!(matrix, bias, output),
+        address_type!(matrix, correction_a, correction_b, bias, output),
         matrix.into_tensor_arg(),
+        correction_a.map(|v| v.into_tensor_arg()).into(),
+        correction_b.map(|v| v.into_tensor_arg()).into(),
         bias.map(|b| b.into_tensor_arg()).into(),
         output.clone().into_linear_view(),
         geometry,

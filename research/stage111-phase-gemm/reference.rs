@@ -108,3 +108,44 @@ fn phase_batched_matmul_matches_reference() {
         assert!(error < 2e-6, "phase GEMM wrong: {error}, stride={}, kernel={}, groups={}", c.stride,c.kernel,c.groups);
     }
 }
+
+#[test]
+fn compensated_tf32_recovers_f32_matmul_precision() {
+    fn round_tf32(value: f32) -> f32 {
+        let bits = value.to_bits();
+        f32::from_bits((bits + 0xfff + ((bits >> 13) & 1)) & 0xffff_e000)
+    }
+
+    let k = 256;
+    let m = 4;
+    let n = 16;
+    let x: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.031).sin() * 0.2).collect();
+    let w: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.027).cos() * 0.1).collect();
+    let mut uncorrected_max = 0.0f32;
+    let mut corrected_max = 0.0f32;
+    for row in 0..m {
+        for column in 0..n {
+            let mut reference = 0f64;
+            let mut high_high = 0f32;
+            let mut high_low = 0f32;
+            let mut low_high = 0f32;
+            for reduction in 0..k {
+                let a = x[row * k + reduction];
+                let b = w[reduction * n + column];
+                let a_high = round_tf32(a);
+                let b_high = round_tf32(b);
+                let a_low = round_tf32(a - a_high);
+                let b_low = round_tf32(b - b_high);
+                reference += f64::from(a) * f64::from(b);
+                high_high = a_high.mul_add(b_high, high_high);
+                high_low = a_high.mul_add(b_low, high_low);
+                low_high = a_low.mul_add(b_high, low_high);
+            }
+            let corrected = (high_high + high_low) + low_high;
+            uncorrected_max = uncorrected_max.max((f64::from(high_high) - reference).abs() as f32);
+            corrected_max = corrected_max.max((f64::from(corrected) - reference).abs() as f32);
+        }
+    }
+    assert!(uncorrected_max > 1e-4, "TF32 failure not reproduced: {uncorrected_max}");
+    assert!(corrected_max < 1e-5, "Compensated TF32 inaccurate: {corrected_max}");
+}

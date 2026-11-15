@@ -2,7 +2,9 @@ use burn::tensor::{DType, Device, Tensor, TensorData, module, ops::ConvTranspose
 use burn_cubecl::{
     Cube,
     kernel::conv::{
-        conv_transpose1d_phase_gemm_packed, prepack_conv_transpose1d_phase_gemm_weight,
+        conv_transpose1d_phase_gemm_packed, conv_transpose1d_phase_gemm_packed_compensated,
+        prepack_conv_transpose1d_phase_gemm_weight,
+        prepack_conv_transpose1d_phase_gemm_weight_compensated,
     },
 };
 use serde_json::json;
@@ -127,19 +129,22 @@ fn main() -> Result<(), String> {
     );
     let opts = ConvTransposeOptions::new([c.stride], [c.padding], [0], [1], 1);
     let half = mode == "phase_f16";
-    let packed = if mode != "direct" {
-        let weight = if half {
-            w.clone().cast(DType::F16)
-        } else {
-            w.clone()
-        };
-        let raw_weight = weight.try_into_primitive::<Cube>().expect("CubeCL weight");
-        Some(Tensor::<4>::from_primitive::<Cube>(
-            prepack_conv_transpose1d_phase_gemm_weight(raw_weight, c.stride, c.padding, 1)
-                .expect("phase matrix prepack"),
-        ))
+    let (packed, packed_low) = if mode == "phase_f16" {
+        let raw = w.clone().cast(DType::F16)
+            .try_into_primitive::<Cube>().expect("CubeCL half weight");
+        (Some(Tensor::<4>::from_primitive::<Cube>(
+            prepack_conv_transpose1d_phase_gemm_weight(raw, c.stride, c.padding, 1)
+                .expect("phase matrix half prepack"),
+        )), None)
+    } else if mode == "phase_f32" {
+        let raw = w.clone().try_into_primitive::<Cube>().expect("CubeCL FP32 weight");
+        let (high, low) = prepack_conv_transpose1d_phase_gemm_weight_compensated(
+            raw, c.stride, c.padding, 1,
+        ).expect("phase matrix compensated FP32 prepack");
+        (Some(Tensor::<4>::from_primitive::<Cube>(high)),
+         Some(Tensor::<4>::from_primitive::<Cube>(low)))
     } else {
-        None
+        (None, None)
     };
     device.sync().map_err(|e| e.to_string())?;
     let execute = || -> Tensor<3> {
@@ -161,18 +166,19 @@ fn main() -> Result<(), String> {
                 .expect("CubeCL weight");
             let raw_bias = b.try_into_primitive::<Cube>().expect("CubeCL bias");
             let out = Tensor::<3>::from_primitive::<Cube>(
-                conv_transpose1d_phase_gemm_packed(
-                    raw_x,
-                    raw_weight,
-                    Some(raw_bias),
-                    c.stride,
-                    c.padding,
-                    c.kernel,
-                    1,
-                    0,
-                    1,
-                )
-                .expect("CubeCL phase matmul"),
+                if let Some(low) = &packed_low {
+                    let raw_low = low.clone().try_into_primitive::<Cube>()
+                        .expect("CubeCL FP32 low weight");
+                    conv_transpose1d_phase_gemm_packed_compensated(
+                        raw_x, raw_weight, raw_low, Some(raw_bias),
+                        c.stride, c.padding, c.kernel, 1, 0, 1,
+                    )
+                } else {
+                    conv_transpose1d_phase_gemm_packed(
+                        raw_x, raw_weight, Some(raw_bias),
+                        c.stride, c.padding, c.kernel, 1, 0, 1,
+                    )
+                }.expect("CubeCL phase matmul"),
             );
             if half { out.cast(DType::F32) } else { out }
         } else {
@@ -223,8 +229,12 @@ fn main() -> Result<(), String> {
     } else {
         None
     };
-    let limit = if half { 5e-3 } else { 1e-4 };
-    if !max_abs.is_finite() || max_abs > limit || (half && snr.is_none_or(|v| v < 50.0)) {
+    let limit = if half { 5e-3 } else { 2e-5 };
+    if !max_abs.is_finite()
+        || max_abs > limit
+        || (half && snr.is_none_or(|v| v < 50.0))
+        || (mode == "phase_f32" && snr.is_none_or(|v| v < 90.0))
+    {
         return Err(format!(
             "full-output parity failure: {case} {mode}, max_abs={max_abs}, snr_db={snr:?}"
         ));

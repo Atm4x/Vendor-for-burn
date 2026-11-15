@@ -17,4 +17,4 @@ pub use polyphase1d::{conv_transpose1d_polyphase, conv_transpose1d_polyphase_pac
 #[cfg(feature = "autotune")]
 pub use tune::*;
 
-pub use phase_gemm1d::{prepack_conv_transpose1d_phase_gemm_weight, conv_transpose1d_phase_gemm_packed};
+pub use phase_gemm1d::{prepack_conv_transpose1d_phase_gemm_weight, prepack_conv_transpose1d_phase_gemm_weight_compensated, conv_transpose1d_phase_gemm_packed, conv_transpose1d_phase_gemm_packed_compensated};

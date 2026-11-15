@@ -41,6 +41,17 @@ if ($Profiler -eq 'ncu') {
         throw "Stage111 NVTX not available: $status"
     }
 }
+if ($Profiler -eq 'ncu') {
+    foreach ($case in $Cases) {
+        foreach ($mode in $validModes) {
+            Write-Host "Stage111 preflight parity $case/$mode"
+            & $probe $Backend $case $mode 3 2>&1 | Out-Host
+            if ($LASTEXITCODE -ne 0) {
+                throw "Stage111 CUDA parity failed before NCU profiling: $case/$mode"
+            }
+        }
+    }
+}
 $records = @()
 foreach ($case in $Cases) {
     foreach ($mode in $validModes) {

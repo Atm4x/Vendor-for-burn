@@ -28,4 +28,4 @@ pub use conv_transpose2d::{ConvTranspose2dStrategy, conv_transpose2d, conv_trans
 
 pub(crate) use tune_key::*;
 
-pub use conv_transpose2d::{prepack_conv_transpose1d_phase_gemm_weight, conv_transpose1d_phase_gemm_packed};
+pub use conv_transpose2d::{prepack_conv_transpose1d_phase_gemm_weight, prepack_conv_transpose1d_phase_gemm_weight_compensated, conv_transpose1d_phase_gemm_packed, conv_transpose1d_phase_gemm_packed_compensated};

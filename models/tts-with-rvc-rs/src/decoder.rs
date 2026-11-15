@@ -115,6 +115,7 @@ struct TransposedConv1d {
     packed_weight: Option<Tensor<3>>,
     kic_mode: Option<bool>,
     phase_gemm_weight: Option<Tensor<4>>,
+    phase_gemm_weight_low: Option<Tensor<4>>,
     phase_gemm_half: bool,
     bias: Tensor<1>,
     stride: usize,
@@ -132,12 +133,17 @@ impl TransposedConv1d {
         }
         let phase_gemm_mode = std::env::var("RVC_NSF_PHASE_GEMM").unwrap_or_default();
         let phase_gemm_half = phase_gemm_mode == "f16";
-        let phase_gemm_weight = if phase_gemm_half || phase_gemm_mode == "f32" {
-            Some(crate::cubecl_conv::prepack_transpose1d_phase_gemm(
-                weight.clone(), stride, (kernel - stride) / 2, phase_gemm_half,
-            ))
+        let (phase_gemm_weight, phase_gemm_weight_low) = if phase_gemm_half {
+            (Some(crate::cubecl_conv::prepack_transpose1d_phase_gemm(
+                weight.clone(), stride, (kernel - stride) / 2, true,
+            )), None)
+        } else if phase_gemm_mode == "f32" {
+            let (high, low) = crate::cubecl_conv::prepack_transpose1d_phase_gemm_compensated(
+                weight.clone(), stride, (kernel - stride) / 2,
+            );
+            (Some(high), Some(low))
         } else {
-            None
+            (None, None)
         };
         let polyphase_enabled = std::env::var("RVC_NSF_POLYPHASE").as_deref() == Ok("1");
         let kic_mode = if polyphase_enabled {
@@ -156,14 +162,14 @@ impl TransposedConv1d {
                 crate::cubecl_conv::prepack_transpose1d_weight(weight.clone())
             })
         } else { None };
-        Ok(Self {weight, packed_weight, kic_mode, phase_gemm_weight, phase_gemm_half, bias, stride, padding: (kernel - stride) / 2})
+        Ok(Self {weight, packed_weight, kic_mode, phase_gemm_weight, phase_gemm_weight_low, phase_gemm_half, bias, stride, padding: (kernel - stride) / 2})
     }
 
     fn forward(&self, input: Tensor<3>) -> Tensor<3> {
         if let Some(weight) = self.phase_gemm_weight.as_ref() {
             return crate::cubecl_conv::conv_transpose1d_phase_gemm(
-                input, weight.clone(), self.bias.clone(), self.stride, self.padding,
-                self.weight.dims()[2], self.phase_gemm_half,
+                input, weight.clone(), self.phase_gemm_weight_low.clone(), self.bias.clone(),
+                self.stride, self.padding, self.weight.dims()[2], self.phase_gemm_half,
             );
         }
         if std::env::var("RVC_NSF_POLYPHASE").as_deref() == Ok("1") {
