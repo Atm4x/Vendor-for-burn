@@ -26,7 +26,12 @@ fn main() -> Result<(), String> {
     let repeats: usize = args.next().unwrap_or_else(|| "8".to_owned()).parse().map_err(|_| "repeats must be an integer")?;
     if !(2..=64).contains(&repeats) || args.next().is_some() { return Err("repeats must be 2..64".into()); }
     let device = match backend.as_str() {
-        "cuda" => Device::cuda(0),
+        "cuda" => {
+            #[cfg(feature = "cuda")]
+            { Device::cuda(0) }
+            #[cfg(not(feature = "cuda"))]
+            { return Err("CUDA feature was not enabled at build time".into()); }
+        },
         "cpu" => Device::cpu(),
         _ => return Err("backend must be cpu or cuda".into()),
     };
