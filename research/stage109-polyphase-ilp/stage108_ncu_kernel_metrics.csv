@@ -1,0 +1,7 @@
+capture,captured_kernels,kernel_us,l1tex_lsu_pct,fma_pct,eligible_warps_per_scheduler,long_scoreboard_per_issue,warp_occupancy_pct,registers_per_thread,issue_active_pct
+transpose-upsample10-kic.ncu.csv,2,113.632,65.616,30.512,1.164,15.964,86.909,40.0,49.814
+transpose-upsample10-kic_ntc.ncu.csv,2,123.6,75.349,29.373,1.131,15.582,88.187,40.0,48.57
+transpose-upsample10-single.ncu.csv,2,117.904,65.542,30.476,1.132,16.141,88.167,40.0,49.145
+transpose-upsample8-kic.ncu.csv,2,49.808,62.843,29.572,1.398,13.013,87.065,40.0,52.071
+transpose-upsample8-kic_ntc.ncu.csv,2,59.824,79.24,23.738,1.022,14.46,86.125,40.0,41.319
+transpose-upsample8-single.ncu.csv,2,49.264,62.823,29.547,1.438,12.701,86.954,40.0,52.277

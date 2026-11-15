@@ -2,9 +2,9 @@ use burn::tensor::{Device, Tensor, TensorData, module, ops::ConvTransposeOptions
 use burn_cubecl::{
     Cube,
     kernel::conv::{
-        conv_transpose1d_polyphase_packed, conv_transpose1d_polyphase_single_packed,
+        conv_transpose1d_polyphase_packed, conv_transpose1d_polyphase_pipeline4_packed,
+        conv_transpose1d_polyphase_single_packed, conv_transpose1d_polyphase_single_packed_kic,
         conv_transpose1d_prepack_weight, conv_transpose1d_prepack_weight_kic,
-        conv_transpose1d_polyphase_single_packed_kic,
     },
 };
 use serde_json::json;
@@ -100,10 +100,21 @@ fn main() -> Result<(), String> {
         .parse()
         .map_err(|_| "repetitions must be integer")?;
     if !(2..=40).contains(&repetitions)
-        || !matches!(mode.as_str(), "direct" | "polyphase" | "single" | "kic" | "kic_ntc")
+        || !matches!(
+            mode.as_str(),
+            "direct"
+                | "polyphase"
+                | "single"
+                | "kic"
+                | "kic_ntc"
+                | "pipe4"
+                | "pipe4_kic"
+                | "ilp4"
+                | "ilp4_kic"
+        )
     {
         return Err(
-            "usage: stage106_polyphase_probe [cuda|cpu] [case] [direct|polyphase|single|kic|kic_ntc] [repetitions=8]"
+            "usage: stage106_polyphase_probe [cuda|cpu] [case] [direct|polyphase|single|kic|kic_ntc|pipe4|pipe4_kic|ilp4|ilp4_kic] [repetitions=8]"
                 .into(),
         );
     }
@@ -160,7 +171,9 @@ fn main() -> Result<(), String> {
     );
     let packed_weight = Tensor::<3>::from_primitive::<Cube>(packed_weight);
     let packed_kic = Tensor::<3>::from_primitive::<Cube>(conv_transpose1d_prepack_weight_kic(
-        w.clone().try_into_primitive::<Cube>().expect("CubeCL weight"),
+        w.clone()
+            .try_into_primitive::<Cube>()
+            .expect("CubeCL weight"),
     ));
     device.sync().map_err(|e| e.to_string())?;
 
@@ -172,15 +185,37 @@ fn main() -> Result<(), String> {
                 .clone()
                 .try_into_primitive::<Cube>()
                 .expect("CubeCL input");
-            let pw = if matches!(mode.as_str(), "kic" | "kic_ntc") {
+            let pw = if matches!(mode.as_str(), "kic" | "kic_ntc" | "pipe4_kic" | "ilp4_kic") {
                 packed_kic.clone().try_into_primitive::<Cube>()
             } else {
                 packed_weight.clone().try_into_primitive::<Cube>()
-            }.expect("CubeCL packed weight");
+            }
+            .expect("CubeCL packed weight");
             let bias = b.clone().try_into_primitive::<Cube>().expect("CubeCL bias");
-            let forward = if matches!(mode.as_str(), "kic" | "kic_ntc") {
+            let forward = if matches!(mode.as_str(), "pipe4" | "pipe4_kic" | "ilp4" | "ilp4_kic") {
+                conv_transpose1d_polyphase_pipeline4_packed(
+                    x,
+                    pw,
+                    Some(bias),
+                    c.stride,
+                    c.pad,
+                    1,
+                    0,
+                    1,
+                    mode.ends_with("_kic"),
+                    mode.starts_with("ilp4"),
+                )
+            } else if matches!(mode.as_str(), "kic" | "kic_ntc") {
                 conv_transpose1d_polyphase_single_packed_kic(
-                    x, pw, Some(bias), c.stride, c.pad, 1, 0, 1, mode == "kic_ntc",
+                    x,
+                    pw,
+                    Some(bias),
+                    c.stride,
+                    c.pad,
+                    1,
+                    0,
+                    1,
+                    mode == "kic_ntc",
                 )
             } else if mode == "single" {
                 conv_transpose1d_polyphase_single_packed(

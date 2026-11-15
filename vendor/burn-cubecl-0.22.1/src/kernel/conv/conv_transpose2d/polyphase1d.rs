@@ -205,6 +205,151 @@ fn polyphase_single_kernel<E: Numeric, N: Size>(
     output.write(out_base + time * vectors_per_time, sum);
 }
 
+/// Four independent input/weight loads issued before use. The ordered mode
+/// preserves the original reduction order, whereas interleaved mode uses four
+/// independent FFMA chains to expose latency-hiding instruction parallelism.
+#[cube(launch, address_type = "dynamic")]
+fn polyphase_pipeline4_kernel<E: Numeric, N: Size>(
+    input: &Tensor<E>,
+    weight: &Tensor<Vector<E, N>>,
+    bias: ComptimeOption<&[Vector<E, N>]>,
+    mut output: LinearViewMut<'_, Vector<E, N>>,
+    args: PolyphaseSingleArgs,
+    #[comptime] weight_kic: bool,
+    #[comptime] independent_acc: bool,
+    #[define(E)] _dtype: ElemType,
+) {
+    let line = weight.vector_size();
+    let cout_group = weight.shape(2);
+    let cout = cout_group * args.groups;
+    let vectors_per_time = cout / line;
+    let channel_vector = ABSOLUTE_POS % vectors_per_time;
+    let temporal_index = ABSOLUTE_POS / vectors_per_time;
+    let phase_time = temporal_index % args.samples_per_phase;
+    let batch_phase = temporal_index / args.samples_per_phase;
+    let phase = batch_phase % args.stride;
+    let batch = batch_phase / args.stride;
+    let time = phase + phase_time * args.stride;
+    if batch >= input.shape(0) || time >= args.out_length {
+        terminate!();
+    }
+
+    let oc = channel_vector * line;
+    let group = oc / cout_group;
+    let local_oc = oc % cout_group;
+    let cin_group = input.shape(2) / args.groups;
+    let cin_begin = group * cin_group;
+    let input_length = input.shape(1);
+    let kernel = if comptime!(weight_kic) { weight.shape(0) } else { weight.shape(1) };
+    let base = time + args.padding;
+    let filter_phase = base % args.stride;
+    let source_time = base / args.stride;
+    let taps = (kernel + args.stride - 1 - filter_phase) / args.stride;
+    let weight_stride0 = weight.stride(0);
+    let weight_stride1 = weight.stride(1);
+    let input_stride0 = input.stride(0);
+    let input_stride1 = input.stride(1);
+    let input_stride2 = input.stride(2);
+    let weight_channel_base = if comptime!(weight_kic) {
+        cin_begin * weight_stride1 + local_oc
+    } else {
+        cin_begin * weight_stride0 + local_oc
+    };
+    let input_channel_base = batch * input_stride0 + cin_begin * input_stride2;
+
+    let bvec: ComptimeOption<Vector<E, N>> = bias.map(|b| b[channel_vector]);
+    let mut acc0 = if comptime!(independent_acc) {
+        Vector::zero()
+    } else {
+        bvec.unwrap_or_else(|| Vector::zero())
+    };
+    let mut acc1 = Vector::zero();
+    let mut acc2 = Vector::zero();
+    let mut acc3 = Vector::zero();
+
+    let in_bounds = if taps > 0 { source_time >= taps - 1 } else { false };
+    if in_bounds && source_time < input_length {
+        for tap in 0..taps {
+            let xbase = input_channel_base + (source_time - tap) * input_stride1;
+            let wbase = weight_channel_base + (filter_phase + tap * args.stride) *
+                if comptime!(weight_kic) { weight_stride0 } else { weight_stride1 };
+            let weight_ci_stride = if comptime!(weight_kic) { weight_stride1 } else { weight_stride0 };
+            let groups_of_four = cin_group / 4;
+            for block in 0..groups_of_four {
+                let ci = block * 4;
+                let w0 = weight[(wbase + ci * weight_ci_stride) / line];
+                let w1 = weight[(wbase + (ci + 1) * weight_ci_stride) / line];
+                let w2 = weight[(wbase + (ci + 2) * weight_ci_stride) / line];
+                let w3 = weight[(wbase + (ci + 3) * weight_ci_stride) / line];
+                let x0 = input[xbase + ci * input_stride2];
+                let x1 = input[xbase + (ci + 1) * input_stride2];
+                let x2 = input[xbase + (ci + 2) * input_stride2];
+                let x3 = input[xbase + (ci + 3) * input_stride2];
+                if comptime!(independent_acc) {
+                    acc0 += Vector::broadcast(x0) * w0;
+                    acc1 += Vector::broadcast(x1) * w1;
+                    acc2 += Vector::broadcast(x2) * w2;
+                    acc3 += Vector::broadcast(x3) * w3;
+                } else {
+                    acc0 += Vector::broadcast(x0) * w0;
+                    acc0 += Vector::broadcast(x1) * w1;
+                    acc0 += Vector::broadcast(x2) * w2;
+                    acc0 += Vector::broadcast(x3) * w3;
+                }
+            }
+            for ci in (groups_of_four * 4)..cin_group {
+                let w = weight[(wbase + ci * weight_ci_stride) / line];
+                let x = input[xbase + ci * input_stride2];
+                acc0 += Vector::broadcast(x) * w;
+            }
+        }
+    } else {
+        for tap in 0..taps {
+            if source_time >= tap && source_time - tap < input_length {
+                let xbase = input_channel_base + (source_time - tap) * input_stride1;
+                let wbase = weight_channel_base + (filter_phase + tap * args.stride) *
+                    if comptime!(weight_kic) { weight_stride0 } else { weight_stride1 };
+                let weight_ci_stride = if comptime!(weight_kic) { weight_stride1 } else { weight_stride0 };
+                let groups_of_four = cin_group / 4;
+                for block in 0..groups_of_four {
+                    let ci = block * 4;
+                    let w0 = weight[(wbase + ci * weight_ci_stride) / line];
+                    let w1 = weight[(wbase + (ci + 1) * weight_ci_stride) / line];
+                    let w2 = weight[(wbase + (ci + 2) * weight_ci_stride) / line];
+                    let w3 = weight[(wbase + (ci + 3) * weight_ci_stride) / line];
+                    let x0 = input[xbase + ci * input_stride2];
+                    let x1 = input[xbase + (ci + 1) * input_stride2];
+                    let x2 = input[xbase + (ci + 2) * input_stride2];
+                    let x3 = input[xbase + (ci + 3) * input_stride2];
+                    if comptime!(independent_acc) {
+                        acc0 += Vector::broadcast(x0) * w0;
+                        acc1 += Vector::broadcast(x1) * w1;
+                        acc2 += Vector::broadcast(x2) * w2;
+                        acc3 += Vector::broadcast(x3) * w3;
+                    } else {
+                        acc0 += Vector::broadcast(x0) * w0;
+                        acc0 += Vector::broadcast(x1) * w1;
+                        acc0 += Vector::broadcast(x2) * w2;
+                        acc0 += Vector::broadcast(x3) * w3;
+                    }
+                }
+                for ci in (groups_of_four * 4)..cin_group {
+                    let w = weight[(wbase + ci * weight_ci_stride) / line];
+                    let x = input[xbase + ci * input_stride2];
+                    acc0 += Vector::broadcast(x) * w;
+                }
+            }
+        }
+    }
+    let sum = if comptime!(independent_acc) {
+        (acc0 + acc1) + (acc2 + acc3) + bvec.unwrap_or_else(|| Vector::zero())
+    } else {
+        acc0
+    };
+    let out_base = batch * args.out_length * vectors_per_time + channel_vector;
+    output.write(out_base + time * vectors_per_time, sum);
+}
+
 /// Alternative full-output FP32 polyphase kernel, specializing in maximum warp
 /// availability rather than cross-time weight reuse. Uses already packed weights.
 pub fn conv_transpose1d_polyphase_single_packed(
@@ -218,7 +363,7 @@ pub fn conv_transpose1d_polyphase_single_packed(
     groups: usize,
 ) -> Result<CubeTensor, ConvSetupError> {
     conv_transpose1d_polyphase_single_packed_mode(
-        input, weight, bias, stride, padding, dilation, padding_out, groups, false, false,
+        input, weight, bias, stride, padding, dilation, padding_out, groups, false, false, None,
     )
 }
 
@@ -243,7 +388,28 @@ pub fn conv_transpose1d_polyphase_single_packed_kic(
     contiguous_ntc: bool,
 ) -> Result<CubeTensor, ConvSetupError> {
     conv_transpose1d_polyphase_single_packed_mode(
-        input, weight, bias, stride, padding, dilation, padding_out, groups, true, contiguous_ntc,
+        input, weight, bias, stride, padding, dilation, padding_out, groups, true, contiguous_ntc, None,
+    )
+}
+
+/// Four-deep software-pipelined polyphase FP32 kernel. The ordered variant
+/// retains the original accumulation order; independent accumulators trade
+/// controlled FP32 reassociation for additional arithmetic ILP.
+pub fn conv_transpose1d_polyphase_pipeline4_packed(
+    input: CubeTensor,
+    weight: CubeTensor,
+    bias: Option<CubeTensor>,
+    stride: usize,
+    padding: usize,
+    dilation: usize,
+    padding_out: usize,
+    groups: usize,
+    weight_kic: bool,
+    independent_acc: bool,
+) -> Result<CubeTensor, ConvSetupError> {
+    conv_transpose1d_polyphase_single_packed_mode(
+        input, weight, bias, stride, padding, dilation, padding_out, groups,
+        weight_kic, false, Some(independent_acc),
     )
 }
 
@@ -258,6 +424,7 @@ fn conv_transpose1d_polyphase_single_packed_mode(
     groups: usize,
     weight_kic: bool,
     contiguous_ntc: bool,
+    pipeline4: Option<bool>,
 ) -> Result<CubeTensor, ConvSetupError> {
     if groups == 0 || stride == 0 || dilation != 1 {
         return Err(ConvSetupError::Unknown);
@@ -298,20 +465,38 @@ fn conv_transpose1d_polyphase_single_packed_mode(
     let count = calculate_cube_count_elemwise(&input.client, work_items, dim);
     let dtype = input.dtype;
     let client = input.client.clone();
-    polyphase_single_kernel::launch(
-        &client,
-        count,
-        dim,
-        address_type!(input, weight, bias, out),
-        line,
-        input.into_tensor_arg(),
-        weight.into_tensor_arg(),
-        bias.map(|b| b.into_buffer_arg()).into(),
-        out.clone().into_linear_view(),
-        PolyphaseSingleArgsLaunch::new(out_len, stride, padding, groups, samples_per_phase),
-        weight_kic,
-        dtype_to_storage_type(dtype),
-    );
+    if let Some(independent_acc) = pipeline4 {
+        polyphase_pipeline4_kernel::launch(
+            &client,
+            count,
+            dim,
+            address_type!(input, weight, bias, out),
+            line,
+            input.into_tensor_arg(),
+            weight.into_tensor_arg(),
+            bias.map(|b| b.into_buffer_arg()).into(),
+            out.clone().into_linear_view(),
+            PolyphaseSingleArgsLaunch::new(out_len, stride, padding, groups, samples_per_phase),
+            weight_kic,
+            independent_acc,
+            dtype_to_storage_type(dtype),
+        );
+    } else {
+        polyphase_single_kernel::launch(
+            &client,
+            count,
+            dim,
+            address_type!(input, weight, bias, out),
+            line,
+            input.into_tensor_arg(),
+            weight.into_tensor_arg(),
+            bias.map(|b| b.into_buffer_arg()).into(),
+            out.clone().into_linear_view(),
+            PolyphaseSingleArgsLaunch::new(out_len, stride, padding, groups, samples_per_phase),
+            weight_kic,
+            dtype_to_storage_type(dtype),
+        );
+    }
     Ok(permute_nhwc_to_nchw(out))
 }
 
