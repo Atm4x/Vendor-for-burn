@@ -4,6 +4,7 @@ mod col2im;
 mod transpose_direct;
 mod polyphase1d;
 mod phase_gemm1d;
+mod fused2tap1d;
 
 #[cfg(feature = "autotune")]
 mod tune;
@@ -18,3 +19,5 @@ pub use polyphase1d::{conv_transpose1d_polyphase, conv_transpose1d_polyphase_pac
 pub use tune::*;
 
 pub use phase_gemm1d::{prepack_conv_transpose1d_phase_gemm_weight, prepack_conv_transpose1d_phase_gemm_weight_compensated, conv_transpose1d_phase_gemm_packed, conv_transpose1d_phase_gemm_packed_compensated};
+
+pub use fused2tap1d::conv_transpose1d_fused_two_tap_packed;

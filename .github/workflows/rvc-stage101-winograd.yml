@@ -1,4 +1,4 @@
-name: RVC Stage111 NSF phase-domain batched matmul FP16 CUDA profiler
+name: RVC Stage112 fused two-tap polyphase shared-memory Windows profiler
 
 on:
   workflow_dispatch:
@@ -21,13 +21,14 @@ on:
       - 'research/stage109-polyphase-ilp/**'
       - 'research/stage110-channel-tile2/**'
       - 'research/stage111-phase-gemm/**'
+      - 'research/stage112-fused-polyphase/**'
       - '.github/workflows/rvc-stage101-winograd.yml'
 
 permissions:
   contents: read
 
 concurrency:
-  group: rvc-stage111-phase-gemm-${{ github.ref }}
+  group: rvc-stage112-fused-two-tap-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -55,7 +56,7 @@ jobs:
           Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
           python tools/restore_vendor_checksums.py --zerocopy-archive $archive
           if ($LASTEXITCODE -ne 0) { throw 'Vendor checksum repair failed' }
-      - name: Validate Stage101-111 analyzers, references, and PowerShell runners
+      - name: Validate Stage101-112 analyzers, references, and PowerShell runners
         shell: pwsh
         run: |
           python research/stage101-winograd/windows/test_stage101_analyzer.py
@@ -75,6 +76,21 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Stage105 pair contract tests failed' }
           python research/stage106-nsf-polyphase/windows/test_stage106.py
           if ($LASTEXITCODE -ne 0) { throw 'Stage106 source contract failed' }
+          python research/stage112-fused-polyphase/windows/test_stage112.py
+          if ($LASTEXITCODE -ne 0) { throw 'Stage112 analyzer contract failed' }
+          python -m compileall -q research/stage112-fused-polyphase/windows
+          if ($LASTEXITCODE -ne 0) { throw 'Stage112 Python validation failed' }
+          $stage112Ref = Join-Path $env:RUNNER_TEMP 'stage112-fused-reference.exe'
+          rustc --edition=2024 --test research/stage112-fused-polyphase/reference.rs -o $stage112Ref
+          if ($LASTEXITCODE -ne 0) { throw 'Stage112 reference compilation failed' }
+          & $stage112Ref
+          if ($LASTEXITCODE -ne 0) { throw 'Stage112 reference parity failed' }
+          $stage112 = 'research/stage112-fused-polyphase/windows/Run-RVC-Stage112-Fused-Polyphase.ps1'
+          $tokens112 = $null
+          $errors112 = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $stage112).Path,[ref]$tokens112,[ref]$errors112)
+          if ($errors112.Count -gt 0) { $errors112 | Format-List | Out-String | Write-Host; throw 'Stage112 PowerShell invalid' }
+          & $stage112 -DryRun -Profiler ncu
           python research/stage111-phase-gemm/windows/test_stage111.py
           if ($LASTEXITCODE -ne 0) { throw 'Stage111 comparator contract failed' }
           python -m compileall -q research/stage111-phase-gemm/windows
@@ -193,11 +209,11 @@ jobs:
             [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path "research/stage102-cuda-profile/windows/$script").Path,[ref]$tokens,[ref]$errors)
             if ($errors.Count -gt 0) { $errors | Format-List | Out-String | Write-Host; throw "Invalid PowerShell: $script" }
           }
-      - name: Build Stage111 unified CPU CUDA WGPU and probes
+      - name: Build Stage112 unified CPU CUDA WGPU and probes
         shell: pwsh
         run: |
-          cargo build --release --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs --bin stage102_conv2d_probe --bin stage103_conv2d_probe --bin stage106_polyphase_probe --bin stage106_noise_probe --bin stage111_phase_gemm_probe
-          if ($LASTEXITCODE -ne 0) { throw 'Stage111 unified build failed' }
+          cargo build --release --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs --bin stage102_conv2d_probe --bin stage103_conv2d_probe --bin stage106_polyphase_probe --bin stage106_noise_probe --bin stage111_phase_gemm_probe --bin stage112_fused_probe
+          if ($LASTEXITCODE -ne 0) { throw 'Stage112 unified build failed' }
           & target/release/tts-with-rvc-rs.exe doctor
           if ($LASTEXITCODE -ne 0) { throw 'Stage101 doctor failed' }
           & target/release/tts-with-rvc-rs.exe nvtx-status
@@ -212,6 +228,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Stage106 noise NVTX probe failed' }
           & target/release/stage111_phase_gemm_probe.exe nvtx-status
           if ($LASTEXITCODE -ne 0) { throw 'Stage111 NVTX probe failed' }
+          & target/release/stage112_fused_probe.exe nvtx-status
+          if ($LASTEXITCODE -ne 0) { throw 'Stage112 NVTX probe failed' }
+          foreach ($case in @('grouped2','odd2')) {
+            & target/release/stage112_fused_probe.exe cpu $case fused2tap 3
+            if ($LASTEXITCODE -ne 0) { throw "Stage112 shared-memory CPU parity failed: $case" }
+          }
           & target/release/stage111_phase_gemm_probe.exe cpu small phase_f32 3
           if ($LASTEXITCODE -ne 0) { throw 'Stage111 full-output CubeCL CPU phase GEMM parity failed' }
 
@@ -239,7 +261,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Stage107 noise interior CPU parity failed' }
           & target/release/tts-with-rvc-rs.exe --help
           if ($LASTEXITCODE -ne 0) { throw 'Stage101 help failed' }
-      - name: Package Stage111 phase GEMM profiler package
+      - name: Package Stage112 fused two-tap profiler package
         shell: pwsh
         run: |
           $folder = 'dist/stage104-ncu-matrix'
@@ -250,6 +272,11 @@ jobs:
           Copy-Item target/release/stage106_polyphase_probe.exe (Join-Path $folder 'stage106_polyphase_probe.exe')
           Copy-Item target/release/stage106_noise_probe.exe (Join-Path $folder 'stage106_noise_probe.exe')
           Copy-Item target/release/stage111_phase_gemm_probe.exe (Join-Path $folder 'stage111_phase_gemm_probe.exe')
+          Copy-Item target/release/stage112_fused_probe.exe (Join-Path $folder 'stage112_fused_probe.exe')
+          Copy-Item research/stage112-fused-polyphase/windows/Run-RVC-Stage112-Fused-Polyphase.ps1 $folder
+          Copy-Item research/stage112-fused-polyphase/windows/compare_stage112.py $folder
+          Copy-Item research/stage112-fused-polyphase/windows/torch_reference.py (Join-Path $folder 'torch_reference_stage112.py')
+          Copy-Item research/stage112-fused-polyphase/README.md (Join-Path $folder 'STAGE112_README.md')
           Copy-Item research/stage111-phase-gemm/windows/Run-RVC-Stage111-Phase-GEMM.ps1 $folder
           Copy-Item research/stage111-phase-gemm/windows/compare_stage111.py $folder
           Copy-Item research/stage111-phase-gemm/windows/torch_reference.py $folder
@@ -299,7 +326,7 @@ jobs:
           '@ | Set-Content (Join-Path $folder 'README.txt')
       - uses: actions/upload-artifact@v4
         with:
-          name: rvc-stage111-phase-gemm-windows-x64
+          name: rvc-stage112-fused-two-tap-windows-x64
           path: dist/stage104-ncu-matrix/
           retention-days: 14
           if-no-files-found: error
