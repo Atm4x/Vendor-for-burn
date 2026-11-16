@@ -16,6 +16,7 @@ fn preact_residual_temporal_kernel<E: Float, NOut: Size>(
     residual: ComptimeOption<&[Vector<E, NOut>]>,
     mut output: LinearViewMut<'_, Vector<E, NOut>>,
     out_len: u32,
+    #[comptime] temporal_tile: u32,
     stride: u32,
     dilation: u32,
     padding: i32,
@@ -24,7 +25,7 @@ fn preact_residual_temporal_kernel<E: Float, NOut: Size>(
     let lanes = output.vector_size() as u32;
     let channels = weight.shape(3) as u32;
     let vectors_per_position = channels / lanes;
-    let pairs = (out_len + 1) / 2;
+    let pairs = (out_len + temporal_tile - 1) / temporal_tile;
     let unit = ABSOLUTE_POS as u32;
     if unit >= input.shape(0) as u32 * pairs * vectors_per_position {
         terminate!();
@@ -33,20 +34,28 @@ fn preact_residual_temporal_kernel<E: Float, NOut: Size>(
     let output_vector = unit % vectors_per_position;
     let pair = unit / vectors_per_position;
     let batch = pair / pairs;
-    let t0 = (pair % pairs) * 2;
+    let t0 = (pair % pairs) * temporal_tile;
     let t1 = t0 + 1;
+    let t2 = t0 + 2;
+    let t3 = t0 + 3;
     let cin = weight.shape(2) as u32;
     let kernel_size = weight.shape(1) as u32;
     let length = input.shape(1) as u32;
     let mut sum0 = Vector::<E, NOut>::zero();
     let mut sum1 = Vector::<E, NOut>::zero();
+    let mut sum2 = Vector::<E, NOut>::zero();
+    let mut sum3 = Vector::<E, NOut>::zero();
 
     for k in 0..kernel_size {
         let i0 = (t0 * stride + k * dilation) as i32 - padding;
         let i1 = (t1 * stride + k * dilation) as i32 - padding;
+        let i2 = (t2 * stride + k * dilation) as i32 - padding;
+        let i3 = (t3 * stride + k * dilation) as i32 - padding;
         let valid0 = i0 >= 0 && (i0 as u32) < length;
         let valid1 = t1 < out_len && i1 >= 0 && (i1 as u32) < length;
-        if valid0 || valid1 {
+        let valid2 = temporal_tile == 4 && t2 < out_len && i2 >= 0 && (i2 as u32) < length;
+        let valid3 = temporal_tile == 4 && t3 < out_len && i3 >= 0 && (i3 as u32) < length;
+        if valid0 || valid1 || valid2 || valid3 {
             for ci in 0..cin {
                 let w_offset = k as usize * weight.stride(1)
                     + ci as usize * weight.stride(2)
@@ -76,6 +85,30 @@ fn preact_residual_temporal_kernel<E: Float, NOut: Size>(
                     };
                     sum1 += w * Vector::new(activated);
                 }
+                if valid2 {
+                    let x_offset = batch as usize * input.stride(0)
+                        + i2 as usize * input.stride(1)
+                        + ci as usize * input.stride(2);
+                    let x = input[x_offset];
+                    let activated = if x >= E::from_int(0) {
+                        x
+                    } else {
+                        x * (E::from_int(1) / E::from_int(10))
+                    };
+                    sum2 += w * Vector::new(activated);
+                }
+                if valid3 {
+                    let x_offset = batch as usize * input.stride(0)
+                        + i3 as usize * input.stride(1)
+                        + ci as usize * input.stride(2);
+                    let x = input[x_offset];
+                    let activated = if x >= E::from_int(0) {
+                        x
+                    } else {
+                        x * (E::from_int(1) / E::from_int(10))
+                    };
+                    sum3 += w * Vector::new(activated);
+                }
             }
         }
     }
@@ -87,11 +120,29 @@ fn preact_residual_temporal_kernel<E: Float, NOut: Size>(
     let b = base_bias.unwrap_or_else(|| Vector::zero());
     sum0 += b;
     sum1 += b;
+    if temporal_tile == 4 {
+        sum2 += b;
+        sum3 += b;
+    }
     let base_residual: ComptimeOption<Vector<E, NOut>> = residual.map(|r| r[index0]);
     sum0 += base_residual.unwrap_or_else(|| Vector::zero());
     if t1 < out_len {
         let next_residual: ComptimeOption<Vector<E, NOut>> = residual.map(|r| r[index1]);
         sum1 += next_residual.unwrap_or_else(|| Vector::zero());
+    }
+    if temporal_tile == 4 {
+        let index2 = base + t2 as usize * vectors_per_position as usize + output_vector as usize;
+        let index3 = base + t3 as usize * vectors_per_position as usize + output_vector as usize;
+        if t2 < out_len {
+            let residual2: ComptimeOption<Vector<E, NOut>> = residual.map(|r| r[index2]);
+            sum2 += residual2.unwrap_or_else(|| Vector::zero());
+            output.write(index2, sum2);
+        }
+        if t3 < out_len {
+            let residual3: ComptimeOption<Vector<E, NOut>> = residual.map(|r| r[index3]);
+            sum3 += residual3.unwrap_or_else(|| Vector::zero());
+            output.write(index3, sum3);
+        }
     }
     output.write(index0, sum0);
     if t1 < out_len {
@@ -109,6 +160,7 @@ pub fn launch_preact_residual_temporal(
     stride: usize,
     dilation: usize,
     padding: usize,
+    temporal_tile: usize,
     dtype: ElemType,
 ) -> Result<(), ConvSetupError> {
     if input.shape.len() != 3
@@ -118,6 +170,7 @@ pub fn launch_preact_residual_temporal(
         || input.shape[2] != weight.shape[2]
         || weight.shape[3] != output.shape[2]
         || input.shape[0] != output.shape[0]
+        || (temporal_tile != 2 && temporal_tile != 4)
         || stride != 1
         || input.shape[1] != output.shape[1]
         || input.shape.iter().any(|&n| n == 0)
@@ -149,7 +202,7 @@ pub fn launch_preact_residual_temporal(
     if output.shape[2] % vector_size != 0 {
         return Err(ConvSetupError::Unknown);
     }
-    let work = input.shape[0] * output.shape[1].div_ceil(2) * (output.shape[2] / vector_size);
+    let work = input.shape[0] * output.shape[1].div_ceil(temporal_tile) * (output.shape[2] / vector_size);
     let cube_dim = CubeDim::new(client, work);
     let cube_count = calculate_cube_count_elemwise(client, work, cube_dim);
     let mut address_type = input
@@ -173,6 +226,7 @@ pub fn launch_preact_residual_temporal(
             residual.map(|x| x.into_buffer_arg()).into(),
             linear_view(output),
             length,
+            temporal_tile as u32,
             stride as u32,
             dilation as u32,
             padding as i32,

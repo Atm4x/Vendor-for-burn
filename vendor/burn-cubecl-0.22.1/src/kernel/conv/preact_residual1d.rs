@@ -72,6 +72,13 @@ pub fn conv1d_preact_residual_temporal(
     packed.shape = vec![1, kernel, cin, cout].into();
     packed.strides = vec![kernel * cin * cout, cin * cout, cout, 1].into();
     let client = input.client.clone();
+    let temporal_tile = if cout == 128 && kernel == 11
+        && std::env::var("RVC_NSF_RESBLOCK_TEMPORAL_TILE").as_deref() == Ok("4")
+    {
+        4
+    } else {
+        2
+    };
     launch_preact_residual_temporal(
         &client,
         input.binding(),
@@ -82,6 +89,7 @@ pub fn conv1d_preact_residual_temporal(
         1,
         dilation,
         padding,
+        temporal_tile,
         dtype_to_storage_type(DType::F32),
     )?;
     Ok(permute_nhwc_to_nchw(out))
