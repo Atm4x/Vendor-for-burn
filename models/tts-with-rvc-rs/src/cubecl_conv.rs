@@ -4,8 +4,27 @@ use burn::tensor::{
 };
 use burn_cubecl::{
     Cube,
-    kernel::conv::{ConvStrategy, ConvTranspose2dStrategy, conv1d_single_input_packed, conv1d_single_input_prepack_weight, conv_transpose1d_polyphase, conv_transpose1d_polyphase_packed, conv_transpose1d_prepack_weight, conv_transpose1d_prepack_weight_kic, conv_transpose1d_polyphase_single_packed_kic, prepack_conv_transpose1d_phase_gemm_weight, prepack_conv_transpose1d_phase_gemm_weight_compensated, conv_transpose1d_phase_gemm_packed, conv_transpose1d_phase_gemm_packed_compensated, conv_forward, conv_forward_spatial_quad, conv_forward_spatial_reuse, conv_forward_spatial_pair, conv_transpose2d, prepack_winograd_weights, transform_winograd_input, inverse_winograd_output},
+    kernel::conv::{ConvStrategy, ConvTranspose2dStrategy, conv1d_preact_residual_temporal, prepare_resblock_input_ntc, conv1d_single_input_packed, conv1d_single_input_prepack_weight, conv_transpose1d_polyphase, conv_transpose1d_polyphase_packed, conv_transpose1d_prepack_weight, conv_transpose1d_prepack_weight_kic, conv_transpose1d_polyphase_single_packed_kic, prepack_conv_transpose1d_phase_gemm_weight, prepack_conv_transpose1d_phase_gemm_weight_compensated, conv_transpose1d_phase_gemm_packed, conv_transpose1d_phase_gemm_packed_compensated, conv_forward, conv_forward_spatial_quad, conv_forward_spatial_reuse, conv_forward_spatial_pair, conv_transpose2d, prepack_winograd_weights, transform_winograd_input, inverse_winograd_output},
 };
+
+pub(crate) fn prepare_resblock_ntc(input: Tensor<3>) -> Tensor<3> {
+    let raw = input.try_into_primitive::<Cube>().expect("ResBlock NTC prepack requires CubeCL");
+    Tensor::from_primitive::<Cube>(prepare_resblock_input_ntc(raw))
+}
+
+pub(crate) fn preact_resblock_conv(
+    input: Tensor<3>, weight: Tensor<3>, bias: Option<Tensor<1>>,
+    residual: Option<Tensor<3>>, dilation: usize, padding: usize,
+) -> Tensor<3> {
+    let input = input.try_into_primitive::<Cube>().expect("ResBlock input requires CubeCL");
+    let weight = weight.try_into_primitive::<Cube>().expect("ResBlock weight requires CubeCL");
+    let bias = bias.map(|b| b.try_into_primitive::<Cube>().expect("ResBlock bias requires CubeCL"));
+    let residual = residual.map(|r| r.try_into_primitive::<Cube>().expect("ResBlock residual requires CubeCL"));
+    Tensor::from_primitive::<Cube>(
+        conv1d_preact_residual_temporal(input, weight, bias, residual, dilation, padding)
+            .expect("ResBlock temporal transport unsupported shape"),
+    )
+}
 
 pub(crate) fn prepack_single_input_conv1d_weight(weight: Tensor<3>) -> Tensor<3> {
     let raw = weight.try_into_primitive::<Cube>().expect("NSF noise prepack requires CubeCL");
@@ -444,6 +463,75 @@ mod polyphase_tests {
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0f32, f32::max);
             assert!(max_abs < 3e-5, "N={batch} Cin={cin} Cout={cout} K={kernel} stride={stride}: error {max_abs}");
+        }
+    }
+}
+
+#[cfg(all(test, feature = "cpu"))]
+mod resblock_transport_tests {
+    use super::*;
+    use burn::tensor::{activation, module, Device, TensorData};
+    use crate::conv1d_layout::{from_host_values, Conv1dWeightLayout};
+
+    #[test]
+    fn packed_preact_residual_matches_two_resblock_convs() {
+        let device = Device::cpu();
+        for (batch, channels, length, kernel, dilation) in [
+            (1, 3, 19, 3, 1),
+            (2, 7, 35, 7, 3),
+            (1, 8, 16, 11, 5),
+            (1, 32, 21, 11, 5),
+        ] {
+            let x_values = (0..batch * channels * length)
+                .map(|i| ((i * 17 + 19) as f32 * 0.037).sin() * 0.38 - 0.12)
+                .collect::<Vec<_>>();
+            let w_values = (0..channels * channels * kernel)
+                .map(|i| ((i * 5 + 11) as f32 * 0.043).cos() * 0.05)
+                .collect::<Vec<_>>();
+            let b_values = (0..channels)
+                .map(|i| (i as f32 * 0.017).cos() * 0.011)
+                .collect::<Vec<_>>();
+            let x = Tensor::<3>::from_data(TensorData::new(
+                x_values, [batch, channels, length],
+            ), &device);
+            let w = Tensor::<3>::from_data(TensorData::new(
+                w_values.clone(), [channels, channels, kernel],
+            ), &device);
+            let packed = from_host_values(
+                [channels, channels, kernel], w_values, &device, Conv1dWeightLayout::Temporal,
+            );
+            let b = Tensor::<1>::from_data(TensorData::new(b_values, [channels]), &device);
+            let pad = (kernel - 1) * dilation / 2;
+            let options = ConvOptions::new_with_padding([1], [(pad, pad)], [dilation], 1);
+
+            let reference = module::conv1d(
+                activation::leaky_relu(x.clone(), 0.1), w, Some(b.clone()), options,
+            ) + x.clone();
+            let transport = preact_resblock_conv(x.clone(), packed.clone(), Some(b.clone()),
+                Some(x.clone()), dilation, pad);
+            assert_eq!(transport.dims(), reference.dims());
+            let expected = reference.into_data().try_into_vec::<f32>().unwrap();
+            let actual = transport.into_data().try_into_vec::<f32>().unwrap();
+            let max_abs = actual.iter().zip(expected.iter())
+                .map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            assert!(max_abs < 7e-5,
+                "channels={channels} kernel={kernel} dilation={dilation} error={max_abs}");
+
+            let shared_ntc = prepare_resblock_ntc(x.clone());
+            let shared_logical = shared_ntc.clone().into_data().try_into_vec::<f32>().unwrap();
+            let original_logical = x.clone().into_data().try_into_vec::<f32>().unwrap();
+            assert_eq!(shared_logical, original_logical);
+            let shared_result = preact_resblock_conv(
+                shared_ntc.clone(), packed.clone(), Some(b.clone()), Some(shared_ntc),
+                dilation, pad,
+            );
+            let shared_actual = shared_result.into_data().try_into_vec::<f32>().unwrap();
+            let shared_max_abs = shared_actual.iter().zip(&expected)
+                .map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            assert!(shared_max_abs < 7e-5,
+                "shared NTC channels={channels} kernel={kernel} dilation={dilation} error={shared_max_abs}");
+            let first = preact_resblock_conv(x, packed, Some(b), None, dilation, pad);
+            assert_eq!(first.dims(), [batch, channels, length]);
         }
     }
 }

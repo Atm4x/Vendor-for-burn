@@ -48,6 +48,7 @@ struct Conv1d {
     dilation: usize,
     padding: usize,
     fp16_resblock: bool,
+    resblock_transport: bool,
 }
 
 impl Conv1d {
@@ -57,7 +58,10 @@ impl Conv1d {
         }
         let normalized = checkpoint.contains(&format!("{prefix}.weight_v"));
         let kernel_mode = std::env::var("RVC_NSF_CONV_KERNEL").unwrap_or_default();
-        let layout = if matches!(kernel_mode.as_str(), "packed" | "quad" | "quad_interior") {
+        let resblock_transport = prefix.contains(".resblocks.")
+            && std::env::var("RVC_NSF_RESBLOCK_TRANSPORT").as_deref() == Ok("1");
+        let layout = if resblock_transport
+            || matches!(kernel_mode.as_str(), "packed" | "quad" | "quad_interior") {
             Conv1dWeightLayout::Temporal
         } else {
             default_conv1d_layout()
@@ -85,7 +89,16 @@ impl Conv1d {
         } else {
             None
         };
-        Ok(Self {weight, packed_noise_weight, bias, stride, dilation, padding, fp16_resblock})
+        if resblock_transport && fp16_resblock {
+            return Err(format!("{prefix}: RVC_NSF_RESBLOCK_TRANSPORT requires FP32"));
+        }
+        Ok(Self {weight, packed_noise_weight, bias, stride, dilation, padding, fp16_resblock, resblock_transport})
+    }
+
+    fn forward_preact(&self, input: Tensor<3>, residual: Option<Tensor<3>>) -> Tensor<3> {
+        crate::cubecl_conv::preact_resblock_conv(
+            input, self.weight.clone(), self.bias.clone(), residual, self.dilation, self.padding,
+        )
     }
 
     fn forward(&self, input: Tensor<3>) -> Tensor<3> {
@@ -246,7 +259,22 @@ impl ResBlock1 {
         if fp16 {
             x = x.cast(DType::F16);
         }
+        let transport = scheduling == NsfScheduling::Default
+            && self.first.iter().all(|conv| conv.resblock_transport)
+            && self.second.iter().all(|conv| conv.resblock_transport);
         for (first, second) in self.first.iter().zip(&self.second) {
+            if transport {
+                let range_first = format!("stage116_resblock_c{}_k{}_d{}_first",
+                    self.channels, first.weight.dims()[2], first.dilation);
+                let _range_first = crate::nvtx::Range::new(&range_first);
+                let h = first.forward_preact(x.clone(), None);
+                drop(_range_first);
+                let range_second = format!("stage116_resblock_c{}_k{}_d{}_second",
+                    self.channels, second.weight.dims()[2], second.dilation);
+                let _range_second = crate::nvtx::Range::new(&range_second);
+                x = second.forward_preact(h, Some(x));
+                continue;
+            }
             if shared_tile && crate::nsf_pair_tile::supports(self.channels, second.weight.dims()[2], second.dilation) {
                 x = crate::nsf_pair_tile::forward(
                     x, first.weight.clone(), first.bias.clone(), first.dilation, first.padding,
@@ -265,17 +293,25 @@ impl ResBlock1 {
                 ).expect("NSF experimental second fused convolution failed");
                 continue;
             }
+            let range_first = format!("stage116_resblock_c{}_k{}_d{}_first",
+                self.channels, first.weight.dims()[2], first.dilation);
+            let _range_first = crate::nvtx::Range::new(&range_first);
             let h = activation::leaky_relu(x.clone(), 0.1);
             let h = first.forward(h);
+            drop(_range_first);
             if scheduling == NsfScheduling::FlushPerConv {
                 h.device().flush().expect("NSF first Conv flush failed");
             }
+            let range_second = format!("stage116_resblock_c{}_k{}_d{}_second",
+                self.channels, second.weight.dims()[2], second.dilation);
+            let _range_second = crate::nvtx::Range::new(&range_second);
             let h = activation::leaky_relu(h, 0.1);
             let h = second.forward(h);
             if scheduling == NsfScheduling::FlushPerConv {
                 h.device().flush().expect("NSF second Conv flush failed");
             }
             x = x + h;
+            drop(_range_second);
             match scheduling {
                 NsfScheduling::FlushPerPair => x.device().flush().expect("NSF pair flush failed"),
                 NsfScheduling::SyncPerPair => x.device().sync().expect("NSF pair sync failed"),
@@ -408,6 +444,13 @@ impl DecoderStage {
         }
         assert_eq!(upsampled.dims(), source.dims(), "harmonic source must align with upsampled features");
         let prepared = upsampled + source;
+        let prepared = if scheduling == NsfScheduling::Default
+            && std::env::var("RVC_NSF_RESBLOCK_SHARED_NTC").as_deref() == Ok("1")
+        {
+            crate::cubecl_conv::prepare_resblock_ntc(prepared)
+        } else {
+            prepared
+        };
         let residual_started = trace.map(|_| Instant::now());
         let mut result = match aggregation {
             ResidualAggregation::ZeroSeeded => Some(Tensor::<3>::zeros(prepared.dims(), &prepared.device())),

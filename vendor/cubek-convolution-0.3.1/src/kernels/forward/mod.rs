@@ -3,6 +3,7 @@ pub mod depthwise;
 pub mod direct;
 pub mod direct_prepacked;
 pub mod direct_prepacked_quad;
+pub mod direct_preact_residual;
 pub mod direct_spatial_quad;
 pub mod direct_spatial_reuse;
 pub mod direct_spatial_pair;
@@ -29,3 +30,5 @@ pub use direct_prepacked_quad::{
 pub use direct_temporal_pair::launch_temporal_pair;
 pub use direct_temporal_pair_vector::launch_temporal_pair_vector;
 pub use pack_weights::launch_pack_conv1d_weights;
+
+pub use direct_preact_residual::launch_preact_residual_temporal;
