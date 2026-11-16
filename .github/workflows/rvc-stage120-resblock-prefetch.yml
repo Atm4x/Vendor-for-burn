@@ -1,0 +1,83 @@
+name: RVC Stage120 ResBlock prefetch Windows profile package
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - experiment/conv-kernel-rnd-stage33-20261110
+    paths:
+      - 'vendor/cubek-convolution-0.3.1/src/kernels/forward/direct_preact_residual.rs'
+      - 'vendor/burn-cubecl-0.22.1/src/kernel/conv/preact_residual1d.rs'
+      - 'research/stage120-resblock-prefetch/**'
+      - '.github/workflows/rvc-stage120-resblock-prefetch.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stage120-resblock-prefetch-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cache/tracel
+          key: rvc-rust100-stage120-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            stage116-rust100-
+            stage114-windows-rust100-
+      - name: Verify Stage120 PowerShell and numerical reference
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $runner = 'research/stage120-resblock-prefetch/windows/Run-Stage120-ResBlock-Prefetch.ps1'
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $runner).Path, [ref]$tokens, [ref]$errors)
+          if ($errors.Count -gt 0) { $errors | Format-List | Out-String | Write-Host; throw 'Stage120 PowerShell parser failed' }
+          rustc --edition=2024 --test -O research/stage120-resblock-prefetch/reference.rs -o "$env:RUNNER_TEMP/stage120-reference.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Stage120 reference compilation failed' }
+          & "$env:RUNNER_TEMP/stage120-reference.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Stage120 reference parity failed' }
+      - name: Restore vendored crate integrity
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Vendored crate integrity repair failed' }
+      - name: Build Rust CPU CUDA WGPU executable
+        shell: pwsh
+        run: |
+          cargo build --release --offline --locked -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs
+          if ($LASTEXITCODE -ne 0) { throw 'Stage120 Rust executable build failed' }
+          & target/release/tts-with-rvc-rs.exe doctor
+          if ($LASTEXITCODE -ne 0) { throw 'Stage120 doctor failed' }
+      - name: Assemble one self-contained Windows package
+        shell: pwsh
+        run: |
+          $dest = 'dist/rvc-stage120-resblock-prefetch-windows-x64'
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Copy-Item target/release/tts-with-rvc-rs.exe $dest
+          Copy-Item research/stage120-resblock-prefetch/windows/Run-Stage120-ResBlock-Prefetch.ps1 $dest
+          Copy-Item research/stage120-resblock-prefetch/README.md (Join-Path $dest 'README.md')
+          Copy-Item research/stage120-resblock-prefetch/REPORT.md (Join-Path $dest 'STAGE120_REPORT.md')
+          Copy-Item research/stage120-resblock-prefetch/WORKFLOW_CONTRACT.md (Join-Path $dest 'RVC_RND_WORKFLOW_CONTRACT.md')
+          Set-Content -Path (Join-Path $dest 'BUILD_STATUS.txt') -Value "Stage120 Rust build PASS; SHA=$env:GITHUB_SHA; no GPU on CI." -Encoding utf8
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rvc-stage120-resblock-prefetch-windows-x64
+          path: dist/rvc-stage120-resblock-prefetch-windows-x64/
+          if-no-files-found: error
+          retention-days: 14

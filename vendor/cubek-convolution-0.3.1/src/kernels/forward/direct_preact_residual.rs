@@ -17,6 +17,7 @@ fn preact_residual_temporal_kernel<E: Float, NOut: Size>(
     mut output: LinearViewMut<'_, Vector<E, NOut>>,
     out_len: u32,
     #[comptime] temporal_tile: u32,
+    #[comptime] prefetch_weights: bool,
     stride: u32,
     dilation: u32,
     padding: i32,
@@ -56,11 +57,23 @@ fn preact_residual_temporal_kernel<E: Float, NOut: Size>(
         let valid2 = temporal_tile == 4 && t2 < out_len && i2 >= 0 && (i2 as u32) < length;
         let valid3 = temporal_tile == 4 && t3 < out_len && i3 >= 0 && (i3 as u32) < length;
         if valid0 || valid1 || valid2 || valid3 {
+            let base_weight_offset = k as usize * weight.stride(1)
+                + (output_vector * lanes) as usize;
+            let mut prefetched_weight = Vector::<E, NOut>::zero();
+            if prefetch_weights {
+                prefetched_weight = weight[base_weight_offset / lanes as usize];
+            }
             for ci in 0..cin {
-                let w_offset = k as usize * weight.stride(1)
-                    + ci as usize * weight.stride(2)
-                    + (output_vector * lanes) as usize;
-                let w = weight[w_offset / lanes as usize];
+                let w_offset = base_weight_offset + ci as usize * weight.stride(2);
+                let w = if prefetch_weights {
+                    prefetched_weight
+                } else {
+                    weight[w_offset / lanes as usize]
+                };
+                if prefetch_weights && ci + 1 < cin {
+                    let next_offset = w_offset + weight.stride(2);
+                    prefetched_weight = weight[next_offset / lanes as usize];
+                }
                 if valid0 {
                     let x_offset = batch as usize * input.stride(0)
                         + i0 as usize * input.stride(1)
@@ -161,6 +174,7 @@ pub fn launch_preact_residual_temporal(
     dilation: usize,
     padding: usize,
     temporal_tile: usize,
+    prefetch_weights: bool,
     dtype: ElemType,
 ) -> Result<(), ConvSetupError> {
     if input.shape.len() != 3
@@ -227,6 +241,7 @@ pub fn launch_preact_residual_temporal(
             linear_view(output),
             length,
             temporal_tile as u32,
+            prefetch_weights,
             stride as u32,
             dilation as u32,
             padding as i32,

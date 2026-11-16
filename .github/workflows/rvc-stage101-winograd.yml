@@ -2,27 +2,6 @@ name: RVC Stage112 fused two-tap polyphase shared-memory Windows profiler
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - experiment/conv-kernel-rnd-stage33-20261110
-    paths:
-      - 'models/tts-with-rvc-rs/src/**'
-      - 'models/tts-with-rvc-rs/Cargo.toml'
-      - 'vendor/burn-cubecl-0.22.1/src/kernel/conv/**'
-      - 'vendor/cubek-convolution-0.3.1/src/kernels/forward/**'
-      - 'research/stage101-winograd/**'
-      - 'research/stage102-cuda-profile/**'
-      - 'research/stage103-l1-reuse/**'
-      - 'research/stage104-ncu-matrix/**'
-      - 'research/stage105-register-budget/**'
-      - 'research/stage106-nsf-polyphase/**'
-      - 'research/stage107-nsf-scheduling/**'
-      - 'research/stage108-polyphase-transport/**'
-      - 'research/stage109-polyphase-ilp/**'
-      - 'research/stage110-channel-tile2/**'
-      - 'research/stage111-phase-gemm/**'
-      - 'research/stage112-fused-polyphase/**'
-      - '.github/workflows/rvc-stage101-winograd.yml'
 
 permissions:
   contents: read

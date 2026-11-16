@@ -79,6 +79,8 @@ pub fn conv1d_preact_residual_temporal(
     } else {
         2
     };
+    let prefetch_weights = cout == 128 && kernel == 11
+        && std::env::var("RVC_NSF_RESBLOCK_WEIGHT_PREFETCH").as_deref() == Ok("1");
     launch_preact_residual_temporal(
         &client,
         input.binding(),
@@ -90,6 +92,7 @@ pub fn conv1d_preact_residual_temporal(
         dilation,
         padding,
         temporal_tile,
+        prefetch_weights,
         dtype_to_storage_type(DType::F32),
     )?;
     Ok(permute_nhwc_to_nchw(out))
