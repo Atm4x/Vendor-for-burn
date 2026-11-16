@@ -1,0 +1,100 @@
+name: RVC Stage114 graph spectral Windows package
+
+on:
+  push:
+    branches:
+      - experiment/conv-kernel-rnd-stage33-20261110
+    paths:
+      - 'research/stage114-graph-spectral/**'
+      - '.github/workflows/rvc-stage114-graph-spectral.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rvc-stage114-graph-spectral-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  stage114-windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cache/tracel
+          key: stage114-windows-rust100-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            stage101-winograd-
+            stage94-batch-aware-
+      - name: Verify and unpack Stage114 source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = 'research/stage114-graph-spectral/stage114_source.zip'
+          $expectedSha = '3419c2a93e2d6f434fa9ab28c728459e10b05a9684225a8408631727b8176fea'
+          $actualSha = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha -ne $expectedSha) { throw "Stage114 source SHA256 mismatch: $actualSha" }
+          Expand-Archive -LiteralPath $zip -DestinationPath 'research/stage114-graph-spectral/windows' -Force
+          $tokens = $null
+          $errors = $null
+          $scriptPath = (Resolve-Path 'research/stage114-graph-spectral/windows/Run-Stage114.ps1').Path
+          [void][System.Management.Automation.Language.Parser]::ParseFile($scriptPath,[ref]$tokens,[ref]$errors)
+          if ($errors.Count -gt 0) { $errors | Format-List | Out-String | Write-Host; throw 'Stage114 PowerShell parser rejected runner' }
+          python -m compileall -q research/stage114-graph-spectral/windows
+          if ($LASTEXITCODE -ne 0) { throw 'Stage114 Python compileall failed' }
+      - name: Install Torch CPU and run Stage114 mathematical parity on Windows
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m pip install --disable-pip-version-check numpy torch==2.7.1
+          if ($LASTEXITCODE -ne 0) { throw 'Python dependency install failed' }
+          Push-Location 'research/stage114-graph-spectral/windows'
+          try {
+            python -m unittest -v test_reference.py test_torch.py
+            if ($LASTEXITCODE -ne 0) { throw 'Stage114 Windows parity tests failed' }
+          } finally { Pop-Location }
+      - name: Restore vendor checksums
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Vendored crate validation failed' }
+      - name: Compile baseline Windows Rust RVC CLI
+        shell: pwsh
+        run: |
+          cargo build --release --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs
+          if ($LASTEXITCODE -ne 0) { throw 'Baseline RVC Windows build failed' }
+          & target/release/tts-with-rvc-rs.exe doctor
+          if ($LASTEXITCODE -ne 0) { throw 'RVC Windows doctor failed' }
+      - name: Package Stage114 Windows R&D runner
+        if: always()
+        shell: pwsh
+        run: |
+          $dest = 'dist/rvc-stage114-graph-spectral'
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          $source = 'research/stage114-graph-spectral/windows'
+          if (Test-Path $source) { Copy-Item "$source/*" $dest -Recurse -Force }
+          $exe = 'target/release/tts-with-rvc-rs.exe'
+          $built = Test-Path $exe
+          if ($built) { Copy-Item $exe (Join-Path $dest 'tts-with-rvc-rs-stage112-baseline.exe') }
+          $msg = "STAGE114: Python FFT/Conv1d R&D, not integrated into the Rust RVC CLI.`nRUST_BASELINE_EXE=$built`nGITHUB_SHA=$env:GITHUB_SHA`nWindows CI has no NVIDIA GPU; run Run-Stage114.ps1 on RTX4060."
+          Set-Content -Path (Join-Path $dest 'BUILD_STATUS.txt') -Value $msg -Encoding utf8
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rvc-stage114-graph-spectral-windows-x64
+          path: dist/rvc-stage114-graph-spectral/
+          if-no-files-found: error
+          retention-days: 14
