@@ -1,0 +1,26 @@
+[package]
+name = "fish-speech-vendor"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = []
+tensorrt-mock = ["dep:trtx", "dep:trtx-sys"]
+
+[dependencies]
+bytemuck = "1.25"
+half = { version = "2.7", features = ["bytemuck"] }
+hound = "3.5"
+rand_chacha = "0.9"
+rubato = "5"
+rustfft = "6"
+safetensors = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+symphonia = "0.6"
+thiserror = "2"
+tiktoken-rs = "0.12.1"
+trtx = { version = "=0.9.1", default-features = false, features = ["v_1_7", "mock", "dlopen_tensorrt_rtx"], optional = true }
+trtx-sys = { version = "=0.9.1", default-features = false, features = ["v_1_7"], optional = true }

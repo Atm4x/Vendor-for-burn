@@ -1,0 +1,410 @@
+# trtx-rs
+
+> **⚠️ EXPERIMENTAL - NOT FOR PRODUCTION USE**
+>
+> This project is in early experimental development. The API is unstable and will change.
+> This is NOT production-ready software. Use at your own risk.
+>
+> Published on crates.io to reserve the crate names.
+
+Safe Rust bindings to [NVIDIA TensorRT-RTX](https://github.com/NVIDIA/TensorRT-RTX) for high-performance deep learning inference.
+
+## Overview
+
+This project provides ergonomic Rust bindings to TensorRT-RTX, enabling efficient inference of deep learning models on NVIDIA GPUs with minimal overhead.
+
+### Features
+
+- **Safe API**: RAII-based memory management and type-safe abstractions
+- **Two-phase workflow**: Separate build (AOT) and inference (runtime) phases
+- **Zero-cost abstractions**: Minimal overhead over C++ API
+- **Comprehensive error handling**: Proper Rust error types for all operations
+- **Flexible logging**: Customizable log handlers for TensorRT messages
+
+## Project Structure
+
+```
+trtx-rs/
+├── trtx-sys/       # Raw FFI bindings (unsafe)
+└── trtx/           # Safe Rust wrapper (use this!)
+```
+
+## Prerequisites
+
+### Required (building) 
+
+1. **libclang < 22**: Required for autocxx. On Windows: `winget install LLVM.LLVM -v 20.1.2`
+
+   *Important*: libclang version 22 or greater will cause a compilation error
+
+   You can steer discovery of libclang using LIBCLANG_PATH environment variable if auto-discovery
+   discovers a wrong version of libclang, e.g.
+
+   $env:LIBCLANG_PATH="D:\programs\LLVM\bin"  # powershell windows
+   export LIBCLANG_PATH=/usr/lib/llvm-19/lib  # linux
+
+   See https://rust-lang.github.io/rust-bindgen/requirements.html (note that autocxx uses an older fork of bindgen)
+
+TensorRT is by default dynamically loaded. So, the TensorRT SDK is only required for building
+with Cargo features `link_tensorrt_rtx`/ `link_tensorrt_onnxparser` which would link the TensorRT libraries.
+Use `TENSORRT_SDK_DIR` to point to the TensorRT SDK root directory (the path that contains the `lib` folder with the shared libraries).
+
+### Required (GPU execution) 
+
+1. **NVIDIA TensorRT-RTX**: Download and install from [NVIDIA Developer](https://developer.nvidia.com/tensorrt)
+     - The TensorRT libraries should be in a location where they can be dynamically loaded.
+       (e.g. by setting PATH on Windows or LD_LIBRARY_PATH on Linux)
+     - This crate currently requires TensorRT RTX version 1.3, 1.4, 1.5, 1.6 or 1.7 (see Cargo feature `v_1_3`, `v_1_4`, `v_1_5`, `v_1_6`, `v_1_7`).
+       Use `default-features = false` plus version feature to select version.
+       You will also have to either enable `dlopen_tensorrt_rtx` or `link_tensorrt_rtx`.
+
+2. **NVIDIA GPU**: Compatible with TensorRT-RTX requirements
+
+
+### Development Without TensorRT-RTX (Mock Mode)
+
+If you're developing on a machine without TensorRT-RTX (e.g., macOS, or for testing), you can use the `mock` feature. This enables the **trtx mock layer** (safe Rust stubs in `trtx` that mirror the real API), not the low-level FFI:
+
+```bash
+# Build with mock mode
+cargo build --features mock
+
+# Run examples with mock mode
+cargo run --features mock --example basic_workflow
+
+# Run tests with mock mode
+cargo test --features mock
+```
+
+Mock mode provides stub implementations that allow you to:
+- Verify the API compiles correctly
+- Test your application structure
+- Develop without needing an NVIDIA GPU
+- Run CI/CD pipelines on any platform
+
+**Note:** Mock mode only validates structure and API usage. For actual inference, you need real TensorRT-RTX.
+
+## Cargo features
+
+The `trtx` crate has the following Cargo features:
+
+- `default`: "dlopen_tensorrt_onnxparser", "dlopen_tensorrt_rtx", "onnxparser", "v_1_6"
+- `mock`: use this library in mock mode. TensorRT libraries and a Nvidia GPU are no longer necessary for execution
+- `mock_runtime`: only mock runtime features of TensorRT. TensorRT libraries are required, but GPU execution is mocked (no GPU or CUDA required).
+- `dlopen_tensorrt_rtx`: enables dynamic loading of the TensorRT library via `trtx::dynamically_load_tensorrt`
+- `dlopen_tensorrt_onnxparser`: enables dynamic loading of the TensorRT ONNX parser library via `trtx::dynamically_load_tensorrt_onnxparser`
+- `links_tensorrt_rtx`: links the TensorRT library, `trtx::dynamically_load_tensorrt` is now optional
+- `links_tensorrt_onnxparser`: links the TensorRT ONNX parser library, `trtx::dynamically_load_tensorrt_onnxparser` is now optional
+- `onnxparser`: Enables the ONNX parser functionality of this crate. Optional if not using ONNX as the input format for TensorRT,
+  but using the builder library instead
+- `v_1_3` + `default-features = false` + (`dlopen_tensorrt_rtx` or `link_tensorrt_rtx`): Uses TensorRT RTX versions 1.3. At least one version feature has to be enabled
+- `v_1_4` + `default-features = false` + (`dlopen_tensorrt_rtx` or `link_tensorrt_rtx`): Uses TensorRT RTX versions 1.4. At least one version feature has to be enabled
+- `v_1_5` + `default-features = false` + (`dlopen_tensorrt_rtx` or `link_tensorrt_rtx`): Uses TensorRT RTX versions 1.5. At least one version feature has to be enabled
+- `v_1_6` + `default-features = false` + (`dlopen_tensorrt_rtx` or `link_tensorrt_rtx`): Uses TensorRT RTX versions 1.6. At least one version feature has to be enabled
+- `v_1_7` + `default-features = false` + (`dlopen_tensorrt_rtx` or `link_tensorrt_rtx`): Uses TensorRT RTX versions 1.7. At least one version feature has to be enabled
+
+## Installation
+
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+trtx = "0.4"
+```
+
+## Usage
+
+### Build Phase (Creating an Engine)
+
+```rust
+use trtx::{Logger, Builder};
+use trtx::builder::{network_flags, MemoryPoolType};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Dynamically load TensorRT with optional path
+    // when using the crate's dlopen_tensorrt_rtx feature (the default, no-op when link_tensorrt_rtx is also enabled)
+    trtx::dynamically_load_tensorrt(None::<String>).unwrap();
+
+    // Create logger
+    let logger = Logger::stderr()?;
+
+    // Create builder
+    let builder = Builder::new(&logger)?;
+
+    // Create network with explicit batch dimensions
+    let network = builder.create_network(network_flags::EXPLICIT_BATCH)?;
+
+    // Configure builder
+    let mut config = builder.create_config()?;
+    config.set_memory_pool_limit(MemoryPoolType::Workspace, 1 << 30)?; // 1GB
+
+    // Build serialized engine
+    let engine_data = builder.build_serialized_network(&network, &config)?;
+
+    // Save to disk
+    std::fs::write("model.engine", &engine_data)?;
+
+    Ok(())
+}
+```
+
+### Inference Phase (Running Inference)
+
+```rust
+use trtx::{Logger, Runtime};
+use std::fs;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Dynamically load TensorRT with optional path
+    // when using the crate's dlopen_tensorrt_rtx feature (the default, no-op when link_tensorrt_rtx is also enabled)
+    trtx::dynamically_load_tensorrt(None::<String>).unwrap();
+
+    // Create logger and runtime
+    let logger = Logger::stderr()?;
+    let runtime = Runtime::new(&logger)?;
+
+    // Load serialized engine
+    let engine_data = fs::read("model.engine")?;
+    let engine = runtime.deserialize_cuda_engine(&engine_data)?;
+
+    // Create execution context
+    let mut context = engine.create_execution_context()?;
+
+    // Query tensor information
+    let num_tensors = engine.get_nb_io_tensors()?;
+    for i in 0..num_tensors {
+        let name = engine.get_tensor_name(i)?;
+        println!("Tensor {}: {}", i, name);
+    }
+
+    // Set tensor addresses (requires CUDA memory)
+    unsafe {
+        context.set_tensor_address("input", input_device_ptr)?;
+        context.set_tensor_address("output", output_device_ptr)?;
+    }
+
+    // Execute inference
+    unsafe {
+        context.enqueue_v3(cuda_stream)?;
+    }
+
+    Ok(())
+}
+```
+
+### Custom Logging
+
+```rust
+use trtx::{Logger, LogHandler, Severity};
+
+struct MyLogger;
+
+impl LogHandler for MyLogger {
+    fn log(&self, severity: Severity, message: &str) {
+        match severity {
+            Severity::Error | Severity::InternalError => {
+                eprintln!("ERROR: {}", message);
+            }
+            Severity::Warning => {
+                println!("WARN: {}", message);
+            }
+            _ => {
+                println!("INFO: {}", message);
+            }
+        }
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let logger = Logger::new(MyLogger)?;
+    // Use logger...
+    Ok(())
+}
+```
+
+## API Overview
+
+### Core Types
+
+- **`Logger`**: Captures TensorRT messages with custom handlers
+- **`Builder`**: Creates optimized inference engines
+- **`NetworkDefinition`**: Defines the computational graph
+- **`BuilderConfig`**: Configures optimization parameters
+- **`Runtime`**: Deserializes engines for inference
+- **`CudaEngine`**: Optimized inference engine
+- **`ExecutionContext`**: Manages inference execution
+
+### Error Handling
+
+All fallible operations return `Result<T, Error>`:
+
+```rust
+use trtx::Error;
+
+match builder.create_network(0) {
+    Ok(network) => {
+        // Use network
+    }
+    Err(Error::InvalidArgument(msg)) => {
+        eprintln!("Invalid argument: {}", msg);
+    }
+    Err(e) => {
+        eprintln!("Error: {}", e);
+    }
+}
+```
+
+## Safety
+
+### Safe Operations
+
+Most operations are safe and use RAII for resource management:
+- Creating loggers, builders, runtimes
+- Building and serializing engines
+- Deserializing engines
+- Creating execution contexts
+
+### Unsafe Operations
+
+CUDA-related operations require `unsafe`:
+- **`set_tensor_address`**: Must point to valid CUDA device memory
+- **`enqueue_v3`**: Requires valid CUDA stream and properly bound tensors
+
+## Building from Source
+
+```bash
+# Clone the repository
+git clone https://github.com/rustnn/trtx-rs.git
+cd trtx-rs
+
+# Option 1: Build with TensorRT-RTX (requires NVIDIA GPU)
+export TENSORRT_SDK_DIR=/path/to/tensorrt-rtx
+export LD_LIBRARY_PATH="$TENSORRT_SDK_DIR/lib"
+cargo build --release
+cargo test
+
+# Option 2: Build in mock mode (no GPU required)
+cargo build --features mock --release
+cargo test --features mock
+cargo run --features mock --example basic_workflow
+```
+
+## Architecture
+
+### trtx-sys (FFI Layer)
+
+- **autocxx**-generated bindings for the TensorRT-RTX C++ API
+- Slim C++ logger bridge for virtual method handling (e.g., log callbacks)
+- Optional mock FFI (when `mock` feature is enabled) so the crate can build without TensorRT installed
+- No safety guarantees; internal use only
+
+### trtx (Safe Wrapper)
+
+- **Mock layer**: When the `mock` feature is enabled, the trtx crate uses a Rust mock layer (`trtx/src/mock/`) that mirrors the real API—this is the “mock mode” you use for development without GPU. Real implementation lives in `trtx/src/real/`.
+- RAII-based resource management
+- Type-safe API
+- Lifetime tracking
+- Comprehensive error handling
+- User-facing API
+
+## Troubleshooting
+
+### Build Errors
+
+**Cannot find TensorRT headers:**
+```bash
+export TENSORRT_SDK_DIR=/path/to/tensorrt-rtx
+```
+
+**Linking errors:**
+```bash
+export LD_LIBRARY_PATH=$TENSORRT_RTX_DIR/lib:$LD_LIBRARY_PATH
+```
+
+### Runtime Errors
+
+**CUDA not initialized:**
+Ensure CUDA runtime is properly initialized before creating engines or contexts.
+
+**Invalid tensor addresses:**
+Verify that all tensor addresses point to valid CUDA device memory with correct sizes.
+
+## Development
+
+### Pre-commit Hooks
+
+To ensure code quality, set up the pre-commit hook:
+
+```bash
+cp .githooks/pre-commit .git/hooks/pre-commit
+chmod +x .git/hooks/pre-commit
+```
+
+The hook will automatically run `cargo fmt` and `cargo clippy` before each commit.
+
+### Manual Checks
+
+You can also run checks manually using the Makefile:
+
+```bash
+make check-all  # Run fmt, clippy, and tests
+make fmt        # Format code
+make clippy     # Run lints
+make test       # Run tests
+```
+
+### GPU Testing
+
+The project includes CI workflows for testing with real NVIDIA GPUs:
+
+- **Mock mode CI**: Runs on every push (ubuntu, macos) - tests API without GPU
+- **GPU tests**: Runs on self-hosted Windows runner with T4 GPU - tests real TensorRT-RTX
+
+To set up a GPU runner for real hardware testing, see [GPU Runner Setup Guide](.github/GPU_RUNNER_SETUP.md).
+
+The GPU tests workflow:
+- Builds without mock mode (uses real TensorRT-RTX)
+- Verifies CUDA and GPU availability
+- Runs tests and examples with actual GPU acceleration
+- Can be triggered manually or runs automatically on code changes
+
+## License
+
+This project is licensed under the Apache License, Version 2.0 - see the [LICENSE](LICENSE) file for details.
+
+## Acknowledgments
+
+- NVIDIA for TensorRT-RTX
+- The Rust community for excellent FFI tools
+
+## Status
+
+This project is in early development. APIs may change before 1.0 release.
+
+### Implemented
+
+- ✅ Core FFI layer (autocxx); trtx **mock layer** for development without TensorRT (no GPU)
+- ✅ Logger interface with custom handlers
+- ✅ Builder API for engine creation
+- ✅ Runtime and engine deserialization
+- ✅ Execution context
+- ✅ Error handling with detailed messages
+- ✅ **Network API**: TensorRT-RTX `INetworkDefinition` supported—build networks in Rust without ONNX
+- ✅ **ONNX parser bindings** (nvonnxparser integration)
+- ✅ **CUDA**: cudarc integration for memory management and device sync
+- ✅ **rustnn-compatible executor API** (ready for integration)
+- ✅ RAII-based resource management
+- ✅ Optimization profiles
+- ✅ Weight refitting
+
+### Planned
+
+- ⬜ Comprehensive examples with real models
+- ⬜ Performance benchmarking
+- ⬜ Documentation improvements
+
+## Resources
+
+- [TensorRT-RTX Documentation](https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/)
+- [TensorRT-RTX GitHub](https://github.com/NVIDIA/TensorRT-RTX)
+- [CUDA Programming Guide](https://docs.nvidia.com/cuda/)

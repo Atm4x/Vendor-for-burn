@@ -1,0 +1,16 @@
+[package]
+name = "regex_static_macro"
+description = "Compile-time validated regex, with convenience functions for lazy and static regexes."
+version = "0.1.0"
+authors = ["Brendan Molloy <brendan@bbqsrc.net>"]
+edition = "2018"
+license = "Apache-2.0 OR MIT OR CC0-1.0"
+repository = "https://github.com/bbqrc/regex-static"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+regex_static_impl = { version = "0.1", path = "../impl" }
+syn = "1"
+proc-macro2 = "1"

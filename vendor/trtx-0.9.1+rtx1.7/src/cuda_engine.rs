@@ -1,0 +1,703 @@
+//! CUDA engine and serialization config.
+//!
+//! [`CudaEngine`] wraps [`nvinfer1::ICudaEngine`] (C++ [`nvinfer1::ICudaEngine`](https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/_static/c-api/classnvinfer1_1_1_i_cuda_engine.html)).
+//! [`SerializationConfig`] wraps [`nvinfer1::ISerializationConfig`] (C++ [`nvinfer1::ISerializationConfig`](https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/_static/c-api/classnvinfer1_1_1_i_serialization_config.html)).
+
+use std::rc::Rc;
+#[cfg(all(feature = "v_1_6", not(feature = "enterprise")))]
+use std::{ffi::c_void, pin::Pin};
+use std::{ffi::CStr, marker::PhantomData};
+
+use crate::engine_inspector::EngineInspector;
+use crate::error::PropertySetAttempt;
+use crate::host_memory::HostMemory;
+#[cfg(all(feature = "v_1_6", not(feature = "enterprise")))]
+use crate::interfaces::StreamReaderV2;
+use crate::runtime_config::RuntimeConfig;
+use crate::{DataType, Error, ExecutionContext, Result};
+use autocxx::cxx::UniquePtr;
+use trtx_sys::{
+    nvinfer1::{self, ICudaEngine},
+    SerializationFlag, TensorIOMode,
+};
+use trtx_sys::{TensorFormat, TensorLocation};
+
+/// [`nvinfer1::ISerializationConfig`] — C++ [`nvinfer1::ISerializationConfig`](https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/_static/c-api/classnvinfer1_1_1_i_serialization_config.html).
+pub struct SerializationConfig<'cuda_engine> {
+    inner: UniquePtr<nvinfer1::ISerializationConfig>,
+    _runtime: PhantomData<&'cuda_engine nvinfer1::ICudaEngine>,
+}
+impl std::fmt::Debug for SerializationConfig<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SerializationConfig")
+            .field("inner", &format!("{:x}", self.inner.as_ptr() as usize))
+            .finish_non_exhaustive()
+    }
+}
+
+impl SerializationConfig<'_> {
+    /// See [nvinfer1::ISerializationConfig::getFlag]
+    pub fn flag(&self, flag: SerializationFlag) -> bool {
+        self.inner.getFlag(flag.into())
+    }
+    /// See [nvinfer1::ISerializationConfig::getFlags]
+    pub fn flags(&self) -> u32 {
+        self.inner.getFlags()
+    }
+    /// See [nvinfer1::ISerializationConfig::setFlag]
+    pub fn set_flag(&mut self, flag: SerializationFlag) -> Result<()> {
+        if self.inner.pin_mut().setFlag(flag.into()) {
+            Ok(())
+        } else {
+            Err(Error::FailedToSetProperty(
+                PropertySetAttempt::SerializationFlag,
+            ))
+        }
+    }
+    /// See [nvinfer1::ISerializationConfig::setFlags]
+    pub fn set_flags(&mut self, flags: u32) -> Result<()> {
+        if self.inner.pin_mut().setFlags(flags) {
+            Ok(())
+        } else {
+            Err(Error::FailedToSetProperty(
+                PropertySetAttempt::SerializationFlag,
+            ))
+        }
+    }
+    /// See [nvinfer1::ISerializationConfig::clearFlag]
+    pub fn clear_flag(&mut self, flag: SerializationFlag) -> Result<()> {
+        if self.inner.pin_mut().clearFlag(flag.into()) {
+            Ok(())
+        } else {
+            Err(Error::FailedToSetProperty(
+                PropertySetAttempt::SerializationFlag,
+            ))
+        }
+    }
+}
+
+/// [nvinfer1::ICudaEngine] — C++ [`nvinfer1::ICudaEngine`](https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/_static/c-api/classnvinfer1_1_1_i_cuda_engine.html).
+pub struct CudaEngine<'runtime> {
+    pub(crate) inner: UniquePtr<ICudaEngine>,
+    _runtime: PhantomData<&'runtime nvinfer1::IRuntime>,
+}
+
+impl std::fmt::Debug for CudaEngine<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CudaEngine")
+            .field("inner", &format!("{:x}", self.inner.as_ptr() as usize))
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'engine> CudaEngine<'engine> {
+    /// Creates a manager for saving and restoring this engine's opaque weight data.
+    /// Returns `None` when weight management is unavailable (including mock mode).
+    /// The manager must be dropped before this engine; its lifetime enforces that.
+    #[cfg(all(feature = "v_1_7", not(feature = "enterprise")))]
+    pub fn create_weights_manager(&mut self) -> Result<Option<crate::WeightsManager<'_>>> {
+        if cfg!(feature = "mock_runtime") {
+            return Ok(None);
+        }
+        let ptr = self.inner.pin_mut().createWeightsManager();
+        Ok(unsafe { crate::WeightsManager::from_raw(ptr) })
+    }
+
+    pub(crate) unsafe fn from_ptr(ptr: *mut ICudaEngine) -> Self {
+        Self {
+            inner: unsafe { UniquePtr::from_raw(ptr) },
+            _runtime: Default::default(),
+        }
+    }
+
+    #[deprecated = "use nb_io_tensors instead"]
+    pub fn get_nb_io_tensors(&self) -> Result<i32> {
+        self.nb_io_tensors()
+    }
+    #[deprecated = "use tensor_shape instead"]
+    pub fn get_tensor_shape(&self, name: &str) -> Result<Vec<i64>> {
+        self.tensor_shape(name)
+    }
+    #[deprecated = "use io_tensor_name instead"]
+    pub fn get_tensor_name(&self, index: i32) -> Result<String> {
+        self.io_tensor_name(index)
+    }
+    #[deprecated = "use tensor_data_type instead"]
+    pub fn get_tensor_dtype(&self, name: &str) -> Result<DataType> {
+        self.tensor_data_type(name)
+    }
+
+    /// See [ICudaEngine::getName]
+    pub fn name(&self) -> Result<String> {
+        let ptr = self.inner.getName();
+        if ptr.is_null() {
+            return Ok(String::new());
+        }
+        Ok(unsafe { CStr::from_ptr(ptr) }.to_str()?.to_string())
+    }
+
+    /// See [`nvinfer1::ICudaEngine::getNbIOTensors`].
+    pub fn nb_io_tensors(&self) -> Result<i32> {
+        if cfg!(feature = "mock_runtime") {
+            Ok(0)
+        } else {
+            Ok(self.inner.getNbIOTensors())
+        }
+    }
+
+    /// See [`nvinfer1::ICudaEngine::getIOTensorName`].
+    pub fn io_tensor_name(&self, index: i32) -> Result<String> {
+        if cfg!(feature = "mock_runtime") {
+            Ok("mock_runtime".to_string())
+        } else {
+            let name_ptr = self.inner.getIOTensorName(index);
+            if name_ptr.is_null() {
+                return Err(Error::InvalidArgument("Invalid tensor index".to_string()));
+            }
+            Ok(unsafe { CStr::from_ptr(name_ptr) }.to_str()?.to_string())
+        }
+    }
+
+    /// See [`nvinfer1::ICudaEngine::getTensorShape`].
+    pub fn tensor_shape(&self, name: &str) -> Result<Vec<i64>> {
+        let name_cstr = std::ffi::CString::new(name)?;
+        let dims = unsafe { self.inner.getTensorShape(name_cstr.as_ptr()) };
+        let nb_dims = dims.nbDims as usize;
+        if nb_dims > 8 {
+            return Err(Error::Runtime("Tensor has too many dimensions".to_string()));
+        }
+        Ok((0..nb_dims).map(|i| dims.d[i]).collect())
+    }
+
+    /// See [`nvinfer1::ICudaEngine::getTensorDataType`].
+    pub fn tensor_data_type(&self, name: &str) -> Result<DataType> {
+        if cfg!(not(feature = "mock_runtime")) {
+            let name_cstr = std::ffi::CString::new(name)?;
+            Ok(unsafe { self.inner.getTensorDataType(name_cstr.as_ptr()) }.into())
+        } else {
+            Ok(DataType::kFLOAT)
+        }
+    }
+
+    /// See [`nvinfer1::ICudaEngine::getNbLayers`].
+    pub fn nb_layers(&self) -> Result<i32> {
+        Ok(self.inner.getNbLayers())
+    }
+
+    /// See [`nvinfer1::ICudaEngine::getNbOptimizationProfiles`].
+    pub fn nb_optimization_profiles(&self) -> Result<i32> {
+        Ok(self.inner.getNbOptimizationProfiles())
+    }
+
+    /// See [`nvinfer1::ICudaEngine::getNbAuxStreams`].
+    pub fn nb_aux_streams(&self) -> Result<i32> {
+        Ok(self.inner.getNbAuxStreams())
+    }
+
+    /// See [`nvinfer1::ICudaEngine::getTensorIOMode`].
+    pub fn tensor_io_mode(&self, name: &str) -> Result<TensorIOMode> {
+        let name_cstr = std::ffi::CString::new(name)?;
+        Ok(unsafe { self.inner.getTensorIOMode(name_cstr.as_ptr()).into() })
+    }
+
+    /// See [`nvinfer1::ICudaEngine::getTensorLocation`].
+    pub fn tensor_location(&self, name: &str) -> Result<TensorLocation> {
+        let name_cstr = std::ffi::CString::new(name)?;
+        Ok(unsafe { self.inner.getTensorLocation(name_cstr.as_ptr()).into() })
+    }
+
+    /// See [`nvinfer1::ICudaEngine::getTensorFormat`].
+    pub fn tensor_format(&self, name: &str) -> Result<TensorFormat> {
+        let name_cstr = std::ffi::CString::new(name)?;
+        Ok(unsafe { self.inner.getTensorFormat(name_cstr.as_ptr()).into() })
+    }
+
+    /// See [`nvinfer1::ICudaEngine::getTensorFormat`] (profile variant).
+    pub fn tensor_format_for_profile(
+        &self,
+        name: &str,
+        profile_index: i32,
+    ) -> Result<nvinfer1::TensorFormat> {
+        let name_cstr = std::ffi::CString::new(name)?;
+        Ok(unsafe {
+            self.inner
+                .getTensorFormat1(name_cstr.as_ptr(), profile_index)
+        })
+    }
+
+    /// See [`nvinfer1::ICudaEngine::getTensorFormatDesc`].
+    pub fn tensor_format_desc(&self, name: &str) -> Result<String> {
+        let name_cstr = std::ffi::CString::new(name)?;
+        let ptr = unsafe { self.inner.getTensorFormatDesc(name_cstr.as_ptr()) };
+        if ptr.is_null() {
+            return Ok(String::new());
+        }
+        Ok(unsafe { CStr::from_ptr(ptr) }.to_str()?.to_string())
+    }
+
+    /// See [`nvinfer1::ICudaEngine::getTensorFormatDesc`] (profile variant).
+    pub fn tensor_format_desc_for_profile(&self, name: &str, profile_index: i32) -> Result<String> {
+        let name_cstr = std::ffi::CString::new(name)?;
+        let ptr = unsafe {
+            self.inner
+                .getTensorFormatDesc1(name_cstr.as_ptr(), profile_index)
+        };
+        if ptr.is_null() {
+            return Ok(String::new());
+        }
+        Ok(unsafe { CStr::from_ptr(ptr) }.to_str()?.to_string())
+    }
+
+    /// See [`nvinfer1::ICudaEngine::getTensorVectorizedDim`].
+    pub fn tensor_vectorized_dim(&self, name: &str) -> Result<i32> {
+        let name_cstr = std::ffi::CString::new(name)?;
+        Ok(unsafe { self.inner.getTensorVectorizedDim(name_cstr.as_ptr()) })
+    }
+
+    /// See [`nvinfer1::ICudaEngine::getTensorVectorizedDim`] (profile variant).
+    pub fn tensor_vectorized_dim_for_profile(&self, name: &str, profile_index: i32) -> Result<i32> {
+        let name_cstr = std::ffi::CString::new(name)?;
+        Ok(unsafe {
+            self.inner
+                .getTensorVectorizedDim1(name_cstr.as_ptr(), profile_index)
+        })
+    }
+
+    /// See [`nvinfer1::ICudaEngine::getTensorBytesPerComponent`].
+    pub fn tensor_bytes_per_component(&self, name: &str) -> Result<i32> {
+        #[cfg(not(feature = "mock_runtime"))]
+        {
+            let name_cstr = std::ffi::CString::new(name)?;
+            Ok(unsafe { self.inner.getTensorBytesPerComponent(name_cstr.as_ptr()) })
+        }
+        #[cfg(feature = "mock_runtime")]
+        Ok(42)
+    }
+
+    /// See [`nvinfer1::ICudaEngine::getTensorBytesPerComponent`] (profile variant).
+    pub fn tensor_bytes_per_component_for_profile(
+        &self,
+        name: &str,
+        profile_index: i32,
+    ) -> Result<i32> {
+        if !self.inner.is_null() {
+            let name_cstr = std::ffi::CString::new(name)?;
+            Ok(unsafe {
+                self.inner
+                    .getTensorBytesPerComponent1(name_cstr.as_ptr(), profile_index)
+            })
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// See [`nvinfer1::ICudaEngine::getTensorComponentsPerElement`].
+    pub fn tensor_components_per_element(&self, name: &str) -> Result<i32> {
+        #[cfg(not(feature = "mock_runtime"))]
+        {
+            let name_cstr = std::ffi::CString::new(name)?;
+            Ok(unsafe { self.inner.getTensorComponentsPerElement(name_cstr.as_ptr()) })
+        }
+        #[cfg(feature = "mock_runtime")]
+        {
+            Ok(42)
+        }
+    }
+
+    /// See [`nvinfer1::ICudaEngine::getTensorComponentsPerElement`] (profile variant).
+    pub fn tensor_components_per_element_for_profile(
+        &self,
+        name: &str,
+        profile_index: i32,
+    ) -> Result<i32> {
+        #[cfg(not(feature = "mock_runtime"))]
+        {
+            let name_cstr = std::ffi::CString::new(name)?;
+            Ok(unsafe {
+                self.inner
+                    .getTensorComponentsPerElement1(name_cstr.as_ptr(), profile_index)
+            })
+        }
+        #[cfg(feature = "mock_runtime")]
+        {
+            Ok(42)
+        }
+    }
+
+    /// See [`nvinfer1::ICudaEngine::createEngineInspector`].
+    /// Returns an inspector that can print layer and engine information (e.g. JSON or one-line format).
+    pub fn create_engine_inspector(&self) -> Result<EngineInspector<'_>> {
+        #[cfg(not(feature = "mock_runtime"))]
+        {
+            use crate::engine_inspector::EngineInspector;
+
+            let inspector = self.inner.createEngineInspector();
+            let inspector = unsafe {
+                inspector.as_mut().ok_or_else(|| {
+                    Error::Runtime("Failed to create engine inspector".to_string())
+                })?
+            };
+            Ok(EngineInspector {
+                inner: unsafe { UniquePtr::from_raw(inspector) },
+                _engine: Default::default(),
+            })
+        }
+        #[cfg(feature = "mock_runtime")]
+        {
+            Ok(EngineInspector {
+                inner: UniquePtr::null(),
+                _engine: Default::default(),
+            })
+        }
+    }
+
+    #[deprecated = "use tensor_data_type instead"]
+    pub fn tensor_dtype(&self, name: &str) -> Result<DataType> {
+        self.tensor_data_type(name)
+    }
+
+    /// See [nvinfer1::ICudaEngine::createExecutionContext]
+    pub fn create_execution_context(&'_ mut self) -> Result<ExecutionContext<'engine>> {
+        #[cfg(not(feature = "mock_runtime"))]
+        {
+            use crate::ExecutionContext;
+
+            let context_ptr = self
+                .inner
+                .pin_mut()
+                .createExecutionContext(nvinfer1::ExecutionContextAllocationStrategy::kSTATIC);
+            Ok(unsafe { ExecutionContext::from_ptr(context_ptr, None)? })
+        }
+        #[cfg(feature = "mock_runtime")]
+        Ok(unsafe { ExecutionContext::from_ptr(std::ptr::null_mut(), None)? })
+    }
+
+    /// See [nvinfer1::ICudaEngine::createExecutionContext1]
+    pub fn create_execution_context_with_config(
+        &'_ mut self,
+        runtime_config: Rc<RuntimeConfig<'engine>>,
+    ) -> Result<ExecutionContext<'engine>> {
+        #[cfg(not(feature = "mock_runtime"))]
+        {
+            use crate::ExecutionContext;
+
+            let context_ptr = unsafe {
+                self.inner
+                    .pin_mut()
+                    .createExecutionContext1(runtime_config.inner.as_mut_ptr())
+            };
+            Ok(unsafe { ExecutionContext::from_ptr(context_ptr, Some(runtime_config))? })
+        }
+        #[cfg(feature = "mock_runtime")]
+        Ok(unsafe { ExecutionContext::from_ptr(std::ptr::null_mut(), None)? })
+    }
+
+    /// See [nvinfer1::ICudaEngine::createSerializationConfig]
+    pub fn create_serialization_config(&mut self) -> Result<SerializationConfig<'engine>> {
+        let config = unsafe {
+            self.inner
+                .pin_mut()
+                .createSerializationConfig()
+                .as_mut()
+                .ok_or_else(|| Error::Runtime("SerializationConfig creation failed".to_string()))?
+        };
+        Ok(SerializationConfig {
+            inner: unsafe { UniquePtr::from_raw(config) },
+            _runtime: Default::default(),
+        })
+    }
+
+    /// See [nvinfer1::ICudaEngine::serializeWithConfig]
+    pub fn serialize_with_config(
+        &'_ self,
+        config: &mut SerializationConfig,
+    ) -> Result<HostMemory<'engine>> {
+        if !cfg!(feature = "mock_runtime") {
+            let host_mem = unsafe {
+                self.inner
+                    .serializeWithConfig(config.inner.pin_mut())
+                    .as_mut()
+                    .ok_or_else(|| {
+                        Error::Runtime("Failed to serialize ICudaEngine with config".to_string())
+                    })?
+            };
+            Ok(unsafe { HostMemory::from_raw(host_mem) })
+        } else {
+            Ok(unsafe { HostMemory::from_raw(std::ptr::null_mut()) })
+        }
+    }
+
+    /// See [`nvinfer1::ICudaEngine::isShapeInferenceIO`].
+    pub fn is_shape_inference_io(&self, name: &str) -> Result<bool> {
+        let name_cstr = std::ffi::CString::new(name)?;
+        Ok(unsafe { self.inner.isShapeInferenceIO(name_cstr.as_ptr()) })
+    }
+
+    /// See [nvinfer1::ICudaEngine::createRuntimeConfig]
+    pub fn create_runtime_config(&'_ mut self) -> Result<RuntimeConfig<'engine>> {
+        #[cfg(not(feature = "mock"))]
+        let config_ptr = self.inner.pin_mut().createRuntimeConfig();
+        #[cfg(feature = "mock")]
+        let config_ptr = std::ptr::null_mut();
+        RuntimeConfig::new(config_ptr)
+    }
+
+    /// Returns whether this engine's weights have been loaded onto the GPU.
+    ///
+    /// This is normally `true`. It is `false` after deserializing an engine while
+    /// [`crate::Runtime::deferred_weights_loading`] is enabled and before loading its weights.
+    ///
+    /// See [`nvinfer1::ICudaEngine::areWeightsLoaded`].
+    #[cfg(all(feature = "v_1_6", not(feature = "enterprise")))]
+    pub fn weights_loaded(&self) -> bool {
+        if cfg!(feature = "mock_runtime") {
+            true
+        } else {
+            self.inner.areWeightsLoaded()
+        }
+    }
+
+    /// Frees a deferred-loading engine's GPU weights so they can be loaded again.
+    /// Existing execution contexts remain valid. Returns an error if the engine is not in
+    /// deferred mode or its weights are already unloaded.
+    ///
+    /// # Safety
+    /// All inference on this engine must have completed. No other engine operation may run
+    /// concurrently with this call.
+    #[cfg(all(feature = "v_1_7", not(feature = "enterprise")))]
+    pub unsafe fn unload_weights(&mut self) -> Result<()> {
+        if cfg!(feature = "mock_runtime") || self.inner.pin_mut().unloadWeights() {
+            Ok(())
+        } else {
+            Err(Error::Runtime(
+                "Failed to unload deferred engine weights".to_string(),
+            ))
+        }
+    }
+
+    /// Synchronously loads this engine's weights onto the GPU from its serialized plan.
+    ///
+    /// `plan` must contain the same serialized engine plan that was originally passed to
+    /// [`crate::Runtime::deserialize_cuda_engine`]. TensorRT synchronizes its internal CUDA
+    /// stream before this method returns, so the plan buffer need not remain alive afterward.
+    ///
+    /// Returns an error if this engine was not deserialized in deferred mode, its weights were
+    /// already loaded, the supplied plan does not match, or the GPU copy fails.
+    ///
+    /// See [`nvinfer1::ICudaEngine::loadWeights`].
+    #[cfg(all(feature = "v_1_6", not(feature = "enterprise")))]
+    pub fn load_weights(&mut self, plan: &[u8]) -> Result<()> {
+        if cfg!(feature = "mock_runtime") {
+            return Ok(());
+        }
+        let size = i64::try_from(plan.len())
+            .map_err(|_| Error::InvalidArgument("Engine plan is too large".to_string()))?;
+        let loaded = unsafe {
+            self.inner
+                .pin_mut()
+                .loadWeights(plan.as_ptr().cast::<autocxx::c_void>(), size)
+        };
+        if loaded {
+            Ok(())
+        } else {
+            Err(Error::Runtime(
+                "Failed to load deferred engine weights".to_string(),
+            ))
+        }
+    }
+
+    /// Asynchronously loads this engine's weights onto the GPU using a stream reader.
+    ///
+    /// See [`nvinfer1::ICudaEngine::loadWeightsAsync`].
+    ///
+    /// # Safety
+    ///
+    /// `stream_reader` must read from the same serialized engine plan originally passed to
+    /// TensorRT when this engine was deserialized. `stream` must be a valid, non-null CUDA stream;
+    /// CUDA's null/default stream is not accepted. The caller must keep any source memory used by
+    /// asynchronous reader operations alive until those operations complete on `stream`.
+    ///
+    /// The caller must ensure that any work using the loaded weights is ordered after the transfer
+    /// on that stream, or explicitly synchronize across streams. After this returns successfully,
+    /// [`Self::weights_loaded`] is `true` even though the transfer may still be in flight.
+    #[cfg(all(feature = "v_1_6", not(feature = "enterprise")))]
+    pub unsafe fn load_weights_async(
+        &mut self,
+        stream_reader: Pin<&mut StreamReaderV2>,
+        stream: *mut c_void,
+    ) -> Result<()> {
+        if cfg!(feature = "mock_runtime") {
+            return Ok(());
+        }
+        let loaded = self
+            .inner
+            .pin_mut()
+            .loadWeightsAsync(stream_reader.as_trt_stream_reader(), stream.cast());
+        if loaded {
+            Ok(())
+        } else {
+            Err(Error::Runtime(
+                "Failed to enqueue deferred engine weight loading".to_string(),
+            ))
+        }
+    }
+
+    /// Returns an iterator over all IO tensor names.
+    pub fn io_tensor_names(&self) -> Result<CudaEngineIoTensorNamesIter<'_>> {
+        Ok(CudaEngineIoTensorNamesIter {
+            engine: self,
+            index: 0,
+            count: self.nb_io_tensors()?,
+        })
+    }
+
+    /// Returns an iterator over input tensor names.
+    pub fn input_tensor_names(&self) -> Result<impl Iterator<Item = String> + '_> {
+        Ok(self
+            .io_tensor_names()?
+            .filter(|name| self.tensor_io_mode(name).ok() == Some(TensorIOMode::kINPUT)))
+    }
+
+    /// Returns an iterator over output tensor names.
+    pub fn output_tensor_names(&self) -> Result<impl Iterator<Item = String> + '_> {
+        Ok(self
+            .io_tensor_names()?
+            .filter(|name| self.tensor_io_mode(name).ok() == Some(TensorIOMode::kOUTPUT)))
+    }
+}
+
+/// Iterator over [`CudaEngine`] IO tensor names. Created by [`CudaEngine::io_tensor_names`].
+#[derive(Debug)]
+pub struct CudaEngineIoTensorNamesIter<'a> {
+    engine: &'a CudaEngine<'a>,
+    index: i32,
+    count: i32,
+}
+
+impl Iterator for CudaEngineIoTensorNamesIter<'_> {
+    type Item = String;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.count {
+            return None;
+        }
+        let name = self
+            .engine
+            .io_tensor_name(self.index)
+            .expect("valid tensor index");
+        self.index += 1;
+        Some(name)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = (self.count - self.index).max(0) as usize;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for CudaEngineIoTensorNamesIter<'_> {}
+
+#[cfg(test)]
+#[cfg(not(feature = "mock_runtime"))]
+mod tests {
+    use crate::builder::network_flags;
+    use crate::builder::{Builder, MemoryPoolType};
+    use crate::logger::Logger;
+    use crate::runtime::Runtime;
+    use crate::{CudaEngine, DataType};
+    use trtx_sys::{ActivationType, LayerInformationFormat};
+
+    /// Build a minimal serialized engine with ProfilingVerbosity::kVERBOSE so inspector has layer info.
+    fn build_minimal_engine_with_verbose_profiling(logger: &Logger) -> crate::Result<Vec<u8>> {
+        let mut builder = Builder::new(logger)?;
+        let mut network = builder.create_network(network_flags::EXPLICIT_BATCH)?;
+        let mut tensor = network.add_input("input", DataType::kFLOAT, &[1, 4])?;
+        tensor = network
+            .add_activation(&tensor, ActivationType::kRELU)
+            .unwrap()
+            .output(&network, 0)
+            .unwrap();
+        tensor = network
+            .add_activation(&tensor, ActivationType::kRELU)
+            .unwrap()
+            .output(&network, 0)
+            .unwrap();
+        tensor.set_name(&mut network, "output").unwrap();
+        network.mark_output(&tensor);
+
+        let mut config = builder.create_config()?;
+        config.set_memory_pool_limit(MemoryPoolType::kWORKSPACE, 1 << 20);
+        config.set_profiling_verbosity(crate::ProfilingVerbosity::kDETAILED);
+
+        let engine_data = builder.build_serialized_network(&mut network, &mut config)?;
+        Ok(engine_data.to_vec())
+    }
+
+    #[test]
+    fn input_output_tensor_names_iter() {
+        let logger = Logger::stderr().expect("logger");
+        let engine_data =
+            build_minimal_engine_with_verbose_profiling(&logger).expect("build engine");
+        let mut runtime = Runtime::new(&logger).expect("runtime");
+        let engine = runtime
+            .deserialize_cuda_engine(&engine_data)
+            .expect("deserialize");
+
+        let inputs: Vec<_> = engine.input_tensor_names().unwrap().collect();
+        let outputs: Vec<_> = engine.output_tensor_names().unwrap().collect();
+
+        assert_eq!(inputs, ["input"]);
+        assert_eq!(outputs, ["output"]);
+        assert_eq!(
+            inputs.len() + outputs.len(),
+            engine.nb_io_tensors().unwrap() as usize
+        );
+    }
+
+    #[test]
+    fn io_tensor_names_iter() {
+        let logger = Logger::stderr().expect("logger");
+        let engine_data =
+            build_minimal_engine_with_verbose_profiling(&logger).expect("build engine");
+        let mut runtime = Runtime::new(&logger).expect("runtime");
+        let engine = runtime
+            .deserialize_cuda_engine(&engine_data)
+            .expect("deserialize");
+
+        let names: Vec<_> = engine.io_tensor_names().unwrap().collect();
+        assert_eq!(engine.io_tensor_names().unwrap().len(), names.len());
+
+        // equivalent to the old loop pattern
+        let mut old_style = Vec::new();
+        for i in 0..engine.nb_io_tensors().unwrap() {
+            old_style.push(engine.io_tensor_name(i).unwrap());
+        }
+        assert_eq!(names, old_style);
+    }
+
+    #[test]
+    fn engine_inspector_json_verbose_profiling() {
+        let logger = Logger::stderr().expect("logger");
+        let engine_data =
+            build_minimal_engine_with_verbose_profiling(&logger).expect("build engine");
+
+        let mut runtime = Runtime::new(&logger).expect("runtime");
+        let engine: CudaEngine<'_> = runtime
+            .deserialize_cuda_engine(&engine_data)
+            .expect("deserialize");
+
+        let inspector = engine.create_engine_inspector().expect("engine inspector");
+        let json = inspector
+            .engine_information(LayerInformationFormat::kJSON)
+            .expect("get_engine_information JSON");
+
+        assert!(
+            !json.is_empty(),
+            "engine information JSON should not be empty"
+        );
+        assert!(
+            json.trim_start().starts_with('{'),
+            "engine information should be JSON (starts with '{{'); got: {}...",
+            json.chars().take(80).collect::<String>()
+        );
+    }
+}

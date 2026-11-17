@@ -1,0 +1,744 @@
+//! Runtime for deserializing and managing TensorRT engines.
+//!
+//! [`Runtime`] wraps [`trtx_sys::nvinfer1::IRuntime`] (C++ [`nvinfer1::IRuntime`](https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/_static/c-api/classnvinfer1_1_1_i_runtime.html)).
+//! [`ExecutionContext`] wraps [`trtx_sys::nvinfer1::IExecutionContext`] (C++ [`nvinfer1::IExecutionContext`](https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/_static/c-api/classnvinfer1_1_1_i_execution_context.html)).
+
+use std::marker::PhantomData;
+use std::pin::Pin;
+
+use cxx::UniquePtr;
+use log::trace;
+use trtx_sys::nvinfer1;
+#[cfg(not(feature = "enterprise"))]
+use trtx_sys::EngineInvalidityDiagnostics;
+
+pub use crate::cuda_engine::CudaEngine;
+pub use crate::engine_inspector::EngineInspector;
+use crate::error::{Error, Result};
+pub use crate::execution_context::ExecutionContext;
+use crate::interfaces::GpuAllocator;
+use crate::logger::Logger;
+#[cfg(not(feature = "enterprise"))]
+pub use crate::runtime_cache::RuntimeCache;
+pub use crate::runtime_config::RuntimeConfig;
+
+/// [`trtx_sys::nvinfer1::IRuntime`] — C++ [`nvinfer1::IRuntime`](https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/_static/c-api/classnvinfer1_1_1_i_runtime.html).
+pub struct Runtime<'logger> {
+    inner: UniquePtr<nvinfer1::IRuntime>,
+    _logger: PhantomData<&'logger Logger>,
+    // TensorRT retains this pointer and uses it for every engine deserialized by this runtime.
+    // Keep the Rust implementation alive until after `inner` has been destroyed.
+    gpu_allocator: Option<Pin<Box<GpuAllocator>>>,
+}
+
+impl std::fmt::Debug for Runtime<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Runtime")
+            .field("inner", &format!("{:x}", self.inner.as_ptr() as usize))
+            .finish_non_exhaustive()
+    }
+}
+
+/// # Safety
+///
+/// Transferring to other thread is safe, as
+/// - it is safe for IRuntime from C++ API
+/// - UniquePtr always holds a valid IBuilder and is only mutated in initializer
+/// - setting ErrorRecorder requires a unique reference and ErrorRecorder is Send+Sync
+unsafe impl Send for Runtime<'_> {}
+
+impl<'runtime> Runtime<'runtime> {
+    #[cfg(not(feature = "link_tensorrt_rtx"))]
+    #[cfg(not(feature = "dlopen_tensorrt_rtx"))]
+    pub fn new(logger: &'runtime Logger) -> Result<Self> {
+        Err(Error::TrtRtxLibraryNotLoaded)
+    }
+
+    #[cfg(any(feature = "link_tensorrt_rtx", feature = "dlopen_tensorrt_rtx"))]
+    pub fn new(logger: &'runtime Logger) -> Result<Self> {
+        #[cfg(not(feature = "mock_runtime"))]
+        {
+            use log::debug;
+
+            let logger_ptr = logger.as_logger_ptr();
+            let runtime_ptr = {
+                #[cfg(feature = "link_tensorrt_rtx")]
+                unsafe {
+                    trtx_sys::create_infer_runtime(logger_ptr)
+                }
+                #[cfg(not(feature = "link_tensorrt_rtx"))]
+                #[cfg(feature = "dlopen_tensorrt_rtx")]
+                unsafe {
+                    use libloading::Symbol;
+                    use std::ffi::c_void;
+
+                    use crate::TRTLIB;
+                    if !TRTLIB.read()?.is_some() {
+                        crate::dynamically_load_tensorrt(None::<String>)?;
+                    }
+
+                    let lock = TRTLIB.read()?;
+                    let create_infer_runtime: Symbol<fn(*mut c_void, u32) -> *mut c_void> = lock
+                        .as_ref()
+                        .ok_or(Error::TrtRtxLibraryNotLoaded)?
+                        .get(b"createInferRuntime_INTERNAL")?;
+                    create_infer_runtime(logger_ptr, trtx_sys::get_tensorrt_version())
+                }
+            } as *mut nvinfer1::IRuntime;
+            if runtime_ptr.is_null() {
+                return Err(Error::Runtime("Failed to create runtime".to_string()));
+            }
+            debug!("created TensorRT runtime");
+            Ok(Runtime {
+                inner: unsafe { UniquePtr::from_raw(runtime_ptr) },
+                _logger: Default::default(),
+                gpu_allocator: None,
+            })
+        }
+        #[cfg(feature = "mock_runtime")]
+        Ok(Runtime {
+            inner: UniquePtr::null(),
+            _logger: Default::default(),
+            gpu_allocator: None,
+        })
+    }
+
+    /// Sets the allocator used by this runtime and all engines it deserializes.
+    ///
+    /// The allocator is retained by the runtime and therefore remains valid for the
+    /// lifetime TensorRT requires. Call this before [`Self::deserialize_cuda_engine`].
+    ///
+    /// See [nvinfer1::IRuntime::setGpuAllocator]
+    pub fn set_gpu_allocator(&mut self, allocator: Pin<Box<GpuAllocator>>) {
+        #[cfg(not(feature = "mock_runtime"))]
+        // SAFETY: `GpuAllocator` owns the C++ allocator bridge, and storing it below
+        // keeps that bridge valid for the complete lifetime of this runtime.
+        unsafe {
+            self.inner
+                .pin_mut()
+                .setGpuAllocator(allocator.as_ref().get_ref().as_trt_gpu_allocator());
+        }
+        self.gpu_allocator = Some(allocator);
+    }
+
+    /// See [nvinfer1::IRuntime::deserializeCudaEngine]
+    pub fn deserialize_cuda_engine(&'_ mut self, data: &[u8]) -> Result<CudaEngine<'runtime>> {
+        trace!("deserializing engine of size {}", data.len());
+        if cfg!(feature = "mock_runtime") {
+            Ok(unsafe { CudaEngine::from_ptr(std::ptr::null_mut()) })
+        } else {
+            unsafe {
+                let engine = self.inner.pin_mut().deserializeCudaEngine(
+                    data.as_ref().as_ptr() as *const autocxx::c_void,
+                    data.len(),
+                );
+                Ok(CudaEngine::from_ptr(engine.as_mut().ok_or_else(|| {
+                    Error::Runtime("Failed to deserialize engine".to_string())
+                })?))
+            }
+        }
+    }
+
+    /// Sets the DLA workspace allocation strategy for subsequent engine deserializations.
+    /// Previously deserialized engines retain their strategy.
+    ///
+    /// # Safety
+    /// Engines sharing a static workspace on the same DLA core must never execute concurrently.
+    #[cfg(all(feature = "v_1_7", not(feature = "enterprise")))]
+    pub unsafe fn set_dla_workspace_allocation_strategy(
+        &mut self,
+        strategy: crate::DLAWorkspaceAllocationStrategy,
+    ) -> Result<()> {
+        if cfg!(feature = "mock_runtime")
+            || self
+                .inner
+                .pin_mut()
+                .setDLAWorkspaceAllocationStrategy(strategy.into())
+        {
+            Ok(())
+        } else {
+            Err(Error::Runtime(
+                "Failed to set DLA workspace allocation strategy".to_string(),
+            ))
+        }
+    }
+
+    /// Returns the DLA workspace allocation strategy for subsequent engine deserializations.
+    #[cfg(all(feature = "v_1_7", not(feature = "enterprise")))]
+    pub fn dla_workspace_allocation_strategy(&self) -> crate::DLAWorkspaceAllocationStrategy {
+        if cfg!(feature = "mock_runtime") {
+            crate::DLAWorkspaceAllocationStrategy::kDEFAULT
+        } else {
+            self.inner.getDLAWorkspaceAllocationStrategy().into()
+        }
+    }
+
+    /// Controls whether subsequent engine deserializations defer allocating and copying weights
+    /// to the GPU.
+    ///
+    /// When enabled, an engine can create execution contexts, but inference will fail until
+    /// [`CudaEngine::load_weights`] or [`CudaEngine::load_weights_async`] loads its weights.
+    /// This setting must be changed before calling [`Self::deserialize_cuda_engine`].
+    ///
+    /// See [`nvinfer1::IRuntime::setDeferredWeightsLoading`].
+    #[cfg(all(feature = "v_1_6", not(feature = "enterprise")))]
+    pub fn set_deferred_weights_loading(&mut self, defer: bool) {
+        if !cfg!(feature = "mock_runtime") {
+            self.inner.pin_mut().setDeferredWeightsLoading(defer);
+        }
+    }
+
+    /// Returns whether subsequent engine deserializations defer loading weights onto the GPU.
+    ///
+    /// See [`nvinfer1::IRuntime::getDeferredWeightsLoading`].
+    #[cfg(all(feature = "v_1_6", not(feature = "enterprise")))]
+    pub fn deferred_weights_loading(&self) -> bool {
+        if cfg!(feature = "mock_runtime") {
+            false
+        } else {
+            self.inner.getDeferredWeightsLoading()
+        }
+    }
+
+    /// Returns the number of bytes required to inspect a serialized engine's header.
+    ///
+    /// See [`nvinfer1::IRuntime::getEngineHeaderSize`].
+    #[cfg(not(feature = "enterprise"))]
+    pub fn engine_header_size(&self) -> usize {
+        if cfg!(feature = "mock_runtime") {
+            0
+        } else {
+            self.inner.getEngineHeaderSize() as usize
+        }
+    }
+
+    /// Checks whether a serialized engine is likely to be valid on the current system.
+    ///
+    /// Returns the header-based validity classification and a bitmask of
+    /// [`crate::EngineInvalidityDiagnostics`] values. The diagnostics bitmask is zero for valid
+    /// and suboptimal engines.
+    ///
+    /// This only inspects the engine header and cannot detect corruption in the engine body.
+    ///
+    /// See [`nvinfer1::IRuntime::getEngineValidity`].
+    #[cfg(not(feature = "enterprise"))]
+    pub fn engine_validity(
+        &self,
+        data: &[u8],
+    ) -> Result<(crate::EngineValidity, EngineInvalidityDiagnostics)> {
+        let header_size = self.engine_header_size();
+        if data.len() < header_size {
+            return Err(Error::InvalidArgument(format!(
+                "engine buffer must contain at least {header_size} bytes, got {}",
+                data.len()
+            )));
+        }
+
+        if cfg!(feature = "mock_runtime") {
+            return Ok((
+                crate::EngineValidity::kVALID,
+                EngineInvalidityDiagnostics::empty(),
+            ));
+        }
+
+        let mut diagnostics = 0;
+        let validity = unsafe {
+            self.inner.getEngineValidity(
+                data.as_ptr() as *const autocxx::c_void,
+                data.len() as i64,
+                &mut diagnostics,
+            )
+        };
+        Ok((
+            validity.into(),
+            EngineInvalidityDiagnostics::from_bits_retain(diagnostics),
+        ))
+    }
+    //pub fn deserialize_cuda_engine_v2(
+    //&'_ mut self,
+    //stream_reader: &'runtime mut StreamReaderV2,
+    //) -> Result<CudaEngine<'runtime>> {
+    //if cfg!(feature = "mock_runtime") {
+    //Ok(unsafe { CudaEngine::from_ptr(std::ptr::null_mut()) })
+    //} else {
+    //unsafe {
+    //let engine = self
+    //.inner
+    //.pin_mut()
+    //.deserializeCudaEngine1(stream_reader.pin_mut());
+    //Ok(CudaEngine::from_ptr(engine.as_mut().ok_or_else(|| {
+    //Error::Runtime("Failed to deserialize engine".to_string())
+    //})?))
+    //}
+    //}
+    //}
+}
+
+#[cfg(test)]
+#[cfg(not(feature = "mock_runtime"))]
+mod tests {
+    use std::ffi::c_void;
+    use std::sync::{Arc, Mutex};
+
+    use crate::builder::{Builder, MemoryPoolType};
+    use crate::interfaces::{ProcessDebugTensor, ProcessDebugTensorResult};
+    #[cfg(all(feature = "v_1_6", not(feature = "enterprise")))]
+    use crate::interfaces::{ReadStreamV2, StreamReaderV2};
+    use crate::logger::Logger;
+    #[cfg(all(feature = "v_1_6", not(feature = "enterprise")))]
+    use crate::SeekPosition;
+    use crate::{DataType, ElementWiseOperation, Runtime};
+    use cudarc::driver::{CudaContext, CudaSlice, DevicePtrMut};
+    use trtx_sys::{Dims64, TensorLocation};
+
+    #[cfg(all(feature = "v_1_6", not(feature = "enterprise")))]
+    struct EnginePlanReader {
+        data: Vec<u8>,
+        position: usize,
+        read_calls: Arc<std::sync::atomic::AtomicUsize>,
+        device_reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[cfg(all(feature = "v_1_6", not(feature = "enterprise")))]
+    impl ReadStreamV2 for EnginePlanReader {
+        unsafe fn read(
+            &mut self,
+            destination: *mut std::ffi::c_void,
+            byte_count: i64,
+            _stream: *mut std::ffi::c_void,
+        ) -> i64 {
+            let Ok(byte_count) = usize::try_from(byte_count) else {
+                return -1;
+            };
+            let byte_count = byte_count.min(self.data.len() - self.position);
+            if byte_count == 0 {
+                return 0;
+            }
+            if destination.is_null() {
+                return -1;
+            }
+            let source = &self.data[self.position..self.position + byte_count];
+
+            // TensorRT may provide either host or device memory. A regular host pointer is not
+            // recognized by cuPointerGetAttribute, so an attribute-query failure means host.
+            let mut memory_type = 0_u32;
+            let attribute_result = unsafe {
+                cudarc::driver::sys::cuPointerGetAttribute(
+                    (&mut memory_type as *mut u32).cast(),
+                    cudarc::driver::sys::CUpointer_attribute::CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
+                    destination as usize as cudarc::driver::sys::CUdeviceptr,
+                )
+            };
+            let copy_succeeded = if attribute_result == cudarc::driver::sys::CUresult::CUDA_SUCCESS
+                && matches!(
+                    memory_type,
+                    value
+                        if value
+                            == cudarc::driver::sys::CUmemorytype::CU_MEMORYTYPE_DEVICE as u32
+                            || value
+                                == cudarc::driver::sys::CUmemorytype::CU_MEMORYTYPE_UNIFIED
+                                    as u32
+                ) {
+                self.device_reads
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // A synchronous fallback is valid for a stream reader and avoids requiring this
+                // test's Vec allocation to be page-locked.
+                unsafe {
+                    cudarc::driver::result::memcpy_htod_sync(
+                        destination as usize as cudarc::driver::sys::CUdeviceptr,
+                        source,
+                    )
+                }
+                .is_ok()
+            } else {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        source.as_ptr(),
+                        destination.cast::<u8>(),
+                        byte_count,
+                    );
+                }
+                true
+            };
+            if !copy_succeeded {
+                return -1;
+            }
+
+            self.position += byte_count;
+            self.read_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            byte_count as i64
+        }
+
+        fn seek(&mut self, offset: i64, position: SeekPosition) -> bool {
+            let base = match position {
+                SeekPosition::kSET => 0,
+                SeekPosition::kCUR => self.position as i64,
+                SeekPosition::kEND => self.data.len() as i64,
+            };
+            let Some(position) = base.checked_add(offset) else {
+                return false;
+            };
+            let Ok(position) = usize::try_from(position) else {
+                return false;
+            };
+            if position > self.data.len() {
+                return false;
+            }
+            self.position = position;
+            true
+        }
+    }
+
+    /// Builds a network: input tensor_0 [1] -> +1 -> tensor_1 -> +1 -> tensor_2 -> +1 -> tensor_3 -> +1 -> tensor_4 (output).
+    /// Each intermediate tensor is named and marked for debug.
+    fn build_plus1_chain(logger: &Logger) -> crate::Result<(Vec<u8>, Vec<String>)> {
+        let mut builder = Builder::new(logger)?;
+        let mut network = builder.create_network(0)?;
+
+        let one_bytes = 1.0f32.to_le_bytes();
+        let mut tensor = network.add_input("tensor_0", DataType::kFLOAT, &[1])?;
+        let mut debug_names = Vec::new();
+
+        for i in 1..=4 {
+            let one_layer =
+                network.add_small_constant_copied(&[1], &one_bytes, DataType::kFLOAT, None)?;
+            let one_t = one_layer.output(&network, 0)?;
+            let mut sum_layer =
+                network.add_elementwise(&tensor, &one_t, ElementWiseOperation::kSUM)?;
+            sum_layer.set_name(&mut network, &format!("plus1_{}", i))?;
+            tensor = sum_layer.output(&network, 0)?;
+            let name = format!("tensor_{}", i);
+            tensor.set_name(&mut network, &name)?;
+            network.mark_tensor_debug(&tensor)?;
+            assert!(network.is_debug_tensor(&tensor));
+            debug_names.push(name);
+        }
+        network.mark_output(&tensor);
+
+        let mut config = builder.create_config()?;
+        config.set_memory_pool_limit(MemoryPoolType::kWORKSPACE, 1 << 20);
+        //config.set_flag(trtx_sys::BuilderFlag::kDEBUG);
+        let engine_data = builder.build_serialized_network(&mut network, &mut config)?;
+        Ok((engine_data.to_vec(), debug_names))
+    }
+
+    type ExpectedResults = Vec<(String, Vec<i64>)>;
+    /// Debug listener that collects tensor names and shapes for verification.
+    struct CollectingDebugListener {
+        seen: Arc<Mutex<ExpectedResults>>,
+    }
+
+    impl ProcessDebugTensor for CollectingDebugListener {
+        unsafe fn process_debug_tensor(
+            &self,
+            _addr: *const std::ffi::c_void,
+            _location: TensorLocation,
+            _type_: DataType,
+            shape: &Dims64,
+            name: Option<&str>,
+            _stream: *mut std::ffi::c_void,
+        ) -> ProcessDebugTensorResult {
+            let dims: Vec<i64> = shape
+                .d
+                .iter()
+                .take(shape.nbDims as usize)
+                .copied()
+                .collect();
+            self.seen
+                .lock()
+                .unwrap()
+                .push((name.unwrap().to_string(), dims));
+            Ok(())
+        }
+    }
+
+    /// Builds a small conv network: input [1,1,4,4] -> conv(1->4) -> conv(4->4) -> conv(4->4) -> output.
+    /// Each conv output is named and marked for debug.
+    fn build_conv_chain(logger: &Logger) -> crate::Result<(Vec<u8>, Vec<String>)> {
+        // Declare kernel bytes before builder so their lifetime outlives 'network.
+        // conv0: out=4, in=1, 3x3  conv1/2: out=4, in=4, 3x3
+        let make_kernel = |out_ch: usize, in_ch: usize| -> Vec<u8> {
+            std::iter::repeat_n(0.1f32, out_ch * in_ch * 3 * 3)
+                .flat_map(|v| v.to_le_bytes())
+                .collect()
+        };
+        let kernel_0 = make_kernel(4, 1);
+        let kernel_1 = make_kernel(4, 4);
+        let kernel_2 = make_kernel(4, 4);
+
+        let mut builder = Builder::new(logger)?;
+        let mut network = builder.create_network(0)?;
+
+        // Input: [N=1, C=1, H=4, W=4] — TensorRT conv requires at least 4D
+        let mut tensor = network.add_input("input", DataType::kFLOAT, &[1, 1, 4, 4])?;
+        let mut debug_names = Vec::new();
+
+        let conv_defs: [(i32, &Vec<u8>); 3] = [(4, &kernel_0), (4, &kernel_1), (4, &kernel_2)];
+        for (i, &(out_ch, kbytes)) in conv_defs.iter().enumerate() {
+            let weights = crate::ConvWeights {
+                kernel_weights: kbytes,
+                kernel_dtype: DataType::kFLOAT,
+                kernel_name: None,
+                bias_weights: None,
+                bias_dtype: None,
+                bias_name: None,
+            };
+            let mut conv = network.add_convolution(&tensor, out_ch, &[3, 3], &weights)?;
+            conv.set_padding(&mut network, &[1i64, 1i64]);
+            let name = format!("conv_out_{}", i);
+            conv.set_name(&mut network, &name)?;
+            tensor = conv.output(&network, 0)?;
+            tensor.set_name(&mut network, &name)?;
+            network.mark_tensor_debug(&tensor)?;
+            debug_names.push(name);
+        }
+        network.mark_output(&tensor);
+
+        let mut config = builder.create_config()?;
+        config.set_memory_pool_limit(MemoryPoolType::kWORKSPACE, 1 << 28);
+        let engine_data = builder.build_serialized_network(&mut network, &mut config)?;
+        Ok((engine_data.to_vec(), debug_names))
+    }
+
+    #[test]
+    #[ignore = "only works on TRT enterprise at the moment"]
+    fn set_debug_listener_conv_chain() {
+        let logger = Logger::stderr().expect("logger");
+        let (engine_data, _debug_names) = build_conv_chain(&logger).expect("build conv network");
+
+        let mut runtime = Runtime::new(&logger).expect("runtime");
+        let mut engine = runtime
+            .deserialize_cuda_engine(&engine_data)
+            .expect("deserialize");
+        let mut context = engine
+            .create_execution_context()
+            .expect("execution context");
+
+        let seen = Arc::new(Mutex::new(Vec::<(String, Vec<i64>)>::new()));
+        context
+            .set_debug_listener(Box::new(CollectingDebugListener {
+                seen: Arc::clone(&seen),
+            }))
+            .expect("set_debug_listener");
+        context.set_all_tensors_debug_state(true).unwrap();
+        context.set_unfused_tensors_debug_state(true).unwrap();
+
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.new_stream().unwrap();
+
+        // input: 1 channel 4x4, output: 4 channels 4x4
+        let input_elems = 4 * 4;
+        let output_elems = 4 * 4 * 4;
+        let elem_size = std::mem::size_of::<f32>();
+        let input_bytes: Vec<u8> = std::iter::repeat_n(1.0f32, input_elems)
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+
+        let mut output_device: CudaSlice<u8> = stream
+            .alloc_zeros(output_elems * elem_size)
+            .expect("output buffer");
+
+        let mut input_device = stream.clone_htod(&input_bytes).expect("copy input");
+
+        unsafe {
+            context
+                .set_tensor_address(
+                    "input",
+                    input_device.device_ptr_mut(&stream).0 as *mut c_void,
+                )
+                .expect("set input");
+            context
+                .set_tensor_address(
+                    "conv_out_2",
+                    output_device.device_ptr_mut(&stream).0 as *mut c_void,
+                )
+                .expect("set output");
+            context
+                .enqueue_v3(stream.cu_stream() as *mut c_void)
+                .expect("enqueue");
+        }
+        stream.synchronize().expect("sync");
+
+        let seen = seen.lock().unwrap();
+        assert!(
+            !seen.is_empty(),
+            "debug listener should have seen at least one tensor, saw 0"
+        );
+    }
+
+    #[test]
+    #[ignore = "only works on TRT enterprise at the moment"]
+    fn set_debug_listener_plus1_chain() {
+        let _ = pretty_env_logger::try_init();
+        let logger = Logger::log_crate().expect("logger");
+        let (engine_data, expected_debug_names) =
+            build_plus1_chain(&logger).expect("build network");
+        assert_eq!(
+            expected_debug_names,
+            ["tensor_1", "tensor_2", "tensor_3", "tensor_4"]
+        );
+
+        let mut runtime = Runtime::new(&logger).expect("runtime");
+        let mut engine = runtime
+            .deserialize_cuda_engine(&engine_data)
+            .expect("deserialize");
+        let mut context = engine
+            .create_execution_context()
+            .expect("execution context");
+
+        let seen = Arc::new(Mutex::new(Vec::<(String, Vec<i64>)>::new()));
+        context
+            .set_debug_listener(Box::new(CollectingDebugListener {
+                seen: Arc::clone(&seen),
+            }))
+            .expect("set_debug_listener");
+        context.set_all_tensors_debug_state(true).unwrap();
+        context.set_unfused_tensors_debug_state(true).unwrap();
+
+        let ctx = CudaContext::new(0).expect("CUDA context");
+        let stream = ctx.new_stream().expect("CUDA stream");
+        let mut input_device = stream
+            .clone_htod(&0.0f32.to_le_bytes())
+            .expect("copy input");
+        let mut output_device: CudaSlice<u8> = stream
+            .alloc_zeros(std::mem::size_of::<f32>())
+            .expect("output buffer");
+
+        unsafe {
+            context
+                .set_tensor_address(
+                    "tensor_0",
+                    input_device.device_ptr_mut(&stream).0 as *mut c_void,
+                )
+                .expect("set input");
+            context
+                .set_tensor_address(
+                    "tensor_4",
+                    output_device.device_ptr_mut(&stream).0 as *mut c_void,
+                )
+                .expect("set output");
+            context
+                .enqueue_v3(stream.cu_stream() as *mut c_void)
+                .expect("enqueue");
+        }
+        stream.synchronize().expect("sync");
+
+        let mut output_bytes = [0u8; 4];
+        stream
+            .memcpy_dtoh(&output_device, &mut output_bytes)
+            .expect("copy output");
+        let output_val = f32::from_le_bytes(output_bytes);
+        assert!(
+            (output_val - 4.0f32).abs() < 1e-5,
+            "expected output 4.0 (0+1+1+1+1), got {}",
+            output_val
+        );
+
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.len() >= 4,
+            "debug listener should see at least 4 tensors, saw {}",
+            seen.len()
+        );
+        for expected in &expected_debug_names {
+            assert!(
+                seen.iter().any(|(n, _)| n.contains(expected.as_str())),
+                "expected debug tensor {:?} among names {:?}",
+                expected,
+                seen.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    fn assert_send_sync<T: Send + Sync>(_: &T) {}
+
+    #[cfg(all(feature = "v_1_6", not(feature = "enterprise")))]
+    #[test]
+    fn deferred_weights_can_be_loaded_from_engine_plan() {
+        let logger = Logger::stderr().expect("logger");
+        let (engine_data, _) = build_plus1_chain(&logger).expect("build network");
+
+        let mut runtime = Runtime::new(&logger).expect("runtime");
+        assert!(!runtime.deferred_weights_loading());
+        runtime.set_deferred_weights_loading(true);
+        assert!(runtime.deferred_weights_loading());
+
+        let mut engine = runtime
+            .deserialize_cuda_engine(&engine_data)
+            .expect("deferred deserialize");
+        assert!(!engine.weights_loaded());
+
+        // Context JIT is supported before the deferred GPU weight copy.
+        let context = engine
+            .create_execution_context()
+            .expect("execution context");
+        drop(context);
+
+        engine.load_weights(&engine_data).expect("load weights");
+        assert!(engine.weights_loaded());
+    }
+
+    #[cfg(all(feature = "v_1_6", not(feature = "enterprise")))]
+    #[test]
+    fn deferred_weights_can_be_loaded_asynchronously() {
+        let logger = Logger::stderr().expect("logger");
+        let (engine_data, _) = build_conv_chain(&logger).expect("build network");
+
+        let mut runtime = Runtime::new(&logger).expect("runtime");
+        runtime.set_deferred_weights_loading(true);
+        let mut engine = runtime
+            .deserialize_cuda_engine(&engine_data)
+            .expect("deferred deserialize");
+        assert!(!engine.weights_loaded());
+
+        // TensorRT explicitly supports creating contexts before deferred weights are loaded.
+        let _context = engine
+            .create_execution_context()
+            .expect("execution context");
+        let read_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let device_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut stream_reader = StreamReaderV2::new(Box::new(EnginePlanReader {
+            data: engine_data,
+            position: 0,
+            read_calls: Arc::clone(&read_calls),
+            device_reads: Arc::clone(&device_reads),
+        }))
+        .expect("stream reader");
+
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.new_stream().unwrap();
+
+        unsafe {
+            engine
+                .load_weights_async(stream_reader.as_mut(), stream.cu_stream() as *mut _)
+                .expect("load weights asynchronously");
+        }
+        assert!(engine.weights_loaded());
+        assert!(
+            read_calls.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "TensorRT did not read from the stream reader"
+        );
+        assert!(
+            device_reads.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "TensorRT did not request any engine weights in device memory"
+        );
+
+        stream.synchronize().unwrap();
+    }
+
+    #[test]
+    fn runtime_relevant_objects_send() {
+        let logger = crate::Logger::log_crate().unwrap();
+        let mut builder = crate::Builder::new(&logger).unwrap();
+        let config = builder.create_config().unwrap();
+        let builder = Arc::new(Mutex::new(builder));
+        let config = Arc::new(Mutex::new(config));
+        let network = Arc::new(Mutex::new(builder.lock().unwrap().create_network(0)));
+        let runtime = Arc::new(Mutex::new(crate::Runtime::new(&logger).unwrap()));
+        assert_send_sync(&config);
+        assert_send_sync(&runtime);
+        assert_send_sync(&network);
+        assert_send_sync(&builder);
+    }
+}

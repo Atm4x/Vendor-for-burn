@@ -1,0 +1,58 @@
+[package]
+name = "trtx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Safe Rust bindings to NVIDIA TensorRT-RTX (EXPERIMENTAL - NOT FOR PRODUCTION)"
+readme = "../README.md"
+keywords = ["tensorrt", "inference", "deep-learning", "nvidia", "gpu"]
+categories = ["api-bindings", "science"]
+
+[dependencies]
+trtx-sys = { version = "0.9.1", path = "../trtx-sys", default-features = false }
+thiserror = "2.0"
+cxx = "1.0"
+libloading = { version = "0.9", optional = true }
+autocxx = { version = "0.30" }
+
+log = "0.4.29"
+
+[features]
+# real TensorRT-RTX with cudarc by and dynamic loading by default
+default = [
+	"dlopen_tensorrt_onnxparser",
+	"dlopen_tensorrt_rtx",
+	"onnxparser",
+	"v_1_7",
+]
+mock = ["mock_runtime"] # mock implementation (no CUDA and TRT libs required)
+mock_runtime = [] # mock implementation (no CUDA required)
+link_tensorrt_rtx = ["trtx-sys/link_tensorrt_rtx"]
+dlopen_tensorrt_rtx = ["libloading"]
+link_tensorrt_onnxparser = ["trtx-sys/link_tensorrt_onnxparser", "onnxparser"]
+dlopen_tensorrt_onnxparser = ["libloading", "onnxparser"]
+onnxparser = ["trtx-sys/onnxparser"]
+
+# versions
+v_1_3 = ["trtx-sys/v_1_3"]
+v_1_4 = ["trtx-sys/v_1_4", "v_1_3"]
+v_1_5 = ["trtx-sys/v_1_5", "v_1_4"]
+v_1_6 = ["trtx-sys/v_1_6", "v_1_5"]
+v_1_7 = ["trtx-sys/v_1_7", "v_1_6"]
+# the non-RTX version of TensorRT (mainly for debugging/validating TensorRT RTX)
+enterprise = ["trtx-sys/enterprise"]
+
+[dev-dependencies]
+cudarc = { version = "0.19.9", features = ["cuda-13020"] }
+# For examples and tests
+pretty_env_logger = "0.5"
+
+[[example]]
+name = "tiny_network"
+required-features = []
+
+[[example]]
+name = "basic_workflow"
+required-features = ["onnxparser"]
