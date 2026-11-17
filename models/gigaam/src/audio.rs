@@ -2,7 +2,7 @@ use anyhow::{Context, Result, ensure};
 use rustfft::{FftPlanner, num_complex::Complex};
 use serde::Deserialize;
 use std::f32::consts::PI;
-use std::path::Path;
+use std::{io::{Cursor, Read, Seek}, path::Path};
 
 pub const SAMPLE_RATE: u32 = 16_000;
 pub const FFT_SIZE: usize = 400;
@@ -46,8 +46,11 @@ pub fn load_audio_ffmpeg_16k(path: &Path) -> Result<Vec<f32>> {
 }
 
 pub fn load_wav_16k(path: &Path) -> Result<Vec<f32>> {
-    let mut reader =
-        hound::WavReader::open(path).with_context(|| format!("opening {}", path.display()))?;
+    load_wav_reader(std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?)
+}
+
+fn load_wav_reader<R: Read + Seek>(reader: R) -> Result<Vec<f32>> {
+    let mut reader = hound::WavReader::new(reader)?;
     let spec = reader.spec();
     ensure!(
         spec.sample_rate >= 8000 && spec.sample_rate <= 192000,
@@ -102,27 +105,35 @@ pub fn load_audio_16k(path: &Path) -> Result<Vec<f32>> {
         return load_audio_ffmpeg_16k(path);
     }
 
+    let src = std::fs::File::open(path).with_context(|| format!("opening audio {}", path.display()))?;
+    decode_symphonia_16k(Box::new(src), path.extension().and_then(|e| e.to_str()).unwrap_or(""))
+}
+
+/// Decode an immutable, already verified WAV/FLAC snapshot without re-opening its path.
+pub fn load_audio_16k_bytes(bytes: Vec<u8>, extension: &str) -> Result<Vec<f32>> {
+    match extension {
+        "wav" => load_wav_reader(Cursor::new(bytes)),
+        "flac" => decode_symphonia_16k(Box::new(Cursor::new(bytes)), "flac"),
+        _ => anyhow::bail!("unsupported worker snapshot format"),
+    }
+}
+
+fn decode_symphonia_16k(
+    src: Box<dyn symphonia::core::io::MediaSource>,
+    extension: &str,
+) -> Result<Vec<f32>> {
     use symphonia::core::codecs::audio::AudioDecoderOptions;
     use symphonia::core::errors::Error as AudioError;
     use symphonia::core::formats::{FormatOptions, TrackType, probe::Hint};
     use symphonia::core::io::MediaSourceStream;
     use symphonia::core::meta::MetadataOptions;
 
-    let src =
-        std::fs::File::open(path).with_context(|| format!("opening audio {}", path.display()))?;
-    let stream = MediaSourceStream::new(Box::new(src), Default::default());
+    let stream = MediaSourceStream::new(src, Default::default());
     let mut hint = Hint::new();
-    if let Some(extension) = path.extension().and_then(|value| value.to_str()) {
-        hint.with_extension(extension);
-    }
+    hint.with_extension(extension);
     let mut format = symphonia::default::get_probe()
-        .probe(
-            &hint,
-            stream,
-            FormatOptions::default(),
-            MetadataOptions::default(),
-        )
-        .with_context(|| format!("detecting audio format {}", path.display()))?;
+        .probe(&hint, stream, FormatOptions::default(), MetadataOptions::default())
+        .context("detecting audio format")?;
     let track = format
         .default_track(TrackType::Audio)
         .context("no supported audio track")?;

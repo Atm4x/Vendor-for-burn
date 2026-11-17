@@ -1,0 +1,16 @@
+{
+  "worker_protocol": 1,
+  "gigaam_contract_version": 1,
+  "model_id_prefix": "gigaam_",
+  "supported_models": [
+    "emo",
+    "v1_ctc", "v1_rnnt", "v1_ssl",
+    "v2_ctc", "v2_rnnt", "v2_ssl",
+    "v3_ctc", "v3_rnnt", "v3_e2e_ctc", "v3_e2e_rnnt", "v3_ssl",
+    "multilingual_ctc", "multilingual_ssl",
+    "multilingual_large_ctc", "multilingual_large_ssl"
+  ],
+  "input_formats": ["wav", "flac"],
+  "max_source_bytes": 67108864,
+  "max_request_frame_bytes": 1048576
+}

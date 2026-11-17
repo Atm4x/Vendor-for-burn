@@ -1,3 +1,4 @@
+mod ipc_worker;
 mod jsonl;
 mod serve;
 mod worker;
@@ -28,6 +29,9 @@ compile_error!("gigaam-rs requires a backend feature: cuda (default), cpu, wgpu,
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).is_some_and(|arg| arg == "--ipc-stdio") {
+        return ipc_worker::run(args.into_iter().skip(2)).map_err(anyhow::Error::msg);
+    }
     if args.len() >= 3 && args[1] == "inspect-config" {
         let path = Path::new(&args[2]);
         let configuration = if args.iter().any(|value| value == "--raw") {
