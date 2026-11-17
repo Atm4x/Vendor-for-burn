@@ -125,6 +125,7 @@ impl Conv1d {
         }
         if std::env::var("RVC_NSF_IMPLICIT_GEMM").as_deref() == Ok("1")
             || std::env::var("RVC_NSF_CONV1D_GEMM").as_deref() == Ok("1")
+            || std::env::var("RVC_NSF_CONV1D_GEMM_ASYNC").as_deref() == Ok("1")
         {
             crate::cubecl_conv::conv1d(input, self.weight.clone(), self.bias.clone(), options)
         } else {

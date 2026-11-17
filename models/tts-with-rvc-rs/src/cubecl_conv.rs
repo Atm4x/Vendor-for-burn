@@ -4,7 +4,7 @@ use burn::tensor::{
 };
 use burn_cubecl::{
     Cube,
-    kernel::conv::{ConvStrategy, ConvTranspose2dStrategy, conv1d_preact_residual_temporal_activation_plan, prepare_resblock_input_ntc, conv1d_single_input_packed, conv1d_single_input_prepack_weight, conv_transpose1d_polyphase, conv_transpose1d_polyphase_packed, conv_transpose1d_prepack_weight, conv_transpose1d_prepack_weight_kic, conv_transpose1d_polyphase_single_packed_kic, prepack_conv_transpose1d_phase_gemm_weight, prepack_conv_transpose1d_phase_gemm_weight_compensated, conv_transpose1d_phase_gemm_packed, conv_transpose1d_phase_gemm_packed_compensated, conv_forward, conv_forward_spatial_quad, conv_forward_spatial_reuse, conv_forward_spatial_pair, conv_transpose2d, prepack_winograd_weights, transform_winograd_input, inverse_winograd_output},
+    kernel::conv::{ConvStrategy, ConvTranspose2dStrategy, conv1d_preact_residual_temporal_activation_plan, prepare_resblock_input_ntc, conv1d_single_input_packed, conv1d_single_input_prepack_weight, conv_transpose1d_polyphase, conv_transpose1d_polyphase_packed, conv_transpose1d_prepack_weight, conv_transpose1d_prepack_weight_kic, conv_transpose1d_polyphase_single_packed_kic, prepack_conv_transpose1d_phase_gemm_weight, prepack_conv_transpose1d_phase_gemm_weight_compensated, conv_transpose1d_phase_gemm_packed, conv_transpose1d_phase_gemm_packed_compensated, conv_forward, conv_forward_async, conv_forward_spatial_quad, conv_forward_spatial_reuse, conv_forward_spatial_pair, conv_transpose2d, prepack_winograd_weights, transform_winograd_input, inverse_winograd_output},
 };
 
 pub(crate) fn prepare_resblock_ntc(input: Tensor<3>) -> Tensor<3> {
@@ -71,8 +71,11 @@ pub(crate) fn conv1d(
             .try_into_primitive::<Cube>()
             .expect("CubeCL GEMM requires a direct CubeCL bias")
     });
-    let output = conv_forward::<1>(input, weight, bias, options, ConvStrategy::ImplicitGemm)
-        .expect("CubeCL GEMM convolution is unsupported on this backend or shape");
+    let output = if std::env::var("RVC_NSF_CONV1D_GEMM_ASYNC").as_deref() == Ok("1") {
+        conv_forward_async::<1>(input, weight, bias, options)
+    } else {
+        conv_forward::<1>(input, weight, bias, options, ConvStrategy::ImplicitGemm)
+    }.expect("CubeCL GEMM convolution is unsupported on this backend or shape");
     Tensor::from_primitive::<Cube>(output)
 }
 

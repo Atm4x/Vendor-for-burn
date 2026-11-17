@@ -1,13 +1,6 @@
 name: RVC Stage126 Full90 Rust NTC vs original PyTorch CUDA
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - experiment/conv-kernel-rnd-stage33-20261110
-    paths:
-      - 'models/tts-with-rvc-rs/src/main.rs'
-      - 'research/stage126-full90-torch/**'
-      - '.github/workflows/rvc-stage126-full90-torch.yml'
 permissions:
   contents: read
 concurrency:

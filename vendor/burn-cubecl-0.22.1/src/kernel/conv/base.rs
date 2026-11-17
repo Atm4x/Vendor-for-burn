@@ -8,7 +8,7 @@ use crate::{
     kernel::conv::{
         backward_data::{fallback::conv_data_backward_fallback, implicit_gemm::*},
         backward_weight::{fallback::conv_weight_backward_fallback, implicit_gemm::*},
-        forward::implicit_gemm::conv_gemm_simple_sync,
+        forward::implicit_gemm::{conv_gemm_simple_async, conv_gemm_simple_sync},
     },
     ops::{permute_nchw_to_nhwc, permute_nchw_to_nhwc_shape, permute_nhwc_to_nchw},
     tensor::CubeTensor,
@@ -74,6 +74,24 @@ pub fn conv_forward_spatial_quad(
     let input = permute_nchw_to_nhwc(input);
     let weight = permute_nchw_to_nhwc(weight);
     let output = conv_spatial_quad(input, weight, bias, options)?;
+    Ok(permute_nhwc_to_nchw(output))
+}
+
+/// Experimental asynchronous implicit GEMM forward route with the same convolution
+/// geometry and output contract as the synchronous CMMA route.
+pub fn conv_forward_async<const N: usize>(
+    input: CubeTensor,
+    weight: CubeTensor,
+    bias: Option<CubeTensor>,
+    options: ConvOptions<N>,
+) -> Result<CubeTensor, ConvSetupError> {
+    let input = permute_nchw_to_nhwc(input);
+    let weight = permute_nchw_to_nhwc(weight);
+    let output = if options.groups == 1 {
+        conv_gemm_simple_async::<N>(input, weight, bias, options, AcceleratedTileKind::Cmma)?
+    } else {
+        conv_direct::<N>(input, weight, bias, options)?
+    };
     Ok(permute_nhwc_to_nchw(output))
 }
 

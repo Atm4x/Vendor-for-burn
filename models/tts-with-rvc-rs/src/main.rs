@@ -448,7 +448,9 @@ fn run() -> Result<(), String> {
                 {"mixed"} else {"direct"},
             "nsf_conv1d_execution": if std::env::var("RVC_NSF_IMPLICIT_GEMM").as_deref() == Ok("1")
                 || std::env::var("RVC_NSF_CONV1D_GEMM").as_deref() == Ok("1")
+                || std::env::var("RVC_NSF_CONV1D_GEMM_ASYNC").as_deref() == Ok("1")
                 {"implicit_gemm"} else {"direct"},
+            "nsf_conv1d_gemm_loading": if std::env::var("RVC_NSF_CONV1D_GEMM_ASYNC").as_deref() == Ok("1") {"async_cyclic"} else {"sync_cyclic"},
             "nsf_transpose_execution": if std::env::var("RVC_NSF_IMPLICIT_GEMM").as_deref() == Ok("1")
                 || std::env::var("RVC_NSF_TRANSPOSE_GEMM").as_deref() == Ok("1")
                 {"gemm"} else {"direct"},
