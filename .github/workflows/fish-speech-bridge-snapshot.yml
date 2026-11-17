@@ -26,7 +26,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git fetch origin +refs/heads/codex/fish-speech:refs/heads/codex/fish-speech
           test "$(git rev-parse refs/heads/codex/fish-speech)" = "$(git rev-parse HEAD)"
           git bundle create "${RUNNER_TEMP}/repository.bundle" refs/heads/codex/fish-speech
           git bundle verify "${RUNNER_TEMP}/repository.bundle"
