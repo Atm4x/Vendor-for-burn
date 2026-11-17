@@ -29,7 +29,7 @@ For RNN-T, add the `rnnt` object with `pred_hidden`, `pred_rnn_layers`, `joint_h
 
 For `emo`, use `model_type: "emo"`, `id2name` as an ordered string array or a map of consecutive numeric string IDs, and a linear classifier `head.weight` / `head.bias` (or `head.0.weight` / `head.0.bias`). `GigaAm::emotion_probs_16k()` returns named class probabilities. Only single-recording inputs of at most 25 seconds are supported by the emotion API.
 
-For non-E2E ASR use `vocabulary` as an ordered array of characters (length `num_classes-1`). For E2E, put the original `<model_name>_tokenizer.model` file beside the weights, or set `sentencepiece_model` to another basename in `config.json`. The included pure-Rust Protobuf decoder reads SentencePiece vocabulary IDs and decodes ordinary, unknown, control, and byte-fallback tokens. Training tokenization is not needed for ASR output decoding.
+For non-E2E ASR use `vocabulary` as an ordered array of characters (length `num_classes-1`). For E2E, put the original `<model_name>_tokenizer.model` file beside the weights, or set `sentencepiece_model` to another basename in `config.json`. The included pure-Rust Protobuf decoder reads SentencePiece vocabulary IDs and decodes ordinary, unknown, control, and byte-fallback tokens. Training tokenization is not needed for ASR output decoding. SentencePiece byte fallback follows the reference decoder’s one-replacement-per-invalid-byte behavior (rather than Rust `from_utf8_lossy` coalescing some malformed UTF-8 sequences).
 
 Example RNN-T manifest (illustrative fields; replace all dimensions with the checkpoint's exact configuration):
 
@@ -96,7 +96,7 @@ Default build uses Burn Flex CPU, with CUDA (`--no-default-features --features c
 ## Verification (Rust 1.100.0, Linux Flex CPU)
 
 - `cargo check --offline -p gigaam-rs` — PASS.
-- `cargo test --offline -p gigaam-rs --lib` — **28/28 PASS** (current test suite).
+- `cargo test --offline -p gigaam-rs --lib` — **29/29 PASS**; `cargo test --offline -p gigaam-rs --tests` additionally verifies two independent Python-reference fixtures.
 - CTC logits from previous implementation are byte-identical after sharing Conformer encoder with RNN-T/SSL.
 - Python/PyTorch synthetic Conformer+CTC log-probability parity: maximum absolute difference **3.22e-6** (previous stage).
 - RNN-T synthetic blank-only case and two-symbols-per-frame case match PyTorch text and token counts; standalone two-step LSTM matches PyTorch to **1e-6**.
@@ -132,5 +132,13 @@ These do **not** establish official-checkpoint parity, GPU timing, or support fo
 - Synthetic SSL Conformer checkpoint: embedded OmegaConf vs explicit `config.json` produced **bit-identical** 14×8 embeddings on Rust Flex CPU.
 - Synthetic v2 CTC, Emo and fine-tuned CTC checkpoints: automatic config and explicit sidecar runs produced identical Rust CLI transcriptions / emotion probabilities.
 - An in-repository small synthetic OmegaConf checkpoint is used as a unit-test fixture. Additional malformed-pickle tests ensure failure without panicking. **These are not official GigaAM weights.**
+
+
+### Python-reference inference preprocessing and text parity (stage 8)
+
+- `tests/mel_parity.rs` compares the native 64-bin 16-kHz log-mel extraction with Torchaudio 2.10 CPU on identical synthetic PCM (`n_fft=400`, `hop=160`, `win=400`, HTK). Maximum absolute error **0.001114**, mean **0.0000112** in log-mel units; both tests run entirely on Rust without requiring PyTorch at test time. This numerical bound is for the supplied synthetic input, not arbitrary audio.
+- `tests/sentencepiece_parity.rs` verifies **308/308** decoded token sequences against SentencePiece 0.2.1 generated output, including malformed UTF-8 byte-fallback sequences. The source parser previously differed on **44/308** of these inputs. The test model and expected outputs were generated from synthetic text, are committed as fixtures, and require no Python/SentencePiece installation at test time.
+- `text::normalize_raw_text` ports the original GigaAM Unicode/whitespace/punctuation normalization function. All **35** reference cases from upstream `tests/test_normalize.py` pass on Rust.
+- These tests cover the **preprocessor and text decoder**, not the full end-to-end ASR accuracy of any official GigaAM weights. The user-supplied 89.939-second `MitaKind.wav` is accepted by `probe-audio` at 16 kHz and split into four segments; there is still no recognized transcript without a genuine checkpoint.
 
 Open requirements: compare every official checkpoint and its embedded architecture against this reader; confirm GPU / Windows execution separately. No claim of official model parity, real-audio WER or production readiness is made by these synthetic fixtures.

@@ -18,6 +18,29 @@ struct SentencePiece {
     kind: i32,
 }
 
+fn decode_utf8_per_invalid_byte(bytes: &[u8]) -> String {
+    let mut decoded = String::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        match std::str::from_utf8(&bytes[offset..]) {
+            Ok(valid) => {
+                decoded.push_str(valid);
+                break;
+            }
+            Err(error) => {
+                let valid = error.valid_up_to();
+                if valid != 0 {
+                    decoded.push_str(std::str::from_utf8(&bytes[offset..offset + valid]).unwrap());
+                    offset += valid;
+                }
+                decoded.push('\u{fffd}');
+                offset += 1;
+            }
+        }
+    }
+    decoded
+}
+
 pub enum Tokenizer {
     Character(Vec<String>),
     SentencePiece(Vec<(String, i32)>),
@@ -102,7 +125,7 @@ impl Tokenizer {
                 }
             }
         }
-        let out = String::from_utf8_lossy(&bytes).replace('▁', " ");
+        let out = decode_utf8_per_invalid_byte(&bytes).replace('▁', " ");
         if matches!(self, Self::SentencePiece(_)) && trim_dummy_prefix {
             Ok(out.strip_prefix(' ').unwrap_or(&out).to_owned())
         } else {

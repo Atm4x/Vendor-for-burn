@@ -3,6 +3,7 @@ pub mod checkpoint_config;
 pub mod decode;
 pub mod model;
 pub mod rnnt;
+pub mod text;
 pub mod tokenizer;
 pub mod weights;
 
