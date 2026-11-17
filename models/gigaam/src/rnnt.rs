@@ -267,7 +267,7 @@ impl RnntModel {
     }
 }
 
-#[cfg(all(test, feature = "flex"))]
+#[cfg(all(test, any(feature = "cpu", feature = "flex")))]
 mod tests {
     use super::*;
     use burn::tensor::TensorData;
@@ -282,9 +282,19 @@ mod tests {
             .collect()
     }
 
+    #[cfg(feature = "cpu")]
+    fn test_device() -> Device {
+        Device::cpu()
+    }
+
+    #[cfg(all(not(feature = "cpu"), feature = "flex"))]
+    fn test_device() -> Device {
+        Device::flex()
+    }
+
     #[test]
     fn lstm_matches_pytorch_two_recurrent_steps() {
-        let d = Device::flex();
+        let d = test_device();
         let hidden = 3;
         let layer = LstmLayer {
             weight_ih: tensor(linspace(-0.12, 0.15, 36), [12, 3], &d),

@@ -6,7 +6,7 @@ rust-version = "1.100"
 license = "MIT"
 
 [features]
-default = ["flex"]
+default = ["cuda"]
 cpu = ["burn/cpu"]
 flex = ["burn/flex"]
 cuda = ["burn/cuda"]

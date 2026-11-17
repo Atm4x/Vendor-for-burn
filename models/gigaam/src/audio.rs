@@ -342,14 +342,29 @@ impl SpeechRegionSeconds {
     }
 }
 
-/// Return VAD-aligned chunks without copying PCM. Long regions are subdivided
-/// using the same low-energy boundary heuristic as the fallback longform path.
-pub fn speech_chunks_in_regions<'a>(
-    samples: &'a [f32],
-    regions: &[SpeechRegion],
-    max_samples: usize,
-) -> Result<Vec<AudioChunk<'a>>> {
-    ensure!(max_samples > 0, "maximum chunk length must be positive");
+/// Parameters of the grouping stage from GigaAM's Python `segment_audio_file`.
+/// All durations are represented in 16 kHz samples to avoid float rounding.
+#[derive(Debug, Clone, Copy)]
+pub struct VadGrouping {
+    pub max_samples: usize,
+    pub min_samples: usize,
+    pub strict_limit_samples: usize,
+    pub new_chunk_threshold_samples: usize,
+}
+
+impl Default for VadGrouping {
+    fn default() -> Self {
+        let rate = SAMPLE_RATE as usize;
+        Self {
+            max_samples: 22 * rate,
+            min_samples: 15 * rate,
+            strict_limit_samples: 30 * rate,
+            new_chunk_threshold_samples: rate / 5,
+        }
+    }
+}
+
+fn validate_speech_regions(samples: &[f32], regions: &[SpeechRegion]) -> Result<()> {
     let mut previous_end = 0;
     for (index, region) in regions.iter().enumerate() {
         ensure!(
@@ -366,6 +381,95 @@ pub fn speech_chunks_in_regions<'a>(
         );
         previous_end = region.end_sample;
     }
+    Ok(())
+}
+
+/// Group externally detected speech regions according to GigaAM's Python
+/// longform segmenter. Unlike `speech_chunks_in_regions`, neighboring VAD
+/// regions may be joined into one contiguous PCM slice including the silence
+/// between them. Chunks over `strict_limit_samples` are divided equally.
+/// No VAD model is loaded; only the supplied intervals are used.
+pub fn speech_chunks_grouped_vad<'a>(
+    samples: &'a [f32],
+    regions: &[SpeechRegion],
+    options: VadGrouping,
+) -> Result<Vec<AudioChunk<'a>>> {
+    validate_speech_regions(samples, regions)?;
+    ensure!(
+        options.max_samples > 0 && options.min_samples > 0 && options.strict_limit_samples > 0,
+        "VAD grouping durations must be positive"
+    );
+
+    fn flush<'a>(
+        samples: &'a [f32],
+        chunks: &mut Vec<AudioChunk<'a>>,
+        start: usize,
+        end: usize,
+        strict_limit_samples: usize,
+    ) {
+        let duration = end - start;
+        let pieces = duration / strict_limit_samples + 1;
+        let pieces = if duration > strict_limit_samples {
+            pieces
+        } else {
+            1
+        };
+        for i in 0..pieces {
+            let left = start + duration * i / pieces;
+            let right = start + duration * (i + 1) / pieces;
+            chunks.push(AudioChunk {
+                start_sample: left,
+                samples: &samples[left..right],
+            });
+        }
+    }
+
+    let mut chunks = Vec::new();
+    let (mut curr_start, mut curr_end, mut curr_duration) = (0usize, 0usize, 0.0_f64);
+    let rate = SAMPLE_RATE as f64;
+    for region in regions {
+        let start = region.start_sample;
+        let end = region.end_sample;
+        if curr_duration == 0.0 {
+            curr_start = start;
+        } else if curr_duration > options.new_chunk_threshold_samples as f64 / rate
+            && (curr_duration + (end as f64 / rate - curr_end as f64 / rate)
+                > options.max_samples as f64 / rate
+                || curr_duration > options.min_samples as f64 / rate)
+        {
+            flush(
+                samples,
+                &mut chunks,
+                curr_start,
+                curr_end,
+                options.strict_limit_samples,
+            );
+            curr_start = start;
+        }
+        curr_end = end;
+        curr_duration = (curr_end as f64 / rate) - (curr_start as f64 / rate);
+    }
+    if curr_duration > options.new_chunk_threshold_samples as f64 / rate {
+        flush(
+            samples,
+            &mut chunks,
+            curr_start,
+            curr_end,
+            options.strict_limit_samples,
+        );
+    }
+    Ok(chunks)
+}
+
+/// Return VAD-aligned chunks without copying PCM. Long regions are subdivided
+/// using the same low-energy boundary heuristic as the fallback longform path.
+pub fn speech_chunks_in_regions<'a>(
+    samples: &'a [f32],
+    regions: &[SpeechRegion],
+    max_samples: usize,
+) -> Result<Vec<AudioChunk<'a>>> {
+    ensure!(max_samples > 0, "maximum chunk length must be positive");
+    validate_speech_regions(samples, regions)?;
 
     let mut chunks = Vec::new();
     for region in regions {

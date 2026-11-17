@@ -3,6 +3,22 @@ use burn::tensor::Device;
 use gigaam_rs::{GigaAm, audio};
 use std::path::Path;
 
+#[cfg(feature = "cuda")]
+const DEFAULT_DEVICE: &str = "cuda";
+#[cfg(all(not(feature = "cuda"), feature = "cpu"))]
+const DEFAULT_DEVICE: &str = "cpu";
+#[cfg(all(not(feature = "cuda"), not(feature = "cpu"), feature = "wgpu"))]
+const DEFAULT_DEVICE: &str = "wgpu";
+#[cfg(all(
+    not(feature = "cuda"),
+    not(feature = "cpu"),
+    not(feature = "wgpu"),
+    feature = "flex"
+))]
+const DEFAULT_DEVICE: &str = "flex";
+#[cfg(not(any(feature = "cuda", feature = "cpu", feature = "wgpu", feature = "flex")))]
+compile_error!("gigaam-rs requires a backend feature: cuda (default), cpu, wgpu, or flex");
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 3 && args[1] == "inspect-config" {
@@ -81,7 +97,9 @@ fn main() -> Result<()> {
         ]
         .contains(&args[1].as_str())
     {
-        eprintln!("Usage: gigaam-rs transcribe <model_dir> <audio.wav> [--device cpu|cuda|wgpu]");
+        eprintln!(
+            "Usage: gigaam-rs transcribe <model_dir> <audio.wav> [--device cuda|cpu|wgpu|flex]"
+        );
         eprintln!("       gigaam-rs probe-audio <audio.wav>");
         eprintln!("       gigaam-rs inspect-checkpoint <model.ckpt|model.safetensors> [--all]");
         eprintln!("       gigaam-rs inspect-config <model.ckpt> [--raw]");
@@ -92,7 +110,10 @@ fn main() -> Result<()> {
         eprintln!("       gigaam-rs transcribe <model_dir> <audio.wav> --word-timestamps");
         eprintln!("       gigaam-rs transcribe <model_dir> <audio.wav> --segments-json <vad.json>");
         eprintln!(
-            "       gigaam-rs transcribe-batch <model_dir> <audio_paths.json> [--device cpu|cuda|wgpu]"
+            "       gigaam-rs transcribe <model_dir> <audio.wav> --segments-json <vad.json> --group-vad-python"
+        );
+        eprintln!(
+            "       gigaam-rs transcribe-batch <model_dir> <audio_paths.json> [--device cuda|cpu|wgpu|flex]"
         );
         std::process::exit(2);
     }
@@ -100,20 +121,28 @@ fn main() -> Result<()> {
         .windows(2)
         .find(|x| x[0] == "--device")
         .map(|x| x[1].as_str())
-        .unwrap_or("cpu");
+        .unwrap_or(DEFAULT_DEVICE);
     let device = match selected {
         "cpu" => {
+            #[cfg(feature = "cpu")]
+            {
+                Device::cpu()
+            }
+            #[cfg(not(feature = "cpu"))]
+            {
+                bail!(
+                    "CubeCL CPU backend not enabled; build with --no-default-features --features cpu"
+                )
+            }
+        }
+        "flex" => {
             #[cfg(feature = "flex")]
             {
                 Device::flex()
             }
-            #[cfg(all(not(feature = "flex"), feature = "cpu"))]
+            #[cfg(not(feature = "flex"))]
             {
-                Device::cpu()
-            }
-            #[cfg(all(not(feature = "flex"), not(feature = "cpu")))]
-            {
-                bail!("build with --features flex or cpu")
+                bail!("Flex fallback not enabled; build with --no-default-features --features flex")
             }
         }
         "cuda" => {
@@ -252,8 +281,18 @@ fn main() -> Result<()> {
     } else {
         None
     };
+    let group_vad = args.iter().any(|arg| arg == "--group-vad-python");
+    if group_vad && external_regions.is_none() {
+        bail!("--group-vad-python requires --segments-json");
+    }
     if args.iter().any(|arg| arg == "--word-timestamps") {
-        let chunks = if let Some(regions) = &external_regions {
+        let chunks = if group_vad {
+            model.transcribe_grouped_vad_with_timestamps_16k(
+                &samples,
+                external_regions.as_deref().unwrap_or_default(),
+                audio::VadGrouping::default(),
+            )?
+        } else if let Some(regions) = &external_regions {
             model.transcribe_regions_with_timestamps_16k(&samples, regions)?
         } else {
             model.transcribe_long_with_timestamps_16k(&samples)?
@@ -268,7 +307,13 @@ fn main() -> Result<()> {
             }
         }
     } else {
-        let chunks = if let Some(regions) = &external_regions {
+        let chunks = if group_vad {
+            model.transcribe_grouped_vad_16k(
+                &samples,
+                external_regions.as_deref().unwrap_or_default(),
+                audio::VadGrouping::default(),
+            )?
+        } else if let Some(regions) = &external_regions {
             model.transcribe_regions_16k(&samples, regions)?
         } else {
             model.transcribe_long_16k(&samples)?

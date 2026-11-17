@@ -732,9 +732,19 @@ impl EmotionModel {
     }
 }
 
-#[cfg(all(test, feature = "flex"))]
+#[cfg(all(test, any(feature = "cpu", feature = "flex")))]
 mod legacy_tests {
     use super::*;
+
+    #[cfg(feature = "cpu")]
+    fn test_device() -> Device {
+        Device::cpu()
+    }
+
+    #[cfg(all(not(feature = "cpu"), feature = "flex"))]
+    fn test_device() -> Device {
+        Device::flex()
+    }
 
     #[test]
     fn parametrized_subsampling_rejects_non_power_of_two() {
@@ -762,7 +772,7 @@ mod legacy_tests {
     }
     #[test]
     fn relative_shift_matches_pytorch_reshape() {
-        let device = Device::flex();
+        let device = test_device();
         let input = Tensor::<4>::from_data(
             TensorData::new((0..15).map(|x| x as f32).collect::<Vec<_>>(), [1, 1, 3, 5]),
             &device,

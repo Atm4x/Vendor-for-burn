@@ -9,8 +9,8 @@ pub mod weights;
 
 use anyhow::{Context, Result, bail, ensure};
 use audio::{
-    SAMPLE_RATE, SpeechRegion, log_mel, speech_chunks, speech_chunks_in_regions,
-    speech_chunks_with_offsets,
+    SAMPLE_RATE, SpeechRegion, VadGrouping, log_mel, speech_chunks, speech_chunks_grouped_vad,
+    speech_chunks_in_regions, speech_chunks_with_offsets,
 };
 use burn::tensor::Device;
 use decode::{Transcription, Word, ctc_argmax, words_from_frames};
@@ -618,10 +618,7 @@ impl GigaAm {
     }
 
     fn decode_with_length_16k(&self, pcm: &[f32]) -> Result<(Transcription, usize)> {
-        ensure!(
-            !pcm.is_empty() && pcm.len() <= SAMPLE_RATE as usize * 25,
-            "transcription requires 0 < audio duration <= 25s"
-        );
+        ensure!(!pcm.is_empty(), "transcription requires nonempty audio");
         let tokenizer = self
             .tokenizer
             .as_ref()
@@ -731,11 +728,25 @@ impl GigaAm {
             .collect()
     }
 
+    fn check_short_transcription(pcm: &[f32]) -> Result<()> {
+        ensure!(
+            !pcm.is_empty() && pcm.len() <= SAMPLE_RATE as usize * 25,
+            "transcription requires 0 < audio duration <= 25s"
+        );
+        Ok(())
+    }
+
     pub fn transcribe_16k(&self, pcm: &[f32]) -> Result<Transcription> {
+        Self::check_short_transcription(pcm)?;
         Ok(self.decode_with_length_16k(pcm)?.0)
     }
 
     pub fn transcribe_with_timestamps_16k(&self, pcm: &[f32]) -> Result<TimedTranscription> {
+        Self::check_short_transcription(pcm)?;
+        self.transcribe_segment_with_timestamps_16k(pcm)
+    }
+
+    fn transcribe_segment_with_timestamps_16k(&self, pcm: &[f32]) -> Result<TimedTranscription> {
         let (transcription, encoded_len) = self.decode_with_length_16k(pcm)?;
         let tokenizer = self.tokenizer.as_ref().context("ASR tokenizer missing")?;
         let words = words_from_frames(
@@ -771,6 +782,39 @@ impl GigaAm {
             );
         }
         Ok(output)
+    }
+
+    /// Match the Python `transcribe_longform` VAD grouping after receiving
+    /// precomputed speech regions from the application's VAD service.
+    /// Longform runs may contain chunks up to 30 seconds, unlike short ASR.
+    pub fn transcribe_grouped_vad_with_timestamps_16k(
+        &self,
+        samples: &[f32],
+        regions: &[SpeechRegion],
+        options: VadGrouping,
+    ) -> Result<Vec<TimedTranscription>> {
+        speech_chunks_grouped_vad(samples, regions, options)?
+            .iter()
+            .map(|chunk| {
+                self.transcribe_segment_with_timestamps_16k(chunk.samples)
+                    .map(|result| result.with_sample_offset(chunk.start_sample))
+            })
+            .collect()
+    }
+
+    pub fn transcribe_grouped_vad_16k(
+        &self,
+        samples: &[f32],
+        regions: &[SpeechRegion],
+        options: VadGrouping,
+    ) -> Result<Vec<Transcription>> {
+        speech_chunks_grouped_vad(samples, regions, options)?
+            .iter()
+            .map(|chunk| {
+                self.decode_with_length_16k(chunk.samples)
+                    .map(|(text, _)| text)
+            })
+            .collect()
     }
 
     /// Transcribe VAD-provided intervals without the overhead of word alignment.
