@@ -17,7 +17,7 @@ This crate implements the GigaAM Conformer family in Rust using Burn tensors. No
 | `multilingual_ctc`, `multilingual_large_ctc` | Same Conformer/CTC building blocks | Configured character vocabulary | No official checkpoint tested |
 | `multilingual_ssl`, `multilingual_large_ssl` | Same Conformer encoder | Frame embeddings | No official checkpoint tested |
 
-The shared Conformer supports rotary or relative positional attention, Conv1D or Conv2D strided subsampling factors 2/4/8/16/32 (powers of two), and convolution BatchNorm or LayerNorm. Factors 2 and 8 have been tested against the original PyTorch encoder on small random-weight configurations. Original PyTorch ZIP checkpoints containing `cfg` (OmegaConf DictConfig) or fine-tuning `hyper_parameters.model_cfg` now load their embedded configuration **natively in Rust** without `config.json`, when the architecture uses supported GigaAM operators. A `config.json` remains an explicit override and is still required for Safetensors-only files or unsupported checkpoint metadata. Arbitrary non-power-of-two subsampling, advanced emotion heads, GPU-vectorized batch execution, neural VAD, and all official-weight parity checks are **not yet implemented/verified**. Functional batch APIs run each recording independently, preserving output order without padding-induced changes. This is not a performance claim. v1/v2 and `emo` should be treated as experimental until checked with original checkpoint configurations. The source expects model-specific dimensions from the checkpoint. Model names are not interchangeable with weight files. Known model names are resolved through an exact registry; unknown names must supply an explicit `model_type`, and conflicting registered name/type combinations fail at load time instead of silently falling back to CTC.
+The shared Conformer supports rotary or relative positional attention, Conv1D or Conv2D strided subsampling factors 2/4/8/16/32 (powers of two), and convolution BatchNorm or LayerNorm. Factors 2 and 8 have been tested against the original PyTorch encoder on small random-weight configurations. Original PyTorch ZIP checkpoints containing `cfg` (OmegaConf DictConfig) or fine-tuning `hyper_parameters.model_cfg` now load their embedded configuration **natively in Rust** without `config.json`, when the architecture uses supported GigaAM operators. A `config.json` remains an explicit override and is still required for Safetensors-only files or unsupported checkpoint metadata. Arbitrary non-power-of-two subsampling, advanced emotion heads, neural VAD, and official-weight numerical batch parity are **not yet implemented/verified**. Native CTC/RNN-T ASR batches now use one padded Conformer tensor with the upstream masking contract; text decoding runs separately for each sample. This is not a CUDA performance claim. v1/v2 and `emo` should be treated as experimental until checked with original checkpoint configurations. The source expects model-specific dimensions from the checkpoint. Model names are not interchangeable with weight files. Known model names are resolved through an exact registry; unknown names must supply an explicit `model_type`, and conflicting registered name/type combinations fail at load time instead of silently falling back to CTC.
 
 ## Configuration
 
@@ -79,9 +79,9 @@ Use `gigaam-rs inspect-checkpoint ./v3_ctc.ckpt` to examine parameter shapes and
 
 ### Batch and audio input
 
-`GigaAm::transcribe_batch_16k`, `transcribe_batch_with_timestamps_16k`, `infer_embeddings_batch_16k`, and `emotion_probs_batch_16k` accept slices of individual 16-kHz PCM recordings and produce ordered results. Each recording is executed independently (not a single padded GPU batch); failures are annotated with the input index. `transcribe-batch <model_dir> <audio_paths.json>` reads a JSON array of paths and prints per-file JSON transcriptions.
+`GigaAm::transcribe_batch_16k`, `transcribe_batch_with_timestamps_16k`, `infer_embeddings_batch_16k`, and `emotion_probs_batch_16k` accept slices of individual 16-kHz PCM recordings and produce ordered results. CTC and RNN-T now use a genuine padded Conformer batch with valid-length masking and per-sample decoding; `infer_embeddings_batch_16k` and `emotion_probs_batch_16k` still process recordings individually. Service batches default to a maximum of 16 recordings, matching Python `fr_batch_size` for longform. `transcribe-batch <model_dir> <audio_paths.json>` reads a JSON array of paths and prints per-file JSON transcriptions.
 
-The CLI's `load_audio_16k` accepts PCM WAV, FLAC, and Ogg/Vorbis via pure Rust decoders; unsupported formats such as MP3/AAC still need conversion upstream. The WAV path remains the original `hound` decoder for parity. The Symphonia codec dependency uses MPL-2.0; see `THIRD_PARTY_NOTICES.md`.
+The CLI's `load_audio_16k` accepts PCM WAV, FLAC, and Ogg/Vorbis via pure Rust decoders; MP3/AAC-family formats use an external FFmpeg fallback when installed. `audio::load_audio_ffmpeg_16k` and CLI `--python-audio` explicitly reproduce Python's FFmpeg PCM16 conversion and resampling, which can differ numerically from native decoding. The WAV path remains the original `hound` decoder for parity. The Symphonia codec dependency uses MPL-2.0; see `THIRD_PARTY_NOTICES.md`.
 
 ### External VAD / NeuroMita integration
 
@@ -163,3 +163,53 @@ Open requirements: compare every official checkpoint and its embedded architectu
 - The native log-mel extractor rejects PCM of 200 samples or fewer, matching Torchaudio's reflect-padding requirement for `n_fft=400`, as well as nonfinite PCM input.
 - The 25-second guard remains on **short-form transcription**. It no longer restricts SSL embeddings, emotion classification or diagnostic CTC logits: upstream `GigaAM.embed_audio` and `GigaAMEmo.get_probs` have no short-form guard. These unrestricted forwards can consume substantial CPU/GPU memory on long audio; chunking is still recommended.
 - This update adds source-level/fixture parity only. Official model weights, CUDA execution and end-to-end ASR accuracy have **not** been validated.
+
+## Reusable inference service (integration API)
+
+`gigaam_rs::service::GigaAmService` keeps **one** `GigaAm` instance loaded across calls. It does not spawn Python or instantiate a second VAD; model downloads occur only through explicitly configured `load_named`/`CacheOptions` when opted in. Use one owner per active model and drop the service before switching to another checkpoint. The synchronous API leaves execution scheduling and cancellation to the application.
+
+```rust
+use burn::tensor::Device;
+use gigaam_rs::service::{GigaAmService, TranscribeOptions};
+use std::path::Path;
+
+let service = GigaAmService::load(Path::new("v3_e2e_ctc.ckpt"), Device::cuda(0))?;
+let transcript = service.transcribe_file(Path::new("speech.wav"), TranscribeOptions::default())?;
+println!("{}", transcript.text);
+```
+
+The API also accepts decoded **mono 16-kHz float32 PCM** via `transcribe_16k` and supports `Segmentation::SpeechRegions` and `Segmentation::GroupedSpeechRegions` for half-open sample intervals supplied by the host VAD. The grouping policy reproduces the Python longform segment-boundary rules, but does **not** run pyannote. The `Energy` fallback is a low-energy chunker, not neural speech activity detection. Results include text, absolute segment boundaries in seconds and optional absolute word timestamps. Non-ASR models expose `embed_16k` / `embed_file` and `emotions_16k` / `emotions_file` on the same service object. Incorrect model/operation combinations fail before inference.
+
+For an application that cannot link the Rust crate, the executable has a **persistent local JSONL stdio interface**. Start it once with `gigaam-rs serve <checkpoint> --device cuda`. Each line sent to stdin is one JSON object; each stdout line is one JSON response with `id`, `ok`, and either `result` or `error`. The process stays running after a recoverable request error. It accepts these methods:
+
+```json
+{"id":1,"method":"status"}
+{"id":2,"method":"transcribe","audio_path":"speech.wav","word_timestamps":true}
+{"id":3,"method":"transcribe","audio_path":"speech.wav","segments":[{"start":1.2,"end":3.7}],"group_vad":true}
+{"id":4,"method":"embed","audio_path":"speech.wav","output_path":"embeddings.f32"}
+{"id":5,"method":"emotion","audio_path":"speech.wav"}
+{"id":6,"method":"shutdown"}
+```
+
+`embed` writes row-major little-endian float32 values to the requested path and returns `[frames, channels]` metadata rather than sending a large tensor through JSON. Do not send the JSON objects above as one multi-line JSON document: they are independent JSONL requests. Use absolute paths in external-process integrations unless the child working directory is explicitly configured. The JSONL protocol is **local synchronous request/response**, not a network service, parallel inference engine, scheduler, authentication boundary, or streaming ASR. `shutdown` exits cleanly after acknowledging the request; EOF also stops the server. Inputs with `segments` must be seconds, finite, ordered, non-overlapping and within the decoded recording.
+
+The `Test-GigaAM.ps1` script now resolves user-supplied checkpoint/audio paths from the PowerShell working directory to absolute paths before spawning the native process (which may otherwise inherit `C:\Windows\System32`). Each external test has a configurable `-TestTimeoutSeconds` guard (default: 300). With `--profile`, the CLI additionally prints checkpoints after model loading and after audio decoding to help localize later stalls.
+
+
+## Python source parity audit and stable API (CONT2)
+
+See [UPSTREAM_PARITY.md](UPSTREAM_PARITY.md) for a method-by-method comparison to the user-provided GigaAM Python source, explicitly separated from official-weight parity tests.
+
+The Rust `GigaAmService` now distinguishes Python's short-form `transcribe` (one recording, maximum 25 seconds) from `transcribe_longform_regions_16k` (caller-supplied external VAD intervals). No internal VAD is loaded. `Segmentation::FullRecording` is the default; `Segmentation::Energy` is an opt-in **non-Python legacy fallback**. `transcribe_short_16k` returns `{text, words}`; `TranscriptResult` exposes `words()` and `has_word_timestamps()` to match Python's longform result accessors. `emotions_dict_16k` returns a label-to-probability mapping matching Python `get_probs`.
+
+`gigaam-rs serve` accepts `transcribe_longform` with a required `segments` array (empty is allowed) and `transcribe_batch` with `audio_paths`. `transcribe` without segments is strict short-form. The original standalone `gigaam-rs transcribe` CLI remains compatible with its long-recording energy chunking; it does not represent the Python VAD method. CTC/RNN-T batching now uses a padded encoder; SSL/Emo batch helpers still process recordings individually.
+
+Official-weight parity diagnostics: `parity-encoder` now supports CTC, RNNT, SSL and Emo models, and writes Conformer activations in `[time, hidden]` order. See [UPSTREAM_PARITY.md](UPSTREAM_PARITY.md) and `tools/official_reference_dump.py` / `tools/compare_reference.py`. The Python scripts are diagnostic-only and not required by native inference.
+
+### Source-mapped CONT3: runtime parity updates
+
+The model cache/API follows Python `__init__.py::load_model`: 16 named artifacts, five short v3 aliases, original MD5 hashes for cached official checkpoints and required E2E/v1-RNNT tokenizer names. `GigaAmService::load_named(name, device, &CacheOptions)` accepts an upstream name or local checkpoint directory/file. `CacheOptions` defaults to **offline**; set `download_if_missing=true` and compile with `model-download` to allow HTTPS retrieval. For the CLI, use `--model-cache <dir>` and `--download-model`. Installed FFmpeg is required only for `--python-audio` (or compressed formats falling back to FFmpeg); native WAV/FLAC/Vorbis input is unchanged.
+
+For multiple short recordings, `transcribe_batch_16k` and `transcribe_batch_with_timestamps_16k` share one padded Conformer execution for CTC and RNN-T, then run CTC/RNN-T decoding with each valid frame count. Encoder-level masks cover input mel padding, the output of each strided convolution, attention and depthwise convolution. `GigaAmService::with_batch_size(size)` configures the maximum batch size (default 16); the same flag is available to JSONL `serve` as `--batch-size`. Longform accepts **only** externally supplied VAD speech intervals in its source-parity API.
+
+Local tests on Rust 1.100.0/Flex CPU compare batch sizes 1/2/4/16 and multiple Conformer families against individual inference and check CTC/RNN-T decoded text/timestamps. The tests do **not** establish exact official checkpoint PyTorch/CUDA numerical parity or Windows GPU performance. Python's FP16 encoder/Flash Attention policy, fine-tuned checkpoint base fallback when embedded configuration is incomplete, and the separate ONNX exporter remain open deployment-specific parity items. The original decoder was not modified.

@@ -8,6 +8,43 @@ pub const SAMPLE_RATE: u32 = 16_000;
 pub const FFT_SIZE: usize = 400;
 pub const HOP: usize = 160;
 
+/// Reference-compatible audio decoder: matches Python `load_audio` by asking
+/// FFmpeg for mono 16-kHz signed PCM16, then scaling samples by 32768.0.
+/// FFmpeg must be installed and discoverable in PATH.
+pub fn load_audio_ffmpeg_16k(path: &Path) -> Result<Vec<f32>> {
+    let output = std::process::Command::new("ffmpeg")
+        .args(["-nostdin", "-threads", "0", "-i"])
+        .arg(path)
+        .args([
+            "-f",
+            "s16le",
+            "-ac",
+            "1",
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            "16000",
+            "-",
+        ])
+        .output()
+        .with_context(|| "launching ffmpeg (required for Python-compatible audio input)")?;
+    ensure!(
+        output.status.success(),
+        "FFmpeg failed to load audio {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    ensure!(
+        !output.stdout.is_empty() && output.stdout.len() % 2 == 0,
+        "FFmpeg returned empty or truncated PCM16 audio"
+    );
+    Ok(output
+        .stdout
+        .chunks_exact(2)
+        .map(|pair| i16::from_le_bytes([pair[0], pair[1]]) as f32 / 32768.0)
+        .collect())
+}
+
 pub fn load_wav_16k(path: &Path) -> Result<Vec<f32>> {
     let mut reader =
         hound::WavReader::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -55,6 +92,14 @@ pub fn load_audio_16k(path: &Path) -> Result<Vec<f32>> {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
     {
         return load_wav_16k(path);
+    }
+
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "mp3" | "m4a" | "aac" | "mp4" | "wma" | "opus"
+    ) {
+        return load_audio_ffmpeg_16k(path);
     }
 
     use symphonia::core::codecs::audio::AudioDecoderOptions;

@@ -475,6 +475,7 @@ impl<'a> Pickle<'a> {
 pub struct CheckpointConfig {
     pub config: Value,
     pub base_model_name: Option<String>,
+    pub is_finetuned: bool,
 }
 
 pub fn read_checkpoint_metadata(path: &Path) -> Result<CheckpointConfig> {
@@ -506,10 +507,8 @@ pub fn read_checkpoint_metadata(path: &Path) -> Result<CheckpointConfig> {
     let mut pickle = Pickle::new(&data);
     let root = pickle.unpickle()?;
     let hp = pickle.get(root, "hyper_parameters");
-    let cfg = pickle
-        .get(root, "cfg")
-        .or_else(|| hp.and_then(|h| pickle.get(h, "model_cfg")))
-        .context("checkpoint has no cfg or hyper_parameters.model_cfg")?;
+    let direct_cfg = pickle.get(root, "cfg");
+    let cfg = direct_cfg.or_else(|| hp.and_then(|h| pickle.get(h, "model_cfg")));
     let base_model_name = hp
         .and_then(|h| pickle.get(h, "model_name"))
         .and_then(|id| match &pickle.nodes[id] {
@@ -517,13 +516,18 @@ pub fn read_checkpoint_metadata(path: &Path) -> Result<CheckpointConfig> {
             _ => None,
         });
     Ok(CheckpointConfig {
-        config: pickle.json_value(cfg, 0, &mut HashSet::new())?,
+        config: cfg.map_or(Ok(Value::Null), |id| {
+            pickle.json_value(id, 0, &mut HashSet::new())
+        })?,
         base_model_name,
+        is_finetuned: hp.is_some() && direct_cfg.is_none(),
     })
 }
 
 pub fn read_checkpoint_config(path: &Path) -> Result<Value> {
-    Ok(read_checkpoint_metadata(path)?.config)
+    let cfg = read_checkpoint_metadata(path)?.config;
+    ensure!(!cfg.is_null(), "checkpoint has no cfg or hyper_parameters.model_cfg");
+    Ok(cfg)
 }
 
 #[cfg(test)]

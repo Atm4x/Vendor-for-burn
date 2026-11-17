@@ -90,3 +90,36 @@ Share `results/summary.json`, relevant `results/*.log`, `results/nvidia-smi.txt`
 `gigaam-rs.exe` is a CUDA-only build. `-Device cpu` or `-Device flex` requires a separately compiled backend; it does not silently fall back. GitHub-hosted Windows runners compile the executable but do not provide an NVIDIA GPU for inference verification.
 
 The CTC test suite includes `ctc-v3-mel`, a tiny synthetic checkpoint using official v3 STFT geometry (`n_fft=320`, `center=false`) for a genuine CubeCL CUDA smoke test. With `-RealModelPath`, `Test-GigaAM.ps1` also saves `real-model-config.log` before attempting ASR; errors from a native executable are captured and added to `summary.json` instead of terminating the PowerShell process prematurely. Official checkpoint validation is separate from the synthetic test suite.
+
+## Persistent API mode (no repeated model loading)
+
+Invoke `gigaam-rs.exe serve .\v3_e2e_ctc.ckpt --device cuda` from your application's subprocess launcher and keep its stdin/stdout pipes open. Send one JSON object per input line; parse one UTF-8 JSON response line for every request. For example:
+
+```json
+{"id":"status","method":"status"}
+{"id":"asr-1","method":"transcribe","audio_path":"D:\\Audio\\MitaKind.wav","word_timestamps":true}
+{"id":"stop","method":"shutdown"}
+```
+
+The JSONL interface is synchronous, keeps one model on the selected device, and does not include a VAD engine. For long recordings provide external intervals as `segments` in seconds; `group_vad: true` applies the reference grouping policy. `transcribe` without `segments` accepts only short recordings (up to 25 seconds). External VAD intervals are required for Python-faithful longform. `transcribe_longform` groups the supplied intervals using the upstream grouping rules. Operations on the wrong model family return an `ok: false` response instead of crashing the loop. Use full Windows paths for the checkpoint and audio in subprocess integrations unless you control the child process's working directory.
+
+`Test-GigaAM.ps1` now resolves relative input paths correctly even when `[Environment]::CurrentDirectory` is `C:\Windows\System32`. Use `-TestTimeoutSeconds 300` to change the per-test timeout. Native `--profile` writes stage checkpoints before transcription in addition to the complete timing summary.
+
+## Source-aligned batching and audio input (CONT3)
+
+The `transcribe-batch` CLI and JSONL `transcribe_batch` use **one padded Conformer encoder execution** for multiple samples. The encoder masks padded mel frames after each subsampling layer, masks padded attention queries/keys, and masks depthwise-convolution inputs. CTC and RNN-T decoding preserves per-sample valid lengths. JSONL longform with external VAD intervals also groups chunks into a padded encoder batch, including word timestamps. Individual records are still decoded separately.
+
+Use `-PythonAudio` to invoke the original Python frontend's FFmpeg contract (mono 16 kHz signed PCM16 / 32768 scaling). FFmpeg must be installed on `PATH`. Without the flag, native WAV/FLAC/Vorbis decoding stays enabled; compressed MP3/AAC-like inputs fall back to FFmpeg. The two audio modes have different resampling and quantization semantics by design.
+
+The `-ModelPath` argument also accepts an upstream registered model name (`ctc` maps to `v3_ctc`, for example). `-ModelCache` selects the local cache root. Models already found there are checked against the official MD5 manifest. Automatic model retrieval is **opt-in** via `-DownloadModel`, and the binary must be built with `model-download` enabled for network access. The default CUDA distribution does not implicitly fetch models. An unknown model name or incorrect checksum fails explicitly; local fine-tuned checkpoint paths do not require the upstream official MD5.
+
+Examples:
+
+```powershell
+.\Run-GigaAM.ps1 -Mode serve -Device cuda -ModelPath 'v3_ctc' -ModelCache 'D:\Models\GigaAM'
+.\Run-GigaAM.ps1 -Mode transcribe -Device cuda -ModelPath '.\v3_e2e_ctc.ckpt' -AudioPath '.\test.mp3' -PythonAudio -Profile
+```
+
+Local synthetic batch parity has been tested with sizes 1/2/4/16. This is not a performance or numerical equivalence claim for official Windows CUDA checkpoints; run a new GPU build and real-input comparison before relying on the batch path in production.
+
+`serve` defaults to `--batch-size 16` (matching Python longform's `fr_batch_size=16`). Use `--batch-size 1` for an A/B control run; this affects batching, not the external VAD or model identity. The PowerShell wrapper forwards `-PythonAudio`, `-ModelCache`, and `-DownloadModel` when provided.

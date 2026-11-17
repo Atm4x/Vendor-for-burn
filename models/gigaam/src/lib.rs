@@ -2,7 +2,9 @@ pub mod audio;
 pub mod checkpoint_config;
 pub mod decode;
 pub mod model;
+pub mod model_registry;
 pub mod rnnt;
+pub mod service;
 pub mod text;
 pub mod tokenizer;
 pub mod weights;
@@ -413,6 +415,24 @@ impl GigaAm {
     /// Load from a model directory or a specific checkpoint file. A sibling
     /// `config.json` supplies the architecture and tokenizer configuration.
     pub fn load(model_dir: &Path, device: Device) -> Result<Self> {
+        Self::load_internal(model_dir, device, None)
+    }
+
+    /// Load fine-tuned checkpoints using the upstream base-model fallback when
+    /// model_cfg is absent or its decoder requires external base metadata.
+    pub fn load_with_cache(
+        model_dir: &Path,
+        device: Device,
+        cache: &model_registry::CacheOptions,
+    ) -> Result<Self> {
+        Self::load_internal(model_dir, device, Some(cache))
+    }
+
+    fn load_internal(
+        model_dir: &Path,
+        device: Device,
+        cache: Option<&model_registry::CacheOptions>,
+    ) -> Result<Self> {
         let direct_checkpoint = match model_dir.extension().and_then(|ext| ext.to_str()) {
             Some("ckpt" | "pth" | "pt" | "safetensors") => {
                 ensure!(
@@ -452,14 +472,54 @@ impl GigaAm {
             );
             available.into_iter().next()
         };
+        let mut base_checkpoint = None;
         let manifest: ModelManifest = if cfg_path.is_file() {
             serde_json::from_slice(
                 &std::fs::read(&cfg_path)
                     .with_context(|| format!("reading {}", cfg_path.display()))?,
             )?
         } else {
-            let path=inferred_checkpoint.as_deref().context("automatic configuration requires a PyTorch .ckpt/.pt/.pth file; use config.json with Safetensors")?;
-            ModelManifest::from_checkpoint(path)?
+            let path = inferred_checkpoint.as_deref().context(
+                "automatic configuration requires a PyTorch checkpoint; use config.json with Safetensors",
+            )?;
+            let metadata = checkpoint_config::read_checkpoint_metadata(path)?;
+            let decoder_needs_base = metadata
+                .config
+                .pointer("/decoding/model_path")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| !value.is_empty());
+            let needs_base = metadata.is_finetuned
+                && (metadata.config.is_null() || decoder_needs_base);
+            if needs_base {
+                let name = metadata
+                    .base_model_name
+                    .context("fine-tuned checkpoint requires hyper_parameters.model_name")?;
+                let defaults = model_registry::CacheOptions::default();
+                let cache = cache.unwrap_or(&defaults);
+                let path_to_base = model_registry::resolve_model_path(&name, cache)
+                    .with_context(|| {
+                        format!("resolving base checkpoint {name:?} for fine-tuned weights")
+                    })?;
+                ensure!(
+                    path_to_base != path,
+                    "fine-tuned checkpoint cannot resolve itself as its base model"
+                );
+                let manifest = ModelManifest::from_checkpoint(&path_to_base).with_context(|| {
+                    format!("extracting base architecture from {}", path_to_base.display())
+                })?;
+                base_checkpoint = Some(path_to_base);
+                manifest
+            } else {
+                ensure!(
+                    !metadata.config.is_null(),
+                    "checkpoint has no cfg or hyper_parameters.model_cfg"
+                );
+                ModelManifest::from_upstream_values(
+                    metadata.config,
+                    path,
+                    metadata.base_model_name.as_deref(),
+                )?
+            }
         };
         manifest.config.validate()?;
         manifest.mel.validate()?;
@@ -479,6 +539,10 @@ impl GigaAm {
             .model_name
             .as_deref()
             .map(ModelKind::canonical_model_name);
+        let tokenizer_root = base_checkpoint
+            .as_deref()
+            .and_then(Path::parent)
+            .unwrap_or(model_root);
         let tokenizer = if kind.is_ssl() || kind.is_emo() {
             None
         } else {
@@ -487,11 +551,11 @@ impl GigaAm {
                     !path.contains('/') && !path.contains('\\') && !path.contains(".."),
                     "sentencepiece_model must be a filename in model_dir"
                 );
-                Some(model_root.join(path))
+                Some(tokenizer_root.join(path))
             } else if matches!(kind, ModelKind::E2eCtc | ModelKind::E2eRnnt)
                 || canonical_name == Some("v1_rnnt")
             {
-                Some(model_root.join(match canonical_name {
+                Some(tokenizer_root.join(match canonical_name {
                     Some("v1_rnnt") => "v1_rnnt_tokenizer.model",
                     Some("v3_e2e_ctc") => "v3_e2e_ctc_tokenizer.model",
                     Some("v3_e2e_rnnt") => "v3_e2e_rnnt_tokenizer.model",
@@ -619,6 +683,64 @@ impl GigaAm {
         }
     }
 
+    /// Dump Conformer activations before task-specific heads, for Python parity.
+    /// Output is row-major [time, channels], equivalent to Python
+    /// `encoded.transpose(1, 2)[0]` (Python returns [1, channels, time]).
+    pub fn infer_encoder_16k(&self, pcm: &[f32]) -> Result<(Vec<f32>, usize, usize)> {
+        let features = log_mel_with_config(pcm, self.n_mels, self.mel)?;
+        let encoded = match &self.network {
+            Network::Ctc(model) => model.encode(&features, &self.device)?,
+            Network::Rnnt(model) => model.encode(&features, &self.device)?,
+            Network::Ssl(model) => model.encode(&features, &self.device)?,
+            Network::Emo(model) => model.encode(&features, &self.device)?,
+        };
+        let [batch, frames, channels] = encoded.dims();
+        ensure!(batch == 1, "only single-sample encoder export supported");
+        let values = encoded.into_data().try_to_vec::<f32>()?;
+        Ok((values, frames, channels))
+    }
+
+    /// Python `ConformerEncoder.forward` parity probe for variable-length padded batches.
+    /// Returns one contiguous [valid_frames, d_model] array per recording.
+    pub fn infer_encoder_batch_16k<T: AsRef<[f32]>>(
+        &self,
+        recordings: &[T],
+    ) -> Result<Vec<(Vec<f32>, usize, usize)>> {
+        if recordings.is_empty() {
+            return Ok(Vec::new());
+        }
+        let features = recordings
+            .iter()
+            .enumerate()
+            .map(|(index, pcm)| {
+                let pcm = pcm.as_ref();
+                ensure!(!pcm.is_empty(), "empty recording at batch index {index}");
+                log_mel_with_config(pcm, self.n_mels, self.mel)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let (encoded, lengths) = match &self.network {
+            Network::Ctc(model) => model.encode_padded(&features, &self.device)?,
+            Network::Rnnt(model) => model.encode_padded(&features, &self.device)?,
+            Network::Ssl(model) => model.encode_padded(&features, &self.device)?,
+            Network::Emo(model) => model.encode_padded(&features, &self.device)?,
+        };
+        let [_, max_time, channels] = encoded.dims();
+        let values = encoded.into_data().try_to_vec::<f32>()?;
+        Ok(lengths
+            .into_iter()
+            .enumerate()
+            .map(|(index, len)| {
+                (
+                    values
+                        [index * max_time * channels..index * max_time * channels + len * channels]
+                        .to_vec(),
+                    len,
+                    channels,
+                )
+            })
+            .collect())
+    }
+
     pub fn infer_embeddings_16k(&self, pcm: &[f32]) -> Result<(Vec<f32>, usize, usize)> {
         let features = log_mel_with_config(pcm, self.n_mels, self.mel)?;
         let net = match &self.network {
@@ -668,44 +790,136 @@ impl GigaAm {
         ))
     }
 
-    /// Ordered inference for multiple recordings. Each sample is executed
-    /// independently to avoid padding-dependent output changes in Conformer.
-    /// This is a functional batch API, not GPU-batched execution.
-    pub fn transcribe_batch_16k<T: AsRef<[f32]>>(
+    /// Shared padded Conformer, with CTC/RNNT decoding per valid sequence.
+    fn decode_padded_batch_16k<T: AsRef<[f32]>>(
         &self,
         recordings: &[T],
-    ) -> Result<Vec<Transcription>> {
-        ensure!(
-            self.tokenizer.is_some(),
-            "batch transcription requires an ASR model"
-        );
-        recordings
+        short_form: bool,
+    ) -> Result<Vec<(Transcription, usize)>> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .context("batch transcription requires an ASR model")?;
+        if recordings.is_empty() {
+            return Ok(Vec::new());
+        }
+        let features = recordings
             .iter()
             .enumerate()
             .map(|(index, pcm)| {
-                self.transcribe_16k(pcm.as_ref())
-                    .with_context(|| format!("transcribing batch element {index}"))
+                let pcm = pcm.as_ref();
+                if short_form {
+                    Self::check_short_transcription(pcm)
+                        .with_context(|| format!("validating batch item {index}"))?;
+                } else {
+                    ensure!(!pcm.is_empty(), "longform segment {index} cannot be empty");
+                }
+                log_mel_with_config(pcm, self.n_mels, self.mel)
+                    .with_context(|| format!("preprocessing batch item {index}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let paths: Vec<(Vec<usize>, Vec<usize>, usize)> = match &self.network {
+            Network::Ctc(model) => {
+                let (logits, lengths) = model.infer_logits_padded(&features, &self.device)?;
+                logits
+                    .into_iter()
+                    .zip(lengths)
+                    .map(|(values, encoded_len)| {
+                        let labels = ctc_argmax(&values, encoded_len, tokenizer.len() + 1)?;
+                        let blank = tokenizer.len();
+                        let mut ids = Vec::new();
+                        let mut token_frames = Vec::new();
+                        for (t, &id) in labels.iter().enumerate() {
+                            if id != blank && (t == 0 || id != labels[t - 1]) {
+                                ids.push(id);
+                                token_frames.push(t);
+                            }
+                        }
+                        Ok((ids, token_frames, encoded_len))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+            Network::Rnnt(model) => model.infer_ids_padded(&features, &self.device)?,
+            _ => bail!("batch transcription requires a CTC or RNN-T model"),
+        };
+        paths
+            .into_iter()
+            .map(|(ids, frames, length)| {
+                Ok((
+                    Transcription {
+                        text: tokenizer.decode(&ids)?,
+                        token_ids: ids,
+                        frames,
+                    },
+                    length,
+                ))
             })
             .collect()
     }
 
-    /// Ordered batch transcription with word timestamps relative to each sample.
+    pub fn transcribe_batch_16k<T: AsRef<[f32]>>(
+        &self,
+        recordings: &[T],
+    ) -> Result<Vec<Transcription>> {
+        Ok(self
+            .decode_padded_batch_16k(recordings, true)?
+            .into_iter()
+            .map(|(result, _)| result)
+            .collect())
+    }
+
+    pub(crate) fn transcribe_segments_padded_16k<T: AsRef<[f32]>>(
+        &self,
+        recordings: &[T],
+    ) -> Result<Vec<Transcription>> {
+        Ok(self
+            .decode_padded_batch_16k(recordings, false)?
+            .into_iter()
+            .map(|(result, _)| result)
+            .collect())
+    }
+
+    fn timed_padded_batch_16k<T: AsRef<[f32]>>(
+        &self,
+        recordings: &[T],
+        short_form: bool,
+    ) -> Result<Vec<TimedTranscription>> {
+        let tokenizer = self.tokenizer.as_ref().context("ASR tokenizer missing")?;
+        let decoded = self.decode_padded_batch_16k(recordings, short_form)?;
+        decoded
+            .into_iter()
+            .zip(recordings)
+            .map(|((transcription, encoded_frames), recording)| {
+                let pcm = recording.as_ref();
+                let words = words_from_frames(
+                    tokenizer,
+                    &transcription.token_ids,
+                    &transcription.frames,
+                    pcm.len(),
+                    encoded_frames,
+                )?;
+                Ok(TimedTranscription {
+                    transcription,
+                    words,
+                    start: 0.0,
+                    end: pcm.len() as f64 / SAMPLE_RATE as f64,
+                })
+            })
+            .collect()
+    }
+
     pub fn transcribe_batch_with_timestamps_16k<T: AsRef<[f32]>>(
         &self,
         recordings: &[T],
     ) -> Result<Vec<TimedTranscription>> {
-        ensure!(
-            self.tokenizer.is_some(),
-            "batch transcription requires an ASR model"
-        );
-        recordings
-            .iter()
-            .enumerate()
-            .map(|(index, pcm)| {
-                self.transcribe_with_timestamps_16k(pcm.as_ref())
-                    .with_context(|| format!("transcribing timed batch element {index}"))
-            })
-            .collect()
+        self.timed_padded_batch_16k(recordings, true)
+    }
+
+    pub(crate) fn transcribe_segments_padded_with_timestamps_16k<T: AsRef<[f32]>>(
+        &self,
+        recordings: &[T],
+    ) -> Result<Vec<TimedTranscription>> {
+        self.timed_padded_batch_16k(recordings, false)
     }
 
     /// Ordered batch encoder outputs as (row-major frames, time, channels).
@@ -751,6 +965,10 @@ impl GigaAm {
         Ok(())
     }
 
+    pub(crate) fn transcribe_segment_16k(&self, pcm: &[f32]) -> Result<Transcription> {
+        Ok(self.decode_with_length_16k(pcm)?.0)
+    }
+
     pub fn transcribe_16k(&self, pcm: &[f32]) -> Result<Transcription> {
         Self::check_short_transcription(pcm)?;
         Ok(self.decode_with_length_16k(pcm)?.0)
@@ -761,7 +979,10 @@ impl GigaAm {
         self.transcribe_segment_with_timestamps_16k(pcm)
     }
 
-    fn transcribe_segment_with_timestamps_16k(&self, pcm: &[f32]) -> Result<TimedTranscription> {
+    pub(crate) fn transcribe_segment_with_timestamps_16k(
+        &self,
+        pcm: &[f32],
+    ) -> Result<TimedTranscription> {
         let (transcription, encoded_len) = self.decode_with_length_16k(pcm)?;
         let tokenizer = self.tokenizer.as_ref().context("ASR tokenizer missing")?;
         let words = words_from_frames(

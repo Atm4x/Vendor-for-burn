@@ -1,6 +1,11 @@
+mod serve;
+
 use anyhow::{Context, Result, bail};
 use burn::tensor::Device;
-use gigaam_rs::{GigaAm, audio};
+use gigaam_rs::{
+    GigaAm, audio,
+    model_registry::{CacheOptions, resolve_model_path},
+};
 use std::{path::Path, time::Instant};
 
 #[cfg(feature = "cuda")]
@@ -86,9 +91,10 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
-    if args.len() < 4
+    if (args.len() < 4 && !(args.len() == 3 && args[1] == "serve"))
         || ![
             "transcribe",
+            "serve",
             "transcribe-batch",
             "parity",
             "parity-encoder",
@@ -97,6 +103,9 @@ fn main() -> Result<()> {
         ]
         .contains(&args[1].as_str())
     {
+        eprintln!(
+            "       gigaam-rs serve <model_dir> [--device cuda|cpu|wgpu|flex] (JSONL stdin/stdout)"
+        );
         eprintln!(
             "Usage: gigaam-rs transcribe <model_dir> <audio.wav> [--device cuda|cpu|wgpu|flex]"
         );
@@ -114,6 +123,13 @@ fn main() -> Result<()> {
         );
         eprintln!(
             "       gigaam-rs transcribe-batch <model_dir> <audio_paths.json> [--device cuda|cpu|wgpu|flex]"
+        );
+        eprintln!(
+            "       gigaam-rs transcribe <model-name|model-path> <audio> --model-cache <dir> [--download-model] [--python-audio]"
+        );
+        eprintln!("       --download-model requires compiling with --features model-download");
+        eprintln!(
+            "       --python-audio invokes installed FFmpeg and matches Python's mono PCM16 frontend"
         );
         eprintln!("       gigaam-rs transcribe <model_dir> <audio.wav> --profile");
         std::process::exit(2);
@@ -168,9 +184,38 @@ fn main() -> Result<()> {
         }
         _ => bail!("unknown backend: {selected}"),
     };
+    let mut model_cache = CacheOptions::default();
+    if let Some(index) = args.iter().position(|arg| arg == "--model-cache") {
+        model_cache.directory = args
+            .get(index + 1)
+            .map(std::path::PathBuf::from)
+            .context("--model-cache requires a directory")?;
+    }
+    model_cache.download_if_missing = args.iter().any(|arg| arg == "--download-model");
+    let python_audio = args.iter().any(|arg| arg == "--python-audio");
+    let model_path = resolve_model_path(&args[2], &model_cache)?;
     let model_start = Instant::now();
-    let model = GigaAm::load(Path::new(&args[2]), device).context("loading GigaAM weights")?;
+    let model = GigaAm::load(&model_path, device).context("loading GigaAM weights")?;
     let model_load_seconds = model_start.elapsed().as_secs_f64();
+    if args.iter().any(|arg| arg == "--profile") {
+        eprintln!("[profile-stage] model_load_s={model_load_seconds:.6}");
+    }
+    if args[1] == "serve" {
+        let batch_size = args
+            .iter()
+            .position(|x| x == "--batch-size")
+            .map(|index| {
+                args.get(index + 1)
+                    .context("--batch-size requires an integer")?
+                    .parse::<usize>()
+                    .context("invalid --batch-size")
+            })
+            .transpose()?
+            .unwrap_or(16);
+        let service =
+            gigaam_rs::service::GigaAmService::from_loaded(model).with_batch_size(batch_size)?;
+        return serve::run(&service, python_audio);
+    }
     if args[1] == "transcribe-batch" {
         let paths: Vec<String> = serde_json::from_slice(
             &std::fs::read(&args[3])
@@ -181,8 +226,12 @@ fn main() -> Result<()> {
             .iter()
             .enumerate()
             .map(|(index, path)| {
-                audio::load_audio_16k(Path::new(path))
-                    .with_context(|| format!("loading batch recording {index}: {path}"))
+                if python_audio {
+                    audio::load_audio_ffmpeg_16k(Path::new(path))
+                } else {
+                    audio::load_audio_16k(Path::new(path))
+                }
+                .with_context(|| format!("loading batch recording {index}: {path}"))
             })
             .collect::<Result<Vec<_>>>()?;
         let results = model.transcribe_batch_16k(&recordings)?;
@@ -195,8 +244,15 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let audio_start = Instant::now();
-    let samples = audio::load_audio_16k(Path::new(&args[3]))?;
+    let samples = if python_audio {
+        audio::load_audio_ffmpeg_16k(Path::new(&args[3]))?
+    } else {
+        audio::load_audio_16k(Path::new(&args[3]))?
+    };
     let audio_decode_seconds = audio_start.elapsed().as_secs_f64();
+    if args.iter().any(|arg| arg == "--profile") {
+        eprintln!("[profile-stage] audio_decode_s={audio_decode_seconds:.6}");
+    }
     if args[1] == "emotion" {
         let probs = model.emotion_probs_16k(&samples)?;
         for (label, prob) in probs {
@@ -230,7 +286,7 @@ fn main() -> Result<()> {
         let out = Path::new(&args[4]);
         std::fs::create_dir_all(out)?;
         let features = model.extract_features_16k(&samples)?;
-        let (encoded, frames, channels) = model.infer_embeddings_16k(&samples)?;
+        let (encoded, frames, channels) = model.infer_encoder_16k(&samples)?;
         std::fs::write(
             out.join("mel.f32"),
             features

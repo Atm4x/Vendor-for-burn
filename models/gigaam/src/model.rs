@@ -2,7 +2,7 @@ use crate::audio::Features;
 use crate::weights::Weights;
 use anyhow::{Context, Result, ensure};
 use burn::tensor::ops::ConvOptions;
-use burn::tensor::{Device, Tensor, TensorData, activation, module};
+use burn::tensor::{Bool, Device, Tensor, TensorData, activation, module};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -93,6 +93,40 @@ impl Config {
             "subsample_channels must equal d_model for current encoder"
         );
         Ok(())
+    }
+}
+
+fn padding_mask_3d(lengths: &[usize], time: usize, device: &Device) -> Tensor<3, Bool> {
+    let mut data = Vec::with_capacity(lengths.len() * time);
+    for &length in lengths {
+        data.extend((0..time).map(|index| index >= length));
+    }
+    Tensor::<3, Bool>::from_data(TensorData::new(data, [lengths.len(), 1, time]), device)
+}
+
+fn padding_mask_4d(lengths: &[usize], time: usize, device: &Device) -> Tensor<4, Bool> {
+    padding_mask_3d(lengths, time, device).unsqueeze_dim(3)
+}
+
+fn attention_mask(lengths: &[usize], time: usize, device: &Device) -> Tensor<4, Bool> {
+    let mut data = Vec::with_capacity(lengths.len() * time * time);
+    for &length in lengths {
+        for query in 0..time {
+            for key in 0..time {
+                data.push(query >= length || key >= length);
+            }
+        }
+    }
+    Tensor::<4, Bool>::from_data(
+        TensorData::new(data, [lengths.len(), 1, time, time]),
+        device,
+    )
+}
+
+fn subsampled_lengths(lengths: &mut [usize], kernel: usize) {
+    let padding = kernel / 2;
+    for length in lengths {
+        *length = (*length + 2 * padding - kernel) / 2 + 1;
     }
 }
 
@@ -292,12 +326,14 @@ impl Attention {
             },
         })
     }
-    fn forward(&self, x: Tensor<3>) -> Tensor<3> {
+    fn forward(&self, x: Tensor<3>, lengths: Option<&[usize]>) -> Tensor<3> {
         let [batch, time, dim] = x.dims();
         match &self.position {
-            PositionKind::Rotary { base } => self.forward_rotary(x, batch, time, dim, *base),
+            PositionKind::Rotary { base } => {
+                self.forward_rotary(x, batch, time, dim, *base, lengths)
+            }
             PositionKind::Relative { linear_pos, u, v } => {
-                self.forward_relative(x, batch, time, dim, linear_pos, u, v)
+                self.forward_relative(x, batch, time, dim, linear_pos, u, v, lengths)
             }
         }
     }
@@ -311,6 +347,7 @@ impl Attention {
         linear_pos: &Linear,
         bias_u: &Tensor<2>,
         bias_v: &Tensor<2>,
+        lengths: Option<&[usize]>,
     ) -> Tensor<3> {
         let q = self
             .q
@@ -354,8 +391,15 @@ impl Attention {
         let v_bias = bias_v.clone().reshape([1, self.heads, 1, self.head_dim]);
         let content = (q.clone() + u).matmul(k);
         let positional = relative_shift((q + v_bias).matmul(p));
-        let attention =
-            activation::softmax((content + positional) / (self.head_dim as f64).sqrt(), 3);
+        let scores = (content + positional) / (self.head_dim as f64).sqrt();
+        let attention = match lengths {
+            Some(lengths) => {
+                let mask = attention_mask(lengths, time, &device);
+                activation::softmax(scores.mask_fill(mask.clone(), -10000.0), 3)
+                    .mask_fill(mask, 0.0)
+            }
+            None => activation::softmax(scores, 3),
+        };
         let attended = attention
             .matmul(v)
             .permute([0, 2, 1, 3])
@@ -370,6 +414,7 @@ impl Attention {
         time: usize,
         dim: usize,
         base: f32,
+        lengths: Option<&[usize]>,
     ) -> Tensor<3> {
         let device = x.device();
         let half = self.head_dim / 2;
@@ -419,7 +464,15 @@ impl Attention {
             .forward(x)
             .reshape([batch, time, self.heads, self.head_dim])
             .permute([0, 2, 1, 3]);
-        let probs = activation::softmax(q.matmul(k) / (self.head_dim as f64).sqrt(), 3);
+        let scores = q.matmul(k) / (self.head_dim as f64).sqrt();
+        let probs = match lengths {
+            Some(lengths) => {
+                let mask = attention_mask(lengths, time, &device);
+                activation::softmax(scores.mask_fill(mask.clone(), -10000.0), 3)
+                    .mask_fill(mask, 0.0)
+            }
+            None => activation::softmax(scores, 3),
+        };
         let attended = probs
             .matmul(v)
             .permute([0, 2, 1, 3])
@@ -465,12 +518,19 @@ impl Convolution {
             },
         })
     }
-    fn forward(&self, x: Tensor<3>) -> Tensor<3> {
+    fn forward(&self, x: Tensor<3>, lengths: Option<&[usize]>) -> Tensor<3> {
         let [batch, time, channels] = x.dims();
         let projected = self.pointwise1.forward(x.permute([0, 2, 1]));
         let a = projected.clone().slice([0..batch, 0..channels, 0..time]);
         let b = projected.slice([0..batch, channels..channels * 2, 0..time]);
         let gated = a * activation::sigmoid(b);
+        let gated = match lengths {
+            Some(lengths) => {
+                let device = gated.device();
+                gated.mask_fill(padding_mask_3d(lengths, time, &device), 0.0)
+            }
+            None => gated,
+        };
         let depth = self.depthwise.forward(gated);
         self.pointwise2
             .forward(activation::silu(self.norm.forward(depth)))
@@ -502,10 +562,14 @@ impl Block {
             no: Norm::load(w, &format!("{key}.norm_out"), d)?,
         })
     }
-    fn forward(&self, x: Tensor<3>) -> Tensor<3> {
+    fn forward(&self, x: Tensor<3>, lengths: Option<&[usize]>) -> Tensor<3> {
         let residual = x.clone() + self.ff1.forward(self.n1.forward(x)) * 0.5;
-        let residual = residual.clone() + self.att.forward(self.na.forward(residual.clone()));
-        let residual = residual.clone() + self.conv.forward(self.nc.forward(residual.clone()));
+        let residual =
+            residual.clone() + self.att.forward(self.na.forward(residual.clone()), lengths);
+        let residual = residual.clone()
+            + self
+                .conv
+                .forward(self.nc.forward(residual.clone()), lengths);
         let residual = residual.clone() + self.ff2.forward(self.n2.forward(residual.clone())) * 0.5;
         self.no.forward(residual)
     }
@@ -607,9 +671,79 @@ impl EncoderModel {
             }
         };
         for layer in &self.layers {
-            seq = layer.forward(seq);
+            seq = layer.forward(seq, None);
         }
         Ok(seq)
+    }
+
+    /// Batched Conformer forward with Python-equivalent padding masks.
+    /// Input mel features are laid out [mel, time], and each clip has an independent valid length.
+    pub fn encode_padded(
+        &self,
+        features: &[Features],
+        device: &Device,
+    ) -> Result<(Tensor<3>, Vec<usize>)> {
+        ensure!(!features.is_empty(), "cannot batch zero features");
+        ensure!(
+            features
+                .iter()
+                .all(|f| f.n_mels == self.config.n_mels && f.frames > 0),
+            "invalid mel batch dimensions"
+        );
+        let batch = features.len();
+        let mel = self.config.n_mels;
+        let max_time = features.iter().map(|f| f.frames).max().unwrap();
+        let mut lengths: Vec<usize> = features.iter().map(|f| f.frames).collect();
+        let mut values = vec![0.0f32; batch * mel * max_time];
+        for (index, feature) in features.iter().enumerate() {
+            for channel in 0..mel {
+                let source =
+                    &feature.values[channel * feature.frames..(channel + 1) * feature.frames];
+                let start = index * mel * max_time + channel * max_time;
+                values[start..start + feature.frames].copy_from_slice(source);
+            }
+        }
+        let mut seq = match &self.subsampling {
+            Subsampling::Conv2 { layers, projection } => {
+                let mut x = Tensor::<4>::from_data(
+                    TensorData::new(values, [batch, 1, mel, max_time]),
+                    device,
+                )
+                .permute([0, 1, 3, 2]);
+                x = x.mask_fill(padding_mask_4d(&lengths, max_time, device), 0.0);
+                for layer in layers {
+                    x = activation::relu(layer.forward(x));
+                    subsampled_lengths(&mut lengths, self.config.subsample_kernel);
+                    let time = x.dims()[2];
+                    x = x.mask_fill(padding_mask_4d(&lengths, time, device), 0.0);
+                }
+                let [_, channels, time, frequency] = x.dims();
+                let seq = x
+                    .permute([0, 2, 1, 3])
+                    .reshape([batch, time, frequency * channels]);
+                ensure!(
+                    projection.weight.dims()[1] == frequency * channels,
+                    "unexpected subsampling projection input"
+                );
+                projection.forward(seq)
+            }
+            Subsampling::Conv1 { layers } => {
+                let mut x =
+                    Tensor::<3>::from_data(TensorData::new(values, [batch, mel, max_time]), device)
+                        .mask_fill(padding_mask_3d(&lengths, max_time, device), 0.0);
+                for layer in layers {
+                    x = activation::relu(layer.forward(x));
+                    subsampled_lengths(&mut lengths, self.config.subsample_kernel);
+                    let time = x.dims()[2];
+                    x = x.mask_fill(padding_mask_3d(&lengths, time, device), 0.0);
+                }
+                x.permute([0, 2, 1])
+            }
+        };
+        for layer in &self.layers {
+            seq = layer.forward(seq, Some(&lengths));
+        }
+        Ok((seq, lengths))
     }
 
     pub fn n_mels(&self) -> usize {
@@ -639,6 +773,10 @@ impl CtcModel {
         })
     }
 
+    pub fn encode(&self, features: &Features, device: &Device) -> Result<Tensor<3>> {
+        self.encoder.encode(features, device)
+    }
+
     pub fn infer_logits(&self, features: &Features, device: &Device) -> Result<(Vec<f32>, usize)> {
         let encoded = self.encoder.encode(features, device)?;
         let logits = self
@@ -652,6 +790,41 @@ impl CtcModel {
             .try_to_vec::<f32>()
             .context("retrieving model logits")?;
         Ok((values, out_t))
+    }
+
+    pub fn encode_padded(
+        &self,
+        features: &[Features],
+        device: &Device,
+    ) -> Result<(Tensor<3>, Vec<usize>)> {
+        self.encoder.encode_padded(features, device)
+    }
+
+    pub fn infer_logits_padded(
+        &self,
+        features: &[Features],
+        device: &Device,
+    ) -> Result<(Vec<Vec<f32>>, Vec<usize>)> {
+        let (encoded, lengths) = self.encoder.encode_padded(features, device)?;
+        let [batch, _, _] = encoded.dims();
+        let logits = self
+            .head
+            .forward(encoded.permute([0, 2, 1]))
+            .permute([0, 2, 1]);
+        let [_, time, classes] = logits.dims();
+        ensure!(
+            batch == features.len() && classes == self.num_classes,
+            "batched CTC tensor dimensions mismatch"
+        );
+        let values = logits.into_data().try_to_vec::<f32>()?;
+        let result = lengths
+            .iter()
+            .enumerate()
+            .map(|(index, &len)| {
+                values[index * time * classes..index * time * classes + len * classes].to_vec()
+            })
+            .collect();
+        Ok((result, lengths))
     }
 
     pub fn n_mels(&self) -> usize {
@@ -708,6 +881,17 @@ impl EmotionModel {
             bias,
             num_emotions,
         })
+    }
+
+    pub fn encode(&self, features: &Features, device: &Device) -> Result<Tensor<3>> {
+        self.encoder.encode(features, device)
+    }
+    pub fn encode_padded(
+        &self,
+        features: &[Features],
+        device: &Device,
+    ) -> Result<(Tensor<3>, Vec<usize>)> {
+        self.encoder.encode_padded(features, device)
     }
 
     pub fn infer_probs(&self, features: &Features, device: &Device) -> Result<Vec<f32>> {

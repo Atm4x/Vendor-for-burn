@@ -8,7 +8,9 @@ param(
     [string]$E2ECtcModelPath,
     [string]$E2ERnntModelPath,
     [string]$E2EAudioPath,
-    [string]$ResultsDir
+    [string]$ResultsDir,
+    [ValidateRange(1, 86400)]
+    [int]$TestTimeoutSeconds = 300
 )
 
 $ErrorActionPreference = 'Stop'
@@ -19,6 +21,17 @@ if (-not $ResultsDir) { $ResultsDir = Join-Path $PSScriptRoot 'results' }
 New-Item -ItemType Directory -Force -Path $ResultsDir | Out-Null
 if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "Missing executable: $exe" }
 if (-not (Test-Path -LiteralPath $audio -PathType Leaf)) { throw "Missing test WAV: $audio" }
+
+foreach ($pathVariable in @('RealModelPath', 'RealAudioPath', 'E2ECtcModelPath', 'E2ERnntModelPath', 'E2EAudioPath')) {
+    $value = Get-Variable -Name $pathVariable -ValueOnly
+    if ($value) {
+        $absolute = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($value)
+        if (-not (Test-Path -LiteralPath $absolute -PathType Leaf)) {
+            throw "File not found for -${pathVariable}: $absolute"
+        }
+        Set-Variable -Name $pathVariable -Value $absolute
+    }
+}
 
 $results = [System.Collections.Generic.List[object]]::new()
 $failed = 0
@@ -63,6 +76,7 @@ function Invoke-TestCase {
     try {
         $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
         $startInfo.FileName = $exe
+        $startInfo.WorkingDirectory = $PSScriptRoot
         $startInfo.Arguments = ($CommandArgs | ForEach-Object { ConvertTo-WindowsArgument -Value $_ }) -join ' '
         $startInfo.UseShellExecute = $false
         $startInfo.CreateNoWindow = $true
@@ -75,10 +89,15 @@ function Invoke-TestCase {
         if (-not $process.Start()) { throw 'Native process did not start.' }
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
-        $process.WaitForExit()
+        $timedOut = -not $process.WaitForExit($TestTimeoutSeconds * 1000)
+        if ($timedOut) {
+            $process.Kill()
+            $process.WaitForExit()
+        }
         $stdout = $stdoutTask.GetAwaiter().GetResult()
         $stderr = $stderrTask.GetAwaiter().GetResult()
         $code = $process.ExitCode
+        if ($timedOut) { throw "Test exceeded $TestTimeoutSeconds seconds" }
     } catch {
         $stderr += "`nProcess launch or I/O failed: $_"
     } finally {

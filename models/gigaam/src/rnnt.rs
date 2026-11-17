@@ -213,6 +213,17 @@ impl RnntModel {
         self.encoder.n_mels()
     }
 
+    pub fn encode(&self, features: &Features, device: &Device) -> Result<Tensor<3>> {
+        self.encoder.encode(features, device)
+    }
+    pub fn encode_padded(
+        &self,
+        features: &[Features],
+        device: &Device,
+    ) -> Result<(Tensor<3>, Vec<usize>)> {
+        self.encoder.encode_padded(features, device)
+    }
+
     pub fn infer_ids(
         &self,
         features: &Features,
@@ -228,8 +239,31 @@ impl RnntModel {
         device: &Device,
     ) -> Result<(Vec<usize>, Vec<usize>, usize)> {
         let encoded = self.encoder.encode(features, device)?;
+        self.decode_encoded(encoded, device)
+    }
+
+    pub fn infer_ids_padded(
+        &self,
+        features: &[Features],
+        device: &Device,
+    ) -> Result<Vec<(Vec<usize>, Vec<usize>, usize)>> {
+        let (encoded, lengths) = self.encoder.encode_padded(features, device)?;
+        let [batch, _, dim] = encoded.dims();
+        let mut results = Vec::with_capacity(batch);
+        for (index, &frames) in lengths.iter().enumerate() {
+            let sample = encoded.clone().slice([index..index + 1, 0..frames, 0..dim]);
+            results.push(self.decode_encoded(sample, device)?);
+        }
+        Ok(results)
+    }
+
+    fn decode_encoded(
+        &self,
+        encoded: Tensor<3>,
+        device: &Device,
+    ) -> Result<(Vec<usize>, Vec<usize>, usize)> {
         let [batch, frames, dim] = encoded.dims();
-        ensure!(batch == 1, "RNN-T currently supports batch=1");
+        ensure!(batch == 1, "RNN-T decoding expects one encoder sequence");
         let enc_proj = self.joint.enc.apply(encoded.reshape([frames, dim]));
         let mut ids = Vec::new();
         let mut token_frames = Vec::new();

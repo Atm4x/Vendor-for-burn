@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('transcribe', 'transcribe-batch', 'embed', 'emotion', 'parity', 'parity-encoder', 'probe-audio', 'inspect-checkpoint', 'inspect-config')]
+    [ValidateSet('transcribe', 'transcribe-batch', 'embed', 'emotion', 'parity', 'parity-encoder', 'probe-audio', 'inspect-checkpoint', 'inspect-config', 'serve')]
     [string]$Mode = 'transcribe',
     [string]$ModelPath,
     [string]$AudioPath,
@@ -13,7 +13,10 @@ param(
     [switch]$GroupVadPython,
     [switch]$Raw,
     [switch]$All,
-    [switch]$Profile
+    [switch]$Profile,
+    [switch]$PythonAudio,
+    [switch]$DownloadModel,
+    [string]$ModelCache
 )
 
 $ErrorActionPreference = 'Stop'
@@ -37,6 +40,10 @@ switch ($Mode) {
         if (-not $ModelPath) { throw '-ModelPath must point to a .ckpt file.' }
         $cliArgs = @('inspect-config', $ModelPath)
         if ($Raw) { $cliArgs += '--raw' }
+    }
+    'serve' {
+        if (-not $ModelPath) { throw '-ModelPath or model name is required for serve.' }
+        $cliArgs = @('serve', $ModelPath, '--device', $Device)
     }
     'transcribe-batch' {
         if (-not $ModelPath -or -not $BatchJson) { throw 'Both -ModelPath and -BatchJson are required.' }
@@ -71,6 +78,10 @@ switch ($Mode) {
         if ($Profile -and $Mode -eq 'transcribe') { $cliArgs += '--profile' }
     }
 }
+
+if ($PythonAudio) { $cliArgs += '--python-audio' }
+if ($DownloadModel) { $cliArgs += '--download-model' }
+if ($ModelCache) { $cliArgs += @('--model-cache', $ModelCache) }
 
 Write-Host "Command: $Mode | Backend: $Device | Executable: $exe"
 $previousOutputEncoding = [Console]::OutputEncoding

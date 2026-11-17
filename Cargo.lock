@@ -3097,6 +3097,7 @@ dependencies = [
  "serde",
  "serde_json",
  "symphonia",
+ "ureq 2.12.1",
  "zip 9.4.2",
 ]
 

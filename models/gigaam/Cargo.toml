@@ -11,6 +11,7 @@ cpu = ["burn/cpu"]
 flex = ["burn/flex"]
 cuda = ["burn/cuda"]
 wgpu = ["burn/wgpu"]
+model-download = ["dep:ureq"]
 
 [dependencies]
 burn = { version = "=0.22.1", default-features = false, features = ["std"] }
@@ -27,3 +28,4 @@ rustfft = "6.4.1"
 prost = "=0.14.4"
 pytorch-reader = "=0.22.1"
 zip = { version = "=9.4.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+ureq = { version = "=2.12.1", default-features = false, features = ["tls"], optional = true }
