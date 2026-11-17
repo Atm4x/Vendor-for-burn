@@ -1,0 +1,46 @@
+name: Fish Speech Git Bridge Snapshot
+
+on:
+  push:
+    branches:
+      - codex/fish-speech
+    paths:
+      - .github/workflows/fish-speech-bridge-snapshot.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact fish-speech branch
+        uses: actions/checkout@v4
+        with:
+          ref: codex/fish-speech
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Create verified Git bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin +refs/heads/codex/fish-speech:refs/heads/codex/fish-speech
+          test "$(git rev-parse refs/heads/codex/fish-speech)" = "$(git rev-parse HEAD)"
+          git bundle create "${RUNNER_TEMP}/repository.bundle" refs/heads/codex/fish-speech
+          git bundle verify "${RUNNER_TEMP}/repository.bundle"
+          git bundle list-heads "${RUNNER_TEMP}/repository.bundle"
+          (cd "${RUNNER_TEMP}" && sha256sum repository.bundle > repository.bundle.sha256)
+          git rev-parse HEAD > "${RUNNER_TEMP}/source-head.txt"
+      - name: Upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: fish-speech-git-bridge
+          path: |
+            ${{ runner.temp }}/repository.bundle
+            ${{ runner.temp }}/repository.bundle.sha256
+            ${{ runner.temp }}/source-head.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
