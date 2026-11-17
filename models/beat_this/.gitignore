@@ -1,0 +1,7 @@
+/target/
+*.ckpt
+*.pt
+*.pth
+*.beats
+*.flac
+*.wav

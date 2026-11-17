@@ -1,0 +1,29 @@
+[package]
+name = "beat-this-rs"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.100"
+license = "MIT"
+description = "Native Rust inference for the Beat This! neural beat/downbeat tracker"
+
+[features]
+default = ["flex"]
+flex = ["burn/flex"]
+cuda = ["burn/cuda"]
+cpu = ["burn/cpu"]
+
+[dependencies]
+burn = { version = "=0.22.1", default-features = false, features = ["std", "cubecl"] }
+pytorch-reader = "=0.22.1"
+rustfft = "=6.4.1"
+rubato = "=5.0.1"
+audioadapter = "=5.0.0"
+audioadapter-buffers = "=5.2.0"
+symphonia = { version = "=0.6.1", default-features = false, features = ["flac", "wav", "pcm", "ogg", "vorbis"] }
+serde = { version = "1.0", features = ["derive"] }
+libloading = "=0.9.0"
+serde_json = "=1.0.154"
+sha2 = "=0.10.9"
+uuid = { version = "=1.29.1", features = ["serde"] }
+
+[workspace]
