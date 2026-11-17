@@ -1,0 +1,88 @@
+name: RVC Stage125 NTC direct-conv route matrix Windows package
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - experiment/conv-kernel-rnd-stage33-20261110
+    paths:
+      - 'vendor/cubek-convolution-0.3.1/src/kernels/forward/direct_preact_residual.rs'
+      - 'vendor/burn-cubecl-0.22.1/src/kernel/conv/preact_residual1d.rs'
+      - 'research/stage125-ntc-routes/**'
+      - '.github/workflows/rvc-stage125-ntc-routes.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rvc-stage125-ntc-routes-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cache/tracel
+          key: rvc-stage125-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            rvc-stage123-
+            rvc-stage121-
+      - name: Check Stage125 runner and arithmetic reference
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $script = 'research/stage125-ntc-routes/windows/Run-Stage125-NTC-Routes.ps1'
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $script).Path,[ref]$tokens,[ref]$errors)
+          if ($errors.Count -gt 0) { $errors | Format-List | Out-String | Write-Host; throw 'Stage125 runner parse failed' }
+          rustc --edition=2024 --test -O research/stage125-ntc-routes/reference.rs -o "$env:RUNNER_TEMP/stage125_reference.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Stage125 reference build failed' }
+          & "$env:RUNNER_TEMP/stage125_reference.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Stage125 mathematical reference failed' }
+          rustc --edition=2024 --test -O research/stage125-ntc-routes/interior_linear_reference.rs -o "$env:RUNNER_TEMP/stage124_reference.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Stage124 reference build failed' }
+          & "$env:RUNNER_TEMP/stage124_reference.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Stage124 mathematical reference failed' }
+      - name: Restore vendored crate checksums
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Vendored crate integrity failed' }
+      - name: Build RVC Rust 1.100.0 CLI with CPU CUDA WGPU
+        shell: pwsh
+        run: |
+          cargo build --release --offline --locked -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs
+          if ($LASTEXITCODE -ne 0) { throw 'Stage125 release build failed' }
+          & target/release/tts-with-rvc-rs.exe doctor
+          if ($LASTEXITCODE -ne 0) { throw 'Stage125 doctor failed' }
+      - name: Package all Stage125 routes with one EXE
+        shell: pwsh
+        run: |
+          $out = 'dist/rvc-stage125-ntc-routes-windows-x64'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item target/release/tts-with-rvc-rs.exe $out
+          Copy-Item research/stage125-ntc-routes/windows/Run-Stage125-NTC-Routes.ps1 $out
+          Copy-Item research/stage125-ntc-routes/windows/Export-Stage125-NCU-Metrics.py $out
+          Copy-Item research/stage125-ntc-routes/README.md $out
+          Copy-Item research/stage125-ntc-routes/REPORT.md (Join-Path $out 'STAGE125_REPORT.md')
+          Copy-Item research/stage125-ntc-routes/WORKFLOW_CONTRACT.md (Join-Path $out 'RVC_RND_WORKFLOW_CONTRACT.md')
+          Set-Content -Path (Join-Path $out 'BUILD_STATUS.txt') -Encoding utf8 -Value "Stage125 Rust Windows build PASS; commit=$env:GITHUB_SHA; GPU parity/performance unverified on CI; user RTX validation required."
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rvc-stage125-ntc-routes-windows-x64
+          path: dist/rvc-stage125-ntc-routes-windows-x64/
+          if-no-files-found: error
+          retention-days: 14

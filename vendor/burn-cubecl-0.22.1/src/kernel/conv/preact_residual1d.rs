@@ -96,6 +96,12 @@ pub fn conv1d_preact_residual_temporal_activation_plan(
     };
     let broadcast_inputs = cout == 128 && kernel == 11 && temporal_tile == 4
         && std::env::var("RVC_NSF_RESBLOCK_PLANE_BROADCAST").as_deref() == Ok("1");
+    let fast_interior_linear = cout == 128 && kernel == 11 && temporal_tile == 4
+        && std::env::var("RVC_NSF_RESBLOCK_LINEAR_INTERIOR").as_deref() == Ok("1")
+        && input.meta.strides()[2] == 1;
+    let residue_time_order = cout == 128 && kernel == 11 && temporal_tile == 4
+        && dilation > 1 && output_activated && !input_activated
+        && std::env::var("RVC_NSF_RESBLOCK_RESIDUE_ORDER").as_deref() == Ok("1");
     launch_preact_residual_temporal(
         &client,
         input.binding(),
@@ -110,6 +116,8 @@ pub fn conv1d_preact_residual_temporal_activation_plan(
         broadcast_inputs,
         input_activated,
         output_activated,
+        fast_interior_linear,
+        residue_time_order,
         dtype_to_storage_type(DType::F32),
     )?;
     Ok(permute_nhwc_to_nchw(out))
