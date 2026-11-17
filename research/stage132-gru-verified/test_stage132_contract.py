@@ -1,6 +1,7 @@
 """Validate the low-storage CUDA profiler contracts and fail-closed evidence parser."""
 
 import csv
+from contextlib import closing
 import importlib.util
 import sqlite3
 import tempfile
@@ -55,23 +56,26 @@ class Stage132Contracts(unittest.TestCase):
         analyzer = load("stage132_analyzer", "Analyze-Stage132-GRU-Nsight.py")
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "trace.sqlite"
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db:
                 db.execute("CREATE TABLE StringIds(id INTEGER,value TEXT)")
                 db.execute("INSERT INTO StringIds VALUES(1,'bigru_gate_parallel_kernel_a')")
                 db.execute("CREATE TABLE NVTX_EVENTS(start INTEGER,end INTEGER,text TEXT)")
                 db.execute("INSERT INTO NVTX_EVENTS VALUES(0,10000000,'stage102_rust_measured')")
                 db.execute("CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL(start INTEGER,end INTEGER,gridX INTEGER,gridY INTEGER,gridZ INTEGER,blockX INTEGER,blockY INTEGER,blockZ INTEGER,registersPerThread INTEGER,staticSharedMemory INTEGER,dynamicSharedMemory INTEGER,shortName INTEGER)")
                 db.execute("INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES(100,1000100,2,2,1,768,1,1,40,4096,0,1)")
+                db.commit()
             result = analyzer.inspect_nsys(path, 768, "bigru_gate_parallel_kernel")
             self.assertEqual(result["warm_passes"][0]["kernel_count"], 1)
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db:
                 db.execute("DELETE FROM StringIds")
+                db.commit()
             result = analyzer.inspect_nsys(path, 768, "bigru_gate_parallel_kernel")
             self.assertIn("geometry only", result["kernel_identity"])
             with self.assertRaises(ValueError):
                 analyzer.inspect_nsys(path, 256, "bigru_kernel")
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db:
                 db.execute("INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES(200,2000200,2,2,1,768,1,1,40,4096,0,1)")
+                db.commit()
             with self.assertRaisesRegex(ValueError, "Expected one"):
                 analyzer.inspect_nsys(path, 768, "bigru_gate_parallel_kernel")
 
