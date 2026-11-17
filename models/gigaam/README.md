@@ -60,6 +60,9 @@ cargo run --offline -p gigaam-rs -- transcribe ./weights ./MitaKind.wav --device
 cargo run --offline -p gigaam-rs -- embed ./ssl-weights ./short.wav ./embeddings.f32
 cargo run --offline -p gigaam-rs -- parity ./ctc-weights ./short.wav ./parity-output
 cargo run --offline -p gigaam-rs -- probe-audio ./MitaKind.wav
+cargo run --offline -p gigaam-rs -- transcribe ./weights ./short.wav --word-timestamps
+cargo run --offline -p gigaam-rs -- emotion ./emo-weights ./short.wav
+cargo run --offline -p gigaam-rs -- parity-encoder ./ssl-weights ./short.wav ./encoder-parity
 ```
 
 `transcribe` automatically splits long WAV recordings into <=24 second segments near low-energy boundaries; this is a heuristic, **not** a VAD model. The SSL `embed` command writes row-major `[time, hidden]` float32 and prints the shape. The diagnostic `parity` command writes `mel.f32` and *unnormalized* CTC `logits.f32` for reference comparison. `parity-encoder` writes `mel.f32` and row-major `encoder.f32` for SSL checkpoint parity. The `--word-timestamps` flag emits approximate word intervals using GigaAM's original encoder-frame-to-audio-duration mapping; the intervals are not forced-alignment boundaries, and longform chunk splitting remains energy-based rather than neural VAD.
@@ -69,7 +72,7 @@ Default build uses Burn Flex CPU, with CUDA (`--no-default-features --features c
 ## Verification (Rust 1.100.0, Linux Flex CPU)
 
 - `cargo check --offline -p gigaam-rs` — PASS.
-- `cargo test --offline -p gigaam-rs --lib` — **9/9 PASS**.
+- `cargo test --offline -p gigaam-rs --lib` — **14/14 PASS**.
 - CTC logits from previous implementation are byte-identical after sharing Conformer encoder with RNN-T/SSL.
 - Python/PyTorch synthetic Conformer+CTC log-probability parity: maximum absolute difference **3.22e-6** (previous stage).
 - RNN-T synthetic blank-only case and two-symbols-per-frame case match PyTorch text and token counts; standalone two-step LSTM matches PyTorch to **1e-6**.
