@@ -26,3 +26,4 @@ symphonia = { version = "=0.6.1", default-features = false, features = ["flac", 
 rustfft = "6.4.1"
 prost = "=0.14.4"
 pytorch-reader = "=0.22.1"
+zip = { version = "=9.4.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }

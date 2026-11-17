@@ -3097,6 +3097,7 @@ dependencies = [
  "serde",
  "serde_json",
  "symphonia",
+ "zip 9.4.2",
 ]
 
 [[package]]

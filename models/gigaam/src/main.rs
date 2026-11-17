@@ -5,6 +5,16 @@ use std::path::Path;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 3 && args[1] == "inspect-config" {
+        let path = Path::new(&args[2]);
+        let configuration = if args.iter().any(|value| value == "--raw") {
+            gigaam_rs::checkpoint_config::read_checkpoint_config(path)?
+        } else {
+            gigaam_rs::inspect_native_manifest(path)?
+        };
+        println!("{}", serde_json::to_string_pretty(&configuration)?);
+        return Ok(());
+    }
     if args.len() >= 3 && args[1] == "inspect-checkpoint" {
         let tensors = gigaam_rs::weights::inspect_checkpoint(Path::new(&args[2]))?;
         let count = tensors.len();
@@ -74,6 +84,7 @@ fn main() -> Result<()> {
         eprintln!("Usage: gigaam-rs transcribe <model_dir> <audio.wav> [--device cpu|cuda|wgpu]");
         eprintln!("       gigaam-rs probe-audio <audio.wav>");
         eprintln!("       gigaam-rs inspect-checkpoint <model.ckpt|model.safetensors> [--all]");
+        eprintln!("       gigaam-rs inspect-config <model.ckpt> [--raw]");
         eprintln!("       gigaam-rs parity <ctc_model_dir> <audio.wav> <out_dir>");
         eprintln!("       gigaam-rs embed <ssl_model_dir> <audio.wav> <out_file.f32>");
         eprintln!("       gigaam-rs emotion <emo_model_dir> <audio.wav>");

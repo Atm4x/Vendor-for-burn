@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod checkpoint_config;
 pub mod decode;
 pub mod model;
 pub mod rnnt;
@@ -14,12 +15,12 @@ use burn::tensor::Device;
 use decode::{Transcription, Word, ctc_argmax, words_from_frames};
 use model::{Config, CtcModel, EmotionModel, EncoderModel};
 use rnnt::{RnntConfig, RnntModel};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tokenizer::Tokenizer;
 use weights::Weights;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelKind {
     Ctc,
@@ -85,7 +86,7 @@ impl ModelKind {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct ModelManifest {
     #[serde(flatten)]
     config: Config,
@@ -101,6 +102,206 @@ struct ModelManifest {
     rnnt: Option<RnntConfig>,
     #[serde(default)]
     id2name: Option<EmotionLabels>,
+}
+
+impl ModelManifest {
+    fn from_checkpoint(path: &Path) -> Result<Self> {
+        let metadata = checkpoint_config::read_checkpoint_metadata(path).with_context(|| {
+            format!(
+                "extracting native GigaAM configuration from {}",
+                path.display()
+            )
+        })?;
+        Self::from_upstream_values(metadata.config, path, metadata.base_model_name.as_deref())
+    }
+
+    fn from_upstream_values(
+        cfg: serde_json::Value,
+        path: &Path,
+        base_model_name: Option<&str>,
+    ) -> Result<Self> {
+        let encoder = cfg
+            .get("encoder")
+            .context("checkpoint cfg.encoder is missing")?;
+        let pre = cfg
+            .get("preprocessor")
+            .context("checkpoint cfg.preprocessor is missing")?;
+        let kind_name = cfg
+            .get("model_name")
+            .and_then(|v| v.as_str())
+            .or(base_model_name)
+            .or_else(|| path.file_stem().and_then(|name| name.to_str()))
+            .context("checkpoint has no model identity")?;
+        let model_name = ModelKind::canonical_model_name(kind_name);
+        ensure!(
+            ModelKind::from_model_name(model_name).is_some(),
+            "cannot infer architecture for checkpoint model {kind_name:?}; provide config.json"
+        );
+        let kind = ModelKind::from_model_name(model_name).unwrap();
+
+        let field = |root: &serde_json::Value, key: &str, fallback: usize| -> Result<usize> {
+            root.get(key).map_or(Ok(fallback), |v| {
+                v.as_u64()
+                    .and_then(|x| usize::try_from(x).ok())
+                    .with_context(|| format!("invalid nonnegative integer for {key}"))
+            })
+        };
+        let string = |root: &serde_json::Value, key: &str, fallback: &str| -> Result<String> {
+            root.get(key).map_or(Ok(fallback.to_owned()), |v| {
+                v.as_str()
+                    .map(str::to_owned)
+                    .with_context(|| format!("invalid string for {key}"))
+            })
+        };
+        let sample_rate = field(pre, "sample_rate", 16000)?;
+        ensure!(
+            sample_rate == audio::SAMPLE_RATE as usize,
+            "preprocessor sample_rate={sample_rate} not supported (only 16000 Hz)"
+        );
+        for (name, expected) in [
+            ("n_fft", 400),
+            ("hop_length", 160),
+            ("win_length", 400),
+            ("pad", 0),
+        ] {
+            ensure!(
+                field(pre, name, expected)? == expected,
+                "preprocessor.{name} differs from native GigaAM log-mel: expected {expected}"
+            );
+        }
+        for (name, expected) in [("f_min", 0.0), ("f_max", 8000.0), ("power", 2.0)] {
+            if let Some(value) = pre.get(name) {
+                ensure!(
+                    value.is_null() && name == "f_max" || value.as_f64() == Some(expected),
+                    "preprocessor.{name} is not supported by native log-mel"
+                );
+            }
+        }
+        ensure!(
+            pre.get("center").is_none_or(|v| v.as_bool() == Some(true)),
+            "preprocessor.center=false not implemented"
+        );
+        ensure!(
+            pre.get("norm").is_none_or(serde_json::Value::is_null),
+            "preprocessor.norm not implemented"
+        );
+        ensure!(
+            pre.get("mel_scale")
+                .is_none_or(|v| v.as_str() == Some("htk")),
+            "preprocessor.mel_scale must be HTK"
+        );
+        if let Some(target) = pre.get("_target_").and_then(|v| v.as_str()) {
+            ensure!(
+                target == "gigaam.preprocess.FeatureExtractor",
+                "unsupported preprocessor target: {target}"
+            );
+        }
+        if let Some(target) = encoder.get("_target_").and_then(|v| v.as_str()) {
+            ensure!(
+                target == "gigaam.encoder.ConformerEncoder",
+                "unsupported encoder target: {target}"
+            );
+        }
+        let n_mels = field(pre, "features", field(encoder, "feat_in", 64)?)?;
+        ensure!(
+            n_mels == field(encoder, "feat_in", 64)?,
+            "preprocessor.features and encoder.feat_in differ"
+        );
+        let decoding = cfg.get("decoding").unwrap_or(&serde_json::Value::Null);
+        let head = cfg.get("head").unwrap_or(&serde_json::Value::Null);
+        let id2name = cfg.get("id2name").filter(|v| !v.is_null()).cloned();
+        let classes = if kind.is_emo() {
+            let names = id2name
+                .as_ref()
+                .context("emotion checkpoint lacks id2name")?;
+            match names {
+                serde_json::Value::Object(map) => map.len(),
+                serde_json::Value::Array(a) => a.len(),
+                _ => bail!("invalid emotion labels"),
+            }
+        } else if kind.is_ssl() {
+            2
+        } else if kind.is_rnnt() {
+            field(&head["joint"], "num_classes", 0)?
+        } else {
+            field(head, "num_classes", 0)?
+        };
+        ensure!(classes > 1, "checkpoint does not specify num_classes");
+        let config = Config {
+            n_mels,
+            n_layers: field(encoder, "n_layers", 16)?,
+            d_model: field(encoder, "d_model", 768)?,
+            n_heads: field(encoder, "n_heads", 16)?,
+            ff_expansion: field(encoder, "ff_expansion_factor", 4)?,
+            conv_kernel: field(encoder, "conv_kernel_size", 31)?,
+            subsample_kernel: field(encoder, "subs_kernel_size", 3)?,
+            subsample_channels: field(encoder, "d_model", 768)?,
+            num_classes: classes,
+            self_attention_model: string(encoder, "self_attention_model", "rotary")?,
+            conv_norm_type: string(encoder, "conv_norm_type", "batch_norm")?,
+            subsampling: string(encoder, "subsampling", "conv2d")?,
+            subsampling_factor: field(encoder, "subsampling_factor", 4)?,
+            pos_emb_max_len: field(encoder, "pos_emb_max_len", 5000)?,
+        };
+        config.validate()?;
+        let rnnt = if kind.is_rnnt() {
+            let decoder = head.get("decoder").context("RNN-T head.decoder missing")?;
+            let joint = head.get("joint").context("RNN-T head.joint missing")?;
+            let rnnt = RnntConfig {
+                pred_hidden: field(decoder, "pred_hidden", 0)?,
+                pred_rnn_layers: field(decoder, "pred_rnn_layers", 0)?,
+                joint_hidden: field(joint, "joint_hidden", 0)?,
+                max_symbols_per_step: field(decoding, "max_symbols_per_step", 10)?,
+            };
+            ensure!(
+                field(decoder, "num_classes", classes)? == classes,
+                "RNN-T decoder and joint num_classes disagree"
+            );
+            ensure!(
+                field(joint, "enc_hidden", config.d_model)? == config.d_model,
+                "RNN-T joint enc_hidden disagrees with encoder"
+            );
+            ensure!(
+                field(joint, "pred_hidden", rnnt.pred_hidden)? == rnnt.pred_hidden,
+                "RNN-T joint pred_hidden disagrees with predictor"
+            );
+            rnnt.validate()?;
+            Some(rnnt)
+        } else {
+            None
+        };
+        let vocab =
+            decoding
+                .get("vocabulary")
+                .filter(|v| !v.is_null())
+                .map_or(Ok(Vec::new()), |v| {
+                    serde_json::from_value::<Vec<String>>(v.clone())
+                        .context("invalid decoding.vocabulary")
+                })?;
+        let sp_name = decoding
+            .get("model_path")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .and_then(|s| Path::new(s).file_name().and_then(|s| s.to_str()))
+            .filter(|basename| {
+                path.parent()
+                    .is_some_and(|dir| dir.join(basename).is_file())
+            })
+            .map(str::to_owned);
+        let id2name = id2name
+            .map(serde_json::from_value)
+            .transpose()
+            .context("invalid emotion id2name")?;
+        Ok(Self {
+            config,
+            vocabulary: vocab,
+            model_name: Some(model_name.to_owned()),
+            model_type: Some(kind),
+            sentencepiece_model: sp_name,
+            rnnt,
+            id2name,
+        })
+    }
 }
 
 impl ModelManifest {
@@ -126,7 +327,7 @@ impl ModelManifest {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 enum EmotionLabels {
     List(Vec<String>),
@@ -184,6 +385,12 @@ pub struct TimedTranscription {
     pub end: f64,
 }
 
+/// Build a native inference manifest from an original PyTorch checkpoint's
+/// OmegaConf metadata without launching Python or writing a sidecar file.
+pub fn inspect_native_manifest(path: &Path) -> Result<serde_json::Value> {
+    serde_json::to_value(ModelManifest::from_checkpoint(path)?).map_err(Into::into)
+}
+
 impl GigaAm {
     /// Load from a model directory or a specific checkpoint file. A sibling
     /// `config.json` supplies the architecture and tokenizer configuration.
@@ -206,9 +413,36 @@ impl GigaAm {
             None => model_dir,
         };
         let cfg_path = model_root.join("config.json");
-        let manifest: ModelManifest = serde_json::from_slice(
-            &std::fs::read(&cfg_path).with_context(|| format!("reading {}", cfg_path.display()))?,
-        )?;
+        let inferred_checkpoint = if cfg_path.is_file() || direct_checkpoint.is_some() {
+            direct_checkpoint.map(Path::to_path_buf)
+        } else {
+            let available = std::fs::read_dir(model_root)
+                .with_context(|| format!("scanning {}", model_root.display()))?
+                .filter_map(|entry| entry.ok().map(|x| x.path()))
+                .filter(|path| {
+                    path.is_file()
+                        && matches!(
+                            path.extension().and_then(|ext| ext.to_str()),
+                            Some("ckpt" | "pt" | "pth")
+                        )
+                })
+                .collect::<Vec<_>>();
+            ensure!(
+                available.len() == 1,
+                "without config.json the model directory must contain exactly one PyTorch checkpoint; found {}",
+                available.len()
+            );
+            available.into_iter().next()
+        };
+        let manifest: ModelManifest = if cfg_path.is_file() {
+            serde_json::from_slice(
+                &std::fs::read(&cfg_path)
+                    .with_context(|| format!("reading {}", cfg_path.display()))?,
+            )?
+        } else {
+            let path=inferred_checkpoint.as_deref().context("automatic configuration requires a PyTorch .ckpt/.pt/.pth file; use config.json with Safetensors")?;
+            ModelManifest::from_checkpoint(path)?
+        };
         manifest.config.validate()?;
         let kind = manifest.resolve_kind()?;
         let num_classes = manifest.config.num_classes;
@@ -272,6 +506,9 @@ impl GigaAm {
         }
         let weights_path = match direct_checkpoint {
             Some(path) => path.to_owned(),
+            None if !cfg_path.is_file() => {
+                inferred_checkpoint.context("checkpoint required for auto configuration")?
+            }
             None => weight_names
                 .iter()
                 .map(|n| model_root.join(n))
@@ -667,5 +904,65 @@ mod tests {
         cfg.subsampling = "conv1d".into();
         cfg.conv_norm_type = "layer_norm".into();
         assert!(cfg.validate().is_ok());
+    }
+    #[test]
+    fn omegaconf_checkpoint_maps_all_required_conformer_fields() {
+        let original = serde_json::json!({
+            "model_name":"v3_ctc",
+            "preprocessor":{"sample_rate":16000,"features":64,"center":true},
+            "encoder":{"n_layers":22,"d_model":512,"n_heads":8,"feat_in":64,
+                "ff_expansion_factor":6,"conv_kernel_size":15,"subs_kernel_size":5,
+                "subsampling":"conv1d","subsampling_factor":8,"self_attention_model":"rel_pos",
+                "conv_norm_type":"layer_norm","pos_emb_max_len":1024},
+            "head":{"num_classes":34},
+            "decoding":{"vocabulary":(0..33).map(|n|n.to_string()).collect::<Vec<_>>()}
+        });
+        let path = Path::new("v3_ctc.ckpt");
+        let manifest = ModelManifest::from_upstream_values(original, path, None).unwrap();
+        assert_eq!(manifest.config.n_layers, 22);
+        assert_eq!(manifest.config.ff_expansion, 6);
+        assert_eq!(manifest.config.conv_kernel, 15);
+        assert_eq!(manifest.config.subsample_kernel, 5);
+        assert_eq!(manifest.config.subsampling_factor, 8);
+        assert_eq!(manifest.config.self_attention_model, "rel_pos");
+        assert_eq!(manifest.config.conv_norm_type, "layer_norm");
+        assert_eq!(manifest.config.pos_emb_max_len, 1024);
+        assert_eq!(manifest.resolve_kind().unwrap(), ModelKind::Ctc);
+    }
+
+    #[test]
+    fn omegaconf_checkpoint_maps_rnnt_and_e2e() {
+        let original = serde_json::json!({
+            "model_name":"v3_e2e_rnnt",
+            "preprocessor":{"sample_rate":16000,"features":8},
+            "encoder":{"n_layers":1,"d_model":8,"n_heads":2,"feat_in":8},
+            "head":{"decoder":{"pred_hidden":16,"pred_rnn_layers":2,"num_classes":128},
+                    "joint":{"enc_hidden":8,"pred_hidden":16,"joint_hidden":12,"num_classes":128}},
+            "decoding":{"max_symbols_per_step":6,"model_path":"/unused/old/path/v3_e2e_rnnt_tokenizer.model"}
+        });
+        let model =
+            ModelManifest::from_upstream_values(original, Path::new("v3_e2e_rnnt.ckpt"), None)
+                .unwrap();
+        assert_eq!(model.resolve_kind().unwrap(), ModelKind::E2eRnnt);
+        assert_eq!(model.config.num_classes, 128);
+        let rnnt = model.rnnt.unwrap();
+        assert_eq!(rnnt.pred_hidden, 16);
+        assert_eq!(rnnt.pred_rnn_layers, 2);
+        assert_eq!(rnnt.joint_hidden, 12);
+        assert_eq!(rnnt.max_symbols_per_step, 6);
+        assert!(model.sentencepiece_model.is_none());
+    }
+
+    #[test]
+    fn config_extraction_rejects_nonmatching_mel_audio_contract() {
+        let base = serde_json::json!({"model_name":"v3_ssl","preprocessor":{"sample_rate":16000,"features":8},
+            "encoder":{"feat_in":8,"d_model":8,"n_heads":2,"n_layers":1}});
+        let mut bad = base.clone();
+        bad["preprocessor"]["hop_length"] = serde_json::json!(256);
+        assert!(ModelManifest::from_upstream_values(bad, Path::new("v3_ssl.ckpt"), None).is_err());
+        let mut bad = base.clone();
+        bad["encoder"]["feat_in"] = serde_json::json!(16);
+        assert!(ModelManifest::from_upstream_values(bad, Path::new("v3_ssl.ckpt"), None).is_err());
+        assert!(ModelManifest::from_upstream_values(base, Path::new("v3_ssl.ckpt"), None).is_ok());
     }
 }
