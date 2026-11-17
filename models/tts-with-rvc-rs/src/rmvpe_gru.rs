@@ -123,6 +123,24 @@ impl RmvpeBiGru {
         let fused_hidden_weight = Tensor::stack(vec![
             forward_direction.hidden_weight.clone(), reverse_direction.hidden_weight.clone(),
         ], 0);
+        if std::env::var("RVC_RMVPE_GRU_COLUMN_SPLIT").ok().as_deref().is_some_and(|s| s != "1")
+            && std::env::var("RVC_RMVPE_GRU_WEIGHT_COALESCED").as_deref() != Ok("1") {
+            return Err("RVC_RMVPE_GRU_COLUMN_SPLIT requires RVC_RMVPE_GRU_WEIGHT_COALESCED=1".into());
+        }
+        if std::env::var("RVC_RMVPE_GRU_GATE_PARALLEL").as_deref() == Ok("1")
+            && (std::env::var("RVC_RMVPE_GRU_PERSISTENT").as_deref() != Ok("1")
+                || std::env::var("RVC_RMVPE_GRU_WEIGHT_COALESCED").as_deref() != Ok("1")
+                || std::env::var("RVC_RMVPE_GRU_COLUMN_SPLIT").ok().as_deref().is_some_and(|s| s != "1")) {
+            return Err("RVC_RMVPE_GRU_GATE_PARALLEL requires persistent GRU, coalesced weights, and COLUMN_SPLIT=1".into());
+        }
+        let fused_hidden_weight = if std::env::var("RVC_RMVPE_GRU_WEIGHT_COALESCED").as_deref() == Ok("1") {
+            if std::env::var("RVC_RMVPE_GRU_PERSISTENT").as_deref() != Ok("1") {
+                return Err("RVC_RMVPE_GRU_WEIGHT_COALESCED requires RVC_RMVPE_GRU_PERSISTENT=1".into());
+            }
+            crate::rmvpe_persistent::pack_hidden_weight(fused_hidden_weight)?
+        } else {
+            fused_hidden_weight
+        };
         let fused_hidden_bias = Tensor::stack(vec![
             forward_direction.hidden_bias.clone(), reverse_direction.hidden_bias.clone(),
         ], 0);

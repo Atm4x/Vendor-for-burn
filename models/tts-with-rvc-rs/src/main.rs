@@ -440,6 +440,10 @@ fn run() -> Result<(), String> {
             "nsf_global_noise": std::env::var_os("RVC_NSF_GLOBAL_NOISE").is_some_and(|value| value == "1"),
             "rmvpe_mel_reuse": std::env::var_os("RVC_RMVPE_MEL_REUSE").is_some_and(|value| value == "1"),
             "rmvpe_gru_execution": if std::env::var("RVC_RMVPE_GRU_PERSISTENT").as_deref() == Ok("1") {"persistent"} else {"stepwise"},
+            "rmvpe_gru_hidden_weight_layout": if std::env::var("RVC_RMVPE_GRU_WEIGHT_COALESCED").as_deref() == Ok("1") {"coalesced"} else {"original"},
+            "rmvpe_gru_column_split": std::env::var("RVC_RMVPE_GRU_COLUMN_SPLIT")
+                .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1),
+            "rmvpe_gru_gate_parallel": std::env::var("RVC_RMVPE_GRU_GATE_PARALLEL").as_deref() == Ok("1"),
             "nsf_conv_execution": if std::env::var("RVC_NSF_IMPLICIT_GEMM").as_deref() == Ok("1")
                 || (std::env::var("RVC_NSF_CONV1D_GEMM").as_deref() == Ok("1")
                     && std::env::var("RVC_NSF_TRANSPOSE_GEMM").as_deref() == Ok("1"))

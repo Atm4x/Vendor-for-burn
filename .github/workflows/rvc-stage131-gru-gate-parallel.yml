@@ -1,0 +1,83 @@
+name: RVC Stage131 gate-parallel persistent BiGRU Windows x64
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - experiment/conv-kernel-rnd-stage33-20261110
+    paths:
+      - 'models/tts-with-rvc-rs/src/rmvpe_gru.rs'
+      - 'models/tts-with-rvc-rs/src/rmvpe_persistent.rs'
+      - 'models/tts-with-rvc-rs/src/main.rs'
+      - 'research/stage131-gru-gate-parallel/**'
+      - '.github/workflows/rvc-stage131-gru-gate-parallel.yml'
+permissions:
+  contents: read
+concurrency:
+  group: rvc-stage131-gru-gate-parallel-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cache/tracel
+          key: rvc-stage131-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            rvc-stage130-
+            rvc-stage127-
+      - name: Validate PowerShell, native FP32 math and Stage131 contracts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = 'research/stage131-gru-gate-parallel'
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path "$root/Run-Stage131-GRU-AB.ps1").Path,[ref]$tokens,[ref]$errors)
+          if ($errors.Count) { $errors | Format-List | Out-String | Write-Host; throw 'Stage131 PowerShell parser failed' }
+          rustc --edition=2024 --test -O "$root/reference.rs" -o "$env:RUNNER_TEMP/stage131_reference.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Stage131 native FP32 test build failed' }
+          & "$env:RUNNER_TEMP/stage131_reference.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Stage131 native FP32 tests failed' }
+          python -m compileall -q $root
+          if ($LASTEXITCODE -ne 0) { throw 'Stage131 Python compilation failed' }
+          python -m unittest discover -s $root -p 'test_stage131_contract.py' -v
+          if ($LASTEXITCODE -ne 0) { throw 'Stage131 route/profile tests failed' }
+      - name: Restore known vendor checksum data
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Vendor checksum restoration failed' }
+      - name: Compile Rust CUDA CPU WGPU release and doctor
+        shell: pwsh
+        run: |
+          cargo build --release --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs
+          if ($LASTEXITCODE -ne 0) { throw 'Stage131 release build failed' }
+          & target/release/tts-with-rvc-rs.exe doctor
+          if ($LASTEXITCODE -ne 0) { throw 'Stage131 doctor failed' }
+      - name: Package tested Stage131 executable and self-contained profiler
+        shell: pwsh
+        run: |
+          $out = 'dist/rvc-stage131-gru-gate-parallel-windows-x64'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item target/release/tts-with-rvc-rs.exe $out
+          Copy-Item research/stage131-gru-gate-parallel/Run-Stage131-GRU-AB.ps1 $out
+          Copy-Item research/stage131-gru-gate-parallel/*.py $out
+          Copy-Item research/stage131-gru-gate-parallel/README.md $out
+          Copy-Item research/stage131-gru-gate-parallel/REPORT.md (Join-Path $out 'STAGE131_REPORT.md')
+          Set-Content -LiteralPath (Join-Path $out 'BUILD_STATUS.txt') -Encoding utf8 -Value "Stage131 Windows build and CPU FP32 checks PASS; RTX4060 CUDA JIT, GPU bit-exactness, NCU and performance PENDING; commit=$env:GITHUB_SHA"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rvc-stage131-gru-gate-parallel-windows-x64
+          path: dist/rvc-stage131-gru-gate-parallel-windows-x64/
+          if-no-files-found: error
+          retention-days: 14
