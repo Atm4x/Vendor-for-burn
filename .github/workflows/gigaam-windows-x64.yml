@@ -1,0 +1,107 @@
+name: GigaAM Burn CubeCL CUDA Windows x64
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/gigaam-v3-ctc-burn-20261117
+    paths:
+      - .github/workflows/gigaam-windows-x64.yml
+      - models/gigaam/windows/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gigaam-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      CUDARC_CUDA_VERSION: '12090'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cache/tracel
+          key: gigaam-windows-rust100-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            gigaam-windows-rust100-
+            rvc-stage121-
+      - name: Validate PowerShell scripts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Get-ChildItem 'models/gigaam/windows' -Filter '*.ps1' | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors)
+            if ($errors.Count) { $errors | Format-List | Out-String | Write-Host; throw "Invalid PowerShell: $($_.Name)" }
+          }
+      - name: Repair vendored checksum metadata
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Vendored checksum restoration failed' }
+      - name: Build release GigaAM CUDA executable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustc --version
+          cargo build --release --locked --offline -p gigaam-rs --no-default-features --features cuda --bin gigaam-rs
+          if ($LASTEXITCODE -ne 0) { throw 'gigaam-rs CUDA release build failed' }
+          if (-not (Test-Path -LiteralPath 'target/release/gigaam-rs.exe')) { throw 'Missing release executable' }
+          "GIGAAM_BUILD_SUCCESS=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Verify GPU-independent CLI behavior
+        if: env.GIGAAM_BUILD_SUCCESS == '1'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & target/release/gigaam-rs.exe probe-audio models/gigaam/tests/fixtures/backend/tone.wav
+          if ($LASTEXITCODE -ne 0) { throw 'probe-audio failed on Windows' }
+          & target/release/gigaam-rs.exe inspect-checkpoint models/gigaam/tests/fixtures/backend/ctc/model.safetensors
+          if ($LASTEXITCODE -ne 0) { throw 'inspect-checkpoint failed on Windows' }
+      - name: Package Windows x64 executable and tests
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dest = 'dist/gigaam-cubecl-cuda-windows-x64'
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Copy-Item models/gigaam/windows/*.ps1 $dest
+          Copy-Item models/gigaam/windows/README-WINDOWS.md $dest
+          Copy-Item models/gigaam/LICENSE (Join-Path $dest 'GIGAAM_LICENSE.txt')
+          Copy-Item models/gigaam/THIRD_PARTY_NOTICES.md $dest
+          New-Item -ItemType Directory -Force -Path (Join-Path $dest 'fixtures') | Out-Null
+          Copy-Item models/gigaam/tests/fixtures/backend (Join-Path $dest 'fixtures') -Recurse -Force
+          $binary = 'target/release/gigaam-rs.exe'
+          $built = Test-Path -LiteralPath $binary -PathType Leaf
+          if ($built) { Copy-Item $binary $dest }
+          @(
+            "commit=$env:GITHUB_SHA",
+            "built=$built",
+            "target=x86_64-pc-windows-msvc",
+            "backend=Burn/CubeCL CUDA",
+            "cuda_version=12.9",
+            "gpu_inference_tested_on_ci=false",
+            "rustc=$(rustc --version)",
+            "workflow_url=https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          ) | Set-Content -LiteralPath (Join-Path $dest 'BUILD_STATUS.txt') -Encoding utf8
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gigaam-cubecl-cuda-windows-x64
+          path: dist/gigaam-cubecl-cuda-windows-x64/
+          if-no-files-found: error
+          retention-days: 14
