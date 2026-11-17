@@ -53,6 +53,36 @@ To run only GPU-independent preprocessing/checkpoint checks:
 
 This should **not** be interpreted as a CubeCL GPU pass.
 
+## Punctuation and normalized text (E2E models)
+
+The official `v3_ctc` and `v3_rnnt` checkpoints predict plain transcription text; the CTC character vocabulary does not contain punctuation. For punctuation and text normalization use **`v3_e2e_ctc`** or **`v3_e2e_rnnt`** instead. Their native Rust inference path requires the matching SentencePiece model stored alongside the checkpoint:
+
+- `v3_e2e_ctc.ckpt` + `v3_e2e_ctc_tokenizer.model`
+- `v3_e2e_rnnt.ckpt` + `v3_e2e_rnnt_tokenizer.model`
+
+Both files in each pair must have the exact original names; they are not included in the Windows build artifact. To check one E2E model, use:
+
+```powershell
+.\Run-GigaAM.ps1 -Mode transcribe -Device cuda -ModelPath '.\v3_e2e_ctc.ckpt' -AudioPath '.\MitaKind.wav' -Profile
+```
+
+To compare original CTC against both official E2E variants in the same results archive:
+
+```powershell
+.\Test-GigaAM.ps1 -Device cuda `
+    -RealModelPath '.\v3_ctc.ckpt' -RealAudioPath '.\MitaKind.wav' `
+    -E2ECtcModelPath '.\v3_e2e_ctc.ckpt' `
+    -E2ERnntModelPath '.\v3_e2e_rnnt.ckpt'
+```
+
+You may specify `-E2EAudioPath` to test a different recording. The suite records `e2e-ctc-config.log`, `e2e-ctc-asr.log`, `e2e-rnnt-config.log`, `e2e-rnnt-asr.log`, and corresponding `summary.json` entries. An E2E test fails if the process returns an error **or** no nonempty transcription line is produced; it does not require every recording to contain punctuation, since that is a model prediction, not an unconditional guarantee.
+
+The tester now reads native stdout/stderr as UTF-8 directly using .NET process streams and writes logs as UTF-8. This avoids Russian text corruption in Windows PowerShell 5.1, including when `gigaam-rs.exe` reports an error.
+
+### Per-stage timing
+
+Add `-Profile` to `Run-GigaAM.ps1` (or `--profile` to `gigaam-rs.exe transcribe`). The CLI reports `model_load_s`, `audio_decode_s`, `transcribe_s`, `audio_s` and `rtf` to stderr. `rtf` is **transcription time divided by audio duration**, excluding model loading and file decoding; transcription time still includes CPU mel preprocessing and GPU transfers, so it is not pure kernel time.
+
 ## Reporting failures
 
 Share `results/summary.json`, relevant `results/*.log`, `results/nvidia-smi.txt` when available, and the included `BUILD_STATUS.txt`. If the CLI says the checkpoint configuration is unsupported, capture `inspect-config` and `inspect-checkpoint` output. Never paste private model data or audio if you do not intend to share it.

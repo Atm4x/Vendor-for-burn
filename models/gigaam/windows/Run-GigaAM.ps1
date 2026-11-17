@@ -12,7 +12,8 @@ param(
     [switch]$WordTimestamps,
     [switch]$GroupVadPython,
     [switch]$Raw,
-    [switch]$All
+    [switch]$All,
+    [switch]$Profile
 )
 
 $ErrorActionPreference = 'Stop'
@@ -67,11 +68,19 @@ switch ($Mode) {
             }
         }
         $cliArgs += @('--device', $Device)
+        if ($Profile -and $Mode -eq 'transcribe') { $cliArgs += '--profile' }
     }
 }
 
 Write-Host "Command: $Mode | Backend: $Device | Executable: $exe"
-& $exe @cliArgs
-if ($LASTEXITCODE -ne 0) {
-    throw "gigaam-rs exited with code $LASTEXITCODE (mode=$Mode)."
+$previousOutputEncoding = [Console]::OutputEncoding
+try {
+    [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    & $exe @cliArgs
+    $exitCode = $LASTEXITCODE
+} finally {
+    [Console]::OutputEncoding = $previousOutputEncoding
+}
+if ($exitCode -ne 0) {
+    throw "gigaam-rs exited with code $exitCode (mode=$Mode)."
 }

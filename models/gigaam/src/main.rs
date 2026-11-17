@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use burn::tensor::Device;
 use gigaam_rs::{GigaAm, audio};
-use std::path::Path;
+use std::{path::Path, time::Instant};
 
 #[cfg(feature = "cuda")]
 const DEFAULT_DEVICE: &str = "cuda";
@@ -115,6 +115,7 @@ fn main() -> Result<()> {
         eprintln!(
             "       gigaam-rs transcribe-batch <model_dir> <audio_paths.json> [--device cuda|cpu|wgpu|flex]"
         );
+        eprintln!("       gigaam-rs transcribe <model_dir> <audio.wav> --profile");
         std::process::exit(2);
     }
     let selected = args
@@ -167,7 +168,9 @@ fn main() -> Result<()> {
         }
         _ => bail!("unknown backend: {selected}"),
     };
+    let model_start = Instant::now();
     let model = GigaAm::load(Path::new(&args[2]), device).context("loading GigaAM weights")?;
+    let model_load_seconds = model_start.elapsed().as_secs_f64();
     if args[1] == "transcribe-batch" {
         let paths: Vec<String> = serde_json::from_slice(
             &std::fs::read(&args[3])
@@ -191,7 +194,9 @@ fn main() -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&outputs)?);
         return Ok(());
     }
+    let audio_start = Instant::now();
     let samples = audio::load_audio_16k(Path::new(&args[3]))?;
+    let audio_decode_seconds = audio_start.elapsed().as_secs_f64();
     if args[1] == "emotion" {
         let probs = model.emotion_probs_16k(&samples)?;
         for (label, prob) in probs {
@@ -285,6 +290,7 @@ fn main() -> Result<()> {
     if group_vad && external_regions.is_none() {
         bail!("--group-vad-python requires --segments-json");
     }
+    let inference_start = Instant::now();
     if args.iter().any(|arg| arg == "--word-timestamps") {
         let chunks = if group_vad {
             model.transcribe_grouped_vad_with_timestamps_16k(
@@ -321,6 +327,14 @@ fn main() -> Result<()> {
         for (i, segment) in chunks.iter().enumerate() {
             println!("[{i}] {}", segment.text);
         }
+    }
+    if args.iter().any(|arg| arg == "--profile") {
+        let inference_seconds = inference_start.elapsed().as_secs_f64();
+        let audio_seconds = samples.len() as f64 / audio::SAMPLE_RATE as f64;
+        eprintln!(
+            "[profile] model_load_s={model_load_seconds:.6} audio_decode_s={audio_decode_seconds:.6} transcribe_s={inference_seconds:.6} audio_s={audio_seconds:.3} rtf={:.6}",
+            inference_seconds / audio_seconds.max(f64::EPSILON)
+        );
     }
     Ok(())
 }

@@ -54,6 +54,10 @@ Example RNN-T manifest (illustrative fields; replace all dimensions with the che
 
 **Do not use this illustrative example unchanged**: no official checkpoint configuration has been inferred from the model name, and the abbreviated vocabulary is intentionally invalid.
 
+## Verified official Windows/CUDA checkpoint
+
+A user-supplied Windows x64 test on an RTX 4060 (2026-11-17) confirmed that the native **Burn/CubeCL CUDA** inference path runs the official `v3_ctc.ckpt` (220,718,498 parameters) end-to-end on an 89.939-second Russian WAV. The test suite reported **10/10 PASS** and 6.758 seconds elapsed for `real-model-asr`, including model loading and audio processing. The model produced four nonempty transcription segments. The original CTC vocabulary contains no punctuation; the E2E family (`v3_e2e_ctc`, `v3_e2e_rnnt`) supports punctuation and text normalization but still requires independent official-checkpoint testing. Windows PowerShell 5.1 originally mangled Cyrillic when capturing native stdout; the updated tester captures both streams with explicit UTF-8. The observed result is not a verified WER metric or a kernel-only benchmark.
+
 ## CLI
 
 ```text

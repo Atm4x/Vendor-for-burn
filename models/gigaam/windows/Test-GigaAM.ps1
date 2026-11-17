@@ -5,6 +5,9 @@ param(
     [switch]$SkipGpu,
     [string]$RealModelPath,
     [string]$RealAudioPath,
+    [string]$E2ECtcModelPath,
+    [string]$E2ERnntModelPath,
+    [string]$E2EAudioPath,
     [string]$ResultsDir
 )
 
@@ -20,26 +23,77 @@ if (-not (Test-Path -LiteralPath $audio -PathType Leaf)) { throw "Missing test W
 $results = [System.Collections.Generic.List[object]]::new()
 $failed = 0
 
+function ConvertTo-WindowsArgument {
+    param([string]$Value)
+    $builder = [System.Text.StringBuilder]::new()
+    [void]$builder.Append('"')
+    $backslashes = 0
+    foreach ($character in $Value.ToCharArray()) {
+        if ($character -eq '\') {
+            $backslashes++
+            continue
+        }
+        if ($character -eq '"') {
+            [void]$builder.Append(('\' * ($backslashes * 2 + 1)))
+            [void]$builder.Append('"')
+        } else {
+            [void]$builder.Append(('\' * $backslashes))
+            [void]$builder.Append($character)
+        }
+        $backslashes = 0
+    }
+    [void]$builder.Append(('\' * ($backslashes * 2)))
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
 function Invoke-TestCase {
     param(
         [string]$Name,
         [string[]]$CommandArgs,
-        [string]$RequiredFile
+        [string]$RequiredFile,
+        [switch]$RequireTranscription
     )
     $log = Join-Path $ResultsDir "$Name.log"
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
-    $previousPreference = $ErrorActionPreference
+    $code = -1
+    $stdout = ''
+    $stderr = ''
+    $process = $null
     try {
-        $ErrorActionPreference = 'Continue'
-        $output = (& $exe @CommandArgs 2>&1 | Out-String)
-        $code = $LASTEXITCODE
+        $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = $exe
+        $startInfo.Arguments = ($CommandArgs | ForEach-Object { ConvertTo-WindowsArgument -Value $_ }) -join ' '
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $startInfo.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
+        $startInfo.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
+        $process = [System.Diagnostics.Process]::new()
+        $process.StartInfo = $startInfo
+        if (-not $process.Start()) { throw 'Native process did not start.' }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        $code = $process.ExitCode
+    } catch {
+        $stderr += "`nProcess launch or I/O failed: $_"
     } finally {
-        $ErrorActionPreference = $previousPreference
+        if ($null -ne $process) { $process.Dispose() }
+        $watch.Stop()
     }
-    $watch.Stop()
+    $output = $stdout
+    if ($stderr.Length -gt 0) {
+        if ($output.Length -gt 0 -and -not $output.EndsWith("`n")) { $output += "`r`n" }
+        $output += $stderr
+    }
+    [System.IO.File]::WriteAllText($log, $output, [System.Text.UTF8Encoding]::new($false))
     $filePresent = -not $RequiredFile -or ((Test-Path -LiteralPath $RequiredFile -PathType Leaf) -and ((Get-Item -LiteralPath $RequiredFile).Length -gt 0))
-    $passed = ($code -eq 0) -and $filePresent
-    $output | Set-Content -LiteralPath $log -Encoding utf8
+    $transcriptionPresent = -not $RequireTranscription -or ($stdout -match '(?m)^\[\d+\]\s+\S')
+    $passed = ($code -eq 0) -and $filePresent -and $transcriptionPresent
     if (-not $passed) { $script:failed += 1 }
     $results.Add([pscustomobject]@{
         name = $Name
@@ -48,6 +102,7 @@ function Invoke-TestCase {
         elapsed_ms = $watch.ElapsedMilliseconds
         log = $log
         required_output_exists = [bool]$filePresent
+        required_transcription_exists = [bool]$transcriptionPresent
     })
     if ($passed) { Write-Host "[PASS] $Name ($($watch.ElapsedMilliseconds) ms)" -ForegroundColor Green }
     else { Write-Host "[FAIL] $Name (exit=$code) | $log" -ForegroundColor Red }
@@ -76,7 +131,19 @@ if (-not $SkipGpu) {
     if ([bool]$RealModelPath -ne [bool]$RealAudioPath) { throw 'Pass both -RealModelPath and -RealAudioPath, or neither.' }
     if ($RealModelPath) {
         Invoke-TestCase -Name 'real-model-config' -CommandArgs @('inspect-config', $RealModelPath)
-        Invoke-TestCase -Name 'real-model-asr' -CommandArgs @('transcribe', $RealModelPath, $RealAudioPath, '--device', $Device)
+        Invoke-TestCase -Name 'real-model-asr' -CommandArgs @('transcribe', $RealModelPath, $RealAudioPath, '--device', $Device, '--profile') -RequireTranscription
+    }
+    if ($E2ECtcModelPath -or $E2ERnntModelPath) {
+        if (-not $E2EAudioPath) { $E2EAudioPath = $RealAudioPath }
+        if (-not $E2EAudioPath) { throw 'Pass -E2EAudioPath, or use -RealAudioPath with -E2ECtcModelPath / -E2ERnntModelPath.' }
+        if ($E2ECtcModelPath) {
+            Invoke-TestCase -Name 'e2e-ctc-config' -CommandArgs @('inspect-config', $E2ECtcModelPath)
+            Invoke-TestCase -Name 'e2e-ctc-asr' -CommandArgs @('transcribe', $E2ECtcModelPath, $E2EAudioPath, '--device', $Device, '--profile') -RequireTranscription
+        }
+        if ($E2ERnntModelPath) {
+            Invoke-TestCase -Name 'e2e-rnnt-config' -CommandArgs @('inspect-config', $E2ERnntModelPath)
+            Invoke-TestCase -Name 'e2e-rnnt-asr' -CommandArgs @('transcribe', $E2ERnntModelPath, $E2EAudioPath, '--device', $Device, '--profile') -RequireTranscription
+        }
     }
 } else {
     Write-Host 'GPU inference skipped by request. Only CPU-independent audio/checkpoint inspection was tested.'
