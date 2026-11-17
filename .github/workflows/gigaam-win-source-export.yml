@@ -1,0 +1,33 @@
+name: Temporary GigaAM Windows Source Export
+on:
+  push:
+    branches: [codex/gigaam-win-bundle-export-20261117]
+    paths: [.github/workflows/gigaam-win-source-export.yml]
+permissions:
+  contents: read
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Export branch bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin refs/heads/codex/gigaam-v3-ctc-burn-20261117:refs/heads/gigaam-snapshot
+          git bundle create "$RUNNER_TEMP/gigaam.bundle" refs/heads/gigaam-snapshot
+          git bundle verify "$RUNNER_TEMP/gigaam.bundle"
+          (cd "$RUNNER_TEMP" && sha256sum gigaam.bundle > gigaam.bundle.sha256)
+          git rev-parse refs/heads/gigaam-snapshot > "$RUNNER_TEMP/source-head.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gigaam-windows-source-bundle
+          path: |
+            ${{ runner.temp }}/gigaam.bundle
+            ${{ runner.temp }}/gigaam.bundle.sha256
+            ${{ runner.temp }}/source-head.txt
+          retention-days: 1
+          compression-level: 0
