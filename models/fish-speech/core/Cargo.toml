@@ -1,0 +1,16 @@
+[package]
+name = "fish-speech-core-prototype"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Fish Speech 1.5 CPU contracts and typed mock planning (no inference)"
+
+[lib]
+name = "fish_speech_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fish-proto"
+path = "src/main.rs"
+
+[dependencies]

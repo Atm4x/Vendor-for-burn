@@ -1,0 +1,490 @@
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::cpu_ir::{NamedTensors, TensorData};
+use crate::error::{FishError, Result};
+use crate::graph_ir::{Graph, Op, Origin, TensorType, ValueId};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Binding {
+    Value(ValueId),
+    Temp(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrtPrimitive {
+    Input,
+    ConstantWeight,
+    MatrixMultiplyTransposeRhs,
+    AddBroadcastBias,
+    Sigmoid,
+    ElementwiseProduct,
+    ElementwiseSum,
+    Identity,
+    SliceLastSequenceToken,
+    Deferred { original: Op, reason: &'static str },
+}
+
+#[derive(Debug, Clone)]
+pub struct TrtStep {
+    pub name: String,
+    pub primitive: TrtPrimitive,
+    pub arguments: Vec<Binding>,
+    pub result: Binding,
+    pub output_type: TensorType,
+}
+
+#[derive(Debug, Clone)]
+pub struct TrtBlueprint {
+    pub steps: Vec<TrtStep>,
+    pub outputs: Vec<Binding>,
+    pub deferred: BTreeMap<&'static str, usize>,
+    pub weight_count: usize,
+}
+
+impl TrtBlueprint {
+    pub fn from_graph(graph: &Graph) -> Result<Self> {
+        graph.validate()?;
+        let mut steps = Vec::new();
+        let mut temporary = 0;
+        let mut deferred = BTreeMap::new();
+        let mut weight_count = 0;
+        for (idx, value) in graph.values.iter().enumerate() {
+            let primitive = match value.origin {
+                Origin::Input => TrtPrimitive::Input,
+                Origin::Weight { .. } => {
+                    weight_count += 1;
+                    TrtPrimitive::ConstantWeight
+                }
+                Origin::Node(_) => continue,
+            };
+            steps.push(TrtStep {
+                name: value.name.clone(),
+                primitive,
+                arguments: Vec::new(),
+                result: Binding::Value(ValueId(idx)),
+                output_type: value.ty.clone(),
+            });
+        }
+        for node in &graph.nodes {
+            let output_type = graph.tensor(node.result)?.clone();
+            let args = node
+                .inputs
+                .iter()
+                .copied()
+                .map(Binding::Value)
+                .collect::<Vec<_>>();
+            let result = Binding::Value(node.result);
+            let mut push = |name: String,
+                            primitive: TrtPrimitive,
+                            arguments: Vec<Binding>,
+                            result: Binding,
+                            ty: TensorType| {
+                steps.push(TrtStep {
+                    name,
+                    primitive,
+                    arguments,
+                    result,
+                    output_type: ty,
+                });
+            };
+            match node.op {
+                Op::Linear | Op::LinearBias => {
+                    let linear_output = if matches!(node.op, Op::LinearBias) {
+                        let id = Binding::Temp(temporary);
+                        temporary += 1;
+                        id
+                    } else {
+                        result
+                    };
+                    push(
+                        format!("{}.gemm", node.name),
+                        TrtPrimitive::MatrixMultiplyTransposeRhs,
+                        args[..2].to_vec(),
+                        linear_output,
+                        output_type.clone(),
+                    );
+                    if matches!(node.op, Op::LinearBias) {
+                        push(
+                            node.name.clone(),
+                            TrtPrimitive::AddBroadcastBias,
+                            vec![linear_output, args[2]],
+                            result,
+                            output_type,
+                        );
+                    }
+                }
+                Op::SiLu => {
+                    let sigmoid = Binding::Temp(temporary);
+                    temporary += 1;
+                    push(
+                        format!("{}.sigmoid", node.name),
+                        TrtPrimitive::Sigmoid,
+                        args.clone(),
+                        sigmoid,
+                        output_type.clone(),
+                    );
+                    push(
+                        node.name.clone(),
+                        TrtPrimitive::ElementwiseProduct,
+                        vec![args[0], sigmoid],
+                        result,
+                        output_type,
+                    );
+                }
+                Op::Mul | Op::Add | Op::Identity | Op::LastToken => {
+                    let primitive = match node.op {
+                        Op::Mul => TrtPrimitive::ElementwiseProduct,
+                        Op::Add => TrtPrimitive::ElementwiseSum,
+                        Op::Identity => TrtPrimitive::Identity,
+                        Op::LastToken => TrtPrimitive::SliceLastSequenceToken,
+                        _ => unreachable!(),
+                    };
+                    push(node.name.clone(), primitive, args, result, output_type);
+                }
+                other => {
+                    let reason = match other {
+                        Op::FishEmbedding { .. } => "Fish semantic-gated multi-codebook lookup",
+                        Op::TokenEmbedding => {
+                            "token embedding gather, TRT shape/lifetime to verify"
+                        }
+                        Op::RmsNorm { .. } => "RMSNorm reduction and epsilon semantics",
+                        Op::SplitQkv { .. } => "QKV tensor split and reshape/transposition",
+                        Op::RoPe { .. } => "rotary frequency, complex pair ordering",
+                        Op::KvUpdate { .. } => "external mutable KV buffers and update",
+                        Op::KvPrefix { .. } => "active prefix dynamic slice or bucket profile",
+                        Op::GqaAttention { .. } => "GQA masking/attention needs SDK validation",
+                        _ => unreachable!(),
+                    };
+                    *deferred.entry(reason).or_insert(0) += 1;
+                    push(
+                        node.name.clone(),
+                        TrtPrimitive::Deferred {
+                            original: other,
+                            reason,
+                        },
+                        args,
+                        result,
+                        output_type,
+                    );
+                }
+            }
+        }
+        let plan = Self {
+            steps,
+            outputs: graph.outputs.iter().copied().map(Binding::Value).collect(),
+            deferred,
+            weight_count,
+        };
+        plan.validate()?;
+        Ok(plan)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let mut produced = BTreeSet::new();
+        for step in &self.steps {
+            if step.name.is_empty() {
+                return Err(FishError::InvalidShape("empty TRT blueprint step name"));
+            }
+            if step.output_type.shape.is_empty() || step.output_type.shape.contains(&0) {
+                return Err(FishError::InvalidShape(
+                    "invalid TRT blueprint output shape",
+                ));
+            }
+            if step.arguments.iter().any(|arg| !produced.contains(arg)) {
+                return Err(FishError::InvalidShape("TRT blueprint has dangling input"));
+            }
+            if !produced.insert(step.result) {
+                return Err(FishError::InvalidShape(
+                    "TRT blueprint has multiple producers",
+                ));
+            }
+        }
+        if self.outputs.is_empty() || self.outputs.iter().any(|o| !produced.contains(o)) {
+            return Err(FishError::InvalidShape("TRT blueprint missing output"));
+        }
+        Ok(())
+    }
+
+    pub fn execute_cpu_reference(&self, bindings: &NamedTensors) -> Result<NamedTensors> {
+        self.require_no_deferred_ops()?;
+        self.validate()?;
+        let mut intermediates: BTreeMap<Binding, (TensorType, TensorData)> = BTreeMap::new();
+        for step in &self.steps {
+            let data = match step.primitive {
+                TrtPrimitive::Input | TrtPrimitive::ConstantWeight => bindings
+                    .get(&step.name)
+                    .ok_or(FishError::InvalidShape("missing blueprint CPU input"))?
+                    .clone(),
+                _ => {
+                    let args = step
+                        .arguments
+                        .iter()
+                        .map(|id| {
+                            intermediates
+                                .get(id)
+                                .ok_or(FishError::InvalidShape("blueprint CPU missing parent"))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let read = |index: usize| -> Result<&[f32]> {
+                        match &args[index].1 {
+                            TensorData::F32(data) => Ok(data),
+                            _ => Err(FishError::InvalidShape("blueprint CPU expects FP32 data")),
+                        }
+                    };
+                    let values = match step.primitive {
+                        TrtPrimitive::MatrixMultiplyTransposeRhs => {
+                            let a = read(0)?;
+                            let w = read(1)?;
+                            let input_dim = args[1].0.shape[1];
+                            let output_dim = args[1].0.shape[0];
+                            let mut data = Vec::with_capacity((a.len() / input_dim) * output_dim);
+                            for row in a.chunks_exact(input_dim) {
+                                for weight in w.chunks_exact(input_dim) {
+                                    data.push(
+                                        row.iter().zip(weight).map(|(x, y)| x * y).sum::<f32>(),
+                                    );
+                                }
+                            }
+                            data
+                        }
+                        TrtPrimitive::AddBroadcastBias => {
+                            let a = read(0)?;
+                            let bias = read(1)?;
+                            if bias.len()
+                                != *step
+                                    .output_type
+                                    .shape
+                                    .last()
+                                    .ok_or(FishError::InvalidShape("missing output dimension"))?
+                            {
+                                return Err(FishError::InvalidShape("bias broadcast mismatch"));
+                            }
+                            a.iter()
+                                .enumerate()
+                                .map(|(i, x)| x + bias[i % bias.len()])
+                                .collect()
+                        }
+                        TrtPrimitive::Sigmoid => {
+                            read(0)?.iter().map(|x| 1.0 / (1.0 + (-x).exp())).collect()
+                        }
+                        TrtPrimitive::ElementwiseProduct => {
+                            read(0)?.iter().zip(read(1)?).map(|(a, b)| a * b).collect()
+                        }
+                        TrtPrimitive::ElementwiseSum => {
+                            read(0)?.iter().zip(read(1)?).map(|(a, b)| a + b).collect()
+                        }
+                        TrtPrimitive::Identity => read(0)?.to_vec(),
+                        TrtPrimitive::SliceLastSequenceToken => {
+                            let a = read(0)?;
+                            let ty = &args[0].0;
+                            let (batch, frames, dim) = (ty.shape[0], ty.shape[1], ty.shape[2]);
+                            let mut data = Vec::with_capacity(batch * dim);
+                            for b in 0..batch {
+                                let start = (b * frames + frames - 1) * dim;
+                                data.extend_from_slice(&a[start..start + dim]);
+                            }
+                            data
+                        }
+                        _ => return Err(FishError::Unsupported("unexpected unlowered operation")),
+                    };
+                    TensorData::F32(values)
+                }
+            };
+            let expected: usize = step.output_type.shape.iter().product();
+            let valid = match (&data, step.output_type.dtype) {
+                (
+                    TensorData::F32(v),
+                    crate::graph_ir::ScalarType::F32 | crate::graph_ir::ScalarType::BF16,
+                ) => v.len() == expected,
+                (TensorData::I32(v), crate::graph_ir::ScalarType::I32) => v.len() == expected,
+                _ => false,
+            };
+            if !valid {
+                return Err(FishError::InvalidShape(
+                    "blueprint CPU result shape/dtype mismatch",
+                ));
+            }
+            intermediates.insert(step.result, (step.output_type.clone(), data));
+        }
+        let mut outputs = NamedTensors::new();
+        for id in &self.outputs {
+            let step = self
+                .steps
+                .iter()
+                .find(|step| step.result == *id)
+                .ok_or(FishError::InvalidShape("output producer missing"))?;
+            outputs.insert(step.name.clone(), intermediates[id].1.clone());
+        }
+        Ok(outputs)
+    }
+
+    pub fn require_no_deferred_ops(&self) -> Result<()> {
+        if self.deferred.is_empty() {
+            Ok(())
+        } else {
+            Err(FishError::Unsupported(
+                "TRT blueprint contains non-lowered graph operations",
+            ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::FishModelConfig;
+    use crate::graph::Stage;
+    use crate::graph_ir::{Layout, ScalarType};
+    use crate::transformer_ir::TransformerIrFactory;
+
+    #[test]
+    fn direct_primitives_are_wired_and_decomposed() {
+        let mut graph = Graph::new(Stage::SlowDecode, None, None);
+        let x = graph
+            .input(
+                "x",
+                TensorType::new([1, 2, 3], ScalarType::F32, Layout::SequenceBtd),
+            )
+            .unwrap();
+        let w = graph
+            .weight("w", TensorType::new([4, 3], ScalarType::F32, Layout::Plain))
+            .unwrap();
+        let bias = graph
+            .weight("bias", TensorType::new([4], ScalarType::F32, Layout::Plain))
+            .unwrap();
+        let y = graph
+            .emit("project", Op::LinearBias, &[x, w, bias])
+            .unwrap();
+        let z = graph.emit("silu", Op::SiLu, &[y]).unwrap();
+        graph.output(z).unwrap();
+        let plan = TrtBlueprint::from_graph(&graph).unwrap();
+        plan.require_no_deferred_ops().unwrap();
+        assert_eq!(plan.steps.len(), 7);
+        assert_eq!(plan.weight_count, 2);
+        assert_eq!(
+            plan.steps[3].primitive,
+            TrtPrimitive::MatrixMultiplyTransposeRhs
+        );
+        assert_eq!(plan.steps[4].primitive, TrtPrimitive::AddBroadcastBias);
+        assert_eq!(plan.steps[5].primitive, TrtPrimitive::Sigmoid);
+        assert_eq!(plan.steps[6].primitive, TrtPrimitive::ElementwiseProduct);
+    }
+
+    #[test]
+    fn full_ar_graph_reports_exact_deferred_blockers() {
+        let config = FishModelConfig::synthetic_dual_ar_fixture();
+        let factory = TransformerIrFactory::new(&config).unwrap();
+        for graph in [
+            factory.slow_prefill(4).unwrap(),
+            factory.slow_decode(6).unwrap(),
+            factory.fast_decode(0).unwrap(),
+            factory.fast_decode(2).unwrap(),
+        ] {
+            let plan = TrtBlueprint::from_graph(&graph).unwrap();
+            plan.validate().unwrap();
+            assert!(!plan.deferred.is_empty());
+            assert!(plan.require_no_deferred_ops().is_err());
+            assert_eq!(plan.outputs.len(), graph.outputs.len());
+            assert_eq!(plan.weight_count, graph.weight_requirements().len());
+        }
+    }
+
+    #[test]
+    fn internal_temporary_must_be_produced_before_use() {
+        let config = FishModelConfig::synthetic_dual_ar_fixture();
+        let g = TransformerIrFactory::new(&config)
+            .unwrap()
+            .slow_decode(2)
+            .unwrap();
+        let mut plan = TrtBlueprint::from_graph(&g).unwrap();
+        let idx = plan
+            .steps
+            .iter()
+            .position(|step| matches!(step.primitive, TrtPrimitive::MatrixMultiplyTransposeRhs))
+            .unwrap();
+        plan.steps[idx].arguments[0] = Binding::Temp(usize::MAX);
+        assert!(plan.validate().is_err());
+    }
+
+    #[test]
+    fn primitive_decomposition_matches_original_cpu_ir() {
+        use crate::cpu_ir::CpuIrInterpreter;
+        let mut g = Graph::new(Stage::SlowDecode, None, None);
+        let x = g
+            .input(
+                "x",
+                TensorType::new([1, 2, 3], ScalarType::F32, Layout::SequenceBtd),
+            )
+            .unwrap();
+        let w = g
+            .weight("w", TensorType::new([4, 3], ScalarType::F32, Layout::Plain))
+            .unwrap();
+        let b = g
+            .weight("b", TensorType::new([4], ScalarType::F32, Layout::Plain))
+            .unwrap();
+        let y = g.emit("linear", Op::LinearBias, &[x, w, b]).unwrap();
+        let y = g.emit("silu", Op::SiLu, &[y]).unwrap();
+        let z = g.emit("last", Op::LastToken, &[y]).unwrap();
+        g.output(z).unwrap();
+        let mut bind = NamedTensors::new();
+        bind.insert("x".into(), TensorData::F32(vec![1., -2., 3., 4., -5., 6.]));
+        bind.insert(
+            "w".into(),
+            TensorData::F32(vec![1., 2., 3., -1., 0., 1., 0.5, 0.25, -1., 0., 2., 1.]),
+        );
+        bind.insert("b".into(), TensorData::F32(vec![1., -2., 0., 4.]));
+        let expect = CpuIrInterpreter::run(&g, &bind).unwrap();
+        let got = TrtBlueprint::from_graph(&g)
+            .unwrap()
+            .execute_cpu_reference(&bind)
+            .unwrap();
+        assert_eq!(got, expect);
+    }
+
+    #[test]
+    fn blueprint_cpu_reference_rejects_bad_bindings_and_deferred_ops() {
+        let mut g = Graph::new(Stage::SlowDecode, None, None);
+        let x = g
+            .input(
+                "x",
+                TensorType::new([1, 1, 2], ScalarType::F32, Layout::SequenceBtd),
+            )
+            .unwrap();
+        let y = g.emit("identity", Op::Identity, &[x]).unwrap();
+        g.output(y).unwrap();
+        let plan = TrtBlueprint::from_graph(&g).unwrap();
+        assert!(plan.execute_cpu_reference(&NamedTensors::new()).is_err());
+        let mut b = NamedTensors::new();
+        b.insert("x".into(), TensorData::F32(vec![1., 2.]));
+        assert_eq!(
+            plan.execute_cpu_reference(&b).unwrap()["identity"],
+            TensorData::F32(vec![1., 2.])
+        );
+        b.insert("x".into(), TensorData::F32(vec![3.]));
+        assert!(plan.execute_cpu_reference(&b).is_err());
+        let c = FishModelConfig::synthetic_dual_ar_fixture();
+        let graph = TransformerIrFactory::new(&c)
+            .unwrap()
+            .slow_decode(1)
+            .unwrap();
+        assert!(TrtBlueprint::from_graph(&graph)
+            .unwrap()
+            .execute_cpu_reference(&NamedTensors::new())
+            .is_err());
+    }
+
+    #[test]
+    fn strict_gate_never_calls_deferred_plan_gpu_ready() {
+        let config = FishModelConfig::synthetic_dual_ar_fixture();
+        let factory = TransformerIrFactory::new(&config).unwrap();
+        let first = TrtBlueprint::from_graph(&factory.fast_decode(0).unwrap()).unwrap();
+        let later = TrtBlueprint::from_graph(&factory.fast_decode(1).unwrap()).unwrap();
+        assert!(first.deferred.keys().any(|reason| reason.contains("GQA")));
+        assert!(later
+            .deferred
+            .keys()
+            .any(|reason| reason.contains("embedding gather")));
+        assert!(first.require_no_deferred_ops().is_err());
+        assert!(later.require_no_deferred_ops().is_err());
+    }
+}
