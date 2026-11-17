@@ -43,7 +43,7 @@ The RVC experiments in this repository include specialized NCT↔NTC transport f
 
 ## Validation and limitations
 
-See [VALIDATION.md](VALIDATION.md) for PyTorch-versus-Rust logit comparisons with the supplied `small1.ckpt`, `final1.ckpt`, and music sample. The short-window CPU comparisons pass with approximately 1e-5 maximum absolute difference. The CUDA feature was not built or profiled in the offline CPU-only environment (the CubeCL LLVM bundler attempted a network download). The CPU backend can be slow on long music, especially with the full model; real-time performance and GPU speedups are **not established**.
+See [VALIDATION.md](VALIDATION.md) for PyTorch-versus-Rust logit comparisons with the supplied `small1.ckpt`, `final1.ckpt`, and music sample. The original PyTorch implementation and native Rust match across the **entire 209-second provided FLAC** (10,458 frames) on both `small1.ckpt` and `final1.ckpt`. Mean logit errors are approximately 1e-5 on long-form input. Both models also reproduce the original beat/downbeat counts on that file. The CUDA feature compiled and linked successfully offline after installing the locally provided Tracel LLVM 23.1.0-4 archive; runtime execution and profiling on an NVIDIA GPU remain **unverified**. The CPU backend can be slower than optimized multi-threaded PyTorch, and real-time performance and GPU speedups are **not established**.
 
 ## Licensing
 
