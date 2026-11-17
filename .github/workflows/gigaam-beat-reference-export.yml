@@ -1,0 +1,39 @@
+name: Export Vendor main and Beat This worker
+on:
+  push:
+    branches:
+      - codex/gigaam-beat-reference-export-20261118
+    paths:
+      - .github/workflows/gigaam-beat-reference-export.yml
+permissions:
+  contents: read
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch three source branches and verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin '+refs/heads/main:refs/heads/source-main' '+refs/heads/codex/beat-this-windows-worker:refs/heads/source-beat' '+refs/heads/codex/gigaam-worker-lifecycle-cont5-20261118:refs/heads/source-gigaam'
+          test "$(git rev-parse refs/heads/source-main)" = "a68c6fdb10d8a711a2f36463b6fdb8a6a160cd49"
+          test "$(git rev-parse refs/heads/source-beat)" = "9cfbdbf617bb040b0a5499d1b28d40f25016f873"
+          test "$(git rev-parse refs/heads/source-gigaam)" = "c1a0c54c3afb5ed20112c9b4989a2857622fc893"
+          git bundle create "$RUNNER_TEMP/vendor-beat-gigaam.bundle" refs/heads/source-main refs/heads/source-beat refs/heads/source-gigaam
+          git bundle verify "$RUNNER_TEMP/vendor-beat-gigaam.bundle"
+          git bundle list-heads "$RUNNER_TEMP/vendor-beat-gigaam.bundle" > "$RUNNER_TEMP/source-heads.txt"
+          (cd "$RUNNER_TEMP" && sha256sum vendor-beat-gigaam.bundle > vendor-beat-gigaam.bundle.sha256)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vendor-beat-gigaam-git-bundle
+          path: |
+            ${{ runner.temp }}/vendor-beat-gigaam.bundle
+            ${{ runner.temp }}/vendor-beat-gigaam.bundle.sha256
+            ${{ runner.temp }}/source-heads.txt
+          compression-level: 0
+          retention-days: 2
