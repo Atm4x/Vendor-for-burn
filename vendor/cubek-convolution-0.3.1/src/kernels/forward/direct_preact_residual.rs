@@ -228,15 +228,22 @@ pub fn launch_preact_residual_temporal(
     {
         return Err(ConvSetupError::Unknown);
     }
-    let vector_size = tensor_vector_size_parallel(
-        client.io_optimized_vector_sizes(dtype.size()),
-        &output.shape,
-        &output.strides,
-        2,
-    );
-    if broadcast_inputs && (vector_size != 4 || output.shape[2] / vector_size != 32) {
-        return Err(ConvSetupError::Unknown);
-    }
+    let supported_vectors = client.io_optimized_vector_sizes(dtype.size()).collect::<Vec<_>>();
+    let vector_size = if broadcast_inputs {
+        // 128 channels / 4 elements per lane = exactly one 32-lane plane.
+        // Letting the backend select a wider IO vector can break this geometry.
+        if !supported_vectors.contains(&4) {
+            return Err(ConvSetupError::Unknown);
+        }
+        4
+    } else {
+        tensor_vector_size_parallel(
+            supported_vectors.into_iter(),
+            &output.shape,
+            &output.strides,
+            2,
+        )
+    };
     if output.shape[2] % vector_size != 0 {
         return Err(ConvSetupError::Unknown);
     }

@@ -47,6 +47,12 @@ fn evaluate(device: &Device, time: usize, with_broadcast: bool) -> Result<Vec<f3
     let raw_bias = bias.try_into_primitive::<Cube>().map_err(|e| format!("{e:?}"))?;
     let raw_residual = residual.try_into_primitive::<Cube>().map_err(|e| format!("{e:?}"))?;
     let prepared = prepare_resblock_input_ntc(raw_input);
+    eprintln!(
+        "Stage121 probe: T={time}, broadcast={with_broadcast}; input={:?}/{:?}, weight={:?}/{:?}, residual={:?}/{:?}",
+        prepared.meta.shape(), prepared.meta.strides(),
+        raw_weight.meta.shape(), raw_weight.meta.strides(),
+        raw_residual.meta.shape(), raw_residual.meta.strides(),
+    );
     if with_broadcast {
         unsafe { std::env::set_var("RVC_NSF_RESBLOCK_PLANE_BROADCAST", "1") };
     } else {
@@ -82,8 +88,13 @@ fn main() -> Result<(), String> {
         _ => return Err("Usage: stage121_plane_broadcast_probe [cpu|cuda]".into()),
     };
     for &time in &[3usize, 17, 71] {
-        let base = evaluate(&device, time, false)?;
-        let broadcast = evaluate(&device, time, true)?;
+        let base = evaluate(&device, time, false).map_err(|error| {
+            format!("Stage121 control probe failed at T={time}, backend={backend}: {error}")
+        })?;
+        eprintln!("Stage121 control CubeCL {backend} OK: time={time}");
+        let broadcast = evaluate(&device, time, true).map_err(|error| {
+            format!("Stage121 broadcast probe failed at T={time}, backend={backend}: {error}")
+        })?;
         if base.len() != broadcast.len() {
             return Err(format!("Output shape mismatch: {} != {}", base.len(), broadcast.len()));
         }

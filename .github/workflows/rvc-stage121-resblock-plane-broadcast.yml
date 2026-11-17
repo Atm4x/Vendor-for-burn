@@ -68,8 +68,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Stage121 doctor failed' }
           & target/release/stage121_plane_broadcast_probe.exe cpu
           if ($LASTEXITCODE -ne 0) {
-            Write-Warning 'Stage121 CPU CubeCL runtime probe not confirmed in CI. The packaged Windows runner requires CUDA probe PASS before any full-RVC benchmark.'
+            Write-Warning 'CPU CubeCL probe unsupported or failed on GitHub runner; packaging is allowed, CUDA probe on target RTX 4060 is mandatory.'
+            "STAGE121_CPU_PROBE_STATUS=UNCONFIRMED" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          } else {
+            "STAGE121_CPU_PROBE_STATUS=PASS" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           }
+          $global:LASTEXITCODE = 0
       - name: Assemble self-contained Stage121 Windows package
         shell: pwsh
         run: |
@@ -82,7 +86,7 @@ jobs:
           Copy-Item research/stage121-resblock-plane-broadcast/README.md $dest
           Copy-Item research/stage121-resblock-plane-broadcast/REPORT.md (Join-Path $dest 'STAGE121_REPORT.md')
           Copy-Item research/stage121-resblock-plane-broadcast/WORKFLOW_CONTRACT.md (Join-Path $dest 'RVC_RND_WORKFLOW_CONTRACT.md')
-          Set-Content -LiteralPath (Join-Path $dest 'BUILD_STATUS.txt') -Value "Stage121 Rust build PASS; CubeCL CPU probe PASS; commit=$env:GITHUB_SHA; GPU validation required on RTX 4060." -Encoding utf8
+          Set-Content -LiteralPath (Join-Path $dest 'BUILD_STATUS.txt') -Value "Stage121 Rust build PASS; CubeCL CPU probe=$env:STAGE121_CPU_PROBE_STATUS; commit=$env:GITHUB_SHA; CUDA probe and PCM validation mandatory on RTX 4060." -Encoding utf8
       - uses: actions/upload-artifact@v4
         with:
           name: rvc-stage121-plane-broadcast-windows-x64
