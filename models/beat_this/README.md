@@ -57,8 +57,9 @@ Beats DTO v1 uses `kind: "beats"` and an input object with `file_name`,
 Core-managed input directory. Results contain `beats_seconds`,
 `downbeats_seconds`, `duration_seconds` and `sample_rate_hz`.
 
-The GitHub workflow is dispatched manually from `main` with the version
-committed in `Cargo.toml`. It verifies the upstream weight and SoXR source,
+The GitHub workflow runs on an explicitly published `beat-this-v<version>`
+tag or by manual dispatch from `main`. The version must match `Cargo.toml`.
+It verifies the upstream weight and SoXR source,
 builds the worker, runs the lifecycle smoke test and packages the Windows ZIP,
 standalone EXE, native manifest, install plan and SHA-256 file. The official
 checkpoint is downloaded separately from the URL and digest in the plan.
