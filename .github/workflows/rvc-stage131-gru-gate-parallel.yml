@@ -1,15 +1,6 @@
 name: RVC Stage131 gate-parallel persistent BiGRU Windows x64
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - experiment/conv-kernel-rnd-stage33-20261110
-    paths:
-      - 'models/tts-with-rvc-rs/src/rmvpe_gru.rs'
-      - 'models/tts-with-rvc-rs/src/rmvpe_persistent.rs'
-      - 'models/tts-with-rvc-rs/src/main.rs'
-      - 'research/stage131-gru-gate-parallel/**'
-      - '.github/workflows/rvc-stage131-gru-gate-parallel.yml'
 permissions:
   contents: read
 concurrency:

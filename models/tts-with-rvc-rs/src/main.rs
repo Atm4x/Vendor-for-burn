@@ -115,8 +115,10 @@ fn run() -> Result<(), String> {
         for iteration in 0..runs {
             device.sync().map_err(|e| format!("pre-inference synchronization failed: {e}"))?;
             let start = std::time::Instant::now();
+            let _nvtx = (iteration > 0).then(|| tts_with_rvc_rs::nvtx::Range::new("stage102_rust_measured"));
             converted = inferencer.infer_16khz(&filtered, &options)?;
             device.sync().map_err(|e| format!("post-inference synchronization failed: {e}"))?;
+            drop(_nvtx);
             let inference_ms = start.elapsed().as_secs_f64() * 1000.0;
             eprintln!("profile resident_inference iteration={iteration} inference_ms={inference_ms:.6} samples={}", converted.len());
             timings.push(inference_ms);
