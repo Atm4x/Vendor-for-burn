@@ -46,6 +46,91 @@ pub fn load_wav_16k(path: &Path) -> Result<Vec<f32>> {
     Ok(resample_sinc(&mono, spec.sample_rate, SAMPLE_RATE))
 }
 
+/// Decode PCM WAV, FLAC, or Ogg/Vorbis entirely in Rust and resample to 16 kHz.
+/// Compressed audio uses Symphonia; PCM WAV keeps the existing tested Hound path.
+pub fn load_audio_16k(path: &Path) -> Result<Vec<f32>> {
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
+    {
+        return load_wav_16k(path);
+    }
+
+    use symphonia::core::codecs::audio::AudioDecoderOptions;
+    use symphonia::core::errors::Error as AudioError;
+    use symphonia::core::formats::{FormatOptions, TrackType, probe::Hint};
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+
+    let src =
+        std::fs::File::open(path).with_context(|| format!("opening audio {}", path.display()))?;
+    let stream = MediaSourceStream::new(Box::new(src), Default::default());
+    let mut hint = Hint::new();
+    if let Some(extension) = path.extension().and_then(|value| value.to_str()) {
+        hint.with_extension(extension);
+    }
+    let mut format = symphonia::default::get_probe()
+        .probe(
+            &hint,
+            stream,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .with_context(|| format!("detecting audio format {}", path.display()))?;
+    let track = format
+        .default_track(TrackType::Audio)
+        .context("no supported audio track")?;
+    let audio_params = track
+        .codec_params
+        .as_ref()
+        .context("missing audio codec parameters")?
+        .audio()
+        .context("track is not audio")?;
+    let mut decoder = symphonia::default::get_codecs()
+        .make_audio_decoder(audio_params, &AudioDecoderOptions::default())
+        .context("audio codec unsupported by native decoder")?;
+    let track_id = track.id;
+    let mut pcm = Vec::<f32>::new();
+    let mut rate = None;
+    let mut scratch = Vec::<f32>::new();
+    while let Some(packet) = format.next_packet().context("reading audio packet")? {
+        if packet.track_id != track_id {
+            continue;
+        }
+        let decoded = match decoder.decode(&packet) {
+            Ok(decoded) => decoded,
+            Err(AudioError::DecodeError(error)) => anyhow::bail!("corrupt audio packet: {error}"),
+            Err(error) => return Err(error.into()),
+        };
+        let current_rate = decoded.spec().rate();
+        let channels = decoded.spec().channels().count();
+        ensure!(
+            (8_000..=192_000).contains(&current_rate) && (1..=8).contains(&channels),
+            "unsupported sample rate or channel count"
+        );
+        ensure!(
+            rate.is_none_or(|existing| existing == current_rate),
+            "changing sample rate inside audio stream is unsupported"
+        );
+        rate = Some(current_rate);
+        scratch.resize(decoded.samples_interleaved(), 0.0);
+        decoded.copy_to_slice_interleaved(&mut scratch);
+        pcm.extend(
+            scratch
+                .chunks_exact(channels)
+                .map(|frame| frame.iter().copied().sum::<f32>() / channels as f32),
+        );
+    }
+    ensure!(!pcm.is_empty(), "audio file contains no decoded samples");
+    let rate = rate.context("audio stream has no sample rate")?;
+    if rate == SAMPLE_RATE {
+        Ok(pcm)
+    } else {
+        Ok(resample_sinc(&pcm, rate, SAMPLE_RATE))
+    }
+}
+
 pub fn resample_sinc(samples: &[f32], input_rate: u32, output_rate: u32) -> Vec<f32> {
     if samples.is_empty() {
         return Vec::new();

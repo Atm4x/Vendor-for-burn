@@ -79,11 +79,14 @@ impl Config {
             self.conv_norm_type
         );
         ensure!(
-            matches!(self.subsampling.as_str(), "conv1d" | "conv2d")
-                && self.subsampling_factor == 4,
-            "unsupported subsampling {:?}/{}: only factor 4 is implemented",
-            self.subsampling,
-            self.subsampling_factor
+            matches!(self.subsampling.as_str(), "conv1d" | "conv2d"),
+            "unsupported subsampling {:?}",
+            self.subsampling
+        );
+        ensure!(
+            self.subsampling_factor.is_power_of_two()
+                && (2..=32).contains(&self.subsampling_factor),
+            "subsampling_factor must be a power of two between 2 and 32"
         );
         ensure!(
             self.subsample_channels == self.d_model,
@@ -516,13 +519,11 @@ pub struct EncoderModel {
 
 enum Subsampling {
     Conv2 {
-        first: Conv2,
-        second: Conv2,
+        layers: Vec<Conv2>,
         projection: Linear,
     },
     Conv1 {
-        first: Conv1,
-        second: Conv1,
+        layers: Vec<Conv1>,
     },
 }
 
@@ -531,17 +532,24 @@ impl EncoderModel {
         config.validate()?;
         let k = config.subsample_kernel;
         let p = k / 2;
+        let conv_layers = config.subsampling_factor.ilog2() as usize;
         let subsampling = if config.subsampling == "conv2d" {
+            let mut layers = Vec::with_capacity(conv_layers);
+            for stage in 0..conv_layers {
+                let key = format!("encoder.pre_encode.conv.{}", stage * 2);
+                layers.push(Conv2::load(w, &key, device, 2, p)?);
+            }
             Subsampling::Conv2 {
-                first: Conv2::load(w, "encoder.pre_encode.conv.0", device, 2, p)?,
-                second: Conv2::load(w, "encoder.pre_encode.conv.2", device, 2, p)?,
+                layers,
                 projection: Linear::load(w, "encoder.pre_encode.out", device, true)?,
             }
         } else {
-            Subsampling::Conv1 {
-                first: Conv1::load(w, "encoder.pre_encode.conv.0", device, 2, p, 1)?,
-                second: Conv1::load(w, "encoder.pre_encode.conv.2", device, 2, p, 1)?,
+            let mut layers = Vec::with_capacity(conv_layers);
+            for stage in 0..conv_layers {
+                let key = format!("encoder.pre_encode.conv.{}", stage * 2);
+                layers.push(Conv1::load(w, &key, device, 2, p, 1)?);
             }
+            Subsampling::Conv1 { layers }
         };
         let mut layers = Vec::with_capacity(config.n_layers);
         for i in 0..config.n_layers {
@@ -560,11 +568,7 @@ impl EncoderModel {
     pub fn encode(&self, features: &Features, device: &Device) -> Result<Tensor<3>> {
         ensure!(features.n_mels == self.config.n_mels, "mel-bin mismatch");
         let mut seq = match &self.subsampling {
-            Subsampling::Conv2 {
-                first,
-                second,
-                projection,
-            } => {
+            Subsampling::Conv2 { layers, projection } => {
                 let mut x = Tensor::<4>::from_data(
                     TensorData::new(
                         features.values.clone(),
@@ -573,8 +577,9 @@ impl EncoderModel {
                     device,
                 )
                 .permute([0, 1, 3, 2]);
-                x = activation::relu(first.forward(x));
-                x = activation::relu(second.forward(x));
+                for layer in layers {
+                    x = activation::relu(layer.forward(x));
+                }
                 let [batch, channels, time, frequency] = x.dims();
                 let seq = x
                     .permute([0, 2, 1, 3])
@@ -587,16 +592,18 @@ impl EncoderModel {
                 );
                 projection.forward(seq)
             }
-            Subsampling::Conv1 { first, second } => {
-                let x = Tensor::<3>::from_data(
+            Subsampling::Conv1 { layers } => {
+                let mut x = Tensor::<3>::from_data(
                     TensorData::new(
                         features.values.clone(),
                         [1, features.n_mels, features.frames],
                     ),
                     device,
                 );
-                activation::relu(second.forward(activation::relu(first.forward(x))))
-                    .permute([0, 2, 1])
+                for layer in layers {
+                    x = activation::relu(layer.forward(x));
+                }
+                x.permute([0, 2, 1])
             }
         };
         for layer in &self.layers {
@@ -728,6 +735,19 @@ impl EmotionModel {
 #[cfg(all(test, feature = "flex"))]
 mod legacy_tests {
     use super::*;
+
+    #[test]
+    fn parametrized_subsampling_rejects_non_power_of_two() {
+        let mut cfg = Config::default();
+        for factor in [2, 4, 8, 16, 32] {
+            cfg.subsampling_factor = factor;
+            assert!(cfg.validate().is_ok(), "valid factor {factor} rejected");
+        }
+        for factor in [0, 1, 3, 6, 64] {
+            cfg.subsampling_factor = factor;
+            assert!(cfg.validate().is_err(), "invalid factor {factor} accepted");
+        }
+    }
 
     #[test]
     fn rotary_frequency_base_matches_python_encoder() {

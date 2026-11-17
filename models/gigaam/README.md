@@ -17,11 +17,11 @@ This crate implements the GigaAM Conformer family in Rust using Burn tensors. No
 | `multilingual_ctc`, `multilingual_large_ctc` | Same Conformer/CTC building blocks | Configured character vocabulary | No official checkpoint tested |
 | `multilingual_ssl`, `multilingual_large_ssl` | Same Conformer encoder | Frame embeddings | No official checkpoint tested |
 
-The shared Conformer supports rotary or relative positional attention, Conv1D or Conv2D factor-4 subsampling, and convolution BatchNorm or LayerNorm. Original checkpoint `cfg` fields must be transferred into `config.json` accurately. Other subsampling factors, advanced emotion heads, batch inference, neural VAD, automatic checkpoint-config extraction, and all official-weight parity checks are **not yet implemented/verified**. v1/v2 and `emo` should be treated as experimental until checked with original checkpoint configurations. The source expects model-specific dimensions from the checkpoint. Model names are not interchangeable with weight files. Known model names are resolved through an exact registry; unknown names must supply an explicit `model_type`, and conflicting registered name/type combinations fail at load time instead of silently falling back to CTC.
+The shared Conformer supports rotary or relative positional attention, Conv1D or Conv2D strided subsampling factors 2/4/8/16/32 (powers of two), and convolution BatchNorm or LayerNorm. Factors 2 and 8 have been tested against the original PyTorch encoder on small random-weight configurations. Original checkpoint `cfg` fields must be transferred into `config.json` accurately. Arbitrary non-power-of-two subsampling, advanced emotion heads, GPU-vectorized batch execution, neural VAD, automatic checkpoint-config extraction, and all official-weight parity checks are **not yet implemented/verified**. Functional batch APIs run each recording independently, preserving output order without padding-induced changes. This is not a performance claim. v1/v2 and `emo` should be treated as experimental until checked with original checkpoint configurations. The source expects model-specific dimensions from the checkpoint. Model names are not interchangeable with weight files. Known model names are resolved through an exact registry; unknown names must supply an explicit `model_type`, and conflicting registered name/type combinations fail at load time instead of silently falling back to CTC.
 
 ## Configuration
 
-Place a checkpoint (`<model_name>.ckpt`, `<model_name>.safetensors`, `model.ckpt`, or `model.safetensors`) alongside a `config.json` manifest in a local model directory. For backwards compatibility, CTC also accepts `v3_ctc.ckpt` and `v3_ctc.safetensors`. Original PyTorch `state_dict` parameter names must be preserved, including the `encoder.` and `head.` prefixes.
+Place a checkpoint (`<model_name>.ckpt`, `<model_name>.safetensors`, `model.ckpt`, or `model.safetensors`) alongside a `config.json` manifest in a local model directory. `GigaAm::load()` also accepts an explicit `.ckpt`/`.pth`/`.pt`/`.safetensors` **file path** with a sibling `config.json`. The five upstream short names (`ctc`, `rnnt`, `e2e_ctc`, `e2e_rnnt`, `ssl`) resolve to `v3_*` weights/tokenizer filenames, matching Python's `load_model()` aliases. For backwards compatibility, CTC also accepts `v3_ctc.ckpt` and `v3_ctc.safetensors`. Original PyTorch `state_dict` parameter names must be preserved, including the `encoder.` and `head.` prefixes.
 
 The required dimensions are `n_mels`, `n_layers`, `d_model`, `n_heads`, `ff_expansion`, `conv_kernel`, `subsample_kernel`, `subsample_channels`, and `num_classes`. Optional architecture settings are `self_attention_model` (`rotary` / `rel_pos`), `subsampling` (`conv1d` / `conv2d`), `subsampling_factor` (currently 4), `conv_norm_type` (`batch_norm` / `layer_norm`), and `pos_emb_max_len` (defaults to **5000**, as in the original Python encoder). Note that the Python `RotaryPositionalEmbedding` also uses `pos_emb_max_len` as the **RoPE frequency base**: setting it to the common Transformer value 10000 silently changes GigaAM's output. The defaults describe the v3-style architecture, **not** a reliable description of every checkpoint. They **must match the selected checkpoint**; the defaults of upstream Python classes are not a verified GigaAM v3 checkpoint configuration.
 
@@ -60,6 +60,7 @@ cargo run --offline -p gigaam-rs -- transcribe ./weights ./MitaKind.wav --device
 cargo run --offline -p gigaam-rs -- embed ./ssl-weights ./short.wav ./embeddings.f32
 cargo run --offline -p gigaam-rs -- parity ./ctc-weights ./short.wav ./parity-output
 cargo run --offline -p gigaam-rs -- probe-audio ./MitaKind.wav
+cargo run --offline -p gigaam-rs -- transcribe-batch ./weights ./audio_paths.json
 cargo run --offline -p gigaam-rs -- transcribe ./weights ./short.wav --word-timestamps
 cargo run --offline -p gigaam-rs -- emotion ./emo-weights ./short.wav
 cargo run --offline -p gigaam-rs -- parity-encoder ./ssl-weights ./short.wav ./encoder-parity
@@ -68,6 +69,12 @@ cargo run --offline -p gigaam-rs -- parity-encoder ./ssl-weights ./short.wav ./e
 ### Checkpoint inspection (pure Rust)
 
 Use `gigaam-rs inspect-checkpoint ./v3_ctc.ckpt` to examine parameter shapes and likely encoder/head layers without running PyTorch or allocating converted FP32 weights; `--all` prints every tensor. This also accepts `.safetensors`. It is useful for auditing a newly downloaded model. The official checkpoint `cfg` is serialized as Python OmegaConf objects, so the metadata is **not automatically converted into `config.json`**: tensor shapes alone cannot establish attention heads, positional encoding policy, normalization or tokenizer ordering. Do not infer these silently from the filename. Real-weight parity remains required.
+
+### Batch and audio input
+
+`GigaAm::transcribe_batch_16k`, `transcribe_batch_with_timestamps_16k`, `infer_embeddings_batch_16k`, and `emotion_probs_batch_16k` accept slices of individual 16-kHz PCM recordings and produce ordered results. Each recording is executed independently (not a single padded GPU batch); failures are annotated with the input index. `transcribe-batch <model_dir> <audio_paths.json>` reads a JSON array of paths and prints per-file JSON transcriptions.
+
+The CLI's `load_audio_16k` accepts PCM WAV, FLAC, and Ogg/Vorbis via pure Rust decoders; unsupported formats such as MP3/AAC still need conversion upstream. The WAV path remains the original `hound` decoder for parity. The Symphonia codec dependency uses MPL-2.0; see `THIRD_PARTY_NOTICES.md`.
 
 ### External VAD / NeuroMita integration
 
@@ -88,7 +95,7 @@ Default build uses Burn Flex CPU, with CUDA (`--no-default-features --features c
 ## Verification (Rust 1.100.0, Linux Flex CPU)
 
 - `cargo check --offline -p gigaam-rs` — PASS.
-- `cargo test --offline -p gigaam-rs --lib` — **16/16 PASS**.
+- `cargo test --offline -p gigaam-rs --lib` — **22/22 PASS** (current test suite).
 - CTC logits from previous implementation are byte-identical after sharing Conformer encoder with RNN-T/SSL.
 - Python/PyTorch synthetic Conformer+CTC log-probability parity: maximum absolute difference **3.22e-6** (previous stage).
 - RNN-T synthetic blank-only case and two-symbols-per-frame case match PyTorch text and token counts; standalone two-step LSTM matches PyTorch to **1e-6**.
@@ -105,3 +112,14 @@ Default build uses Burn Flex CPU, with CUDA (`--no-default-features --features c
 ## Licensing
 
 This implementation is derived from the GigaAM architecture and code (MIT; Copyright (c) 2024 GigaChat Team); see the retained `LICENSE`. Check the license of any downloaded weights separately. Neither the checkpoint nor the user's audio is included in the crate.
+
+### Additional parity verification (small synthetic weights, Rust Flex CPU)
+
+- Python short aliases resolve to the correct version-3 checkpoint basename.
+- Loading an explicit `.ckpt` versus the containing model directory produced byte-identical SSL encoder output.
+- `transcribe-batch` produced ordered results for two local recordings.
+- WAV, FLAC and Ogg/Vorbis decoded and produced the same CTC text on a local synthetic checkpoint.
+- Dynamic `subsampling_factor=2` with Conv2D + rotary: output `[101,8]`, max absolute difference **4.77e-7** vs original PyTorch encoder.
+- Dynamic `subsampling_factor=8` with Conv1D + relative attention: output `[26,8]`, max absolute difference **5.96e-7**.
+
+These do **not** establish official-checkpoint parity, GPU timing, or support for the original Python training/ONNX-export API.

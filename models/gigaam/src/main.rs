@@ -39,7 +39,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
     if args.len() == 3 && args[1] == "probe-audio" {
-        let samples = audio::load_wav_16k(Path::new(&args[2]))?;
+        let samples = audio::load_audio_16k(Path::new(&args[2]))?;
         let pieces = audio::speech_chunks(&samples, 24 * audio::SAMPLE_RATE as usize);
         println!(
             "sample_rate={} samples={} duration={:.3} chunks={}",
@@ -61,8 +61,15 @@ fn main() -> Result<()> {
         return Ok(());
     }
     if args.len() < 4
-        || !["transcribe", "parity", "parity-encoder", "embed", "emotion"]
-            .contains(&args[1].as_str())
+        || ![
+            "transcribe",
+            "transcribe-batch",
+            "parity",
+            "parity-encoder",
+            "embed",
+            "emotion",
+        ]
+        .contains(&args[1].as_str())
     {
         eprintln!("Usage: gigaam-rs transcribe <model_dir> <audio.wav> [--device cpu|cuda|wgpu]");
         eprintln!("       gigaam-rs probe-audio <audio.wav>");
@@ -73,6 +80,9 @@ fn main() -> Result<()> {
         eprintln!("       gigaam-rs parity-encoder <ssl_model_dir> <audio.wav> <out_dir>");
         eprintln!("       gigaam-rs transcribe <model_dir> <audio.wav> --word-timestamps");
         eprintln!("       gigaam-rs transcribe <model_dir> <audio.wav> --segments-json <vad.json>");
+        eprintln!(
+            "       gigaam-rs transcribe-batch <model_dir> <audio_paths.json> [--device cpu|cuda|wgpu]"
+        );
         std::process::exit(2);
     }
     let selected = args
@@ -118,7 +128,30 @@ fn main() -> Result<()> {
         _ => bail!("unknown backend: {selected}"),
     };
     let model = GigaAm::load(Path::new(&args[2]), device).context("loading GigaAM weights")?;
-    let samples = audio::load_wav_16k(Path::new(&args[3]))?;
+    if args[1] == "transcribe-batch" {
+        let paths: Vec<String> = serde_json::from_slice(
+            &std::fs::read(&args[3])
+                .with_context(|| format!("reading audio path list {}", args[3]))?,
+        )
+        .context("transcribe-batch expects a JSON array of WAV paths")?;
+        let recordings = paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                audio::load_audio_16k(Path::new(path))
+                    .with_context(|| format!("loading batch recording {index}: {path}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let results = model.transcribe_batch_16k(&recordings)?;
+        let outputs: Vec<_> = paths
+            .iter()
+            .zip(results)
+            .map(|(path, result)| serde_json::json!({"file": path, "text": result.text}))
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&outputs)?);
+        return Ok(());
+    }
+    let samples = audio::load_audio_16k(Path::new(&args[3]))?;
     if args[1] == "emotion" {
         let probs = model.emotion_probs_16k(&samples)?;
         for (label, prob) in probs {

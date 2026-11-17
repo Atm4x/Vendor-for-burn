@@ -42,6 +42,18 @@ impl ModelKind {
     pub fn is_ssl(self) -> bool {
         self == Self::Ssl
     }
+    /// Python's load_model accepts short aliases for the v3 family.
+    pub fn canonical_model_name(name: &str) -> &str {
+        match name {
+            "ctc" => "v3_ctc",
+            "rnnt" => "v3_rnnt",
+            "e2e_ctc" => "v3_e2e_ctc",
+            "e2e_rnnt" => "v3_e2e_rnnt",
+            "ssl" => "v3_ssl",
+            other => other,
+        }
+    }
+
     pub fn from_model_name(name: &str) -> Option<Self> {
         const MODELS: &[(&str, ModelKind)] = &[
             ("ctc", ModelKind::Ctc),
@@ -173,8 +185,27 @@ pub struct TimedTranscription {
 }
 
 impl GigaAm {
+    /// Load from a model directory or a specific checkpoint file. A sibling
+    /// `config.json` supplies the architecture and tokenizer configuration.
     pub fn load(model_dir: &Path, device: Device) -> Result<Self> {
-        let cfg_path = model_dir.join("config.json");
+        let direct_checkpoint = match model_dir.extension().and_then(|ext| ext.to_str()) {
+            Some("ckpt" | "pth" | "pt" | "safetensors") => {
+                ensure!(
+                    model_dir.is_file(),
+                    "checkpoint not found: {}",
+                    model_dir.display()
+                );
+                Some(model_dir)
+            }
+            _ => None,
+        };
+        let model_root = match direct_checkpoint {
+            Some(path) => path
+                .parent()
+                .context("checkpoint has no parent directory")?,
+            None => model_dir,
+        };
+        let cfg_path = model_root.join("config.json");
         let manifest: ModelManifest = serde_json::from_slice(
             &std::fs::read(&cfg_path).with_context(|| format!("reading {}", cfg_path.display()))?,
         )?;
@@ -190,6 +221,10 @@ impl GigaAm {
         } else {
             Vec::new()
         };
+        let canonical_name = manifest
+            .model_name
+            .as_deref()
+            .map(ModelKind::canonical_model_name);
         let tokenizer = if kind.is_ssl() || kind.is_emo() {
             None
         } else {
@@ -198,14 +233,17 @@ impl GigaAm {
                     !path.contains('/') && !path.contains('\\') && !path.contains(".."),
                     "sentencepiece_model must be a filename in model_dir"
                 );
-                Some(model_dir.join(path))
+                Some(model_root.join(path))
             } else if matches!(kind, ModelKind::E2eCtc | ModelKind::E2eRnnt)
-                || manifest.model_name.as_deref() == Some("v1_rnnt")
+                || canonical_name == Some("v1_rnnt")
             {
-                Some(model_dir.join(match manifest.model_name.as_deref() {
+                Some(model_root.join(match canonical_name {
                     Some("v1_rnnt") => "v1_rnnt_tokenizer.model",
                     Some("v3_e2e_ctc") => "v3_e2e_ctc_tokenizer.model",
-                    _ => "v3_e2e_rnnt_tokenizer.model",
+                    Some("v3_e2e_rnnt") => "v3_e2e_rnnt_tokenizer.model",
+                    _ => {
+                        anyhow::bail!("custom E2E model requires sentencepiece_model filename")
+                    }
                 }))
             } else {
                 None
@@ -224,18 +262,22 @@ impl GigaAm {
                 name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
                 "model_name must contain only letters, numbers or underscores"
             );
-            weight_names.push(format!("{name}.ckpt"));
-            weight_names.push(format!("{name}.safetensors"));
+            let canonical = ModelKind::canonical_model_name(name);
+            weight_names.push(format!("{canonical}.ckpt"));
+            weight_names.push(format!("{canonical}.safetensors"));
         }
         weight_names.extend(["model.ckpt".to_owned(), "model.safetensors".to_owned()]);
         if kind == ModelKind::Ctc {
             weight_names.extend(["v3_ctc.ckpt".to_owned(), "v3_ctc.safetensors".to_owned()]);
         }
-        let weights_path = weight_names
-            .iter()
-            .map(|n| model_dir.join(n))
-            .find(|p| p.is_file())
-            .context("GigaAM model weights not found")?;
+        let weights_path = match direct_checkpoint {
+            Some(path) => path.to_owned(),
+            None => weight_names
+                .iter()
+                .map(|n| model_root.join(n))
+                .find(|p| p.is_file())
+                .context("GigaAM model weights not found")?,
+        };
         let mut weights = Weights::open(&weights_path)?;
         let network = match kind {
             ModelKind::Emo => Network::Emo(EmotionModel::load(
@@ -374,6 +416,81 @@ impl GigaAm {
         ))
     }
 
+    /// Ordered inference for multiple recordings. Each sample is executed
+    /// independently to avoid padding-dependent output changes in Conformer.
+    /// This is a functional batch API, not GPU-batched execution.
+    pub fn transcribe_batch_16k<T: AsRef<[f32]>>(
+        &self,
+        recordings: &[T],
+    ) -> Result<Vec<Transcription>> {
+        ensure!(
+            self.tokenizer.is_some(),
+            "batch transcription requires an ASR model"
+        );
+        recordings
+            .iter()
+            .enumerate()
+            .map(|(index, pcm)| {
+                self.transcribe_16k(pcm.as_ref())
+                    .with_context(|| format!("transcribing batch element {index}"))
+            })
+            .collect()
+    }
+
+    /// Ordered batch transcription with word timestamps relative to each sample.
+    pub fn transcribe_batch_with_timestamps_16k<T: AsRef<[f32]>>(
+        &self,
+        recordings: &[T],
+    ) -> Result<Vec<TimedTranscription>> {
+        ensure!(
+            self.tokenizer.is_some(),
+            "batch transcription requires an ASR model"
+        );
+        recordings
+            .iter()
+            .enumerate()
+            .map(|(index, pcm)| {
+                self.transcribe_with_timestamps_16k(pcm.as_ref())
+                    .with_context(|| format!("transcribing timed batch element {index}"))
+            })
+            .collect()
+    }
+
+    /// Ordered batch encoder outputs as (row-major frames, time, channels).
+    pub fn infer_embeddings_batch_16k<T: AsRef<[f32]>>(
+        &self,
+        recordings: &[T],
+    ) -> Result<Vec<(Vec<f32>, usize, usize)>> {
+        ensure!(self.kind.is_ssl(), "batch embeddings require an SSL model");
+        recordings
+            .iter()
+            .enumerate()
+            .map(|(index, pcm)| {
+                self.infer_embeddings_16k(pcm.as_ref())
+                    .with_context(|| format!("embedding batch element {index}"))
+            })
+            .collect()
+    }
+
+    /// Ordered utterance-level emotion probability distributions.
+    pub fn emotion_probs_batch_16k<T: AsRef<[f32]>>(
+        &self,
+        recordings: &[T],
+    ) -> Result<Vec<Vec<(String, f32)>>> {
+        ensure!(
+            self.kind.is_emo(),
+            "batch emotions require an emotion model"
+        );
+        recordings
+            .iter()
+            .enumerate()
+            .map(|(index, pcm)| {
+                self.emotion_probs_16k(pcm.as_ref())
+                    .with_context(|| format!("classifying batch element {index}"))
+            })
+            .collect()
+    }
+
     pub fn transcribe_16k(&self, pcm: &[f32]) -> Result<Transcription> {
         Ok(self.decode_with_length_16k(pcm)?.0)
     }
@@ -463,6 +580,23 @@ impl GigaAm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn python_short_model_names_resolve_to_v3_artifacts() {
+        for (alias, canonical, kind) in [
+            ("ctc", "v3_ctc", ModelKind::Ctc),
+            ("rnnt", "v3_rnnt", ModelKind::Rnnt),
+            ("e2e_ctc", "v3_e2e_ctc", ModelKind::E2eCtc),
+            ("e2e_rnnt", "v3_e2e_rnnt", ModelKind::E2eRnnt),
+            ("ssl", "v3_ssl", ModelKind::Ssl),
+        ] {
+            assert_eq!(ModelKind::canonical_model_name(alias), canonical);
+            assert_eq!(ModelKind::from_model_name(alias), Some(kind));
+            assert_eq!(ModelKind::canonical_model_name(canonical), canonical);
+        }
+        assert_eq!(ModelKind::canonical_model_name("v1_rnnt"), "v1_rnnt");
+        assert_eq!(ModelKind::canonical_model_name("custom"), "custom");
+    }
+
     #[test]
     fn model_name_selects_correct_architecture() {
         assert_eq!(ModelKind::from_model_name("v3_ctc"), Some(ModelKind::Ctc));
