@@ -1,0 +1,33 @@
+name: Git Bridge GigaAM Snapshot
+on:
+  push:
+    branches: ["codex/gigaam-bridge-export-20261117b"]
+    paths: [".github/workflows/gigaam-bridge-snapshot.yml"]
+permissions:
+  contents: read
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Create git bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "refs/heads/codex/gigaam-v3-ctc-burn-20261117:refs/heads/gigaam-base"
+          git bundle create "$RUNNER_TEMP/gigaam.bundle" refs/heads/gigaam-base
+          git bundle verify "$RUNNER_TEMP/gigaam.bundle"
+          (cd "$RUNNER_TEMP" && sha256sum gigaam.bundle > gigaam.bundle.sha256)
+          git rev-parse refs/heads/gigaam-base > "$RUNNER_TEMP/source-head.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gigaam-full-source-bundle
+          path: |
+            ${{ runner.temp }}/gigaam.bundle
+            ${{ runner.temp }}/gigaam.bundle.sha256
+            ${{ runner.temp }}/source-head.txt
+          retention-days: 1
+          compression-level: 0
