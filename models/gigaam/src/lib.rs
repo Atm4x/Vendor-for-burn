@@ -386,6 +386,19 @@ pub struct TimedTranscription {
     pub end: f64,
 }
 
+impl TimedTranscription {
+    fn with_sample_offset(mut self, start_sample: usize) -> Self {
+        let offset = start_sample as f64 / SAMPLE_RATE as f64;
+        self.start = offset;
+        self.end += offset;
+        for word in &mut self.words {
+            word.start = ((word.start + offset) * 1000.0).round_ties_even() / 1000.0;
+            word.end = ((word.end + offset) * 1000.0).round_ties_even() / 1000.0;
+        }
+        self
+    }
+}
+
 /// Build a native inference manifest from an original PyTorch checkpoint's
 /// OmegaConf metadata without launching Python or writing a sidecar file.
 pub fn inspect_native_manifest(path: &Path) -> Result<serde_json::Value> {
@@ -565,10 +578,7 @@ impl GigaAm {
     }
 
     pub fn emotion_probs_16k(&self, pcm: &[f32]) -> Result<Vec<(String, f32)>> {
-        ensure!(
-            !pcm.is_empty() && pcm.len() <= SAMPLE_RATE as usize * 25,
-            "emotion inference requires 0 < audio duration <= 25s"
-        );
+        ensure!(!pcm.is_empty(), "emotion inference requires nonempty audio");
         let model = match &self.network {
             Network::Emo(model) => model,
             _ => bail!("emotion_probs_16k requires an emotion model"),
@@ -587,10 +597,6 @@ impl GigaAm {
     }
 
     pub fn infer_logits_16k(&self, pcm: &[f32]) -> Result<(Vec<f32>, usize)> {
-        ensure!(
-            pcm.len() <= SAMPLE_RATE as usize * 25,
-            "audio exceeds 25 seconds: split before inference"
-        );
         let features = log_mel(pcm, self.n_mels)?;
         match &self.network {
             Network::Ctc(m) => m.infer_logits(&features, &self.device),
@@ -599,10 +605,6 @@ impl GigaAm {
     }
 
     pub fn infer_embeddings_16k(&self, pcm: &[f32]) -> Result<(Vec<f32>, usize, usize)> {
-        ensure!(
-            pcm.len() <= SAMPLE_RATE as usize * 25,
-            "audio exceeds 25 seconds: split before inference"
-        );
         let features = log_mel(pcm, self.n_mels)?;
         let net = match &self.network {
             Network::Ssl(net) => net,
@@ -763,15 +765,10 @@ impl GigaAm {
         let chunks = speech_chunks_in_regions(samples, regions, SAMPLE_RATE as usize * 24)?;
         let mut output = Vec::with_capacity(chunks.len());
         for chunk in chunks {
-            let mut timed = self.transcribe_with_timestamps_16k(chunk.samples)?;
-            let offset = chunk.start_sample as f64 / SAMPLE_RATE as f64;
-            timed.start = offset;
-            timed.end += offset;
-            for word in &mut timed.words {
-                word.start += offset;
-                word.end += offset;
-            }
-            output.push(timed);
+            output.push(
+                self.transcribe_with_timestamps_16k(chunk.samples)?
+                    .with_sample_offset(chunk.start_sample),
+            );
         }
         Ok(output)
     }
@@ -794,15 +791,10 @@ impl GigaAm {
     ) -> Result<Vec<TimedTranscription>> {
         let mut segments = Vec::new();
         for chunk in speech_chunks_with_offsets(samples, SAMPLE_RATE as usize * 24) {
-            let mut timed = self.transcribe_with_timestamps_16k(chunk.samples)?;
-            let offset = chunk.start_sample as f64 / SAMPLE_RATE as f64;
-            timed.start = offset;
-            timed.end += offset;
-            for word in &mut timed.words {
-                word.start += offset;
-                word.end += offset;
-            }
-            segments.push(timed);
+            segments.push(
+                self.transcribe_with_timestamps_16k(chunk.samples)?
+                    .with_sample_offset(chunk.start_sample),
+            );
         }
         Ok(segments)
     }
@@ -818,6 +810,29 @@ impl GigaAm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn longform_word_timestamps_use_absolute_millisecond_grid() {
+        let local = TimedTranscription {
+            transcription: Transcription {
+                text: "слово".to_owned(),
+                token_ids: vec![0],
+                frames: vec![1],
+            },
+            words: vec![Word {
+                text: "слово".to_owned(),
+                start: 0.10137,
+                end: 0.48976,
+            }],
+            start: 0.0,
+            end: 0.5,
+        };
+        let shifted = local.with_sample_offset(20_805);
+        assert!((shifted.start - 1.3003125).abs() < 1e-12);
+        assert!((shifted.end - 1.8003125).abs() < 1e-12);
+        assert!((shifted.words[0].start - 1.402).abs() < 1e-12);
+        assert!((shifted.words[0].end - 1.790).abs() < 1e-12);
+    }
     #[test]
     fn python_short_model_names_resolve_to_v3_artifacts() {
         for (alias, canonical, kind) in [

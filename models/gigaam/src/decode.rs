@@ -94,44 +94,45 @@ pub fn words_from_frames(
     let frame_shift =
         sample_count as f64 / crate::audio::SAMPLE_RATE as f64 / encoded_frames as f64;
     let mut result = Vec::new();
-    let mut current = String::new();
-    let mut first_frame = 0;
-    let mut last_frame = 0;
+    let mut current_pieces = Vec::<&str>::new();
+    let mut current_frames = Vec::<usize>::new();
+
+    let commit = |pieces: &mut Vec<&str>, frames: &mut Vec<usize>, words: &mut Vec<Word>| {
+        if pieces.is_empty() {
+            return;
+        }
+        let combined = pieces.concat();
+        let text = combined.trim();
+        if !text.is_empty() {
+            words.push(Word {
+                text: text.to_owned(),
+                start: frames[0] as f64 * frame_shift,
+                end: (frames[frames.len() - 1] + 1) as f64 * frame_shift,
+            });
+        }
+        pieces.clear();
+        frames.clear();
+    };
 
     for (&token, &frame) in token_ids.iter().zip(token_frames.iter()) {
         ensure!(
             frame < encoded_frames,
             "token frame outside encoder sequence"
         );
-        let mut piece = tokenizer.id_to_str(token)?;
-        let boundary = piece.starts_with('▁') || piece == " ";
-        if boundary && !current.trim().is_empty() {
-            result.push(Word {
-                text: current.trim().to_owned(),
-                start: first_frame as f64 * frame_shift,
-                end: (last_frame + 1) as f64 * frame_shift,
-            });
-            current.clear();
-        }
-        if piece == " " {
+        let piece = tokenizer.id_to_str(token)?;
+        let piece = if let Some(rest) = piece.strip_prefix('▁') {
+            commit(&mut current_pieces, &mut current_frames, &mut result);
+            rest
+        } else if piece == " " {
+            commit(&mut current_pieces, &mut current_frames, &mut result);
             continue;
-        }
-        if boundary {
-            piece = &piece['▁'.len_utf8()..];
-        }
-        if current.is_empty() {
-            first_frame = frame;
-        }
-        current.push_str(piece);
-        last_frame = frame;
+        } else {
+            piece
+        };
+        current_pieces.push(piece);
+        current_frames.push(frame);
     }
-    if !current.trim().is_empty() {
-        result.push(Word {
-            text: current.trim().to_owned(),
-            start: first_frame as f64 * frame_shift,
-            end: (last_frame + 1) as f64 * frame_shift,
-        });
-    }
+    commit(&mut current_pieces, &mut current_frames, &mut result);
     Ok(result)
 }
 
@@ -160,6 +161,41 @@ mod timestamp_tests {
         assert_eq!(words[1].text, "мир!");
         assert!((words[1].start - 0.16).abs() < 1e-8);
         assert!((words[1].end - 0.24).abs() < 1e-8);
+    }
+
+    #[test]
+    fn empty_sentencepiece_boundary_counts_as_a_frame() {
+        let tok = Tokenizer::SentencePiece(vec![
+            ("▁".to_owned(), 1),
+            ("д".to_owned(), 1),
+            ("о".to_owned(), 1),
+            (" ".to_owned(), 1),
+            ("▁кот".to_owned(), 1),
+        ]);
+        let words =
+            words_from_frames(&tok, &[0, 1, 2, 3, 4], &[1, 3, 4, 6, 8], 16_000, 10).unwrap();
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[0].text, "до");
+        assert!((words[0].start - 0.1).abs() < 1e-12);
+        assert!((words[0].end - 0.5).abs() < 1e-12);
+        assert_eq!(words[1].text, "кот");
+        assert!((words[1].start - 0.8).abs() < 1e-12);
+    }
+
+    #[test]
+    fn repeated_empty_pieces_do_not_leak_into_next_word() {
+        let tok = Tokenizer::SentencePiece(vec![
+            ("▁".to_owned(), 1),
+            (" ".to_owned(), 1),
+            ("▁да".to_owned(), 1),
+            ("!".to_owned(), 1),
+        ]);
+        let words =
+            words_from_frames(&tok, &[0, 0, 1, 2, 3], &[0, 1, 2, 5, 7], 16_000, 10).unwrap();
+        assert_eq!(words.len(), 1);
+        assert_eq!(words[0].text, "да!");
+        assert!((words[0].start - 0.5).abs() < 1e-12);
+        assert!((words[0].end - 0.8).abs() < 1e-12);
     }
 
     #[test]

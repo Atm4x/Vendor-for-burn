@@ -221,7 +221,15 @@ pub struct Features {
 }
 
 pub fn log_mel(samples: &[f32], n_mels: usize) -> Result<Features> {
-    ensure!(!samples.is_empty(), "empty audio input");
+    ensure!(
+        samples.len() > FFT_SIZE / 2,
+        "audio must have more than {} samples for reflect-padded STFT",
+        FFT_SIZE / 2
+    );
+    ensure!(
+        samples.iter().all(|sample| sample.is_finite()),
+        "audio contains non-finite PCM samples"
+    );
     ensure!((1..=256).contains(&n_mels), "n_mels outside 1..=256");
     let frames = samples.len() / HOP + 1;
     let bins = FFT_SIZE / 2 + 1;
@@ -382,6 +390,23 @@ pub fn speech_chunks(samples: &[f32], max_samples: usize) -> Vec<&[f32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn log_mel_rejects_torchaudio_reflect_padding_underflow() {
+        for count in [0, 1, 199, 200] {
+            assert!(log_mel(&vec![0.0; count], 64).is_err(), "length {count}");
+        }
+        assert_eq!(log_mel(&vec![0.0; 201], 64).unwrap().frames, 2);
+    }
+
+    #[test]
+    fn log_mel_rejects_invalid_pcm_values() {
+        let mut samples = vec![0.0; 16_000];
+        samples[400] = f32::NAN;
+        assert!(log_mel(&samples, 64).is_err());
+        samples[400] = f32::INFINITY;
+        assert!(log_mel(&samples, 64).is_err());
+    }
+
     #[test]
     fn mel_frame_count() {
         let m = log_mel(&vec![0.0; 16000], 64).unwrap();
