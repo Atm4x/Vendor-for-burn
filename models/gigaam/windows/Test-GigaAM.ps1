@@ -28,8 +28,14 @@ function Invoke-TestCase {
     )
     $log = Join-Path $ResultsDir "$Name.log"
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
-    $output = (& $exe @CommandArgs 2>&1 | Out-String)
-    $code = $LASTEXITCODE
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = (& $exe @CommandArgs 2>&1 | Out-String)
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
     $watch.Stop()
     $filePresent = -not $RequiredFile -or ((Test-Path -LiteralPath $RequiredFile -PathType Leaf) -and ((Get-Item -LiteralPath $RequiredFile).Length -gt 0))
     $passed = ($code -eq 0) -and $filePresent
@@ -60,6 +66,7 @@ if (-not $SkipGpu) {
         }
     }
     Invoke-TestCase -Name 'ctc' -CommandArgs @('transcribe', (Join-Path $fixtureDir 'ctc'), $audio, '--device', $Device)
+    Invoke-TestCase -Name 'ctc-v3-mel' -CommandArgs @('transcribe', (Join-Path $fixtureDir 'ctc-v3-mel'), $audio, '--device', $Device)
     Invoke-TestCase -Name 'rnnt' -CommandArgs @('transcribe', (Join-Path $fixtureDir 'rnnt'), $audio, '--device', $Device)
     $embeddings = Join-Path $ResultsDir 'ssl_embeddings.f32'
     Invoke-TestCase -Name 'ssl' -CommandArgs @('embed', (Join-Path $fixtureDir 'ssl'), $audio, $embeddings, '--device', $Device) -RequiredFile $embeddings
@@ -68,6 +75,7 @@ if (-not $SkipGpu) {
     Invoke-TestCase -Name 'ctc-parity' -CommandArgs @('parity', (Join-Path $fixtureDir 'ctc'), $audio, $parity, '--device', $Device) -RequiredFile (Join-Path $parity 'logits.f32')
     if ([bool]$RealModelPath -ne [bool]$RealAudioPath) { throw 'Pass both -RealModelPath and -RealAudioPath, or neither.' }
     if ($RealModelPath) {
+        Invoke-TestCase -Name 'real-model-config' -CommandArgs @('inspect-config', $RealModelPath)
         Invoke-TestCase -Name 'real-model-asr' -CommandArgs @('transcribe', $RealModelPath, $RealAudioPath, '--device', $Device)
     }
 } else {

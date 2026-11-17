@@ -193,8 +193,46 @@ fn htk_mel_to_hz(mel: f32) -> f32 {
     700.0 * (10f32.powf(mel / 2595.0) - 1.0)
 }
 
-fn mel_weights(n_mels: usize) -> Vec<f32> {
-    let bins = FFT_SIZE / 2 + 1;
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct MelConfig {
+    pub n_fft: usize,
+    pub win_length: usize,
+    pub hop_length: usize,
+    pub center: bool,
+}
+
+impl Default for MelConfig {
+    fn default() -> Self {
+        Self {
+            n_fft: FFT_SIZE,
+            win_length: FFT_SIZE,
+            hop_length: HOP,
+            center: true,
+        }
+    }
+}
+
+impl MelConfig {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.n_fft >= 2 && self.n_fft <= 8192,
+            "n_fft outside 2..=8192"
+        );
+        ensure!(
+            self.win_length >= 1 && self.win_length <= self.n_fft,
+            "win_length must be between 1 and n_fft"
+        );
+        ensure!(
+            self.hop_length >= 1 && self.hop_length <= 8192,
+            "invalid hop_length"
+        );
+        Ok(())
+    }
+}
+
+fn mel_weights(n_mels: usize, n_fft: usize) -> Vec<f32> {
+    let bins = n_fft / 2 + 1;
     let low = htk_hz_to_mel(0.0);
     let high = htk_hz_to_mel(SAMPLE_RATE as f32 / 2.0);
     let mel_points: Vec<f32> = (0..(n_mels + 2))
@@ -203,7 +241,7 @@ fn mel_weights(n_mels: usize) -> Vec<f32> {
     let mut weights = vec![0f32; n_mels * bins];
     for m in 0..n_mels {
         for k in 0..bins {
-            let f = k as f32 * SAMPLE_RATE as f32 / FFT_SIZE as f32;
+            let f = k as f32 * SAMPLE_RATE as f32 / n_fft as f32;
             let lo = (f - mel_points[m]) / (mel_points[m + 1] - mel_points[m]);
             let hi = (mel_points[m + 2] - f) / (mel_points[m + 2] - mel_points[m + 1]);
             weights[m * bins + k] = lo.min(hi).max(0.0);
@@ -221,39 +259,65 @@ pub struct Features {
 }
 
 pub fn log_mel(samples: &[f32], n_mels: usize) -> Result<Features> {
-    ensure!(
-        samples.len() > FFT_SIZE / 2,
-        "audio must have more than {} samples for reflect-padded STFT",
-        FFT_SIZE / 2
-    );
+    log_mel_with_config(samples, n_mels, MelConfig::default())
+}
+
+pub fn log_mel_with_config(samples: &[f32], n_mels: usize, config: MelConfig) -> Result<Features> {
+    config.validate()?;
+    let n_fft = config.n_fft;
+    let hop = config.hop_length;
+    if config.center {
+        ensure!(
+            samples.len() > n_fft / 2,
+            "audio must have more than {} samples for reflect-padded STFT",
+            n_fft / 2
+        );
+    } else {
+        ensure!(
+            samples.len() >= n_fft,
+            "audio must have at least {n_fft} samples for uncentered STFT"
+        );
+    }
     ensure!(
         samples.iter().all(|sample| sample.is_finite()),
         "audio contains non-finite PCM samples"
     );
     ensure!((1..=256).contains(&n_mels), "n_mels outside 1..=256");
-    let frames = samples.len() / HOP + 1;
-    let bins = FFT_SIZE / 2 + 1;
-    let weights = mel_weights(n_mels);
+    let frames = if config.center {
+        samples.len() / hop + 1
+    } else {
+        (samples.len() - n_fft) / hop + 1
+    };
+    let bins = n_fft / 2 + 1;
+    let weights = mel_weights(n_mels, n_fft);
     let mut data = vec![0f32; n_mels * frames];
-    let hann: Vec<f32> = (0..FFT_SIZE)
-        .map(|i| 0.5 - 0.5 * (2.0 * PI * i as f32 / FFT_SIZE as f32).cos())
-        .collect();
+    let window_start = (n_fft - config.win_length) / 2;
+    let mut hann = vec![0.0f32; n_fft];
+    for i in 0..config.win_length {
+        hann[window_start + i] = 0.5 - 0.5 * (2.0 * PI * i as f32 / config.win_length as f32).cos();
+    }
     let mut planner = FftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(FFT_SIZE);
+    let fft = planner.plan_fft_forward(n_fft);
     let mut scratch = vec![Complex::<f32>::default(); fft.get_inplace_scratch_len()];
-    let mut buffer = vec![Complex::<f32>::default(); FFT_SIZE];
+    let mut buffer = vec![Complex::<f32>::default(); n_fft];
     for t in 0..frames {
-        let center = (t * HOP) as isize;
-        for i in 0..FFT_SIZE {
-            let sample = samples
-                [reflect_index(center + i as isize - (FFT_SIZE / 2) as isize, samples.len())];
-            buffer[i] = Complex::new(sample * hann[i], 0.0);
+        let start = t * hop;
+        for i in 0..n_fft {
+            let index = if config.center {
+                reflect_index(
+                    start as isize + i as isize - (n_fft / 2) as isize,
+                    samples.len(),
+                )
+            } else {
+                start + i
+            };
+            buffer[i] = Complex::new(samples[index] * hann[i], 0.0);
         }
         fft.process_with_scratch(&mut buffer, &mut scratch);
         for m in 0..n_mels {
             let mut mel = 0.0f32;
             for k in 0..bins {
-                mel += (buffer[k].norm_sqr()) * weights[m * bins + k]
+                mel += buffer[k].norm_sqr() * weights[m * bins + k];
             }
             data[m * frames + t] = mel.clamp(1e-9, 1e9).ln();
         }
@@ -509,6 +573,29 @@ mod tests {
         assert!(log_mel(&samples, 64).is_err());
         samples[400] = f32::INFINITY;
         assert!(log_mel(&samples, 64).is_err());
+    }
+
+    #[test]
+    fn uncentered_stft_has_official_v3_frame_count() {
+        let config = MelConfig {
+            n_fft: 320,
+            win_length: 320,
+            hop_length: 160,
+            center: false,
+        };
+        assert!(log_mel_with_config(&vec![0.0; 319], 64, config).is_err());
+        assert_eq!(
+            log_mel_with_config(&vec![0.0; 320], 64, config)
+                .unwrap()
+                .frames,
+            1
+        );
+        assert_eq!(
+            log_mel_with_config(&vec![0.0; 16_000], 64, config)
+                .unwrap()
+                .frames,
+            99
+        );
     }
 
     #[test]

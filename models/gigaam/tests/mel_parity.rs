@@ -26,3 +26,59 @@ fn log_mel_matches_torchaudio_reference() {
     assert!(max_error < 0.002, "max log-mel error: {max_error}");
     assert!(mean_error < 5e-5, "mean log-mel error: {mean_error}");
 }
+
+#[test]
+fn log_mel_matches_official_v3_uncentered_torchaudio() {
+    use gigaam_rs::audio::{MelConfig, log_mel_with_config};
+
+    let audio = floats(include_bytes!("fixtures/log_mel_input_16k.f32"));
+    let expected = floats(include_bytes!("fixtures/log_mel_torchaudio_v3_320.f32"));
+    let config = MelConfig {
+        n_fft: 320,
+        win_length: 320,
+        hop_length: 160,
+        center: false,
+    };
+    let calculated = log_mel_with_config(&audio, 64, config).unwrap();
+    assert_eq!(calculated.frames, 26);
+    assert_eq!(calculated.values.len(), expected.len());
+    let max_error = calculated
+        .values
+        .iter()
+        .zip(expected.iter())
+        .map(|(actual, reference)| (actual - reference).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_error < 0.003,
+        "official v3 max log-mel error: {max_error}"
+    );
+}
+
+#[test]
+fn log_mel_matches_torchaudio_when_window_is_shorter_than_fft() {
+    use gigaam_rs::audio::{MelConfig, log_mel_with_config};
+
+    let audio = floats(include_bytes!("fixtures/log_mel_input_16k.f32"));
+    let expected = floats(include_bytes!(
+        "fixtures/log_mel_torchaudio_unaligned_512.f32"
+    ));
+    let config = MelConfig {
+        n_fft: 512,
+        win_length: 320,
+        hop_length: 160,
+        center: false,
+    };
+    let calculated = log_mel_with_config(&audio, 64, config).unwrap();
+    assert_eq!(calculated.frames, 25);
+    assert_eq!(calculated.values.len(), expected.len());
+    let max_error = calculated
+        .values
+        .iter()
+        .zip(expected.iter())
+        .map(|(actual, reference)| (actual - reference).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_error < 0.003,
+        "padded-window max log-mel error: {max_error}"
+    );
+}

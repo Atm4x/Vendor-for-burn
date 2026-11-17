@@ -58,3 +58,5 @@ This should **not** be interpreted as a CubeCL GPU pass.
 Share `results/summary.json`, relevant `results/*.log`, `results/nvidia-smi.txt` when available, and the included `BUILD_STATUS.txt`. If the CLI says the checkpoint configuration is unsupported, capture `inspect-config` and `inspect-checkpoint` output. Never paste private model data or audio if you do not intend to share it.
 
 `gigaam-rs.exe` is a CUDA-only build. `-Device cpu` or `-Device flex` requires a separately compiled backend; it does not silently fall back. GitHub-hosted Windows runners compile the executable but do not provide an NVIDIA GPU for inference verification.
+
+The CTC test suite includes `ctc-v3-mel`, a tiny synthetic checkpoint using official v3 STFT geometry (`n_fft=320`, `center=false`) for a genuine CubeCL CUDA smoke test. With `-RealModelPath`, `Test-GigaAM.ps1` also saves `real-model-config.log` before attempting ASR; errors from a native executable are captured and added to `summary.json` instead of terminating the PowerShell process prematurely. Official checkpoint validation is separate from the synthetic test suite.

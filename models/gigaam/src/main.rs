@@ -205,7 +205,7 @@ fn main() -> Result<()> {
         }
         let out = Path::new(&args[4]);
         std::fs::create_dir_all(out)?;
-        let features = audio::log_mel(&samples, model.n_mels())?;
+        let features = model.extract_features_16k(&samples)?;
         let (logits, time) = model.infer_logits_16k(&samples)?;
         let mel: Vec<u8> = features
             .values
@@ -224,7 +224,7 @@ fn main() -> Result<()> {
         }
         let out = Path::new(&args[4]);
         std::fs::create_dir_all(out)?;
-        let features = audio::log_mel(&samples, model.n_mels())?;
+        let features = model.extract_features_16k(&samples)?;
         let (encoded, frames, channels) = model.infer_embeddings_16k(&samples)?;
         std::fs::write(
             out.join("mel.f32"),

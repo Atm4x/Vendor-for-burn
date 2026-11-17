@@ -9,8 +9,8 @@ pub mod weights;
 
 use anyhow::{Context, Result, bail, ensure};
 use audio::{
-    SAMPLE_RATE, SpeechRegion, VadGrouping, log_mel, speech_chunks, speech_chunks_grouped_vad,
-    speech_chunks_in_regions, speech_chunks_with_offsets,
+    MelConfig, SAMPLE_RATE, SpeechRegion, VadGrouping, log_mel_with_config, speech_chunks,
+    speech_chunks_grouped_vad, speech_chunks_in_regions, speech_chunks_with_offsets,
 };
 use burn::tensor::Device;
 use decode::{Transcription, Word, ctc_argmax, words_from_frames};
@@ -103,6 +103,8 @@ struct ModelManifest {
     rnnt: Option<RnntConfig>,
     #[serde(default)]
     id2name: Option<EmotionLabels>,
+    #[serde(default)]
+    mel: MelConfig,
 }
 
 impl ModelManifest {
@@ -159,33 +161,33 @@ impl ModelManifest {
             sample_rate == audio::SAMPLE_RATE as usize,
             "preprocessor sample_rate={sample_rate} not supported (only 16000 Hz)"
         );
-        for (name, expected) in [
-            ("n_fft", 400),
-            ("hop_length", 160),
-            ("win_length", 400),
-            ("pad", 0),
-        ] {
-            ensure!(
-                field(pre, name, expected)? == expected,
-                "preprocessor.{name} differs from native GigaAM log-mel: expected {expected}"
-            );
-        }
+        let mel = MelConfig {
+            n_fft: field(pre, "n_fft", 400)?,
+            hop_length: field(pre, "hop_length", 160)?,
+            win_length: field(pre, "win_length", 400)?,
+            center: pre.get("center").map_or(Ok(true), |v| {
+                v.as_bool().context("preprocessor.center must be a boolean")
+            })?,
+        };
+        mel.validate()?;
+        ensure!(
+            field(pre, "pad", 0)? == 0,
+            "preprocessor.pad is not supported"
+        );
         for (name, expected) in [("f_min", 0.0), ("f_max", 8000.0), ("power", 2.0)] {
             if let Some(value) = pre.get(name) {
                 ensure!(
-                    value.is_null() && name == "f_max" || value.as_f64() == Some(expected),
+                    (value.is_null() && name == "f_max") || value.as_f64() == Some(expected),
                     "preprocessor.{name} is not supported by native log-mel"
                 );
             }
         }
-        ensure!(
-            pre.get("center").is_none_or(|v| v.as_bool() == Some(true)),
-            "preprocessor.center=false not implemented"
-        );
-        ensure!(
-            pre.get("norm").is_none_or(serde_json::Value::is_null),
-            "preprocessor.norm not implemented"
-        );
+        for name in ["norm", "mel_norm"] {
+            ensure!(
+                pre.get(name).is_none_or(serde_json::Value::is_null),
+                "preprocessor.{name} not supported by native log-mel"
+            );
+        }
         ensure!(
             pre.get("mel_scale")
                 .is_none_or(|v| v.as_str() == Some("htk")),
@@ -301,6 +303,7 @@ impl ModelManifest {
             sentencepiece_model: sp_name,
             rnnt,
             id2name,
+            mel,
         })
     }
 }
@@ -372,6 +375,7 @@ pub struct GigaAm {
     tokenizer: Option<Tokenizer>,
     device: Device,
     n_mels: usize,
+    mel: MelConfig,
     kind: ModelKind,
     emotion_names: Vec<String>,
 }
@@ -458,6 +462,8 @@ impl GigaAm {
             ModelManifest::from_checkpoint(path)?
         };
         manifest.config.validate()?;
+        manifest.mel.validate()?;
+        let mel = manifest.mel;
         let kind = manifest.resolve_kind()?;
         let num_classes = manifest.config.num_classes;
         let n_mels = manifest.config.n_mels;
@@ -565,6 +571,7 @@ impl GigaAm {
             tokenizer,
             device,
             n_mels,
+            mel,
             kind,
             emotion_names,
         })
@@ -583,7 +590,7 @@ impl GigaAm {
             Network::Emo(model) => model,
             _ => bail!("emotion_probs_16k requires an emotion model"),
         };
-        let features = log_mel(pcm, self.n_mels)?;
+        let features = log_mel_with_config(pcm, self.n_mels, self.mel)?;
         let values = model.infer_probs(&features, &self.device)?;
         ensure!(
             values.len() == self.emotion_names.len(),
@@ -596,8 +603,16 @@ impl GigaAm {
         self.n_mels
     }
 
+    pub fn extract_features_16k(&self, pcm: &[f32]) -> Result<audio::Features> {
+        log_mel_with_config(pcm, self.n_mels, self.mel)
+    }
+
+    pub fn mel_config(&self) -> MelConfig {
+        self.mel
+    }
+
     pub fn infer_logits_16k(&self, pcm: &[f32]) -> Result<(Vec<f32>, usize)> {
-        let features = log_mel(pcm, self.n_mels)?;
+        let features = log_mel_with_config(pcm, self.n_mels, self.mel)?;
         match &self.network {
             Network::Ctc(m) => m.infer_logits(&features, &self.device),
             _ => bail!("infer_logits_16k is only available for CTC variants"),
@@ -605,7 +620,7 @@ impl GigaAm {
     }
 
     pub fn infer_embeddings_16k(&self, pcm: &[f32]) -> Result<(Vec<f32>, usize, usize)> {
-        let features = log_mel(pcm, self.n_mels)?;
+        let features = log_mel_with_config(pcm, self.n_mels, self.mel)?;
         let net = match &self.network {
             Network::Ssl(net) => net,
             _ => bail!("infer_embeddings_16k is only available for SSL models"),
@@ -623,7 +638,7 @@ impl GigaAm {
             .tokenizer
             .as_ref()
             .context("non-ASR models do not produce transcripts")?;
-        let features = log_mel(pcm, self.n_mels)?;
+        let features = log_mel_with_config(pcm, self.n_mels, self.mel)?;
         let (ids, frames, encoded_len) = match &self.network {
             Network::Ctc(m) => {
                 let (logits, time) = m.infer_logits(&features, &self.device)?;
@@ -919,6 +934,7 @@ mod tests {
             sentencepiece_model: None,
             rnnt: None,
             id2name: None,
+            mel: MelConfig::default(),
         };
         assert!(
             cfg(Some("v3_rnnt"), Some(ModelKind::Ctc))
@@ -979,6 +995,7 @@ mod tests {
         });
         let path = Path::new("v3_ctc.ckpt");
         let manifest = ModelManifest::from_upstream_values(original, path, None).unwrap();
+        assert_eq!(manifest.mel, MelConfig::default());
         assert_eq!(manifest.config.n_layers, 22);
         assert_eq!(manifest.config.ff_expansion, 6);
         assert_eq!(manifest.config.conv_kernel, 15);
@@ -1019,7 +1036,31 @@ mod tests {
             "encoder":{"feat_in":8,"d_model":8,"n_heads":2,"n_layers":1}});
         let mut bad = base.clone();
         bad["preprocessor"]["hop_length"] = serde_json::json!(256);
+        assert_eq!(
+            ModelManifest::from_upstream_values(bad, Path::new("v3_ssl.ckpt"), None)
+                .unwrap()
+                .mel
+                .hop_length,
+            256
+        );
+        let mut bad = base.clone();
+        bad["preprocessor"]["n_fft"] = serde_json::json!(128);
         assert!(ModelManifest::from_upstream_values(bad, Path::new("v3_ssl.ckpt"), None).is_err());
+        let mut official = base.clone();
+        official["preprocessor"]["n_fft"] = serde_json::json!(320);
+        official["preprocessor"]["win_length"] = serde_json::json!(320);
+        official["preprocessor"]["center"] = serde_json::json!(false);
+        let parsed =
+            ModelManifest::from_upstream_values(official, Path::new("v3_ssl.ckpt"), None).unwrap();
+        assert_eq!(
+            parsed.mel,
+            MelConfig {
+                n_fft: 320,
+                win_length: 320,
+                hop_length: 160,
+                center: false
+            }
+        );
         let mut bad = base.clone();
         bad["encoder"]["feat_in"] = serde_json::json!(16);
         assert!(ModelManifest::from_upstream_values(bad, Path::new("v3_ssl.ckpt"), None).is_err());

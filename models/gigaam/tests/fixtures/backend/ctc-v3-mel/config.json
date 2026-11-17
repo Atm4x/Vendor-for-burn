@@ -1,0 +1,28 @@
+{
+  "model_name": "v3_ctc",
+  "n_mels": 8,
+  "n_layers": 1,
+  "d_model": 8,
+  "n_heads": 2,
+  "ff_expansion": 2,
+  "conv_kernel": 3,
+  "subsample_kernel": 3,
+  "subsample_channels": 8,
+  "num_classes": 4,
+  "self_attention_model": "rotary",
+  "conv_norm_type": "batch_norm",
+  "subsampling": "conv2d",
+  "subsampling_factor": 4,
+  "pos_emb_max_len": 5000,
+  "vocabulary": [
+    "а",
+    "б",
+    "в"
+  ],
+  "mel": {
+    "n_fft": 320,
+    "win_length": 320,
+    "hop_length": 160,
+    "center": false
+  }
+}
