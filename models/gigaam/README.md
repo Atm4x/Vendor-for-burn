@@ -65,6 +65,22 @@ cargo run --offline -p gigaam-rs -- emotion ./emo-weights ./short.wav
 cargo run --offline -p gigaam-rs -- parity-encoder ./ssl-weights ./short.wav ./encoder-parity
 ```
 
+### Checkpoint inspection (pure Rust)
+
+Use `gigaam-rs inspect-checkpoint ./v3_ctc.ckpt` to examine parameter shapes and likely encoder/head layers without running PyTorch or allocating converted FP32 weights; `--all` prints every tensor. This also accepts `.safetensors`. It is useful for auditing a newly downloaded model. The official checkpoint `cfg` is serialized as Python OmegaConf objects, so the metadata is **not automatically converted into `config.json`**: tensor shapes alone cannot establish attention heads, positional encoding policy, normalization or tokenizer ordering. Do not infer these silently from the filename. Real-weight parity remains required.
+
+### External VAD / NeuroMita integration
+
+The library does **not** instantiate a second VAD. Pass detected speech intervals from the application's VAD as half-open sample ranges via `audio::SpeechRegion { start_sample, end_sample }` and call `GigaAm::transcribe_regions_16k` or `GigaAm::transcribe_regions_with_timestamps_16k`. Regions must be ordered, nonoverlapping, nonempty and in range; longer than 24 seconds are subdivided automatically. Gaps are preserved in the returned absolute timestamps. An empty region list produces an empty transcription list, rather than unexpectedly transcribing silence.
+
+The CLI accepts `--segments-json vad.json` (only with `transcribe`), where `vad.json` is an array of start/end times **in seconds**, not sample positions:
+
+```json
+[{"start": 0.4, "end": 2.3}, {"start": 5.1, "end": 7.8}]
+```
+
+Example: `gigaam-rs transcribe ./weights ./MitaKind.wav --segments-json vad.json --word-timestamps`. Fractional timestamps are rounded to the nearest 16 kHz sample; invalid, nonfinite, out-of-order and overlapping intervals are rejected. Without this file, longform retains the low-energy heuristic (not neural VAD). The library performs no online VAD or streaming audio capture.
+
 `transcribe` automatically splits long WAV recordings into <=24 second segments near low-energy boundaries; this is a heuristic, **not** a VAD model. The SSL `embed` command writes row-major `[time, hidden]` float32 and prints the shape. The diagnostic `parity` command writes `mel.f32` and *unnormalized* CTC `logits.f32` for reference comparison. `parity-encoder` writes `mel.f32` and row-major `encoder.f32` for SSL checkpoint parity. The `--word-timestamps` flag emits approximate word intervals using GigaAM's original encoder-frame-to-audio-duration mapping; the intervals are not forced-alignment boundaries, and longform chunk splitting remains energy-based rather than neural VAD.
 
 Default build uses Burn Flex CPU, with CUDA (`--no-default-features --features cuda`) and WGPU (`--no-default-features --features wgpu`) selected at compile time. Windows CUDA still requires a native build and GPU validation. No Luminal AOT integration is implied by support for Burn CUDA.

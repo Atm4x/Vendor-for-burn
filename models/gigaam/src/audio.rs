@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, ensure};
 use rustfft::{FftPlanner, num_complex::Complex};
+use serde::Deserialize;
 use std::f32::consts::PI;
 use std::path::Path;
 
@@ -211,6 +212,81 @@ pub fn speech_chunks_with_offsets(samples: &[f32], max_samples: usize) -> Vec<Au
     chunks
 }
 
+/// A half-open speech interval in the original 16 kHz PCM, typically from an external VAD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpeechRegion {
+    pub start_sample: usize,
+    pub end_sample: usize,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct SpeechRegionSeconds {
+    pub start: f64,
+    pub end: f64,
+}
+
+impl SpeechRegionSeconds {
+    /// Convert seconds to 16 kHz sample indices, rejecting invalid VAD outputs.
+    pub fn into_samples(self, pcm_samples: usize) -> Result<SpeechRegion> {
+        ensure!(
+            self.start.is_finite() && self.end.is_finite(),
+            "VAD boundaries must be finite"
+        );
+        ensure!(
+            self.start >= 0.0 && self.end > self.start,
+            "invalid VAD time interval"
+        );
+        let start = (self.start * SAMPLE_RATE as f64).round();
+        let end = (self.end * SAMPLE_RATE as f64).round();
+        ensure!(
+            start >= 0.0 && end > start && end <= pcm_samples as f64,
+            "VAD interval is empty, exceeds PCM length or rounds to zero samples"
+        );
+        Ok(SpeechRegion {
+            start_sample: start as usize,
+            end_sample: end as usize,
+        })
+    }
+}
+
+/// Return VAD-aligned chunks without copying PCM. Long regions are subdivided
+/// using the same low-energy boundary heuristic as the fallback longform path.
+pub fn speech_chunks_in_regions<'a>(
+    samples: &'a [f32],
+    regions: &[SpeechRegion],
+    max_samples: usize,
+) -> Result<Vec<AudioChunk<'a>>> {
+    ensure!(max_samples > 0, "maximum chunk length must be positive");
+    let mut previous_end = 0;
+    for (index, region) in regions.iter().enumerate() {
+        ensure!(
+            region.start_sample < region.end_sample,
+            "speech region {index} is empty or reversed"
+        );
+        ensure!(
+            region.end_sample <= samples.len(),
+            "speech region {index} exceeds PCM length"
+        );
+        ensure!(
+            region.start_sample >= previous_end,
+            "speech region {index} overlaps or is unordered"
+        );
+        previous_end = region.end_sample;
+    }
+
+    let mut chunks = Vec::new();
+    for region in regions {
+        let sub = &samples[region.start_sample..region.end_sample];
+        for chunk in speech_chunks_with_offsets(sub, max_samples) {
+            chunks.push(AudioChunk {
+                start_sample: region.start_sample + chunk.start_sample,
+                samples: chunk.samples,
+            });
+        }
+    }
+    Ok(chunks)
+}
+
 pub fn speech_chunks(samples: &[f32], max_samples: usize) -> Vec<&[f32]> {
     speech_chunks_with_offsets(samples, max_samples)
         .into_iter()
@@ -228,6 +304,100 @@ mod tests {
         assert_eq!(m.values.len(), 64 * 101);
         assert!(m.values.iter().all(|x| x.is_finite()));
     }
+    #[test]
+    fn vad_seconds_reject_nonfinite_and_zero_sample_segments() {
+        let convert = |start, end| SpeechRegionSeconds { start, end }.into_samples(16_000);
+        assert_eq!(
+            convert(0.25, 0.75).unwrap(),
+            SpeechRegion {
+                start_sample: 4_000,
+                end_sample: 12_000
+            }
+        );
+        for (start, end) in [
+            (f64::NAN, 0.4),
+            (0.0, f64::INFINITY),
+            (-0.1, 0.1),
+            (0.4, 0.3),
+            (1.0, 1.1),
+            (0.0, 0.00001),
+        ] {
+            assert!(convert(start, end).is_err());
+        }
+    }
+
+    #[test]
+    fn external_vad_regions_keep_absolute_offsets() {
+        let pcm = (0..(16_000 * 9)).map(|x| x as f32).collect::<Vec<_>>();
+        let regions = [
+            SpeechRegion {
+                start_sample: 4_000,
+                end_sample: 28_000,
+            },
+            SpeechRegion {
+                start_sample: 64_000,
+                end_sample: 112_000,
+            },
+        ];
+        let chunks = speech_chunks_in_regions(&pcm, &regions, 16_000).unwrap();
+        assert!(!chunks.is_empty());
+        assert_eq!(chunks[0].start_sample, 4_000);
+        assert_eq!(
+            chunks.last().unwrap().start_sample + chunks.last().unwrap().samples.len(),
+            112_000
+        );
+        assert!(chunks.iter().all(|c| c.samples.len() <= 16_000));
+        for chunk in &chunks {
+            let base = chunk.start_sample;
+            assert_eq!(chunk.samples[0], pcm[base]);
+        }
+        let total = chunks.iter().map(|c| c.samples.len()).sum::<usize>();
+        assert_eq!(total, 24_000 + 48_000);
+    }
+
+    #[test]
+    fn external_vad_regions_reject_invalid_intervals() {
+        let pcm = vec![0.0; 100];
+        for regions in [
+            vec![SpeechRegion {
+                start_sample: 10,
+                end_sample: 10,
+            }],
+            vec![SpeechRegion {
+                start_sample: 20,
+                end_sample: 10,
+            }],
+            vec![SpeechRegion {
+                start_sample: 0,
+                end_sample: 101,
+            }],
+            vec![
+                SpeechRegion {
+                    start_sample: 10,
+                    end_sample: 30,
+                },
+                SpeechRegion {
+                    start_sample: 29,
+                    end_sample: 40,
+                },
+            ],
+            vec![
+                SpeechRegion {
+                    start_sample: 50,
+                    end_sample: 60,
+                },
+                SpeechRegion {
+                    start_sample: 10,
+                    end_sample: 20,
+                },
+            ],
+        ] {
+            assert!(speech_chunks_in_regions(&pcm, &regions, 24).is_err());
+        }
+        assert!(speech_chunks_in_regions(&pcm, &[], 0).is_err());
+        assert!(speech_chunks_in_regions(&pcm, &[], 24).unwrap().is_empty());
+    }
+
     #[test]
     fn resampling_ratio() {
         assert_eq!(resample_sinc(&vec![0.0; 44100], 44100, 16000).len(), 16000);

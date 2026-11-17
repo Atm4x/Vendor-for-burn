@@ -3091,6 +3091,7 @@ dependencies = [
  "half",
  "hound",
  "prost",
+ "pytorch-reader",
  "rustfft",
  "safetensors 0.8.0",
  "serde",

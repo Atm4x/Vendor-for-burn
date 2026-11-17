@@ -5,6 +5,49 @@ use half::{bf16, f16};
 use safetensors::{Dtype, SafeTensors};
 use std::path::Path;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TensorDescriptor {
+    pub name: String,
+    pub shape: Vec<usize>,
+    pub dtype: String,
+}
+
+/// Inspect tensor names and shapes without materializing full float32 weights.
+pub fn inspect_checkpoint(path: &Path) -> Result<Vec<TensorDescriptor>> {
+    let mut tensors = match path.extension().and_then(|ext| ext.to_str()) {
+        Some("ckpt" | "pth" | "pt") => {
+            let reader = pytorch_reader::PytorchReader::with_top_level_key(path, "state_dict")
+                .with_context(|| format!("reading tensor table in {}", path.display()))?;
+            reader
+                .tensors()
+                .iter()
+                .map(|(name, tensor)| TensorDescriptor {
+                    name: name.clone(),
+                    shape: tensor.shape().to_vec(),
+                    dtype: format!("{:?}", tensor.dtype()),
+                })
+                .collect::<Vec<_>>()
+        }
+        Some("safetensors") => {
+            let bytes =
+                std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+            let store = SafeTensors::deserialize(&bytes)?;
+            store
+                .iter()
+                .map(|(name, tensor)| TensorDescriptor {
+                    name: name.to_owned(),
+                    shape: tensor.shape().to_vec(),
+                    dtype: format!("{:?}", tensor.dtype()),
+                })
+                .collect::<Vec<_>>()
+        }
+        _ => bail!("expected PyTorch checkpoint or Safetensors"),
+    };
+    tensors.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+    ensure!(!tensors.is_empty(), "checkpoint contains no tensors");
+    Ok(tensors)
+}
+
 pub enum Weights {
     Safe(Vec<u8>),
     Torch(PytorchStore),
@@ -102,5 +145,40 @@ fn decode_bytes(bytes: &[u8], dtype: Dtype) -> Result<Vec<f32>> {
                 .collect())
         }
         other => bail!("unsupported checkpoint tensor dtype: {other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use safetensors::tensor::TensorView;
+
+    #[test]
+    fn inspect_safetensors_preserves_names_and_shapes() {
+        let dir = std::env::temp_dir().join(format!("gigaam-inspection-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.safetensors");
+        let first = 5_f32.to_le_bytes();
+        let second = [0_u8; 12];
+        let tensors = [
+            (
+                "encoder.dummy.weight",
+                TensorView::new(Dtype::F32, vec![1], &first).unwrap(),
+            ),
+            (
+                "head.weight",
+                TensorView::new(Dtype::F32, vec![3, 1], &second).unwrap(),
+            ),
+        ];
+        safetensors::tensor::serialize_to_file(tensors, None, &path).unwrap();
+        let found = inspect_checkpoint(&path).unwrap();
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].name, "encoder.dummy.weight");
+        assert_eq!(found[0].shape, vec![1]);
+        assert_eq!(found[1].name, "head.weight");
+        assert_eq!(found[1].shape, vec![3, 1]);
+        assert_eq!(found[0].dtype, "F32");
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
 }

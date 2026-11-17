@@ -6,7 +6,10 @@ pub mod tokenizer;
 pub mod weights;
 
 use anyhow::{Context, Result, bail, ensure};
-use audio::{SAMPLE_RATE, log_mel, speech_chunks, speech_chunks_with_offsets};
+use audio::{
+    SAMPLE_RATE, SpeechRegion, log_mel, speech_chunks, speech_chunks_in_regions,
+    speech_chunks_with_offsets,
+};
 use burn::tensor::Device;
 use decode::{Transcription, Word, ctc_argmax, words_from_frames};
 use model::{Config, CtcModel, EmotionModel, EncoderModel};
@@ -391,6 +394,43 @@ impl GigaAm {
             start: 0.0,
             end: pcm.len() as f64 / SAMPLE_RATE as f64,
         })
+    }
+
+    /// Transcribe VAD-provided half-open intervals (16 kHz sample indices),
+    /// preserving their absolute position in the source recording.
+    /// Regions must be ordered, non-overlapping and within PCM boundaries.
+    /// The model itself does not instantiate or duplicate a VAD engine.
+    pub fn transcribe_regions_with_timestamps_16k(
+        &self,
+        samples: &[f32],
+        regions: &[SpeechRegion],
+    ) -> Result<Vec<TimedTranscription>> {
+        let chunks = speech_chunks_in_regions(samples, regions, SAMPLE_RATE as usize * 24)?;
+        let mut output = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            let mut timed = self.transcribe_with_timestamps_16k(chunk.samples)?;
+            let offset = chunk.start_sample as f64 / SAMPLE_RATE as f64;
+            timed.start = offset;
+            timed.end += offset;
+            for word in &mut timed.words {
+                word.start += offset;
+                word.end += offset;
+            }
+            output.push(timed);
+        }
+        Ok(output)
+    }
+
+    /// Transcribe VAD-provided intervals without the overhead of word alignment.
+    pub fn transcribe_regions_16k(
+        &self,
+        samples: &[f32],
+        regions: &[SpeechRegion],
+    ) -> Result<Vec<Transcription>> {
+        speech_chunks_in_regions(samples, regions, SAMPLE_RATE as usize * 24)?
+            .iter()
+            .map(|chunk| self.transcribe_16k(chunk.samples))
+            .collect()
     }
 
     pub fn transcribe_long_with_timestamps_16k(

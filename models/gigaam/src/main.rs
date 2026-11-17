@@ -5,6 +5,39 @@ use std::path::Path;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 3 && args[1] == "inspect-checkpoint" {
+        let tensors = gigaam_rs::weights::inspect_checkpoint(Path::new(&args[2]))?;
+        let count = tensors.len();
+        let mut parameters: u64 = 0;
+        for item in &tensors {
+            let size = item
+                .shape
+                .iter()
+                .try_fold(1_u64, |acc, x| acc.checked_mul(*x as u64))
+                .context("checkpoint tensor dimensions overflow")?;
+            parameters = parameters
+                .checked_add(size)
+                .context("checkpoint parameter count overflow")?;
+        }
+        println!("tensors={count} scalar_values={parameters}");
+        let show_all = args.iter().any(|s| s == "--all");
+        for item in tensors
+            .iter()
+            .filter(|item| {
+                show_all
+                    || item.name.contains("layers.0.")
+                    || item.name.contains("head.")
+                    || item.name.contains("subsampling.")
+            })
+            .take(if show_all { usize::MAX } else { 60 })
+        {
+            println!("{} {:?} {}", item.name, item.shape, item.dtype);
+        }
+        println!(
+            "Note: checkpoint tensor geometry does not uniquely determine all config fields; use an explicit matching config.json."
+        );
+        return Ok(());
+    }
     if args.len() == 3 && args[1] == "probe-audio" {
         let samples = audio::load_wav_16k(Path::new(&args[2]))?;
         let pieces = audio::speech_chunks(&samples, 24 * audio::SAMPLE_RATE as usize);
@@ -33,11 +66,13 @@ fn main() -> Result<()> {
     {
         eprintln!("Usage: gigaam-rs transcribe <model_dir> <audio.wav> [--device cpu|cuda|wgpu]");
         eprintln!("       gigaam-rs probe-audio <audio.wav>");
+        eprintln!("       gigaam-rs inspect-checkpoint <model.ckpt|model.safetensors> [--all]");
         eprintln!("       gigaam-rs parity <ctc_model_dir> <audio.wav> <out_dir>");
         eprintln!("       gigaam-rs embed <ssl_model_dir> <audio.wav> <out_file.f32>");
         eprintln!("       gigaam-rs emotion <emo_model_dir> <audio.wav>");
         eprintln!("       gigaam-rs parity-encoder <ssl_model_dir> <audio.wav> <out_dir>");
         eprintln!("       gigaam-rs transcribe <model_dir> <audio.wav> --word-timestamps");
+        eprintln!("       gigaam-rs transcribe <model_dir> <audio.wav> --segments-json <vad.json>");
         std::process::exit(2);
     }
     let selected = args
@@ -155,8 +190,30 @@ fn main() -> Result<()> {
         println!("embeddings shape=[{frames},{channels}] file={}", args[4]);
         return Ok(());
     }
+    let segment_file = args.iter().position(|arg| arg == "--segments-json");
+    let external_regions = if let Some(index) = segment_file {
+        let path = args
+            .get(index + 1)
+            .context("--segments-json requires a JSON file path")?;
+        let intervals: Vec<audio::SpeechRegionSeconds> = serde_json::from_slice(
+            &std::fs::read(path).with_context(|| format!("reading VAD file {}", path))?,
+        )
+        .context("expected JSON array of {start, end} intervals in seconds")?;
+        Some(
+            intervals
+                .into_iter()
+                .map(|interval| interval.into_samples(samples.len()))
+                .collect::<Result<Vec<_>>>()?,
+        )
+    } else {
+        None
+    };
     if args.iter().any(|arg| arg == "--word-timestamps") {
-        let chunks = model.transcribe_long_with_timestamps_16k(&samples)?;
+        let chunks = if let Some(regions) = &external_regions {
+            model.transcribe_regions_with_timestamps_16k(&samples, regions)?
+        } else {
+            model.transcribe_long_with_timestamps_16k(&samples)?
+        };
         for (i, segment) in chunks.iter().enumerate() {
             println!(
                 "[{i}] [{:.3}-{:.3}] {}",
@@ -167,7 +224,11 @@ fn main() -> Result<()> {
             }
         }
     } else {
-        let chunks = model.transcribe_long_16k(&samples)?;
+        let chunks = if let Some(regions) = &external_regions {
+            model.transcribe_regions_16k(&samples, regions)?
+        } else {
+            model.transcribe_long_16k(&samples)?
+        };
         for (i, segment) in chunks.iter().enumerate() {
             println!("[{i}] {}", segment.text);
         }
