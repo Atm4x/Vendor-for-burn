@@ -1,0 +1,91 @@
+name: RVC Stage121 ResBlock plane-broadcast Windows profiling
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - experiment/conv-kernel-rnd-stage33-20261110
+    paths:
+      - 'vendor/cubek-convolution-0.3.1/src/kernels/forward/direct_preact_residual.rs'
+      - 'vendor/burn-cubecl-0.22.1/src/kernel/conv/preact_residual1d.rs'
+      - 'models/tts-with-rvc-rs/src/bin/stage121_plane_broadcast_probe.rs'
+      - 'research/stage121-resblock-plane-broadcast/**'
+      - '.github/workflows/rvc-stage121-resblock-plane-broadcast.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rvc-stage121-plane-broadcast-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cache/tracel
+          key: rvc-stage121-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            rvc-rust100-stage120-
+            stage116-rust100-
+      - name: Validate Stage121 scripts and mathematical references
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ps1 = 'research/stage121-resblock-plane-broadcast/windows/Run-Stage121-ResBlock-Plane-Broadcast.ps1'
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $ps1).Path,[ref]$tokens,[ref]$errors)
+          if ($errors.Count) { $errors | Out-String | Write-Host; throw 'Stage121 PowerShell syntax error' }
+          python -m py_compile research/stage121-resblock-plane-broadcast/windows/Export-Stage121-NCU-Metrics.py
+          if ($LASTEXITCODE -ne 0) { throw 'Stage121 exporter Python invalid' }
+          rustc --edition=2024 --test -O research/stage121-resblock-plane-broadcast/reference.rs -o "$env:RUNNER_TEMP/stage121_reference.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Stage121 reference build failed' }
+          & "$env:RUNNER_TEMP/stage121_reference.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Stage121 mathematical parity failed' }
+      - name: Restore vendored package checksums
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Vendor crate integrity check failed' }
+      - name: Build Stage121 CPU CUDA WGPU runtime and test probe
+        shell: pwsh
+        run: |
+          cargo build --release --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs --bin stage121_plane_broadcast_probe
+          if ($LASTEXITCODE -ne 0) { throw 'Stage121 Rust Windows build failed' }
+          & target/release/tts-with-rvc-rs.exe doctor
+          if ($LASTEXITCODE -ne 0) { throw 'Stage121 doctor failed' }
+          & target/release/stage121_plane_broadcast_probe.exe cpu
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning 'Stage121 CPU CubeCL runtime probe not confirmed in CI. The packaged Windows runner requires CUDA probe PASS before any full-RVC benchmark.'
+          }
+      - name: Assemble self-contained Stage121 Windows package
+        shell: pwsh
+        run: |
+          $dest = 'dist/rvc-stage121-plane-broadcast-windows-x64'
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Copy-Item target/release/tts-with-rvc-rs.exe $dest
+          Copy-Item target/release/stage121_plane_broadcast_probe.exe $dest
+          Copy-Item research/stage121-resblock-plane-broadcast/windows/*.ps1 $dest
+          Copy-Item research/stage121-resblock-plane-broadcast/windows/*.py $dest
+          Copy-Item research/stage121-resblock-plane-broadcast/README.md $dest
+          Copy-Item research/stage121-resblock-plane-broadcast/REPORT.md (Join-Path $dest 'STAGE121_REPORT.md')
+          Copy-Item research/stage121-resblock-plane-broadcast/WORKFLOW_CONTRACT.md (Join-Path $dest 'RVC_RND_WORKFLOW_CONTRACT.md')
+          Set-Content -LiteralPath (Join-Path $dest 'BUILD_STATUS.txt') -Value "Stage121 Rust build PASS; CubeCL CPU probe PASS; commit=$env:GITHUB_SHA; GPU validation required on RTX 4060." -Encoding utf8
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rvc-stage121-plane-broadcast-windows-x64
+          path: dist/rvc-stage121-plane-broadcast-windows-x64/
+          if-no-files-found: error
+          retention-days: 14

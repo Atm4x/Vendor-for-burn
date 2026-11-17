@@ -2,14 +2,6 @@ name: RVC Stage120 ResBlock prefetch Windows profile package
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - experiment/conv-kernel-rnd-stage33-20261110
-    paths:
-      - 'vendor/cubek-convolution-0.3.1/src/kernels/forward/direct_preact_residual.rs'
-      - 'vendor/burn-cubecl-0.22.1/src/kernel/conv/preact_residual1d.rs'
-      - 'research/stage120-resblock-prefetch/**'
-      - '.github/workflows/rvc-stage120-resblock-prefetch.yml'
 
 permissions:
   contents: read
@@ -48,7 +40,7 @@ jobs:
           rustc --edition=2024 --test -O research/stage120-resblock-prefetch/reference.rs -o "$env:RUNNER_TEMP/stage120-reference.exe"
           if ($LASTEXITCODE -ne 0) { throw 'Stage120 reference compilation failed' }
           & "$env:RUNNER_TEMP/stage120-reference.exe"
-          if ($LASTEXITCODE -ne 0) { throw 'Stage120 reference parity failed' }
+          if ($LASTEXITCODE -ne 0) { throw 'Stage120 mathematical reference failed' }
       - name: Restore vendored crate integrity
         shell: pwsh
         run: |
@@ -65,17 +57,20 @@ jobs:
           & target/release/tts-with-rvc-rs.exe doctor
           if ($LASTEXITCODE -ne 0) { throw 'Stage120 doctor failed' }
       - name: Assemble one self-contained Windows package
+        if: always()
         shell: pwsh
         run: |
           $dest = 'dist/rvc-stage120-resblock-prefetch-windows-x64'
-          New-Item -ItemType Directory -Force -Path $dest | Out-Null
-          Copy-Item target/release/tts-with-rvc-rs.exe $dest
+          New-Item -ItemType Directory -Path $dest -Force | Out-Null
           Copy-Item research/stage120-resblock-prefetch/windows/Run-Stage120-ResBlock-Prefetch.ps1 $dest
           Copy-Item research/stage120-resblock-prefetch/README.md (Join-Path $dest 'README.md')
-          Copy-Item research/stage120-resblock-prefetch/REPORT.md (Join-Path $dest 'STAGE120_REPORT.md')
           Copy-Item research/stage120-resblock-prefetch/WORKFLOW_CONTRACT.md (Join-Path $dest 'RVC_RND_WORKFLOW_CONTRACT.md')
-          Set-Content -Path (Join-Path $dest 'BUILD_STATUS.txt') -Value "Stage120 Rust build PASS; SHA=$env:GITHUB_SHA; no GPU on CI." -Encoding utf8
+          $exe = 'target/release/tts-with-rvc-rs.exe'
+          $built = Test-Path -LiteralPath $exe -PathType Leaf
+          if ($built) { Copy-Item $exe $dest }
+          Set-Content -LiteralPath (Join-Path $dest 'BUILD_STATUS.txt') -Value "Rust CLI built=$built`nSHA=$env:GITHUB_SHA`nNo GPU on CI; run on RTX4060.`nStage120 prefetch opt-in only." -Encoding UTF8
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: rvc-stage120-resblock-prefetch-windows-x64
           path: dist/rvc-stage120-resblock-prefetch-windows-x64/
