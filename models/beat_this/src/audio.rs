@@ -5,6 +5,7 @@ use rustfft::{FftPlanner, num_complex::Complex32};
 use std::{
     ffi::{CStr, c_char, c_uint, c_ulong, c_void},
     fs::File,
+    io::Cursor,
     path::Path,
     sync::Arc,
 };
@@ -12,7 +13,7 @@ use symphonia::core::{
     codecs::audio::AudioDecoderOptions,
     errors::Error,
     formats::{FormatOptions, TrackType, probe::Hint},
-    io::MediaSourceStream,
+    io::{MediaSource, MediaSourceStream},
     meta::MetadataOptions,
 };
 
@@ -29,9 +30,25 @@ pub struct MonoAudio {
 pub fn decode(path: impl AsRef<Path>) -> Result<MonoAudio, String> {
     let path = path.as_ref();
     let file = File::open(path).map_err(|e| e.to_string())?;
-    let source = MediaSourceStream::new(Box::new(file), Default::default());
+    decode_source(
+        Box::new(file),
+        path.extension().and_then(|x| x.to_str()),
+        None,
+    )
+}
+
+pub fn decode_snapshot(bytes: Vec<u8>, extension: &str) -> Result<MonoAudio, String> {
+    decode_source(Box::new(Cursor::new(bytes)), Some(extension), Some(15 * 60))
+}
+
+fn decode_source(
+    source: Box<dyn MediaSource>,
+    extension: Option<&str>,
+    duration_limit_secs: Option<usize>,
+) -> Result<MonoAudio, String> {
+    let source = MediaSourceStream::new(source, Default::default());
     let mut hint = Hint::new();
-    if let Some(extension) = path.extension().and_then(|x| x.to_str()) {
+    if let Some(extension) = extension {
         hint.with_extension(extension);
     }
     let mut format = symphonia::default::get_probe()
@@ -76,6 +93,14 @@ pub fn decode(path: impl AsRef<Path>) -> Result<MonoAudio, String> {
         let channels = spec.channels().count();
         if channels == 0 {
             return Err("audio contains no channels".into());
+        }
+        if let Some(limit) = duration_limit_secs
+            && (!(8_000..=192_000).contains(&spec.rate())
+                || channels > 8
+                || samples.len() + decoded.samples_interleaved() / channels
+                    > limit * spec.rate() as usize)
+        {
+            return Err("audio exceeds supported stream limits".into());
         }
         if let Some(current) = sample_rate {
             if current != spec.rate() {
@@ -138,6 +163,27 @@ fn soxr_resample(input: &[f32], source_rate: u32) -> Result<Vec<f32>, String> {
         .iter()
         .find_map(|&name| unsafe { libloading::Library::new(name).ok() })
         .ok_or("libsoxr is not installed")?;
+    resample_with_soxr(input, source_rate, library)
+}
+
+pub fn resample_with_packaged_soxr(
+    input: &[f32],
+    source_rate: u32,
+    library_path: &Path,
+) -> Result<Vec<f32>, String> {
+    if source_rate == SAMPLE_RATE {
+        return Ok(input.to_vec());
+    }
+    let library = unsafe { libloading::Library::new(library_path) }
+        .map_err(|error| format!("loading packaged SoXR: {error}"))?;
+    resample_with_soxr(input, source_rate, library)
+}
+
+fn resample_with_soxr(
+    input: &[f32],
+    source_rate: u32,
+    library: libloading::Library,
+) -> Result<Vec<f32>, String> {
     let quality_spec: libloading::Symbol<'_, SoxrSpec> =
         unsafe { library.get(b"soxr_quality_spec") }.map_err(|e| e.to_string())?;
     let oneshot: libloading::Symbol<'_, SoxrOneshot> =

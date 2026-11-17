@@ -431,7 +431,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "beat-this-rs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "audioadapter",
  "audioadapter-buffers",
@@ -442,7 +442,9 @@ dependencies = [
  "rustfft",
  "serde",
  "serde_json",
+ "sha2",
  "symphonia",
+ "uuid",
 ]
 
 [[package]]
@@ -6507,6 +6509,7 @@ checksum = "4a06f08a856b009bc7bbaf7d3e79808595d032dd19074c0c2ef26e49e03e6bdc"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
+ "serde_core",
  "sha1_smol",
  "wasm-bindgen",
 ]

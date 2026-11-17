@@ -43,6 +43,26 @@ The RVC experiments in this repository include specialized NCT↔NTC transport f
 
 ## Validation and limitations
 
+### NeuroMita worker and Windows release
+
+The Windows CPU/Flex package runs as a persistent JSON-lines worker using
+`--ipc-stdio --backend cpu --model-dir <path> --runtime-dir <path> --input-dir <path>`.
+The package must contain the verified `small1.ckpt` and the runtime directory
+must provide `soxr/0.1.3/soxr.dll`. The worker checks the version and UUID of
+each request. The supported commands are `capabilities`, `load`, `warmup`,
+`status`, `infer`, `unload`, and `shutdown`.
+
+Beats DTO v1 uses `kind: "beats"` and an input object with `file_name`,
+`size_bytes` and `sha256`. The name is a single WAV or FLAC file inside the
+Core-managed input directory. Results contain `beats_seconds`,
+`downbeats_seconds`, `duration_seconds` and `sample_rate_hz`.
+
+The GitHub workflow is dispatched manually from `main` with the version
+committed in `Cargo.toml`. It verifies the upstream weight and SoXR source,
+builds the worker, runs the lifecycle smoke test and packages the Windows ZIP,
+standalone EXE, native manifest, install plan and SHA-256 file. The official
+checkpoint is downloaded separately from the URL and digest in the plan.
+
 See [VALIDATION.md](VALIDATION.md) for PyTorch-versus-Rust logit comparisons with the supplied `small1.ckpt`, `final1.ckpt`, and music sample. The original PyTorch implementation and native Rust match across the **entire 209-second provided FLAC** (10,458 frames) on both `small1.ckpt` and `final1.ckpt`. Mean logit errors are approximately 1e-5 on long-form input. Both models also reproduce the original beat/downbeat counts on that file. The CUDA feature compiled and linked successfully offline after installing the locally provided Tracel LLVM 23.1.0-4 archive; runtime execution and profiling on an NVIDIA GPU remain **unverified**. The CPU backend can be slower than optimized multi-threaded PyTorch, and real-time performance and GPU speedups are **not established**.
 
 ## Licensing

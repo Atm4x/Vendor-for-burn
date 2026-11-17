@@ -2,6 +2,9 @@ use beat_this_rs::{audio, checkpoint::Checkpoint, model::BeatThisModel, postproc
 use burn::tensor::Device;
 use std::{env, fs, path::PathBuf, time::Instant};
 
+#[cfg(feature = "flex")]
+mod worker;
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("beat-this-rs: {err}");
@@ -10,6 +13,12 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
+    if env::args().nth(1).as_deref() == Some("--ipc-stdio") {
+        #[cfg(feature = "flex")]
+        return worker::run(env::args().skip(2));
+        #[cfg(not(feature = "flex"))]
+        return Err("the Beat This! worker requires the flex build".into());
+    }
     let mut checkpoint = None;
     let mut input = None;
     let mut output = None;
