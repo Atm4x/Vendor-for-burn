@@ -4,7 +4,7 @@ use burn::tensor::{
 };
 use burn_cubecl::{
     Cube,
-    kernel::conv::{ConvStrategy, ConvTranspose2dStrategy, conv1d_preact_residual_temporal, prepare_resblock_input_ntc, conv1d_single_input_packed, conv1d_single_input_prepack_weight, conv_transpose1d_polyphase, conv_transpose1d_polyphase_packed, conv_transpose1d_prepack_weight, conv_transpose1d_prepack_weight_kic, conv_transpose1d_polyphase_single_packed_kic, prepack_conv_transpose1d_phase_gemm_weight, prepack_conv_transpose1d_phase_gemm_weight_compensated, conv_transpose1d_phase_gemm_packed, conv_transpose1d_phase_gemm_packed_compensated, conv_forward, conv_forward_spatial_quad, conv_forward_spatial_reuse, conv_forward_spatial_pair, conv_transpose2d, prepack_winograd_weights, transform_winograd_input, inverse_winograd_output},
+    kernel::conv::{ConvStrategy, ConvTranspose2dStrategy, conv1d_preact_residual_temporal_activation_plan, prepare_resblock_input_ntc, conv1d_single_input_packed, conv1d_single_input_prepack_weight, conv_transpose1d_polyphase, conv_transpose1d_polyphase_packed, conv_transpose1d_prepack_weight, conv_transpose1d_prepack_weight_kic, conv_transpose1d_polyphase_single_packed_kic, prepack_conv_transpose1d_phase_gemm_weight, prepack_conv_transpose1d_phase_gemm_weight_compensated, conv_transpose1d_phase_gemm_packed, conv_transpose1d_phase_gemm_packed_compensated, conv_forward, conv_forward_spatial_quad, conv_forward_spatial_reuse, conv_forward_spatial_pair, conv_transpose2d, prepack_winograd_weights, transform_winograd_input, inverse_winograd_output},
 };
 
 pub(crate) fn prepare_resblock_ntc(input: Tensor<3>) -> Tensor<3> {
@@ -16,12 +16,22 @@ pub(crate) fn preact_resblock_conv(
     input: Tensor<3>, weight: Tensor<3>, bias: Option<Tensor<1>>,
     residual: Option<Tensor<3>>, dilation: usize, padding: usize,
 ) -> Tensor<3> {
+    preact_resblock_conv_activation_plan(input, weight, bias, residual, dilation, padding, false, false)
+}
+
+pub(crate) fn preact_resblock_conv_activation_plan(
+    input: Tensor<3>, weight: Tensor<3>, bias: Option<Tensor<1>>,
+    residual: Option<Tensor<3>>, dilation: usize, padding: usize,
+    input_activated: bool, output_activated: bool,
+) -> Tensor<3> {
     let input = input.try_into_primitive::<Cube>().expect("ResBlock input requires CubeCL");
     let weight = weight.try_into_primitive::<Cube>().expect("ResBlock weight requires CubeCL");
     let bias = bias.map(|b| b.try_into_primitive::<Cube>().expect("ResBlock bias requires CubeCL"));
     let residual = residual.map(|r| r.try_into_primitive::<Cube>().expect("ResBlock residual requires CubeCL"));
     Tensor::from_primitive::<Cube>(
-        conv1d_preact_residual_temporal(input, weight, bias, residual, dilation, padding)
+        conv1d_preact_residual_temporal_activation_plan(
+            input, weight, bias, residual, dilation, padding, input_activated, output_activated,
+        )
             .expect("ResBlock temporal transport unsupported shape"),
     )
 }

@@ -2,15 +2,6 @@ name: RVC Stage121 ResBlock plane-broadcast Windows profiling
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - experiment/conv-kernel-rnd-stage33-20261110
-    paths:
-      - 'vendor/cubek-convolution-0.3.1/src/kernels/forward/direct_preact_residual.rs'
-      - 'vendor/burn-cubecl-0.22.1/src/kernel/conv/preact_residual1d.rs'
-      - 'models/tts-with-rvc-rs/src/bin/stage121_plane_broadcast_probe.rs'
-      - 'research/stage121-resblock-plane-broadcast/**'
-      - '.github/workflows/rvc-stage121-resblock-plane-broadcast.yml'
 
 permissions:
   contents: read

@@ -101,6 +101,16 @@ impl Conv1d {
         )
     }
 
+    fn forward_preact_activation_plan(
+        &self, input: Tensor<3>, residual: Option<Tensor<3>>,
+        input_activated: bool, output_activated: bool,
+    ) -> Tensor<3> {
+        crate::cubecl_conv::preact_resblock_conv_activation_plan(
+            input, self.weight.clone(), self.bias.clone(), residual,
+            self.dilation, self.padding, input_activated, output_activated,
+        )
+    }
+
     fn forward(&self, input: Tensor<3>) -> Tensor<3> {
         let options = ConvOptions::new_with_padding([self.stride], [(self.padding, self.padding)], [self.dilation], 1);
         if let Some(packed_weight) = self.packed_noise_weight.as_ref() {
@@ -264,15 +274,27 @@ impl ResBlock1 {
             && self.second.iter().all(|conv| conv.resblock_transport);
         for (first, second) in self.first.iter().zip(&self.second) {
             if transport {
+                let move_activation = self.channels == 128
+                    && first.weight.dims()[2] == 11
+                    && second.weight.dims()[2] == 11
+                    && std::env::var("RVC_NSF_RESBLOCK_ACTIVATION_PLACEMENT").as_deref() == Ok("1");
                 let range_first = format!("stage116_resblock_c{}_k{}_d{}_first",
                     self.channels, first.weight.dims()[2], first.dilation);
                 let _range_first = crate::nvtx::Range::new(&range_first);
-                let h = first.forward_preact(x.clone(), None);
+                let h = if move_activation {
+                    first.forward_preact_activation_plan(x.clone(), None, false, true)
+                } else {
+                    first.forward_preact(x.clone(), None)
+                };
                 drop(_range_first);
                 let range_second = format!("stage116_resblock_c{}_k{}_d{}_second",
                     self.channels, second.weight.dims()[2], second.dilation);
                 let _range_second = crate::nvtx::Range::new(&range_second);
-                x = second.forward_preact(h, Some(x));
+                x = if move_activation {
+                    second.forward_preact_activation_plan(h, Some(x), true, false)
+                } else {
+                    second.forward_preact(h, Some(x))
+                };
                 continue;
             }
             if shared_tile && crate::nsf_pair_tile::supports(self.channels, second.weight.dims()[2], second.dilation) {

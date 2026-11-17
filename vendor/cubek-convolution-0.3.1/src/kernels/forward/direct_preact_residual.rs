@@ -18,6 +18,8 @@ fn preact_residual_temporal_kernel<E: Float, NOut: Size>(
     out_len: u32,
     #[comptime] temporal_tile: u32,
     #[comptime] broadcast_inputs: bool,
+    #[comptime] input_activated: bool,
+    #[comptime] output_activated: bool,
     stride: u32,
     dilation: u32,
     padding: i32,
@@ -75,7 +77,7 @@ fn preact_residual_temporal_kernel<E: Float, NOut: Size>(
                     } else {
                         input[x_offset]
                     };
-                    let activated = if x >= E::from_int(0) {
+                    let activated = if input_activated || x >= E::from_int(0) {
                         x
                     } else {
                         x * (E::from_int(1) / E::from_int(10))
@@ -95,7 +97,7 @@ fn preact_residual_temporal_kernel<E: Float, NOut: Size>(
                     } else {
                         input[x_offset]
                     };
-                    let activated = if x >= E::from_int(0) {
+                    let activated = if input_activated || x >= E::from_int(0) {
                         x
                     } else {
                         x * (E::from_int(1) / E::from_int(10))
@@ -115,7 +117,7 @@ fn preact_residual_temporal_kernel<E: Float, NOut: Size>(
                     } else {
                         input[x_offset]
                     };
-                    let activated = if x >= E::from_int(0) {
+                    let activated = if input_activated || x >= E::from_int(0) {
                         x
                     } else {
                         x * (E::from_int(1) / E::from_int(10))
@@ -135,7 +137,7 @@ fn preact_residual_temporal_kernel<E: Float, NOut: Size>(
                     } else {
                         input[x_offset]
                     };
-                    let activated = if x >= E::from_int(0) {
+                    let activated = if input_activated || x >= E::from_int(0) {
                         x
                     } else {
                         x * (E::from_int(1) / E::from_int(10))
@@ -169,16 +171,44 @@ fn preact_residual_temporal_kernel<E: Float, NOut: Size>(
         if t2 < out_len {
             let residual2: ComptimeOption<Vector<E, NOut>> = residual.map(|r| r[index2]);
             sum2 += residual2.unwrap_or_else(|| Vector::zero());
+            if output_activated {
+                sum2 = select_many(
+                    sum2.greater_equal(&Vector::<E, NOut>::zero()),
+                    sum2,
+                    sum2 * Vector::new(E::from_int(1) / E::from_int(10)),
+                );
+            }
             output.write(index2, sum2);
         }
         if t3 < out_len {
             let residual3: ComptimeOption<Vector<E, NOut>> = residual.map(|r| r[index3]);
             sum3 += residual3.unwrap_or_else(|| Vector::zero());
+            if output_activated {
+                sum3 = select_many(
+                    sum3.greater_equal(&Vector::<E, NOut>::zero()),
+                    sum3,
+                    sum3 * Vector::new(E::from_int(1) / E::from_int(10)),
+                );
+            }
             output.write(index3, sum3);
         }
     }
+    if output_activated {
+        sum0 = select_many(
+            sum0.greater_equal(&Vector::<E, NOut>::zero()),
+            sum0,
+            sum0 * Vector::new(E::from_int(1) / E::from_int(10)),
+        );
+    }
     output.write(index0, sum0);
     if t1 < out_len {
+        if output_activated {
+            sum1 = select_many(
+                sum1.greater_equal(&Vector::<E, NOut>::zero()),
+                sum1,
+                sum1 * Vector::new(E::from_int(1) / E::from_int(10)),
+            );
+        }
         output.write(index1, sum1);
     }
 }
@@ -195,8 +225,13 @@ pub fn launch_preact_residual_temporal(
     padding: usize,
     temporal_tile: usize,
     broadcast_inputs: bool,
+    input_activated: bool,
+    output_activated: bool,
     dtype: ElemType,
 ) -> Result<(), ConvSetupError> {
+    if output_activated && residual.is_some() {
+        return Err(ConvSetupError::Unknown);
+    }
     if input.shape.len() != 3
         || weight.shape.len() != 4
         || output.shape.len() != 3
@@ -230,8 +265,6 @@ pub fn launch_preact_residual_temporal(
     }
     let supported_vectors = client.io_optimized_vector_sizes(dtype.size()).collect::<Vec<_>>();
     let vector_size = if broadcast_inputs {
-        // 128 channels / 4 elements per lane = exactly one 32-lane plane.
-        // Letting the backend select a wider IO vector can break this geometry.
         if !supported_vectors.contains(&4) {
             return Err(ConvSetupError::Unknown);
         }
@@ -273,6 +306,8 @@ pub fn launch_preact_residual_temporal(
             length,
             temporal_tile as u32,
             broadcast_inputs,
+            input_activated,
+            output_activated,
             stride as u32,
             dilation as u32,
             padding as i32,

@@ -18,6 +18,21 @@ pub fn conv1d_preact_residual_temporal(
     dilation: usize,
     padding: usize,
 ) -> Result<CubeTensor, ConvSetupError> {
+    conv1d_preact_residual_temporal_activation_plan(
+        input, weight, bias, residual, dilation, padding, false, false,
+    )
+}
+
+pub fn conv1d_preact_residual_temporal_activation_plan(
+    input: CubeTensor,
+    weight: CubeTensor,
+    bias: Option<CubeTensor>,
+    residual: Option<CubeTensor>,
+    dilation: usize,
+    padding: usize,
+    input_activated: bool,
+    output_activated: bool,
+) -> Result<CubeTensor, ConvSetupError> {
     if input.dtype != DType::F32
         || weight.dtype != DType::F32
         || bias.as_ref().is_some_and(|b| b.dtype != DType::F32)
@@ -93,6 +108,8 @@ pub fn conv1d_preact_residual_temporal(
         padding,
         temporal_tile,
         broadcast_inputs,
+        input_activated,
+        output_activated,
         dtype_to_storage_type(DType::F32),
     )?;
     Ok(permute_nhwc_to_nchw(out))
