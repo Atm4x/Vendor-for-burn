@@ -171,15 +171,21 @@ pub fn log_mel(samples: &[f32], n_mels: usize) -> Result<Features> {
     })
 }
 
-/// Produces <=max_samples chunks, preferring a low-energy boundary within the final second.
-pub fn speech_chunks(samples: &[f32], max_samples: usize) -> Vec<&[f32]> {
+#[derive(Debug, Clone, Copy)]
+pub struct AudioChunk<'a> {
+    pub start_sample: usize,
+    pub samples: &'a [f32],
+}
+
+/// Returns non-overlapping chunks and exact offsets in the original PCM.
+pub fn speech_chunks_with_offsets(samples: &[f32], max_samples: usize) -> Vec<AudioChunk<'_>> {
     if samples.is_empty() || max_samples == 0 {
         return Vec::new();
     }
     let mut chunks = Vec::new();
     let mut pos = 0;
     while pos < samples.len() {
-        let end = (pos + max_samples).min(samples.len());
+        let end = pos.saturating_add(max_samples).min(samples.len());
         let mut split = end;
         if end < samples.len() && max_samples > SAMPLE_RATE as usize {
             let begin = end.saturating_sub(SAMPLE_RATE as usize).max(pos + 1);
@@ -192,14 +198,24 @@ pub fn speech_chunks(samples: &[f32], max_samples: usize) -> Vec<&[f32]> {
                     .sum::<f64>();
                 if e < energy {
                     energy = e;
-                    split = i
+                    split = i;
                 }
             }
         }
-        chunks.push(&samples[pos..split]);
+        chunks.push(AudioChunk {
+            start_sample: pos,
+            samples: &samples[pos..split],
+        });
         pos = split;
     }
     chunks
+}
+
+pub fn speech_chunks(samples: &[f32], max_samples: usize) -> Vec<&[f32]> {
+    speech_chunks_with_offsets(samples, max_samples)
+        .into_iter()
+        .map(|chunk| chunk.samples)
+        .collect()
 }
 
 #[cfg(test)]
@@ -223,5 +239,17 @@ mod tests {
         assert!(c.len() >= 3);
         assert!(c.iter().all(|x| x.len() <= 16000 * 24));
         assert_eq!(c.iter().map(|x| x.len()).sum::<usize>(), x.len());
+        let timed = speech_chunks_with_offsets(&x, 16000 * 24);
+        assert_eq!(timed.first().unwrap().start_sample, 0);
+        for pair in timed.windows(2) {
+            assert_eq!(
+                pair[0].start_sample + pair[0].samples.len(),
+                pair[1].start_sample
+            );
+        }
+        assert_eq!(
+            timed.last().unwrap().start_sample + timed.last().unwrap().samples.len(),
+            x.len()
+        );
     }
 }

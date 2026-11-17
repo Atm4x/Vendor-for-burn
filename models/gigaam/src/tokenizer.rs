@@ -54,6 +54,19 @@ impl Tokenizer {
             Self::SentencePiece(v) => v.len(),
         }
     }
+    pub fn id_to_str(&self, id: usize) -> Result<&str> {
+        match self {
+            Self::Character(v) => v
+                .get(id)
+                .map(String::as_str)
+                .context("character token ID out of vocabulary"),
+            Self::SentencePiece(v) => v
+                .get(id)
+                .map(|(piece, _)| piece.as_str())
+                .context("SentencePiece token ID out of vocabulary"),
+        }
+    }
+
     pub fn decode(&self, ids: &[usize]) -> Result<String> {
         let mut bytes = Vec::<u8>::new();
         let mut trim_dummy_prefix = false;

@@ -27,11 +27,17 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
-    if args.len() < 4 || !["transcribe", "parity", "embed"].contains(&args[1].as_str()) {
+    if args.len() < 4
+        || !["transcribe", "parity", "parity-encoder", "embed", "emotion"]
+            .contains(&args[1].as_str())
+    {
         eprintln!("Usage: gigaam-rs transcribe <model_dir> <audio.wav> [--device cpu|cuda|wgpu]");
         eprintln!("       gigaam-rs probe-audio <audio.wav>");
         eprintln!("       gigaam-rs parity <ctc_model_dir> <audio.wav> <out_dir>");
         eprintln!("       gigaam-rs embed <ssl_model_dir> <audio.wav> <out_file.f32>");
+        eprintln!("       gigaam-rs emotion <emo_model_dir> <audio.wav>");
+        eprintln!("       gigaam-rs parity-encoder <ssl_model_dir> <audio.wav> <out_dir>");
+        eprintln!("       gigaam-rs transcribe <model_dir> <audio.wav> --word-timestamps");
         std::process::exit(2);
     }
     let selected = args
@@ -78,6 +84,13 @@ fn main() -> Result<()> {
     };
     let model = GigaAm::load(Path::new(&args[2]), device).context("loading GigaAM weights")?;
     let samples = audio::load_wav_16k(Path::new(&args[3]))?;
+    if args[1] == "emotion" {
+        let probs = model.emotion_probs_16k(&samples)?;
+        for (label, prob) in probs {
+            println!("{label}: {prob:.6}");
+        }
+        return Ok(());
+    }
     if args[1] == "parity" {
         if args.len() < 5 {
             bail!("parity requires <out_dir>")
@@ -97,6 +110,36 @@ fn main() -> Result<()> {
         println!("parity frames={time} output={}", out.display());
         return Ok(());
     }
+    if args[1] == "parity-encoder" {
+        if args.len() < 5 {
+            bail!("parity-encoder requires <out_dir>")
+        }
+        let out = Path::new(&args[4]);
+        std::fs::create_dir_all(out)?;
+        let features = audio::log_mel(&samples, model.n_mels())?;
+        let (encoded, frames, channels) = model.infer_embeddings_16k(&samples)?;
+        std::fs::write(
+            out.join("mel.f32"),
+            features
+                .values
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<u8>>(),
+        )?;
+        std::fs::write(
+            out.join("encoder.f32"),
+            encoded
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<u8>>(),
+        )?;
+        println!(
+            "mel=[{},{}] encoder=[{frames},{channels}]",
+            model.n_mels(),
+            features.frames
+        );
+        return Ok(());
+    }
     if args[1] == "embed" {
         if args.len() < 5 {
             bail!("embed requires <out_file.f32>")
@@ -112,9 +155,22 @@ fn main() -> Result<()> {
         println!("embeddings shape=[{frames},{channels}] file={}", args[4]);
         return Ok(());
     }
-    let chunks = model.transcribe_long_16k(&samples)?;
-    for (i, segment) in chunks.iter().enumerate() {
-        println!("[{i}] {}", segment.text);
+    if args.iter().any(|arg| arg == "--word-timestamps") {
+        let chunks = model.transcribe_long_with_timestamps_16k(&samples)?;
+        for (i, segment) in chunks.iter().enumerate() {
+            println!(
+                "[{i}] [{:.3}-{:.3}] {}",
+                segment.start, segment.end, segment.transcription.text
+            );
+            for word in &segment.words {
+                println!("  [{:.3}-{:.3}] {}", word.start, word.end, word.text);
+            }
+        }
+    } else {
+        let chunks = model.transcribe_long_16k(&samples)?;
+        for (i, segment) in chunks.iter().enumerate() {
+            println!("[{i}] {}", segment.text);
+        }
     }
     Ok(())
 }

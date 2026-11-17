@@ -218,6 +218,15 @@ impl RnntModel {
         features: &Features,
         device: &Device,
     ) -> Result<(Vec<usize>, Vec<usize>)> {
+        let (ids, token_frames, _) = self.infer_ids_with_length(features, device)?;
+        Ok((ids, token_frames))
+    }
+
+    pub fn infer_ids_with_length(
+        &self,
+        features: &Features,
+        device: &Device,
+    ) -> Result<(Vec<usize>, Vec<usize>, usize)> {
         let encoded = self.encoder.encode(features, device)?;
         let [batch, frames, dim] = encoded.dims();
         ensure!(batch == 1, "RNN-T currently supports batch=1");
@@ -254,7 +263,7 @@ impl RnntModel {
                 state = Some(proposed_state);
             }
         }
-        Ok((ids, token_frames))
+        Ok((ids, token_frames, frames))
     }
 }
 

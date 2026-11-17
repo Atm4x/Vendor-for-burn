@@ -6,10 +6,10 @@ pub mod tokenizer;
 pub mod weights;
 
 use anyhow::{Context, Result, bail, ensure};
-use audio::{SAMPLE_RATE, log_mel, speech_chunks};
+use audio::{SAMPLE_RATE, log_mel, speech_chunks, speech_chunks_with_offsets};
 use burn::tensor::Device;
-use decode::{Transcription, ctc_argmax};
-use model::{Config, CtcModel, EncoderModel};
+use decode::{Transcription, Word, ctc_argmax, words_from_frames};
+use model::{Config, CtcModel, EmotionModel, EncoderModel};
 use rnnt::{RnntConfig, RnntModel};
 use serde::Deserialize;
 use std::path::Path;
@@ -24,6 +24,7 @@ pub enum ModelKind {
     E2eCtc,
     E2eRnnt,
     Ssl,
+    Emo,
 }
 impl ModelKind {
     pub fn is_ctc(self) -> bool {
@@ -32,10 +33,16 @@ impl ModelKind {
     pub fn is_rnnt(self) -> bool {
         matches!(self, Self::Rnnt | Self::E2eRnnt)
     }
+    pub fn is_emo(self) -> bool {
+        self == Self::Emo
+    }
     pub fn is_ssl(self) -> bool {
         self == Self::Ssl
     }
     pub fn from_model_name(name: &str) -> Self {
+        if name == "emo" || name.ends_with("_emo") {
+            return Self::Emo;
+        }
         match (
             name.contains("e2e"),
             name.ends_with("_rnnt"),
@@ -64,12 +71,47 @@ struct ModelManifest {
     sentencepiece_model: Option<String>,
     #[serde(default)]
     rnnt: Option<RnntConfig>,
+    #[serde(default)]
+    id2name: Option<EmotionLabels>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum EmotionLabels {
+    List(Vec<String>),
+    Map(std::collections::BTreeMap<String, String>),
+}
+
+impl EmotionLabels {
+    fn into_names(self) -> Result<Vec<String>> {
+        let values = match self {
+            Self::List(values) => values,
+            Self::Map(values) => {
+                let mut indexed = values
+                    .into_iter()
+                    .map(|(index, name)| Ok((index.parse::<usize>()?, name)))
+                    .collect::<Result<Vec<_>>>()?;
+                indexed.sort_by_key(|(index, _)| *index);
+                for (expected, (index, _)) in indexed.iter().enumerate() {
+                    ensure!(
+                        *index == expected,
+                        "emotion label IDs must be consecutive from zero"
+                    );
+                }
+                indexed.into_iter().map(|(_, name)| name).collect()
+            }
+        };
+        ensure!(values.len() >= 2, "at least two emotion labels required");
+        ensure!(values.iter().all(|s| !s.is_empty()), "empty emotion label");
+        Ok(values)
+    }
 }
 
 enum Network {
     Ctc(CtcModel),
     Rnnt(RnntModel),
     Ssl(EncoderModel),
+    Emo(EmotionModel),
 }
 
 pub struct GigaAm {
@@ -78,9 +120,18 @@ pub struct GigaAm {
     device: Device,
     n_mels: usize,
     kind: ModelKind,
+    emotion_names: Vec<String>,
 }
 
 pub type GigaAmCtc = GigaAm;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimedTranscription {
+    pub transcription: Transcription,
+    pub words: Vec<Word>,
+    pub start: f64,
+    pub end: f64,
+}
 
 impl GigaAm {
     pub fn load(model_dir: &Path, device: Device) -> Result<Self> {
@@ -98,7 +149,15 @@ impl GigaAm {
         });
         let num_classes = manifest.config.num_classes;
         let n_mels = manifest.config.n_mels;
-        let tokenizer = if kind.is_ssl() {
+        let emotion_names = if kind.is_emo() {
+            manifest
+                .id2name
+                .context("emotion model requires id2name labels")?
+                .into_names()?
+        } else {
+            Vec::new()
+        };
+        let tokenizer = if kind.is_ssl() || kind.is_emo() {
             None
         } else {
             let sp_path = if let Some(path) = manifest.sentencepiece_model {
@@ -107,9 +166,12 @@ impl GigaAm {
                     "sentencepiece_model must be a filename in model_dir"
                 );
                 Some(model_dir.join(path))
-            } else if matches!(kind, ModelKind::E2eCtc | ModelKind::E2eRnnt) {
-                Some(model_dir.join(match kind {
-                    ModelKind::E2eCtc => "v3_e2e_ctc_tokenizer.model",
+            } else if matches!(kind, ModelKind::E2eCtc | ModelKind::E2eRnnt)
+                || manifest.model_name.as_deref() == Some("v1_rnnt")
+            {
+                Some(model_dir.join(match manifest.model_name.as_deref() {
+                    Some("v1_rnnt") => "v1_rnnt_tokenizer.model",
+                    Some("v3_e2e_ctc") => "v3_e2e_ctc_tokenizer.model",
                     _ => "v3_e2e_rnnt_tokenizer.model",
                 }))
             } else {
@@ -151,7 +213,14 @@ impl GigaAm {
             .find(|p| p.is_file())
             .context("GigaAM model weights not found")?;
         let mut weights = Weights::open(&weights_path)?;
-        let network = if kind.is_ctc() {
+        let network = if kind.is_emo() {
+            Network::Emo(EmotionModel::load(
+                &mut weights,
+                manifest.config.clone(),
+                emotion_names.len(),
+                &device,
+            )?)
+        } else if kind.is_ctc() {
             Network::Ctc(CtcModel::load(
                 &mut weights,
                 manifest.config.clone(),
@@ -177,12 +246,35 @@ impl GigaAm {
             device,
             n_mels,
             kind,
+            emotion_names,
         })
     }
 
     pub fn model_kind(&self) -> ModelKind {
         self.kind
     }
+    pub fn emotion_labels(&self) -> &[String] {
+        &self.emotion_names
+    }
+
+    pub fn emotion_probs_16k(&self, pcm: &[f32]) -> Result<Vec<(String, f32)>> {
+        ensure!(
+            !pcm.is_empty() && pcm.len() <= SAMPLE_RATE as usize * 25,
+            "emotion inference requires 0 < audio duration <= 25s"
+        );
+        let model = match &self.network {
+            Network::Emo(model) => model,
+            _ => bail!("emotion_probs_16k requires an emotion model"),
+        };
+        let features = log_mel(pcm, self.n_mels)?;
+        let values = model.infer_probs(&features, &self.device)?;
+        ensure!(
+            values.len() == self.emotion_names.len(),
+            "emotion label count mismatch"
+        );
+        Ok(self.emotion_names.iter().cloned().zip(values).collect())
+    }
+
     pub fn n_mels(&self) -> usize {
         self.n_mels
     }
@@ -216,17 +308,17 @@ impl GigaAm {
         Ok((values, frames, channels))
     }
 
-    pub fn transcribe_16k(&self, pcm: &[f32]) -> Result<Transcription> {
+    fn decode_with_length_16k(&self, pcm: &[f32]) -> Result<(Transcription, usize)> {
         ensure!(
-            pcm.len() <= SAMPLE_RATE as usize * 25,
-            "audio exceeds 25 seconds: use transcribe_long_16k"
+            !pcm.is_empty() && pcm.len() <= SAMPLE_RATE as usize * 25,
+            "transcription requires 0 < audio duration <= 25s"
         );
         let tokenizer = self
             .tokenizer
             .as_ref()
-            .context("SSL models do not produce transcripts")?;
+            .context("non-ASR models do not produce transcripts")?;
         let features = log_mel(pcm, self.n_mels)?;
-        let (ids, frames) = match &self.network {
+        let (ids, frames, encoded_len) = match &self.network {
             Network::Ctc(m) => {
                 let (logits, time) = m.infer_logits(&features, &self.device)?;
                 let labels = ctc_argmax(&logits, time, tokenizer.len() + 1)?;
@@ -239,17 +331,61 @@ impl GigaAm {
                         frames.push(t);
                     }
                 }
-                (ids, frames)
+                (ids, frames, time)
             }
-            Network::Rnnt(m) => m.infer_ids(&features, &self.device)?,
-            Network::Ssl(_) => bail!("SSL models do not produce transcripts"),
+            Network::Rnnt(m) => m.infer_ids_with_length(&features, &self.device)?,
+            Network::Ssl(_) | Network::Emo(_) => bail!("non-ASR models do not produce transcripts"),
         };
         let text = tokenizer.decode(&ids)?;
-        Ok(Transcription {
-            text,
-            token_ids: ids,
-            frames,
+        Ok((
+            Transcription {
+                text,
+                token_ids: ids,
+                frames,
+            },
+            encoded_len,
+        ))
+    }
+
+    pub fn transcribe_16k(&self, pcm: &[f32]) -> Result<Transcription> {
+        Ok(self.decode_with_length_16k(pcm)?.0)
+    }
+
+    pub fn transcribe_with_timestamps_16k(&self, pcm: &[f32]) -> Result<TimedTranscription> {
+        let (transcription, encoded_len) = self.decode_with_length_16k(pcm)?;
+        let tokenizer = self.tokenizer.as_ref().context("ASR tokenizer missing")?;
+        let words = words_from_frames(
+            tokenizer,
+            &transcription.token_ids,
+            &transcription.frames,
+            pcm.len(),
+            encoded_len,
+        )?;
+        Ok(TimedTranscription {
+            transcription,
+            words,
+            start: 0.0,
+            end: pcm.len() as f64 / SAMPLE_RATE as f64,
         })
+    }
+
+    pub fn transcribe_long_with_timestamps_16k(
+        &self,
+        samples: &[f32],
+    ) -> Result<Vec<TimedTranscription>> {
+        let mut segments = Vec::new();
+        for chunk in speech_chunks_with_offsets(samples, SAMPLE_RATE as usize * 24) {
+            let mut timed = self.transcribe_with_timestamps_16k(chunk.samples)?;
+            let offset = chunk.start_sample as f64 / SAMPLE_RATE as f64;
+            timed.start = offset;
+            timed.end += offset;
+            for word in &mut timed.words {
+                word.start += offset;
+                word.end += offset;
+            }
+            segments.push(timed);
+        }
+        Ok(segments)
     }
 
     pub fn transcribe_long_16k(&self, samples: &[f32]) -> Result<Vec<Transcription>> {
@@ -266,6 +402,7 @@ mod tests {
     #[test]
     fn model_name_selects_correct_architecture() {
         assert_eq!(ModelKind::from_model_name("v3_ctc"), ModelKind::Ctc);
+        assert_eq!(ModelKind::from_model_name("emo"), ModelKind::Emo);
         assert_eq!(
             ModelKind::from_model_name("v3_e2e_rnnt"),
             ModelKind::E2eRnnt
@@ -274,5 +411,36 @@ mod tests {
             ModelKind::from_model_name("multilingual_large_ssl"),
             ModelKind::Ssl
         );
+    }
+    #[test]
+    fn emotion_names_preserve_numeric_order() {
+        let names =
+            serde_json::from_str::<EmotionLabels>(r#"{"10":"extra", "0":"a", "1":"b"}"#).unwrap();
+        assert!(names.into_names().is_err());
+        let names =
+            serde_json::from_str::<EmotionLabels>(r#"{"2":"c", "0":"a", "1":"b"}"#).unwrap();
+        assert_eq!(names.into_names().unwrap(), ["a", "b", "c"]);
+    }
+    #[test]
+    fn rejects_unimplemented_encoder_variants() {
+        let mut cfg = Config::default();
+        cfg.self_attention_model = "unsupported".into();
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("attention")
+        );
+        cfg.self_attention_model = "rel_pos".into();
+        cfg.subsampling = "unknown".into();
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("subsampling")
+        );
+        cfg.subsampling = "conv1d".into();
+        cfg.conv_norm_type = "layer_norm".into();
+        assert!(cfg.validate().is_ok());
     }
 }
