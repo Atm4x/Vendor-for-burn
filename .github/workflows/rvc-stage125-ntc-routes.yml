@@ -2,14 +2,6 @@ name: RVC Stage125 NTC direct-conv route matrix Windows package
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - experiment/conv-kernel-rnd-stage33-20261110
-    paths:
-      - 'vendor/cubek-convolution-0.3.1/src/kernels/forward/direct_preact_residual.rs'
-      - 'vendor/burn-cubecl-0.22.1/src/kernel/conv/preact_residual1d.rs'
-      - 'research/stage125-ntc-routes/**'
-      - '.github/workflows/rvc-stage125-ntc-routes.yml'
 
 permissions:
   contents: read

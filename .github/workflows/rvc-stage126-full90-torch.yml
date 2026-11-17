@@ -1,0 +1,81 @@
+name: RVC Stage126 Full90 Rust NTC vs original PyTorch CUDA
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - experiment/conv-kernel-rnd-stage33-20261110
+    paths:
+      - 'models/tts-with-rvc-rs/src/main.rs'
+      - 'research/stage126-full90-torch/**'
+      - '.github/workflows/rvc-stage126-full90-torch.yml'
+permissions:
+  contents: read
+concurrency:
+  group: rvc-stage126-full90-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cache/tracel
+          key: rvc-stage126-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            rvc-stage125-
+            rvc-stage123-
+      - name: Validate Stage126 PowerShell Python and contract
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = 'research/stage126-full90-torch/windows'
+          $ps1 = Join-Path $root 'Run-Stage126-Full90-Compare.ps1'
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $ps1).Path,[ref]$tokens,[ref]$errors)
+          if ($errors.Count) { $errors | Out-String | Write-Host; throw 'Stage126 PS1 parser failed' }
+          python -m py_compile (Join-Path $root 'Run-Stage126-Full90-Compare.py') (Join-Path $root 'Run-Stage126-OriginalTorch.py')
+          if ($LASTEXITCODE -ne 0) { throw 'Stage126 Python parser failed' }
+          python -m unittest discover -s $root -p 'test_stage126_contract.py' -v
+          if ($LASTEXITCODE -ne 0) { throw 'Stage126 contract tests failed' }
+      - name: Restore vendored crates
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Stage126 vendor validation failed' }
+      - name: Build Stage126 Rust release CPU CUDA WGPU
+        shell: pwsh
+        run: |
+          cargo build --release --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs
+          if ($LASTEXITCODE -ne 0) { throw 'Stage126 Rust release build failed' }
+          & target/release/tts-with-rvc-rs.exe doctor
+          if ($LASTEXITCODE -ne 0) { throw 'Stage126 CLI doctor failed' }
+      - name: Package one Windows Stage126 artifact
+        shell: pwsh
+        run: |
+          $out = 'dist/rvc-stage126-full90-torch-windows-x64'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item target/release/tts-with-rvc-rs.exe $out
+          Copy-Item research/stage126-full90-torch/windows/Run-Stage126-Full90-Compare.ps1 $out
+          Copy-Item research/stage126-full90-torch/windows/Run-Stage126-Full90-Compare.py $out
+          Copy-Item research/stage126-full90-torch/windows/Run-Stage126-OriginalTorch.py $out
+          Copy-Item research/stage125-ntc-routes/windows/Run-Stage125-NTC-Routes.ps1 $out
+          Copy-Item research/stage126-full90-torch/README.md $out
+          Copy-Item research/stage126-full90-torch/REPORT.md (Join-Path $out 'STAGE126_REPORT.md')
+          Copy-Item research/stage126-full90-torch/WORKFLOW_CONTRACT.md (Join-Path $out 'RVC_RND_WORKFLOW_CONTRACT.md')
+          Set-Content -LiteralPath (Join-Path $out 'BUILD_STATUS.txt') -Value "Stage126 release built, commit=$env:GITHUB_SHA; user RTX/PyTorch benchmark pending" -Encoding utf8
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rvc-stage126-full90-torch-windows-x64
+          path: dist/rvc-stage126-full90-torch-windows-x64/
+          if-no-files-found: error
+          retention-days: 14

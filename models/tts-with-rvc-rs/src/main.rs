@@ -469,6 +469,22 @@ fn run() -> Result<(), String> {
             "nsf_fused_pair_max_channels": std::env::var("RVC_NSF_FUSED_PAIR_MAX_CHANNELS").ok()
                 .filter(|value| !value.is_empty()).and_then(|value| value.parse::<usize>().ok()),
             "nsf_execution": "sequential",
+            "nsf_resblock_benchmark_requested": {
+                "transport": std::env::var("RVC_NSF_RESBLOCK_TRANSPORT").as_deref() == Ok("1"),
+                "shared_ntc": std::env::var("RVC_NSF_RESBLOCK_SHARED_NTC").as_deref() == Ok("1"),
+                "temporal_tile": std::env::var("RVC_NSF_RESBLOCK_TEMPORAL_TILE").ok(),
+                "activation_placement": std::env::var("RVC_NSF_RESBLOCK_ACTIVATION_PLACEMENT").as_deref() == Ok("1"),
+                "linear_interior": std::env::var("RVC_NSF_RESBLOCK_LINEAR_INTERIOR").as_deref() == Ok("1"),
+                "residue_order": std::env::var("RVC_NSF_RESBLOCK_RESIDUE_ORDER").as_deref() == Ok("1"),
+                "plane_broadcast": std::env::var("RVC_NSF_RESBLOCK_PLANE_BROADCAST").as_deref() == Ok("1"),
+                "weight_prefetch": std::env::var("RVC_NSF_RESBLOCK_WEIGHT_PREFETCH").as_deref() == Ok("1"),
+                "scope": "requested environment; layer shape may select a different implementation"
+            },
+            "full_wav_benchmark_scope": {
+                "timed": "resident synchronized infer_long_filtered_16khz_batched",
+                "excluded": ["checkpoint loading", "preprocessing", "postprocess RMS normalization", "WAV output writing"],
+                "cold_iteration_excluded_from_warm_median": true
+            },
             "warm_definition": "same process, identical full WAV, persistent weights, synchronized outputs; iterations 1..N; no CUDA Graph",
         });
         let path = format!("{target}.benchmark.json");
