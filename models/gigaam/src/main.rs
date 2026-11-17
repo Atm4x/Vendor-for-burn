@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use burn::tensor::Device;
-use gigaam_rs::{GigaAmCtc, audio};
+use gigaam_rs::{GigaAm, audio};
 use std::path::Path;
 
 fn main() -> Result<()> {
@@ -27,10 +27,11 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
-    if args.len() < 4 || !["transcribe", "parity"].contains(&args[1].as_str()) {
+    if args.len() < 4 || !["transcribe", "parity", "embed"].contains(&args[1].as_str()) {
         eprintln!("Usage: gigaam-rs transcribe <model_dir> <audio.wav> [--device cpu|cuda|wgpu]");
         eprintln!("       gigaam-rs probe-audio <audio.wav>");
-        eprintln!("       gigaam-rs parity <model_dir> <audio.wav> <out_dir>");
+        eprintln!("       gigaam-rs parity <ctc_model_dir> <audio.wav> <out_dir>");
+        eprintln!("       gigaam-rs embed <ssl_model_dir> <audio.wav> <out_file.f32>");
         std::process::exit(2);
     }
     let selected = args
@@ -75,7 +76,7 @@ fn main() -> Result<()> {
         }
         _ => bail!("unknown backend: {selected}"),
     };
-    let model = GigaAmCtc::load(Path::new(&args[2]), device).context("loading GigaAM weights")?;
+    let model = GigaAm::load(Path::new(&args[2]), device).context("loading GigaAM weights")?;
     let samples = audio::load_wav_16k(Path::new(&args[3]))?;
     if args[1] == "parity" {
         if args.len() < 5 {
@@ -94,6 +95,21 @@ fn main() -> Result<()> {
         std::fs::write(out.join("mel.f32"), mel)?;
         std::fs::write(out.join("logits.f32"), values)?;
         println!("parity frames={time} output={}", out.display());
+        return Ok(());
+    }
+    if args[1] == "embed" {
+        if args.len() < 5 {
+            bail!("embed requires <out_file.f32>")
+        }
+        let (values, frames, channels) = model.infer_embeddings_16k(&samples)?;
+        std::fs::write(
+            &args[4],
+            values
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<u8>>(),
+        )?;
+        println!("embeddings shape=[{frames},{channels}] file={}", args[4]);
         return Ok(());
     }
     let chunks = model.transcribe_long_16k(&samples)?;

@@ -339,15 +339,14 @@ impl Block {
     }
 }
 
-pub struct CtcModel {
+pub struct EncoderModel {
     config: Config,
     sub1: Conv2,
     sub2: Conv2,
     projection: Linear,
     layers: Vec<Block>,
-    head: Conv1,
 }
-impl CtcModel {
+impl EncoderModel {
     pub fn load(w: &mut Weights, config: Config, device: &Device) -> Result<Self> {
         config.validate()?;
         let k = config.subsample_kernel;
@@ -362,26 +361,22 @@ impl CtcModel {
                     .with_context(|| format!("loading Conformer block {i}"))?,
             );
         }
-        let head = Conv1::load(w, "head.decoder_layers.0", device, 1, 0, 1)?;
-        ensure!(
-            head.w.dims()[0] == config.num_classes,
-            "CTC head classes mismatch"
-        );
         Ok(Self {
             config,
             sub1,
             sub2,
             projection,
             layers,
-            head,
         })
     }
-    pub fn infer_logits(&self, features: &Features, device: &Device) -> Result<(Vec<f32>, usize)> {
+
+    pub fn encode(&self, features: &Features, device: &Device) -> Result<Tensor<3>> {
         ensure!(features.n_mels == self.config.n_mels, "mel-bin mismatch");
-        let time = features.frames;
-        let feat = self.config.n_mels;
         let mut x = Tensor::<4>::from_data(
-            TensorData::new(features.values.clone(), [1, 1, feat, time]),
+            TensorData::new(
+                features.values.clone(),
+                [1, 1, features.n_mels, features.frames],
+            ),
             device,
         )
         .permute([0, 1, 3, 2]);
@@ -399,20 +394,54 @@ impl CtcModel {
         );
         let mut seq = self.projection.forward(seq);
         for layer in &self.layers {
-            seq = layer.forward(seq)
+            seq = layer.forward(seq);
         }
-        let logits = self.head.forward(seq.permute([0, 2, 1])).permute([0, 2, 1]);
+        Ok(seq)
+    }
+
+    pub fn n_mels(&self) -> usize {
+        self.config.n_mels
+    }
+    pub fn d_model(&self) -> usize {
+        self.config.d_model
+    }
+}
+
+pub struct CtcModel {
+    encoder: EncoderModel,
+    head: Conv1,
+    num_classes: usize,
+}
+impl CtcModel {
+    pub fn load(w: &mut Weights, config: Config, device: &Device) -> Result<Self> {
+        let head = Conv1::load(w, "head.decoder_layers.0", device, 1, 0, 1)?;
+        ensure!(
+            head.w.dims()[0] == config.num_classes,
+            "CTC head classes mismatch"
+        );
+        Ok(Self {
+            encoder: EncoderModel::load(w, config.clone(), device)?,
+            head,
+            num_classes: config.num_classes,
+        })
+    }
+
+    pub fn infer_logits(&self, features: &Features, device: &Device) -> Result<(Vec<f32>, usize)> {
+        let encoded = self.encoder.encode(features, device)?;
+        let logits = self
+            .head
+            .forward(encoded.permute([0, 2, 1]))
+            .permute([0, 2, 1]);
         let [_, out_t, classes] = logits.dims();
-        ensure!(classes == self.config.num_classes, "CTC class mismatch");
+        ensure!(classes == self.num_classes, "CTC class mismatch");
         let values = logits
             .into_data()
             .try_to_vec::<f32>()
             .context("retrieving model logits")?;
         Ok((values, out_t))
     }
-}
-impl CtcModel {
+
     pub fn n_mels(&self) -> usize {
-        self.config.n_mels
+        self.encoder.n_mels()
     }
 }
