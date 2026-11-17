@@ -39,21 +39,34 @@ impl ModelKind {
     pub fn is_ssl(self) -> bool {
         self == Self::Ssl
     }
-    pub fn from_model_name(name: &str) -> Self {
-        if name == "emo" || name.ends_with("_emo") {
-            return Self::Emo;
-        }
-        match (
-            name.contains("e2e"),
-            name.ends_with("_rnnt"),
-            name.ends_with("_ssl"),
-        ) {
-            (true, true, _) => Self::E2eRnnt,
-            (true, false, _) => Self::E2eCtc,
-            (_, true, _) => Self::Rnnt,
-            (_, _, true) => Self::Ssl,
-            _ => Self::Ctc,
-        }
+    pub fn from_model_name(name: &str) -> Option<Self> {
+        const MODELS: &[(&str, ModelKind)] = &[
+            ("ctc", ModelKind::Ctc),
+            ("rnnt", ModelKind::Rnnt),
+            ("e2e_ctc", ModelKind::E2eCtc),
+            ("e2e_rnnt", ModelKind::E2eRnnt),
+            ("ssl", ModelKind::Ssl),
+            ("emo", ModelKind::Emo),
+            ("v1_ctc", ModelKind::Ctc),
+            ("v1_rnnt", ModelKind::Rnnt),
+            ("v1_ssl", ModelKind::Ssl),
+            ("v2_ctc", ModelKind::Ctc),
+            ("v2_rnnt", ModelKind::Rnnt),
+            ("v2_ssl", ModelKind::Ssl),
+            ("v3_ctc", ModelKind::Ctc),
+            ("v3_rnnt", ModelKind::Rnnt),
+            ("v3_e2e_ctc", ModelKind::E2eCtc),
+            ("v3_e2e_rnnt", ModelKind::E2eRnnt),
+            ("v3_ssl", ModelKind::Ssl),
+            ("multilingual_ctc", ModelKind::Ctc),
+            ("multilingual_ssl", ModelKind::Ssl),
+            ("multilingual_large_ctc", ModelKind::Ctc),
+            ("multilingual_large_ssl", ModelKind::Ssl),
+        ];
+        MODELS
+            .iter()
+            .find(|(model_name, _)| *model_name == name)
+            .map(|(_, kind)| *kind)
     }
 }
 
@@ -73,6 +86,29 @@ struct ModelManifest {
     rnnt: Option<RnntConfig>,
     #[serde(default)]
     id2name: Option<EmotionLabels>,
+}
+
+impl ModelManifest {
+    fn resolve_kind(&self) -> Result<ModelKind> {
+        match (self.model_type, self.model_name.as_deref()) {
+            (Some(explicit), Some(name)) => {
+                if let Some(registered) = ModelKind::from_model_name(name) {
+                    ensure!(
+                        explicit == registered,
+                        "model_type {explicit:?} conflicts with registered model {name} ({registered:?})"
+                    );
+                }
+                Ok(explicit)
+            }
+            (Some(explicit), None) => Ok(explicit),
+            (None, Some(name)) => ModelKind::from_model_name(name).with_context(|| {
+                format!(
+                    "unknown model_name {name:?}: specify model_type explicitly for custom models"
+                )
+            }),
+            (None, None) => bail!("config.json must specify model_name or model_type"),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -140,13 +176,7 @@ impl GigaAm {
             &std::fs::read(&cfg_path).with_context(|| format!("reading {}", cfg_path.display()))?,
         )?;
         manifest.config.validate()?;
-        let kind = manifest.model_type.unwrap_or_else(|| {
-            manifest
-                .model_name
-                .as_deref()
-                .map(ModelKind::from_model_name)
-                .unwrap_or(ModelKind::Ctc)
-        });
+        let kind = manifest.resolve_kind()?;
         let num_classes = manifest.config.num_classes;
         let n_mels = manifest.config.n_mels;
         let emotion_names = if kind.is_emo() {
@@ -185,15 +215,6 @@ impl GigaAm {
             );
             Some(tok)
         };
-        let rnnt_config = if kind.is_rnnt() {
-            let rnnt = manifest.rnnt.context(
-                "RNN-T requires rnnt config (pred_hidden, pred_rnn_layers, joint_hidden)",
-            )?;
-            rnnt.validate()?;
-            Some(rnnt)
-        } else {
-            None
-        };
         let mut weight_names = Vec::new();
         if let Some(name) = &manifest.model_name {
             ensure!(
@@ -213,32 +234,35 @@ impl GigaAm {
             .find(|p| p.is_file())
             .context("GigaAM model weights not found")?;
         let mut weights = Weights::open(&weights_path)?;
-        let network = if kind.is_emo() {
-            Network::Emo(EmotionModel::load(
+        let network = match kind {
+            ModelKind::Emo => Network::Emo(EmotionModel::load(
                 &mut weights,
                 manifest.config.clone(),
                 emotion_names.len(),
                 &device,
-            )?)
-        } else if kind.is_ctc() {
-            Network::Ctc(CtcModel::load(
+            )?),
+            ModelKind::Ctc | ModelKind::E2eCtc => Network::Ctc(CtcModel::load(
                 &mut weights,
                 manifest.config.clone(),
                 &device,
-            )?)
-        } else if let Some(rnnt) = rnnt_config {
-            Network::Rnnt(RnntModel::load(
+            )?),
+            ModelKind::Rnnt | ModelKind::E2eRnnt => {
+                let rnnt = manifest.rnnt.context(
+                    "RNN-T requires rnnt config (pred_hidden, pred_rnn_layers, joint_hidden)",
+                )?;
+                rnnt.validate()?;
+                Network::Rnnt(RnntModel::load(
+                    &mut weights,
+                    manifest.config.clone(),
+                    rnnt,
+                    &device,
+                )?)
+            }
+            ModelKind::Ssl => Network::Ssl(EncoderModel::load(
                 &mut weights,
                 manifest.config.clone(),
-                rnnt,
                 &device,
-            )?)
-        } else {
-            Network::Ssl(EncoderModel::load(
-                &mut weights,
-                manifest.config.clone(),
-                &device,
-            )?)
+            )?),
         };
         Ok(Self {
             network,
@@ -401,14 +425,41 @@ mod tests {
     use super::*;
     #[test]
     fn model_name_selects_correct_architecture() {
-        assert_eq!(ModelKind::from_model_name("v3_ctc"), ModelKind::Ctc);
-        assert_eq!(ModelKind::from_model_name("emo"), ModelKind::Emo);
+        assert_eq!(ModelKind::from_model_name("v3_ctc"), Some(ModelKind::Ctc));
+        assert_eq!(ModelKind::from_model_name("emo"), Some(ModelKind::Emo));
         assert_eq!(
             ModelKind::from_model_name("v3_e2e_rnnt"),
-            ModelKind::E2eRnnt
+            Some(ModelKind::E2eRnnt)
         );
         assert_eq!(
             ModelKind::from_model_name("multilingual_large_ssl"),
+            Some(ModelKind::Ssl)
+        );
+    }
+    #[test]
+    fn model_selection_rejects_unknown_names_and_conflicting_types() {
+        assert_eq!(ModelKind::from_model_name("unknown_ctc"), None);
+        assert_eq!(ModelKind::from_model_name("v3_e2e_rnnt_typo"), None);
+        let cfg = |name: Option<&str>, model_type: Option<ModelKind>| ModelManifest {
+            config: Config::default(),
+            vocabulary: Vec::new(),
+            model_name: name.map(str::to_owned),
+            model_type,
+            sentencepiece_model: None,
+            rnnt: None,
+            id2name: None,
+        };
+        assert!(
+            cfg(Some("v3_rnnt"), Some(ModelKind::Ctc))
+                .resolve_kind()
+                .is_err()
+        );
+        assert!(cfg(Some("unknown_ctc"), None).resolve_kind().is_err());
+        assert!(cfg(None, None).resolve_kind().is_err());
+        assert_eq!(
+            cfg(Some("custom_encoder"), Some(ModelKind::Ssl))
+                .resolve_kind()
+                .unwrap(),
             ModelKind::Ssl
         );
     }

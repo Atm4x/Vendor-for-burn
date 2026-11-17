@@ -17,13 +17,13 @@ This crate implements the GigaAM Conformer family in Rust using Burn tensors. No
 | `multilingual_ctc`, `multilingual_large_ctc` | Same Conformer/CTC building blocks | Configured character vocabulary | No official checkpoint tested |
 | `multilingual_ssl`, `multilingual_large_ssl` | Same Conformer encoder | Frame embeddings | No official checkpoint tested |
 
-The shared Conformer supports rotary or relative positional attention, Conv1D or Conv2D factor-4 subsampling, and convolution BatchNorm or LayerNorm. Original checkpoint `cfg` fields must be transferred into `config.json` accurately. Other subsampling factors, advanced emotion heads, batch inference, neural VAD, automatic checkpoint-config extraction, and all official-weight parity checks are **not yet implemented/verified**. v1/v2 and `emo` should be treated as experimental until checked with original checkpoint configurations. The source expects model-specific dimensions from the checkpoint. Model names are not interchangeable with weight files.
+The shared Conformer supports rotary or relative positional attention, Conv1D or Conv2D factor-4 subsampling, and convolution BatchNorm or LayerNorm. Original checkpoint `cfg` fields must be transferred into `config.json` accurately. Other subsampling factors, advanced emotion heads, batch inference, neural VAD, automatic checkpoint-config extraction, and all official-weight parity checks are **not yet implemented/verified**. v1/v2 and `emo` should be treated as experimental until checked with original checkpoint configurations. The source expects model-specific dimensions from the checkpoint. Model names are not interchangeable with weight files. Known model names are resolved through an exact registry; unknown names must supply an explicit `model_type`, and conflicting registered name/type combinations fail at load time instead of silently falling back to CTC.
 
 ## Configuration
 
 Place a checkpoint (`<model_name>.ckpt`, `<model_name>.safetensors`, `model.ckpt`, or `model.safetensors`) alongside a `config.json` manifest in a local model directory. For backwards compatibility, CTC also accepts `v3_ctc.ckpt` and `v3_ctc.safetensors`. Original PyTorch `state_dict` parameter names must be preserved, including the `encoder.` and `head.` prefixes.
 
-The required dimensions are `n_mels`, `n_layers`, `d_model`, `n_heads`, `ff_expansion`, `conv_kernel`, `subsample_kernel`, `subsample_channels`, and `num_classes`. Optional architecture settings are `self_attention_model` (`rotary` / `rel_pos`), `subsampling` (`conv1d` / `conv2d`), `subsampling_factor` (currently 4), and `conv_norm_type` (`batch_norm` / `layer_norm`). The defaults describe the v3-style architecture, **not** a reliable description of every checkpoint. They **must match the selected checkpoint**; the defaults of upstream Python classes are not a verified GigaAM v3 checkpoint configuration.
+The required dimensions are `n_mels`, `n_layers`, `d_model`, `n_heads`, `ff_expansion`, `conv_kernel`, `subsample_kernel`, `subsample_channels`, and `num_classes`. Optional architecture settings are `self_attention_model` (`rotary` / `rel_pos`), `subsampling` (`conv1d` / `conv2d`), `subsampling_factor` (currently 4), `conv_norm_type` (`batch_norm` / `layer_norm`), and `pos_emb_max_len` (defaults to **5000**, as in the original Python encoder). Note that the Python `RotaryPositionalEmbedding` also uses `pos_emb_max_len` as the **RoPE frequency base**: setting it to the common Transformer value 10000 silently changes GigaAM's output. The defaults describe the v3-style architecture, **not** a reliable description of every checkpoint. They **must match the selected checkpoint**; the defaults of upstream Python classes are not a verified GigaAM v3 checkpoint configuration.
 
 For RNN-T, add the `rnnt` object with `pred_hidden`, `pred_rnn_layers`, `joint_hidden`, and optional `max_symbols_per_step` (defaults to 10, as upstream). Token ID `num_classes-1` is reserved for blank. RNN-T states are committed only after a nonblank emission, matching the original `RNNTGreedyDecoding` algorithm. The predictor handles single-sample inference.
 
@@ -72,16 +72,18 @@ Default build uses Burn Flex CPU, with CUDA (`--no-default-features --features c
 ## Verification (Rust 1.100.0, Linux Flex CPU)
 
 - `cargo check --offline -p gigaam-rs` — PASS.
-- `cargo test --offline -p gigaam-rs --lib` — **14/14 PASS**.
+- `cargo test --offline -p gigaam-rs --lib` — **16/16 PASS**.
 - CTC logits from previous implementation are byte-identical after sharing Conformer encoder with RNN-T/SSL.
 - Python/PyTorch synthetic Conformer+CTC log-probability parity: maximum absolute difference **3.22e-6** (previous stage).
 - RNN-T synthetic blank-only case and two-symbols-per-frame case match PyTorch text and token counts; standalone two-step LSTM matches PyTorch to **1e-6**.
 - SSL Conformer output on 1-second synthetic WAV matches PyTorch within **9.32e-5** max absolute error.
 - E2E CTC and RNN-T synthetic checkpoint plus a locally trained SentencePiece ModelProto decode successfully.
 - Synthetic v2-style Conformer with `rel_pos` attention, `conv1d` subsampling, `layer_norm`: PyTorch forward parity on 51×8 output: **max 5.96e-7, mean 1.42e-7**.
-- Synthetic v3-style Conformer with `rotary`, `conv2d`, `batch_norm`: PyTorch forward sanity parity on 51×8 output: **max 1.26e-3, mean 1.97e-4** (requires further accuracy profiling).
+- Synthetic v3-style Conformer with `rotary`, `conv2d`, `batch_norm`: after correcting the original `pos_emb_max_len=5000` RoPE frequency base, **max 4.77e-7, mean 1.01e-7** against PyTorch on the 51×8 output. Prior `1.26e-3` discrepancy was caused by using a hard-coded base of 10000.
 - Synthetic legacy-style emotion checkpoint (`head.weight`, `head.bias`): Rust `0.544427 / 0.180733 / 0.274840`, matched PyTorch within the printed precision.
 - Synthetic CTC with `rel_pos`/Conv1D: CLI `--word-timestamps` produced an aligned word interval for a 2-second input.
+- PyTorch ZIP checkpoint (`.ckpt` containing `state_dict` and `cfg`) loaded through `burn-store`: output **bit-identical** to the same weights in `.safetensors` on a 51×8 synthetic Conformer.
+- Explicit exact-name model registry rejects unknown names and conflicting architecture kinds.
 - Supplied 89.94-second `MitaKind.wav`: resampling 44.1 kHz → 16 kHz, four-way segmentation, finite mel features. **No official pretrained GigaAM ASR checkpoint was available**, so real speech recognition is not validated.
 
 ## Licensing

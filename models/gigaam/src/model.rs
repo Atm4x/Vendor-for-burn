@@ -21,6 +21,7 @@ pub struct Config {
     pub conv_norm_type: String,
     pub subsampling: String,
     pub subsampling_factor: usize,
+    pub pos_emb_max_len: usize,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -38,6 +39,7 @@ impl Default for Config {
             conv_norm_type: "batch_norm".to_owned(),
             subsampling: "conv2d".to_owned(),
             subsampling_factor: 4,
+            pos_emb_max_len: 5000,
         }
     }
 }
@@ -47,6 +49,7 @@ impl Config {
             self.n_mels > 0 && self.n_layers > 0 && self.d_model > 0 && self.num_classes > 1,
             "invalid model dimensions"
         );
+        ensure!(self.pos_emb_max_len > 1, "pos_emb_max_len must exceed 1");
         ensure!(
             self.n_heads > 0 && self.d_model % self.n_heads == 0,
             "d_model must be divisible by n_heads"
@@ -240,7 +243,9 @@ struct Attention {
 }
 
 enum PositionKind {
-    Rotary,
+    Rotary {
+        base: f32,
+    },
     Relative {
         linear_pos: Linear,
         u: Tensor<2>,
@@ -272,7 +277,9 @@ impl Attention {
             heads: config.n_heads,
             head_dim: config.d_model / config.n_heads,
             position: if config.self_attention_model == "rotary" {
-                PositionKind::Rotary
+                PositionKind::Rotary {
+                    base: config.pos_emb_max_len as f32,
+                }
             } else {
                 PositionKind::Relative {
                     linear_pos: Linear::load(w, &format!("{key}.linear_pos"), d, false)?,
@@ -285,7 +292,7 @@ impl Attention {
     fn forward(&self, x: Tensor<3>) -> Tensor<3> {
         let [batch, time, dim] = x.dims();
         match &self.position {
-            PositionKind::Rotary => self.forward_rotary(x, batch, time, dim),
+            PositionKind::Rotary { base } => self.forward_rotary(x, batch, time, dim, *base),
             PositionKind::Relative { linear_pos, u, v } => {
                 self.forward_relative(x, batch, time, dim, linear_pos, u, v)
             }
@@ -353,7 +360,14 @@ impl Attention {
         self.o.forward(attended)
     }
 
-    fn forward_rotary(&self, x: Tensor<3>, batch: usize, time: usize, dim: usize) -> Tensor<3> {
+    fn forward_rotary(
+        &self,
+        x: Tensor<3>,
+        batch: usize,
+        time: usize,
+        dim: usize,
+        base: f32,
+    ) -> Tensor<3> {
         let device = x.device();
         let half = self.head_dim / 2;
         assert_eq!(self.head_dim % 2, 0, "RoPE needs even head dimension");
@@ -362,7 +376,7 @@ impl Attention {
         let mut sin = Vec::with_capacity(time * self.head_dim);
         for t in 0..time {
             let phases: Vec<f32> = (0..half)
-                .map(|i| t as f32 / 10000f32.powf((i * 2) as f32 / self.head_dim as f32))
+                .map(|i| t as f32 / base.powf((i * 2) as f32 / self.head_dim as f32))
                 .collect();
             for _ in 0..2 {
                 for a in &phases {
@@ -714,6 +728,18 @@ impl EmotionModel {
 #[cfg(all(test, feature = "flex"))]
 mod legacy_tests {
     use super::*;
+
+    #[test]
+    fn rotary_frequency_base_matches_python_encoder() {
+        let defaults = Config::default();
+        assert_eq!(defaults.pos_emb_max_len, 5000);
+        let parsed: Config = serde_json::from_str(r#"{"pos_emb_max_len": 8192}"#).unwrap();
+        assert_eq!(parsed.pos_emb_max_len, 8192);
+        let omitted: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(omitted.pos_emb_max_len, 5000);
+        let rate = (5000f32).powf(2.0 / 4.0);
+        assert!((rate - 5000f32.sqrt()).abs() < 1e-5);
+    }
     #[test]
     fn relative_shift_matches_pytorch_reshape() {
         let device = Device::flex();
