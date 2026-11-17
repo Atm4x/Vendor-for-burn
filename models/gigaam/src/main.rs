@@ -1,4 +1,6 @@
+mod jsonl;
 mod serve;
+mod worker;
 
 use anyhow::{Context, Result, bail};
 use burn::tensor::Device;
@@ -91,10 +93,13 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
-    if (args.len() < 4 && !(args.len() == 3 && args[1] == "serve"))
+    if (args.len() < 4
+        && !(args.get(1).is_some_and(|arg| arg == "worker")
+            || (args.len() >= 3 && args.get(1).is_some_and(|arg| arg == "serve"))))
         || ![
             "transcribe",
             "serve",
+            "worker",
             "transcribe-batch",
             "parity",
             "parity-encoder",
@@ -105,6 +110,9 @@ fn main() -> Result<()> {
     {
         eprintln!(
             "       gigaam-rs serve <model_dir> [--device cuda|cpu|wgpu|flex] (JSONL stdin/stdout)"
+        );
+        eprintln!(
+            "       gigaam-rs worker [--device cuda|cpu|wgpu|flex] [--model-cache dir] [--batch-size 16]"
         );
         eprintln!(
             "Usage: gigaam-rs transcribe <model_dir> <audio.wav> [--device cuda|cpu|wgpu|flex]"
@@ -193,6 +201,20 @@ fn main() -> Result<()> {
     }
     model_cache.download_if_missing = args.iter().any(|arg| arg == "--download-model");
     let python_audio = args.iter().any(|arg| arg == "--python-audio");
+    if args[1] == "worker" {
+        let batch_size = args
+            .iter()
+            .position(|arg| arg == "--batch-size")
+            .map(|index| {
+                args.get(index + 1)
+                    .context("--batch-size requires an integer")?
+                    .parse::<usize>()
+                    .context("invalid --batch-size")
+            })
+            .transpose()?
+            .unwrap_or(16);
+        return worker::run(device, model_cache, python_audio, batch_size);
+    }
     let model_path = resolve_model_path(&args[2], &model_cache)?;
     let model_start = Instant::now();
     let model = GigaAm::load(&model_path, device).context("loading GigaAM weights")?;

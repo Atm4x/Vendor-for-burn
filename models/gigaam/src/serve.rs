@@ -5,22 +5,17 @@ use gigaam_rs::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{
-    io::{self, BufRead, Write},
-    path::Path,
-};
+use std::path::Path;
 
 #[derive(Deserialize)]
-struct Request {
-    #[serde(default)]
-    id: Value,
+pub(crate) struct Request {
     #[serde(flatten)]
-    command: Command,
+    pub(crate) command: Command,
 }
 
 #[derive(Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
-enum Command {
+pub(crate) enum Command {
     Status,
     Transcribe {
         audio_path: String,
@@ -59,40 +54,11 @@ fn default_true() -> bool {
 }
 
 pub fn run(service: &GigaAmService, python_audio: bool) -> Result<()> {
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    let mut output = stdout.lock();
-    for line in stdin.lock().lines() {
-        let line = line.context("reading request from stdin")?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let parsed: Result<Request> = serde_json::from_str(&line).map_err(Into::into);
-        let shutdown = matches!(
-            &parsed,
-            Ok(Request {
-                command: Command::Shutdown,
-                ..
-            })
-        );
-        let response = match parsed {
-            Ok(request) => {
-                let id = request.id;
-                match execute(service, request.command, python_audio) {
-                    Ok(value) => json!({"id": id, "ok": true, "result": value}),
-                    Err(error) => json!({"id": id, "ok": false, "error": format!("{error:#}")}),
-                }
-            }
-            Err(error) => json!({"id": null, "ok": false, "error": error.to_string()}),
-        };
-        serde_json::to_writer(&mut output, &response)?;
-        output.write_all(b"\n")?;
-        output.flush()?;
-        if shutdown {
-            break;
-        }
-    }
-    Ok(())
+    crate::jsonl::run(|value| {
+        let request: Request = serde_json::from_value(value)?;
+        let shutdown = matches!(request.command, Command::Shutdown);
+        Ok((execute(service, request.command, python_audio)?, shutdown))
+    })
 }
 
 fn decode_file(path: &str, python_audio: bool) -> Result<Vec<f32>> {
@@ -104,7 +70,7 @@ fn decode_file(path: &str, python_audio: bool) -> Result<Vec<f32>> {
     .with_context(|| format!("loading audio {path}"))
 }
 
-fn execute(service: &GigaAmService, command: Command, python_audio: bool) -> Result<Value> {
+pub(crate) fn execute(service: &GigaAmService, command: Command, python_audio: bool) -> Result<Value> {
     match command {
         Command::Status => Ok(serde_json::to_value(service.status())?),
         Command::Transcribe {
