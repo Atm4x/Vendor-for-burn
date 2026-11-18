@@ -132,6 +132,13 @@ impl<F> CudaArDevice<F> {
         Ok(CudaBuffer::from_allocation(allocation, reservation))
     }
 
+    pub fn download_tensor_bytes(&mut self, buffer: &CudaBuffer) -> Result<Vec<u8>> {
+        let guard = buffer.0.data.lock().unwrap();
+        let downloaded = self.stream.clone_dtoh(&*guard).map_err(cuda_error);
+        self.stream.synchronize().map_err(cuda_error)?;
+        downloaded
+    }
+
     pub fn memory_usage(&self) -> DeviceMemoryUsage {
         self.memory.usage()
     }

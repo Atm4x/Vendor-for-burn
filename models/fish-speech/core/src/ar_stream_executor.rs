@@ -252,6 +252,12 @@ where
         Ok(())
     }
 
+    /// Access the same stream-owning device for ordered input uploads and downloads.
+    /// Callers must not free buffers referenced by pending submissions before retirement.
+    pub fn device_mut(&mut self) -> &mut D {
+        self.kv.device_mut()
+    }
+
     pub fn inflight_bytes(&self) -> usize {
         self.inflight_bytes
     }

@@ -2,25 +2,28 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use cudarc::driver::CudaStream;
 use fish_speech_core::{
+    ar_stream_executor::ArStreamExecutor,
     ar_stream_plan::ArStreamPlan,
     error::{FishError, Result},
+    graph_ir::TensorType,
     trtx_blueprint::{Binding, TrtBlueprint, TrtPrimitive},
 };
 use trtx::ExecutionContext;
 
 use crate::{
-    ar_weight_bindings::required_ar_weights,
+    ar_input_contract::{ArInputContract, collect_ar_weight_types},
     cuda_stream::{CudaArDevice, CudaBuffer},
-    trtx_engine::{DeviceRegion, EngineIoContract},
+    trtx_cache::{EngineIdentity, EngineRegistry},
+    trtx_engine::{DeviceRegion, EngineError, EngineIoContract},
     weights::LoadedWeights,
 };
 
-pub fn upload_ar_weights<F>(
+pub fn upload_plan_set_weights<F>(
     device: &mut CudaArDevice<F>,
-    plan: &ArStreamPlan,
+    plans: &[&ArStreamPlan],
     checkpoint: &LoadedWeights,
 ) -> Result<BTreeMap<String, CudaBuffer>> {
-    let required = required_ar_weights(plan)
+    let required = collect_ar_weight_types(plans)
         .map_err(|_| FishError::InvalidShape("TensorRT AR weight plan invalid"))?;
     let mut uploaded = BTreeMap::new();
     let upload = (|| {
@@ -39,6 +42,132 @@ pub fn upload_ar_weights<F>(
     sync?;
     upload?;
     Ok(uploaded)
+}
+
+pub fn upload_ar_weights<F>(
+    device: &mut CudaArDevice<F>,
+    plan: &ArStreamPlan,
+    checkpoint: &LoadedWeights,
+) -> Result<BTreeMap<String, CudaBuffer>> {
+    upload_plan_set_weights(device, &[plan], checkpoint)
+}
+
+pub struct WeightedCudaArSession<F>
+where
+    F: FnMut(&TrtBlueprint, &BTreeMap<Binding, CudaBuffer>, &Arc<CudaStream>) -> Result<()>,
+{
+    executor: ArStreamExecutor<CudaArDevice<F>>,
+    weights: BTreeMap<String, CudaBuffer>,
+}
+
+impl<F> WeightedCudaArSession<F>
+where
+    F: FnMut(&TrtBlueprint, &BTreeMap<Binding, CudaBuffer>, &Arc<CudaStream>) -> Result<()>,
+{
+    pub fn open(
+        mut device: CudaArDevice<F>,
+        plans: &[&ArStreamPlan],
+        checkpoint: &LoadedWeights,
+    ) -> Result<Self> {
+        let weights = upload_plan_set_weights(&mut device, plans, checkpoint)?;
+        Ok(Self {
+            executor: ArStreamExecutor::new(device),
+            weights,
+        })
+    }
+
+    pub fn upload_runtime_input(&mut self, ty: &TensorType, bytes: &[u8]) -> Result<CudaBuffer> {
+        self.executor.device_mut().upload_tensor_bytes(ty, bytes)
+    }
+
+    pub fn enqueue(
+        &mut self,
+        plan: &ArStreamPlan,
+        runtime_inputs: &BTreeMap<String, CudaBuffer>,
+    ) -> Result<BTreeMap<Binding, CudaBuffer>> {
+        let contract = ArInputContract::from_plan(plan)
+            .map_err(|_| FishError::InvalidShape("TensorRT AR input contract invalid"))?;
+        let external = contract
+            .bind(&self.weights, runtime_inputs, CudaBuffer::bytes)
+            .map_err(|_| {
+                FishError::InvalidShape("TensorRT AR device inputs missing or undersized")
+            })?;
+        self.executor.enqueue(plan, &external)
+    }
+
+    pub fn retire_completed(&mut self) -> Result<()> {
+        self.executor.retire_completed()
+    }
+
+    pub fn read_output_bytes(&mut self, output: &CudaBuffer) -> Result<Vec<u8>> {
+        self.executor.retire_completed()?;
+        self.executor.device_mut().download_tensor_bytes(output)
+    }
+
+    pub fn reset_fast_prefix(&mut self) -> Result<()> {
+        self.executor.reset_fast_prefix()
+    }
+
+    pub fn reset_request(&mut self) -> Result<()> {
+        self.executor.reset_request()
+    }
+
+    pub fn inflight_submissions(&self) -> usize {
+        self.executor.inflight_submissions()
+    }
+
+    pub fn device_mut(&mut self) -> &mut CudaArDevice<F> {
+        self.executor.device_mut()
+    }
+}
+
+pub struct CachedArDispatchConfig<'a> {
+    pub model_sha256: &'a str,
+    pub gpu_identity: &'a str,
+    pub tensorrt_version: &'a str,
+    pub driver_version: &'a str,
+    pub precision: &'a str,
+    pub shape_profile: &'a str,
+    pub build_flags: &'a str,
+    pub workspace_bytes: usize,
+}
+
+pub fn cached_ar_dispatch<'a>(
+    registry: &'a EngineRegistry,
+    logger: &'a trtx::Logger,
+    config: CachedArDispatchConfig<'a>,
+) -> impl FnMut(&TrtBlueprint, &BTreeMap<Binding, CudaBuffer>, &Arc<CudaStream>) -> Result<()> + 'a
+{
+    move |plan, buffers, stream| {
+        let identity = EngineIdentity::for_blueprint(
+            plan,
+            config.model_sha256,
+            config.gpu_identity,
+            config.tensorrt_version,
+            config.driver_version,
+            config.precision,
+            config.shape_profile,
+            config.build_flags,
+        )
+        .map_err(|_| FishError::InvalidShape("TensorRT engine cache identity invalid"))?;
+        registry
+            .with_cached_session(
+                logger,
+                plan,
+                &identity,
+                config.workspace_bytes,
+                |context| {
+                    unsafe { enqueue_trt_segment(context, plan, buffers, stream) }
+                        .map_err(|e| EngineError::TensorRt(e.to_string()))
+                },
+                || {
+                    stream
+                        .synchronize()
+                        .map_err(|e| EngineError::TensorRt(e.to_string()))
+                },
+            )
+            .map_err(|_| FishError::InvalidTransition("TensorRT segment execution failed"))
+    }
 }
 
 pub fn segment_regions(
