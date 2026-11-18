@@ -188,6 +188,16 @@ fn visit(node: &Node, rate: f32, pitch: f32) -> Result<Vec<Parsed>> {
     Ok(parsed)
 }
 
+/// Preserve the source package's ordered string replacements, including overlaps.
+/// The original Silero wrapper deliberately inserts raw XML rather than escaping text.
+pub fn symbol_durations_to_ssml(text: &str, symbol_durs: &[(String, u32)]) -> Result<String> {
+    let mut expanded = text.to_owned();
+    for (symbol, duration_ms) in symbol_durs {
+        expanded = expanded.replace(symbol, &format!("{symbol}<break time=\"{duration_ms}ms\"/>"));
+    }
+    Ok(format!("<speak>{expanded}</speak>"))
+}
+
 pub fn process_ssml(config: &ModelConfig, input: &str) -> Result<Vec<Segment>> {
     let document = clean_text(input);
     let root = parse_document(&document)?;
@@ -296,6 +306,47 @@ mod tests {
         assert_eq!(tokens.len(), merged.rates.len());
         assert_eq!(tokens.len(), merged.pitches.len());
         assert_eq!(*merged.rates.last().unwrap(), 0.8);
+    }
+
+    #[test]
+    fn ordered_symbol_duration_replacements_match_original_torch_package() {
+        let Ok(dir) = std::env::var("SILERO_PARITY_DIR") else { return };
+        let dir = std::path::Path::new(&dir);
+        let config: ModelConfig = serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+        let cases: Vec<serde_json::Value> = serde_json::from_slice(
+            &std::fs::read(dir.join("symbol-durations-parity.json")).unwrap()).unwrap();
+        for (index, case) in cases.into_iter().enumerate() {
+            let text = case["text"].as_str().unwrap();
+            let replacements: Vec<(String, u32)> = serde_json::from_value(case["symbol_durs"].clone()).unwrap();
+            let expanded = symbol_durations_to_ssml(text, &replacements).unwrap();
+            assert_eq!(expanded, case["ssml"].as_str().unwrap(), "SSML expansion case {index}");
+            let segments = process_ssml(&config, &expanded).unwrap();
+            let expected_segments = case["segments"].as_array().unwrap();
+            assert_eq!(segments.len(), expected_segments.len(), "Segment count case {index}");
+            for (actual, expected) in segments.iter().zip(expected_segments) {
+                assert_eq!(actual.text, expected["text"].as_str().unwrap(), "Segment text case {index}");
+                assert_eq!(actual.clean_text, expected["clean_text"].as_str().unwrap(), "Clean text case {index}");
+                assert_eq!(actual.break_frames, expected["break_time"].as_u64().map(|v| v as usize), "Break case {index}");
+            }
+            let merged = merge_segments(&segments, case["accented"].as_str().unwrap()).unwrap();
+            let (ids, _) = config.encode_accented(&merged.text).unwrap();
+            let expected_ids: Vec<i64> = serde_json::from_value(case["ids"].clone()).unwrap();
+            assert_eq!(ids, expected_ids, "Token IDs case {index}");
+            let pauses: BTreeMap<usize, usize> = serde_json::from_value(case["pauses"].clone()).unwrap();
+            assert_eq!(merged.pauses, pauses, "Pause indices case {index}");
+            for (key, values) in [("rates", merged.rates), ("pitches", merged.pitches)] {
+                let expected: Vec<f32> = serde_json::from_value(case[key].clone()).unwrap();
+                assert_eq!(values.len(), expected.len(), "{key} length case {index}");
+                assert!(values.iter().zip(&expected).all(|(x,y)| (x-y).abs() < 1e-6), "{key} case {index}");
+            }
+        }
+    }
+
+    #[test]
+    fn empty_duration_symbol_matches_original_insertion_at_char_boundaries() {
+        let ssml = symbol_durations_to_ssml("Да.", &[(String::new(), 50)]).unwrap();
+        assert_eq!(ssml,
+            "<speak><break time=\"50ms\"/>Д<break time=\"50ms\"/>а<break time=\"50ms\"/>.<break time=\"50ms\"/></speak>");
     }
 
     #[test]

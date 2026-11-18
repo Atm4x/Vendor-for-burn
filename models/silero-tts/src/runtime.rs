@@ -138,12 +138,8 @@ impl SileroTts {
     /// substrings into SSML breaks before normalization and accentuation.
     pub fn infer_text_with_symbol_durations(&self, text: &str, speaker: &str,
         sample_rate: u32, symbol_durs: &[(String, u32)], flags: &TextOptions) -> Result<Vec<f32>> {
-        let mut expanded = text.to_string();
-        for (symbol, duration) in symbol_durs {
-            if symbol.is_empty() { anyhow::bail!("Empty symbol_durs key"); }
-            expanded = expanded.replace(symbol, &format!("{symbol}<break time=\"{duration}ms\"/>"));
-        }
-        self.infer_ssml_with_options(&format!("<speak>{expanded}</speak>"), speaker, sample_rate, flags)
+        let ssml = ssml::symbol_durations_to_ssml(text, symbol_durs)?;
+        self.infer_ssml_with_options(&ssml, speaker, sample_rate, flags)
     }
 
     /// Recreates the original Russian frontend for input without unresolved homographs.
@@ -185,6 +181,19 @@ impl SileroTts {
         self.config.validate_sample_rate(sample_rate)?;
         let (mel, _) = self.acoustic.infer(symbols, speaker)?;
         self.synthesizer.forward(mel, sample_rate)
+    }
+
+    /// Produce Silero's 16-bit mono WAV representation from the native text pipeline.
+    pub fn save_wav(&self, text: &str, path: &Path, speaker: &str,
+        sample_rate: u32, flags: &TextOptions) -> Result<()> {
+        let pcm = self.infer_text_with_options(text, speaker, sample_rate, flags)?;
+        crate::audio::write_wav_pcm16(path, &pcm, sample_rate)
+    }
+
+    pub fn save_ssml_wav(&self, ssml: &str, path: &Path, speaker: &str,
+        sample_rate: u32, flags: &TextOptions) -> Result<()> {
+        let pcm = self.infer_ssml_with_options(ssml, speaker, sample_rate, flags)?;
+        crate::audio::write_wav_pcm16(path, &pcm, sample_rate)
     }
 
     pub fn speakers(&self) -> impl Iterator<Item = &str> {
@@ -350,5 +359,72 @@ mod ssml_pcm_parity {
         let error = got.iter().zip(&expected).map(|(a,b)| (a-b).abs()).fold(0.0f32, f32::max);
         println!("short SSML pcm_12 max_abs={error:.8}; samples={}", got.len());
         assert!(error < 3e-3);
+    }
+}
+
+#[cfg(all(test, feature = "reference-flex"))]
+mod symbol_duration_pcm_parity {
+    use super::*;
+
+    #[test]
+    fn original_symbol_durations_pcm_all_sample_rates() {
+        let Ok(dir) = std::env::var("SILERO_PARITY_DIR") else { return };
+        let dir = std::path::Path::new(&dir);
+        let expected = TensorStore::open(&dir.join("symbol-durations-audio.safetensors")).unwrap();
+        let model = SileroTts::load(dir, &Device::flex()).unwrap();
+        let controls = [("а".to_string(), 75)];
+        for sample_rate in [8000, 24000, 48000] {
+            let actual = model.infer_text_with_symbol_durations(
+                "Да.", "aidar", sample_rate, &controls, &TextOptions::default()
+            ).unwrap();
+            let reference = expected.float_data(&format!("pcm_{sample_rate}")).unwrap();
+            assert_eq!(actual.len(), reference.len(), "Sample count mismatch at {sample_rate}");
+            let max_abs = actual.iter().zip(reference.iter())
+                .map(|(x, y)| (x-y).abs()).fold(0.0_f32, f32::max);
+            println!("symbol_durs {sample_rate}: samples={}, max_abs={max_abs:.8}", actual.len());
+            assert!(max_abs < 0.003, "symbol_durs PCM parity failed at {sample_rate}");
+        }
+    }
+}
+
+#[cfg(all(test, feature = "reference-flex"))]
+mod multispeaker_ssml_parity {
+    use super::*;
+
+    #[test]
+    fn original_all_five_speakers_with_duration_and_pitch_controls() {
+        let Ok(dir) = std::env::var("SILERO_PARITY_DIR") else { return };
+        let dir = std::path::Path::new(&dir);
+        let source: Vec<serde_json::Value> = serde_json::from_slice(
+            &fs::read(dir.join("symbol-durations-parity.json")).unwrap()).unwrap();
+        let ids: Vec<i64> = serde_json::from_value(source[0]["ids"].clone()).unwrap();
+        let merged = ssml::MergeInput {
+            text: String::new(),
+            pauses: serde_json::from_value(source[0]["pauses"].clone()).unwrap(),
+            rates: serde_json::from_value(source[0]["rates"].clone()).unwrap(),
+            pitches: serde_json::from_value(source[0]["pitches"].clone()).unwrap(),
+        };
+        let reference = TensorStore::open(&dir.join("multispeaker-ssml-parity.safetensors")).unwrap();
+        let manifest: Vec<serde_json::Value> = serde_json::from_slice(
+            &fs::read(dir.join("multispeaker-ssml-parity.json")).unwrap()).unwrap();
+        let model = SileroTts::load(dir, &Device::flex()).unwrap();
+        let constants = model.control_constants.as_ref().unwrap();
+        for voice in manifest {
+            let name = voice["speaker"].as_str().unwrap();
+            let speaker_id = model.config.validate_speaker(name).unwrap();
+            assert_eq!(speaker_id, voice["speaker_id"].as_u64().unwrap() as usize);
+            let (mel, durations) = model.acoustic.infer_with_controls(
+                &ids, speaker_id as i64, &merged, constants
+            ).unwrap();
+            let expected_durations: Vec<f32> = serde_json::from_value(voice["durations"].clone()).unwrap();
+            assert_eq!(durations, expected_durations, "Duration mismatch: {name}");
+            let got = mel.into_data().try_to_vec::<f32>().unwrap();
+            let expected = reference.float_data(name).unwrap();
+            assert_eq!(got.len(), expected.len(), "Mel length mismatch: {name}");
+            let max_abs = got.iter().zip(expected.iter())
+                .map(|(x,y)| (x-y).abs()).fold(0.0_f32, f32::max);
+            println!("voice {name}: mel max_abs={max_abs:.8}; frames={}", got.len()/192);
+            assert!(max_abs < 0.003, "SSML mel parity failed for speaker {name}");
+        }
     }
 }

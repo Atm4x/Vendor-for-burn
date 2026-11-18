@@ -21,3 +21,4 @@ pub mod accentor;
 pub mod homosolver;
 
 pub mod ssml;
+pub mod audio;

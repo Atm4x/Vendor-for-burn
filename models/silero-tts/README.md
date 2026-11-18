@@ -215,3 +215,42 @@ only to execute numerical parity without the system-provided LLVM CPU runtime.
 CubeCL CPU compilation does not imply executed CubeCL parity. CUDA, Windows and
 performance remain a separate subsequent phase. The independent EXE/IPC worker
 lifecycle is not part of this functional graph-parity cycle.
+
+## Cycle 5 — ordered `symbol_durs`, all speakers and WAV output
+
+The native wrapper now delegates `symbol_durs` expansion to a deterministic
+frontend function that preserves **insertion order** and the original raw
+string-replacement semantics, including overlapping keys and successive
+`<break>` inserts. The package's source implementation is
+`PartTTSModelMultiAcc_v3.transform_durs_to_ssml`.
+
+Reference fixtures generated directly from the supplied `v5_ru.pt`:
+
+- Eight `symbol_durs` scenarios (including an empty substitution key): expanded SSML, normalized segments, token
+  IDs, pause indices, rate and pitch vectors exactly match the Python package.
+- Complete `symbol_durs` inference for 8/24/48 kHz: each rate produces the
+  same number of samples as PyTorch (4,500 / 13,500 / 27,000), with PCM
+  max-absolute errors `1.191e-5`, `1.128e-5`, `1.463e-5` respectively.
+- Managed-duration and pitch-corrected acoustic inference for **all five**
+  actual checkpoint voices (`aidar`, `baya`, `kseniya`, `eugene`, `xenia`): exact
+  duration frames and maximum mel error `1.180e-5` (diagnostic Flex).
+- Mono 16-bit WAV file output compatible with the original `save_wav` numerical
+  conversion, including channel count, sampling frequency and 16-bit samples.
+  Public methods are `SileroTts::save_wav` and `save_ssml_wav`.
+
+Generate the two new reference fixtures:
+
+```
+python tools/create_symbol_duration_fixture.py v5_ru.pt /tmp/silero-assets
+python tools/create_multispeaker_fixture.py v5_ru.pt /tmp/silero-assets
+```
+
+The native inference remains implemented using Burn tensor primitives with
+CubeCL as the primary backend. All numerical execution parity figures above
+use optional Flex **only** as a diagnostic reference while the Linux CubeCL CPU
+LLVM runtime is unavailable. Actual CubeCL CPU/CUDA execution, profiling, and
+Windows packaging remain separate workability tasks, not missing neural-model
+features. The original supplied V5 checkpoint does not support `return_ts`.
+
+The importer does not claim support for arbitrary custom voice checkpoints:
+this particular `v5_ru.pt` exposes exactly five predefined speaker IDs.
