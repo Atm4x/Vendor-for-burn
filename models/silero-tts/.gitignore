@@ -1,2 +1,5 @@
 /Cargo.lock
 /target/
+
+/tools/__pycache__/
+*.pyc

@@ -108,3 +108,63 @@ SILERO_PARITY_DIR=/tmp/silero-assets cargo test --offline --no-default-features 
 The exporter also persists `accentor-ngrams.json` (126,523 ngram IDs) from the
 TorchScript embedding module. This is essential for the upcoming native
 Accentor classifier and was missing from the initial export format.
+
+## Cycle 3 — native Accentor, HomoSolver/BERT and default text inference
+
+The complete default Russian text inference path is implemented:
+
+`prepare_text_input -> HomoSolver (3-layer BERT) -> AccentorNgram -> symbol IDs -> FastPitch -> ConvNeXt -> IRFFT/PQMF -> PCM`.
+
+- `src/accentor.rs`: Unicode ngram generation, CPU-side embedding-bag mean,
+  4-layer Burn classifiers for stress and ё, original threshold/exception and
+  punctuation rules. The classifier matmuls use the selected Burn backend.
+- `src/homosolver.rs`: native 3-layer, 12-head BERT encoder with exact GELU,
+  LayerNorm epsilon, marker/word pooling, binary homograph classifier, UTF-8
+  sentence replacements and the original WordPiece token IDs.
+- `tools/export_weights.py`: developer-only conversion of HomoSolver's INT8
+  word embedding weights to dequantized FP32 in SafeTensors. This makes runtime
+  independent from TorchScript/PyTorch quantization handlers.
+- `SileroTts::accentuate` and `infer_text`: complete default **non-SSML**
+  text-to-PCM path; sessions keep models loaded between calls.
+- `SileroTts::infer_text_unambiguous`: optional shorter path that explicitly
+  rejects unresolved homographs; `infer_text` does not have that limitation.
+
+Local diagnostic reference checks:
+
+- Accentor: 27 ngram/MLP inputs and 18 complete text outputs; exact text match.
+- HomoSolver: 10 marked BERT inputs with embedding, hidden and logit checks;
+  5 homograph sentence replacements exactly match PyTorch.
+- Full default text-to-PCM: `Привет, мир!` (7,900 samples, max absolute error
+  0.001425) and `На двери замок.` (10,100 samples, max absolute error 0.001019)
+  versus the original checkpoint's `apply_tts`, both at 8 kHz.
+
+Tests compare real checkpoint weights on the optional **diagnostic Flex** backend.
+The default backend remains CubeCL CPU, which passed `cargo check --offline`.
+CPU CubeCL execution requires an available LLVM runtime and remains unverified.
+CUDA and Windows remain later validation, not a measure of functional coverage.
+
+Functional gaps remain: SSML and prosody/break/word-timestamp parity, optional
+stress/ё flags, independent long-lived EXE/IPC service, boundary and long-text
+cases, multi-rate real-text parity, and independent CubeCL runtime validation.
+The current exact-size IRFFT via Tensor matmul is functionally correct but slow.
+
+Developer reference fixture generation:
+
+```
+python tools/export_weights.py v5_ru.pt /tmp/silero-assets
+python tools/create_accentor_fixture.py v5_ru.pt /tmp/silero-assets
+python tools/create_homosolver_fixture.py v5_ru.pt /tmp/silero-assets
+python tools/create_text_fixture.py v5_ru.pt /tmp/silero-assets
+SILERO_PARITY_DIR=/tmp/silero-assets cargo test --offline --no-default-features --features reference-flex --lib
+```
+
+Cycle 3 also implements `TextOptions` / `accentuate_with_options` /
+`infer_text_with_options`, preserving Silero's five independent `put_accent`,
+`put_stress_homo`, `put_yo`, `put_yo_homo`, and `stress_single_vowel`
+controls and HomoSolver-specific skip lists. Their text outputs match PyTorch for
+24 option-and-text combinations, after properly performing the original
+TorchScript INT8 embedding dequantization in the reference model.
+
+```
+python tools/create_stress_flags_fixture.py v5_ru.pt /tmp/silero-assets
+```

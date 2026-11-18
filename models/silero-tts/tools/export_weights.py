@@ -33,6 +33,10 @@ def run(checkpoint: Path, output: Path) -> None:
             key: tensor.detach().cpu().contiguous()
             for key, tensor in model.state_dict().items()
         }
+        if name == "homosolver":
+            key = "bert.embeddings.word_embeddings.weight"
+            if state[key].dtype == torch.int8:
+                state[key] = model.bert.scale.float() * (state[key].float() - model.bert.zero_point.float())
         save_file(state, str(output / f"{name}.safetensors"))
         summary[name] = {
             "tensors": len(state),

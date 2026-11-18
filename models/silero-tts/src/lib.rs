@@ -16,3 +16,6 @@ pub mod transformer;
 pub mod predictors;
 pub mod acoustic;
 pub mod runtime;
+
+pub mod accentor;
+pub mod homosolver;
