@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -106,23 +106,47 @@ pub struct CachedEngine {
     pub bytes: Arc<[u8]>,
 }
 
+struct CacheState {
+    entries: BTreeMap<String, Arc<CachedEngine>>,
+    eviction_order: VecDeque<String>,
+    resident_bytes: usize,
+}
+
 pub struct EngineRegistry {
     directory: PathBuf,
     max_engine_bytes: usize,
-    loaded: Mutex<BTreeMap<String, Arc<CachedEngine>>>,
+    max_resident_bytes: usize,
+    loaded: Mutex<CacheState>,
 }
 
 impl EngineRegistry {
     pub fn new(directory: impl AsRef<Path>, max_engine_bytes: usize) -> Result<Self, EngineError> {
-        if max_engine_bytes == 0 || max_engine_bytes > MAX_ENGINE_BYTES {
+        Self::new_with_resident_budget(directory, max_engine_bytes, max_engine_bytes)
+    }
+
+    pub fn new_with_resident_budget(
+        directory: impl AsRef<Path>,
+        max_engine_bytes: usize,
+        max_resident_bytes: usize,
+    ) -> Result<Self, EngineError> {
+        if max_engine_bytes == 0
+            || max_engine_bytes > MAX_ENGINE_BYTES
+            || max_resident_bytes == 0
+            || max_resident_bytes < max_engine_bytes
+        {
             return Err(EngineError::InvalidPlan(
-                "invalid engine cache size budget".into(),
+                "invalid engine cache size or total resident-memory budget".into(),
             ));
         }
         Ok(Self {
             directory: directory.as_ref().to_owned(),
             max_engine_bytes,
-            loaded: Mutex::new(BTreeMap::new()),
+            max_resident_bytes,
+            loaded: Mutex::new(CacheState {
+                entries: BTreeMap::new(),
+                eviction_order: VecDeque::new(),
+                resident_bytes: 0,
+            }),
         })
     }
 
@@ -136,7 +160,7 @@ impl EngineRegistry {
             .loaded
             .lock()
             .map_err(|_| EngineError::InvalidBindings("engine registry lock poisoned".into()))?;
-        if let Some(engine) = loaded.get(&key) {
+        if let Some(engine) = loaded.entries.get(&key) {
             return Ok(Arc::clone(engine));
         }
         fs::create_dir_all(&self.directory)
@@ -162,7 +186,17 @@ impl EngineRegistry {
             key: key.clone(),
             bytes: bytes.into(),
         });
-        loaded.insert(key, Arc::clone(&entry));
+        while loaded.resident_bytes.saturating_add(entry.bytes.len()) > self.max_resident_bytes {
+            let oldest = loaded.eviction_order.pop_front().ok_or_else(|| {
+                EngineError::InvalidPlan("engine resident-memory budget exhausted".into())
+            })?;
+            if let Some(removed) = loaded.entries.remove(&oldest) {
+                loaded.resident_bytes -= removed.bytes.len();
+            }
+        }
+        loaded.resident_bytes += entry.bytes.len();
+        loaded.eviction_order.push_back(key.clone());
+        loaded.entries.insert(key, Arc::clone(&entry));
         Ok(entry)
     }
 
@@ -198,8 +232,14 @@ impl EngineRegistry {
         self.loaded
             .lock()
             .map_err(|_| EngineError::InvalidBindings("engine registry lock poisoned".into()))?
-            .clear();
+            .clear_all();
         Ok(())
+    }
+
+    pub fn resident_bytes(&self) -> Result<usize, EngineError> {
+        Ok(self.loaded.lock()
+            .map_err(|_| EngineError::InvalidBindings("engine registry lock poisoned".into()))?
+            .resident_bytes)
     }
 
     pub fn resident_engines(&self) -> Result<usize, EngineError> {
@@ -207,7 +247,15 @@ impl EngineRegistry {
             .loaded
             .lock()
             .map_err(|_| EngineError::InvalidBindings("engine registry lock poisoned".into()))?
-            .len())
+            .entries.len())
+    }
+}
+
+impl CacheState {
+    fn clear_all(&mut self) {
+        self.entries.clear();
+        self.eviction_order.clear();
+        self.resident_bytes = 0;
     }
 }
 
@@ -360,6 +408,30 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+
+    #[test]
+    fn bounded_resident_cache_evicts_without_invalidating_external_lease() {
+        let directory = std::env::temp_dir().join(format!(
+            "fish-engine-resident-{}-{}",
+            std::process::id(),
+            NEXT_TEST.fetch_add(1, Ordering::Relaxed)
+        ));
+        let registry = EngineRegistry::new_with_resident_budget(&directory, 4, 6).unwrap();
+        let first_id = sample();
+        let mut second_id = first_id.clone();
+        second_id.shape_profile = "decode:t1".into();
+        let first = registry.get_or_build(&first_id, || Ok(vec![1, 2, 3, 4])).unwrap();
+        registry.get_or_build(&second_id, || Ok(vec![5, 6, 7, 8])).unwrap();
+        assert_eq!(registry.resident_engines().unwrap(), 1);
+        assert_eq!(registry.resident_bytes().unwrap(), 4);
+        assert_eq!(&*first.bytes, &[1, 2, 3, 4]);
+        registry.get_or_build(&first_id, || panic!("should load from disk")).unwrap();
+        assert_eq!(registry.resident_engines().unwrap(), 1);
+        assert_eq!(registry.resident_bytes().unwrap(), 4);
+        registry.evict_memory().unwrap();
+        assert_eq!(registry.resident_bytes().unwrap(), 0);
+        fs::remove_dir_all(directory).unwrap();
+    }
     #[test]
     fn invalid_fingerprints_empty_builds_and_budget_are_rejected() {
         let mut identity = sample();
