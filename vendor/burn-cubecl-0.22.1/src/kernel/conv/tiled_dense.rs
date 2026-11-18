@@ -44,6 +44,8 @@ fn dense_tiled_conv(
     dilation: usize,
     padding: usize,
     #[comptime] check_padding: bool,
+    #[comptime] row_groups: usize,
+    #[comptime] packed_channels: usize,
     first_tile: usize,
     out_per_group: usize,
     #[comptime] block: usize,
@@ -52,7 +54,7 @@ fn dense_tiled_conv(
 ) {
     let x = UNIT_POS_X as usize;
     let y = UNIT_POS_Y as usize;
-    let row = (first_tile + CUBE_POS_Y as usize) * block;
+    let row = (first_tile + CUBE_POS_Y as usize) * block * row_groups;
     let col = CUBE_POS_X as usize * block;
     let batch = CUBE_POS_Z as usize;
     let mut length = output.shape(1);
@@ -70,7 +72,7 @@ fn dense_tiled_conv(
         length *= width;
         taps *= weight.shape(2);
     }
-    let mut features = Shared::<[f32]>::new_slice(comptime![block * (block + 1)]);
+    let mut features = Shared::<[f32]>::new_slice(comptime![row_groups * block * (block + 1)]);
     let mut filters = Shared::<[f32]>::new_slice(comptime![block * (block + 1)]);
     let mut acc = Array::<f32>::new(items);
     #[unroll]
@@ -86,7 +88,7 @@ fn dense_tiled_conv(
         #[unroll]
         for i in 0..lanes {
             let (valid, _) = input_offset(
-                row + y + i * 8,
+                row + y + i * 8 * row_groups,
                 tap,
                 input,
                 width,
@@ -102,38 +104,50 @@ fn dense_tiled_conv(
         if comptime![spatial] {
             weight_offset = (tap / 3) * weight.stride(1) + (tap % 3) * weight.stride(2);
         }
-        for tile in 0..weight.shape(dim_c) / block {
+        let mut depth = weight.shape(dim_c);
+        if comptime![packed_channels > 0] {
+            weight_offset = tap * packed_channels;
+            depth = packed_channels;
+        }
+        for tile in 0..depth / block {
             #[unroll]
             for i in 0..items {
-                let index = i * 64 + y * 8 + x;
+                let index = i * 64 * row_groups + y * 8 + x;
                 let line = index / block;
                 let k = index % block;
                 let ci = tile * block + k;
                 let mut value = 0.0_f32;
-                let (valid, offset) = input_offset(
-                    row + line,
-                    tap,
-                    input,
-                    width,
-                    stride,
-                    dilation,
-                    padding,
-                    check_padding,
-                    spatial,
-                );
-                if row + line < length && valid {
-                    value = input[input_base + offset + ci];
+                if comptime![packed_channels > 0] {
+                    let pos = (row + line) * stride + tap * dilation - padding;
+                    value = input[input_base + pos * packed_channels + ci];
+                } else {
+                    let (valid, offset) = input_offset(
+                        row + line,
+                        tap,
+                        input,
+                        width,
+                        stride,
+                        dilation,
+                        padding,
+                        check_padding,
+                        spatial,
+                    );
+                    if row + line < length && valid {
+                        value = input[input_base + offset + ci];
+                    }
                 }
                 features[line * (block + 1) + k] = value;
-                filters[line * (block + 1) + k] =
-                    weight[(col + line) * weight.stride(0) + weight_offset + ci];
+                if row_groups == 1 || line < block {
+                    filters[line * (block + 1) + k] =
+                        weight[(col + line) * weight.stride(0) + weight_offset + ci];
+                }
             }
             sync_cube();
             #[unroll]
             for k in 0..block {
                 #[unroll]
                 for i in 0..lanes {
-                    let a = features[(y + i * 8) * (block + 1) + k];
+                    let a = features[(y + i * 8 * row_groups) * (block + 1) + k];
                     #[unroll]
                     for j in 0..lanes {
                         if !check_padding || use_tap[i] {
@@ -147,7 +161,7 @@ fn dense_tiled_conv(
     }
     #[unroll]
     for i in 0..lanes {
-        let pos = row + y + i * 8;
+        let pos = row + y + i * 8 * row_groups;
         if pos < length {
             #[unroll]
             for j in 0..lanes {
@@ -199,13 +213,25 @@ pub(super) fn try_launch<const N: usize>(
         16
     };
     let hw = &input.client.properties().hardware;
+    let row_groups = if !spatial
+        && length >= 4096
+        && block == 32
+        && hw.max_units_per_cube >= 128
+        && hw.max_cube_dim.1 >= 16
+        && hw.max_shared_memory_size >= 3 * block * (block + 1) * size_of::<f32>()
+    {
+        2
+    } else {
+        1
+    };
+    let row_tile = block * row_groups;
     if input.dtype != DType::F32
         || weight.dtype != DType::F32
         || hw.plane_size_max <= 1
-        || hw.max_units_per_cube < 64
-        || hw.max_shared_memory_size < 2 * block * (block + 1) * size_of::<f32>()
+        || hw.max_units_per_cube < (64 * row_groups) as u32
+        || hw.max_shared_memory_size < (row_groups + 1) * block * (block + 1) * size_of::<f32>()
         || hw.max_cube_dim.0 < 8
-        || hw.max_cube_dim.1 < 8
+        || hw.max_cube_dim.1 < (8 * row_groups) as u32
         || cin < block
         || cin % block != 0
         || out_per_group < block
@@ -215,11 +241,12 @@ pub(super) fn try_launch<const N: usize>(
         || length < block
         || batch == 0
         || cout / block > hw.max_cube_count.0 as usize
-        || length.div_ceil(block) > hw.max_cube_count.1 as usize
+        || length.div_ceil(row_tile) > hw.max_cube_count.1 as usize
         || batch > hw.max_cube_count.2 as usize
     {
         return false;
     }
+    let (left_padding, right_padding) = options.padding[0];
     let launch = |first: usize, end: usize, check: bool| {
         if end <= first {
             return;
@@ -228,7 +255,7 @@ pub(super) fn try_launch<const N: usize>(
         dense_tiled_conv::launch(
             &input.client,
             grid,
-            CubeDim::new_2d(8, 8),
+            CubeDim::new_2d(8, (8 * row_groups) as u32),
             input
                 .required_address_type()
                 .max(weight.required_address_type())
@@ -245,6 +272,17 @@ pub(super) fn try_launch<const N: usize>(
             options.dilation[0],
             options.padding[0].0,
             check,
+            row_groups,
+            if !check
+                && !spatial
+                && (left_padding != 0 || right_padding != 0)
+                && input.meta.strides()[1] == cin
+                && weight.meta.strides()[1] == cin
+            {
+                cin
+            } else {
+                0
+            },
             first,
             out_per_group,
             block,
@@ -252,21 +290,20 @@ pub(super) fn try_launch<const N: usize>(
             spatial,
         );
     };
-    let tiles = length.div_ceil(block);
-    let (left, right) = options.padding[0];
-    if !spatial && length >= 4096 && (left != 0 || right != 0) {
+    let tiles = length.div_ceil(row_tile);
+    if !spatial && length >= 4096 && (left_padding != 0 || right_padding != 0) {
         let stride = options.stride[0];
         let reach = (shape[1] - 1) * options.dilation[0];
-        let first = left.div_ceil(stride).div_ceil(block).min(tiles);
-        let valid = (input.meta.shape()[1] + left)
+        let first = left_padding.div_ceil(stride).div_ceil(row_tile).min(tiles);
+        let valid = (input.meta.shape()[1] + left_padding)
             .saturating_sub(reach)
             .div_ceil(stride);
-        let end = (valid.min(length) / block).max(first);
+        let end = (valid.min(length) / row_tile).max(first);
         launch(0, first, true);
         launch(first, end, false);
         launch(end, tiles, true);
     } else {
-        launch(0, tiles, spatial || left != 0 || right != 0);
+        launch(0, tiles, spatial || left_padding != 0 || right_padding != 0);
     }
     true
 }
