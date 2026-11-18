@@ -5,3 +5,5 @@ pub use fish_speech_core::*;
 
 #[cfg(any(feature = "tensorrt-mock", feature = "tensorrt-api"))]
 pub mod trtx_lowering;
+
+pub mod trtx_engine;

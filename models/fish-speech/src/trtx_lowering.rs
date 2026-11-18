@@ -137,6 +137,9 @@ pub fn lower_blueprint(
         let tensor = tensors
             .get(&output)
             .ok_or(LoweringError::MissingOperand(output))?;
+        tensor
+            .set_name(network, &crate::trtx_engine::output_tensor_name(output))
+            .map_err(|e| LoweringError::TensorRt(e.to_string()))?;
         network.mark_output(tensor);
     }
     Ok(summary)
