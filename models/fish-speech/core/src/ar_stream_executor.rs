@@ -579,6 +579,62 @@ mod tests {
     }
 
     #[test]
+    fn resident_slow_prefill_and_multiple_decodes_retire_once() {
+        let config = FishModelConfig::synthetic_dual_ar_fixture();
+        let factory = TransformerIrFactory::new(&config).unwrap();
+        let plans = [
+            ArStreamPlan::from_graph(&factory.slow_prefill(4).unwrap()).unwrap(),
+            ArStreamPlan::from_graph(&factory.slow_decode(5).unwrap()).unwrap(),
+            ArStreamPlan::from_graph(&factory.slow_decode(6).unwrap()).unwrap(),
+        ];
+        let cache_name = plans[0]
+            .phases
+            .iter()
+            .find_map(|phase| match phase {
+                ArStreamPhase::KvWrites(writes) => Some(writes.key.cache_name.clone()),
+                ArStreamPhase::Network(_) => None,
+            })
+            .unwrap();
+        let operations = Rc::new(RefCell::new(Vec::new()));
+        let mut executor = ArStreamExecutor::new(FakeBackend {
+            operations: operations.clone(),
+        });
+        for plan in &plans {
+            let mut external = BTreeMap::new();
+            for phase in &plan.phases {
+                if let ArStreamPhase::Network(network) = phase {
+                    for step in &network.steps {
+                        if matches!(
+                            step.primitive,
+                            TrtPrimitive::Input | TrtPrimitive::ConstantWeight
+                        ) && !step.name.ends_with("_cache")
+                            && !step.name.ends_with("_updated")
+                        {
+                            external.entry(step.name.clone()).or_insert_with(|| {
+                                Rc::new(RefCell::new(vec![
+                                    0;
+                                    tensor_bytes(&step.output_type).unwrap()
+                                ]))
+                            });
+                        }
+                    }
+                }
+            }
+            executor.enqueue(plan, &external).unwrap();
+        }
+        assert_eq!(executor.inflight_submissions(), 3);
+        assert_eq!(executor.cache_active_len(&cache_name), Some(6));
+        assert!(!operations.borrow().contains(&"sync"));
+        executor.retire_completed().unwrap();
+        assert_eq!(
+            operations.borrow().iter().filter(|x| **x == "sync").count(),
+            1
+        );
+        assert_eq!(executor.inflight_submissions(), 0);
+        assert_eq!(executor.cache_active_len(&cache_name), Some(6));
+    }
+
+    #[test]
     fn missing_later_segment_input_rejected_before_first_enqueue() {
         let config = FishModelConfig::synthetic_dual_ar_fixture();
         let plan = ArStreamPlan::from_graph(

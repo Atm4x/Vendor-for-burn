@@ -1,9 +1,13 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+    sync::Arc,
+};
 
-use cudarc::driver::CudaStream;
+use cudarc::driver::{CudaContext, CudaStream};
 use fish_speech_core::{
     ar_stream_executor::ArStreamExecutor,
-    ar_stream_plan::ArStreamPlan,
+    ar_stream_plan::{ArStreamPhase, ArStreamPlan},
     error::{FishError, Result},
     graph_ir::TensorType,
     trtx_blueprint::{Binding, TrtBlueprint, TrtPrimitive},
@@ -13,6 +17,7 @@ use trtx::ExecutionContext;
 use crate::{
     ar_input_contract::{ArInputContract, collect_ar_weight_types},
     cuda_stream::{CudaArDevice, CudaBuffer},
+    device_memory::DeviceMemoryBudget,
     trtx_cache::{EngineIdentity, EngineRegistry},
     trtx_engine::{DeviceRegion, EngineError, EngineIoContract},
     weights::LoadedWeights,
@@ -136,6 +141,9 @@ pub struct CachedArDispatchConfig<'a> {
     pub workspace_bytes: usize,
 }
 
+#[deprecated(
+    note = "synchronizes every segment; use with_resident_cuda_ar_session for prefill/decode"
+)]
 pub fn cached_ar_dispatch<'a>(
     registry: &'a EngineRegistry,
     logger: &'a trtx::Logger,
@@ -172,6 +180,102 @@ pub fn cached_ar_dispatch<'a>(
             )
             .map_err(|_| FishError::InvalidTransition("TensorRT segment execution failed"))
     }
+}
+
+/// A single-stream, request-scoped TensorRT dispatcher. The entire prefill/decode sequence
+/// reuses each compiled engine and its execution context without synchronizing per segment.
+/// The stream is synchronized while the weighted session and its CUDA buffers are still alive,
+/// even when the request returns an error or panics.
+pub type ResidentArDispatch<'a> = Box<
+    dyn FnMut(&TrtBlueprint, &BTreeMap<Binding, CudaBuffer>, &Arc<CudaStream>) -> Result<()> + 'a,
+>;
+
+pub fn with_resident_cuda_ar_session<T>(
+    registry: &EngineRegistry,
+    logger: &trtx::Logger,
+    config: CachedArDispatchConfig<'_>,
+    plans: &[&ArStreamPlan],
+    checkpoint: &LoadedWeights,
+    device_ordinal: usize,
+    memory: DeviceMemoryBudget,
+    run: impl for<'session> FnOnce(
+        &mut WeightedCudaArSession<ResidentArDispatch<'session>>,
+    ) -> Result<T>,
+) -> Result<T> {
+    let mut prepared = Vec::new();
+    let mut keys = BTreeMap::new();
+    for plan in plans {
+        plan.validate()?;
+        for phase in &plan.phases {
+            let ArStreamPhase::Network(network) = phase else {
+                continue;
+            };
+            let identity = EngineIdentity::for_blueprint(
+                network,
+                config.model_sha256,
+                config.gpu_identity,
+                config.tensorrt_version,
+                config.driver_version,
+                config.precision,
+                config.shape_profile,
+                config.build_flags,
+            )
+            .map_err(|_| FishError::InvalidShape("TensorRT AR engine identity invalid"))?;
+            let key = identity
+                .key()
+                .map_err(|_| FishError::InvalidShape("TensorRT AR engine key invalid"))?;
+            if !keys.contains_key(&key) {
+                keys.insert(key, ());
+                prepared.push((network, identity));
+            }
+        }
+    }
+    let context = CudaContext::new(device_ordinal)
+        .map_err(|_| FishError::InvalidTransition("CUDA device context initialization failed"))?;
+    registry
+        .with_resident_sessions(
+            logger,
+            &prepared,
+            config.workspace_bytes,
+            |contexts| {
+                let dispatch: ResidentArDispatch<'_> = Box::new(|plan, buffers, stream| {
+                    let identity = EngineIdentity::for_blueprint(
+                        plan,
+                        config.model_sha256,
+                        config.gpu_identity,
+                        config.tensorrt_version,
+                        config.driver_version,
+                        config.precision,
+                        config.shape_profile,
+                        config.build_flags,
+                    )
+                    .map_err(|_| FishError::InvalidShape("TensorRT request graph mismatch"))?;
+                    let key = identity
+                        .key()
+                        .map_err(|_| FishError::InvalidShape("TensorRT engine lookup failed"))?;
+                    let context = contexts.get_mut(&key).ok_or(FishError::InvalidShape(
+                        "TensorRT graph is not prepared for the resident session",
+                    ))?;
+                    unsafe { enqueue_trt_segment(context, plan, buffers, stream) }
+                });
+                let device = CudaArDevice::with_context(context, memory, dispatch)
+                    .map_err(|error| EngineError::TensorRt(error.to_string()))?;
+                let mut session = WeightedCudaArSession::open(device, plans, checkpoint)
+                    .map_err(|error| EngineError::TensorRt(error.to_string()))?;
+                let outcome = catch_unwind(AssertUnwindSafe(|| run(&mut session)));
+                let retired = session.retire_completed();
+                drop(session);
+                match outcome {
+                    Err(panic) => resume_unwind(panic),
+                    Ok(value) => {
+                        retired.map_err(|error| EngineError::TensorRt(error.to_string()))?;
+                        value.map_err(|error| EngineError::TensorRt(error.to_string()))
+                    }
+                }
+            },
+            || Ok(()),
+        )
+        .map_err(|_| FishError::InvalidTransition("resident TensorRT AR session failed"))
 }
 
 pub fn segment_regions(

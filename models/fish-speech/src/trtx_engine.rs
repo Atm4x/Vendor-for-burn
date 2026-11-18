@@ -214,6 +214,45 @@ pub fn with_engine_session<T>(
     finish_stream_batch(|| submit(&mut context), synchronize)
 }
 
+/// Preloads every engine, keeps deserialized engines and execution contexts alive for one
+/// complete request, and synchronizes before releasing any TensorRT object.
+/// Contexts are exclusively borrowed by `submit` and cannot escape this scope.
+#[cfg(any(feature = "tensorrt-api", feature = "tensorrt-mock"))]
+pub fn with_resident_engine_sessions<T>(
+    logger: &trtx::Logger,
+    images: &[(&str, &[u8])],
+    submit: impl FnOnce(&mut BTreeMap<String, trtx::ExecutionContext<'_>>) -> Result<T, EngineError>,
+    synchronize: impl FnOnce() -> Result<(), EngineError>,
+) -> Result<T, EngineError> {
+    if images.is_empty() {
+        return Err(EngineError::InvalidPlan(
+            "no resident engines requested".into(),
+        ));
+    }
+    let mut names = BTreeSet::new();
+    for (key, bytes) in images {
+        if key.is_empty() || bytes.is_empty() || !names.insert(*key) {
+            return Err(EngineError::InvalidPlan(
+                "resident engine identity is empty, repeated or has no serialized image".into(),
+            ));
+        }
+    }
+    let err = |e: trtx::Error| EngineError::TensorRt(e.to_string());
+    let mut runtime = trtx::Runtime::new(logger).map_err(err)?;
+    let mut engines = Vec::with_capacity(images.len());
+    for (key, bytes) in images {
+        engines.push((
+            (*key).to_owned(),
+            runtime.deserialize_cuda_engine(bytes).map_err(err)?,
+        ));
+    }
+    let mut contexts = BTreeMap::new();
+    for (key, engine) in &mut engines {
+        contexts.insert(key.clone(), engine.create_execution_context().map_err(err)?);
+    }
+    finish_stream_batch(|| submit(&mut contexts), synchronize)
+}
+
 #[cfg(test)]
 mod session_tests {
     use super::*;

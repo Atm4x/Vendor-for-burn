@@ -228,6 +228,39 @@ impl EngineRegistry {
         crate::trtx_engine::with_engine_session(logger, &image.bytes, submit, synchronize)
     }
 
+    /// Materializes all distinct blueprint engines before submitting work on the request stream.
+    /// The callback owns the entire session boundary; the synchronizer must wait for all enqueues
+    /// before any borrowed execution context or serialized engine lease is released.
+    #[cfg(feature = "tensorrt-api")]
+    pub fn with_resident_sessions<T>(
+        &self,
+        logger: &trtx::Logger,
+        plans: &[(&TrtBlueprint, EngineIdentity)],
+        workspace_bytes: usize,
+        submit: impl FnOnce(&mut BTreeMap<String, trtx::ExecutionContext<'_>>) -> Result<T, EngineError>,
+        synchronize: impl FnOnce() -> Result<(), EngineError>,
+    ) -> Result<T, EngineError> {
+        if plans.is_empty() {
+            return Err(EngineError::InvalidPlan("no TensorRT AR networks".into()));
+        }
+        let mut images = BTreeMap::new();
+        for (plan, identity) in plans {
+            let key = identity.key()?;
+            if !images.contains_key(&key) {
+                let image =
+                    self.build_or_load_blueprint(logger, plan, identity, workspace_bytes)?;
+                images.insert(key, image);
+            } else {
+                identity.validate_blueprint(plan)?;
+            }
+        }
+        let borrowed = images
+            .iter()
+            .map(|(key, image)| (key.as_str(), image.bytes.as_ref()))
+            .collect::<Vec<_>>();
+        crate::trtx_engine::with_resident_engine_sessions(logger, &borrowed, submit, synchronize)
+    }
+
     pub fn evict_memory(&self) -> Result<(), EngineError> {
         self.loaded
             .lock()

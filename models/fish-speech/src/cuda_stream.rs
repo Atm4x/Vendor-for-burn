@@ -108,6 +108,15 @@ impl<F> CudaArDevice<F> {
         dispatch: F,
     ) -> Result<Self> {
         let context = CudaContext::new(device_ordinal).map_err(cuda_error)?;
+        Self::with_context(context, memory, dispatch)
+    }
+
+    pub fn with_context(
+        context: Arc<CudaContext>,
+        memory: DeviceMemoryBudget,
+        dispatch: F,
+    ) -> Result<Self> {
+        context.bind_to_thread().map_err(cuda_error)?;
         let stream = context.new_stream().map_err(cuda_error)?;
         Ok(Self {
             context,
