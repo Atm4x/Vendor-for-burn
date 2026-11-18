@@ -1,10 +1,12 @@
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use burn::tensor::{Device, Tensor};
 use std::{collections::HashSet, fs, path::Path};
 
 use crate::{acoustic::TextToMel, accentor::{Accentor, AccentOptions}, homosolver::HomoSolver, frontend::ModelConfig, store::TensorStore, synthesis::Synthesizer, ssml::{self, SileroControlConstants}};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TextOptions {
     pub put_accent: bool,
     pub put_stress_homo: bool,

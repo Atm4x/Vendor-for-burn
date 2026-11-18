@@ -22,3 +22,5 @@ pub mod homosolver;
 
 pub mod ssml;
 pub mod audio;
+
+pub mod worker;

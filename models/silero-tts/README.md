@@ -258,3 +258,57 @@ this particular `v5_ru.pt` exposes exactly five predefined speaker IDs.
 A follow-up source audit simplified consecutive empty `<p>` and `<s>` handling
 to match the original Python rule. Four checkpoint-derived SSML edge cases
 have explicit regression assertions. This changes no tensor backend behavior.
+
+## Cycle 6 — standalone long-lived model worker
+
+The `silero-tts` executable is a JSONL worker. Start it with `--stdio`, send one
+JSON object followed by `\n` per request, and read one JSON reply per request.
+The process keeps `SileroTts` weights and backend allocations alive across
+multiple inference calls. There is no Python, PyTorch or Flex dependency in
+normal CubeCL builds. `reference-flex` is a developer-only diagnostic feature.
+
+Compile the primary CubeCL CPU configuration:
+
+```
+cargo build --offline --no-default-features --features cubecl-cpu --bin silero-tts
+```
+
+Native CPU *linking/execution* requires Tracel LLVM 23.1.0-4, which is not
+included in the current Git bundle. Setting `DOCS_RS=1` skips native LLVM
+setup for static `cargo check`; it is **not** a valid way to build a working
+CubeCL CPU executable. Do not silently substitute Flex for CubeCL at runtime.
+
+For development, build the independent worker with the optional diagnostic
+backend and load a previously exported model:
+
+```
+cargo build --offline --no-default-features --features reference-flex --bin silero-tts
+```
+
+Example JSONL conversation (one JSON object on each line):
+
+```
+{"command":"capabilities","request_id":"1"}
+{"command":"load","request_id":"2","backend":"cpu","model_dir":"/models/silero-v5-ru"}
+{"command":"status","request_id":"3"}
+{"command":"warmup","request_id":"4"}
+{"command":"infer","request_id":"5","speaker":"aidar","sample_rate":8000,"input":{"kind":"text","text":"Привет, мир!"},"output":{"kind":"inline_f32le"}}
+{"command":"infer","request_id":"6","speaker":"baya","sample_rate":24000,"input":{"kind":"ssml","ssml":"<speak>Привет<break time=\"150ms\"/>мир!</speak>"},"output":{"kind":"wav_file","path":"/output/voice.wav"}}
+{"command":"unload","request_id":"7"}
+{"command":"shutdown","request_id":"8"}
+```
+
+Every reply contains `request_id`, `ok`, and either `data` or `error`.
+Inline audio is little-endian float32 PCM encoded with Base64; `wav_file`
+produces mono PCM16 WAV. `symbol_durations` input supports an ordered list of
+`[symbol, milliseconds]` pairs; `accented` accepts pre-accented text.
+`TextOptions` flags may be provided under `input.options`.
+
+The worker serializes inference and uses at most one resident model. `load`
+refuses a second model until explicit `unload`; failed requests do not end the
+process. `warmup` runs full text inference (including the accent and homograph
+frontend); it is not a no-op. `cancel` responds with `supported: false` because
+active CubeCL kernels cannot yet be interrupted safely. A supervising Core
+should terminate/restart the worker to enforce an inference timeout. The stdin
+request frame limit is 1 MiB; oversized frames are rejected without losing
+the next request. All logging/errors must go to stderr, never protocol stdout.

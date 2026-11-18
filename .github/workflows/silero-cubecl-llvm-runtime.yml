@@ -1,0 +1,42 @@
+name: Export Silero CubeCL LLVM CPU runtime
+
+on:
+  push:
+    branches:
+      - codex/silero-tts-cubecl-port-20261118
+    paths:
+      - .github/workflows/silero-cubecl-llvm-runtime.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export-llvm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Download and verify Tracel LLVM runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          base='https://github.com/tracel-ai/tracel-llvm/releases/download/v23.1.0-4'
+          curl --fail --location --retry 4 --retry-all-errors --silent --show-error "$base/linux-x64.checksums.json" -o output/linux-x64.checksums.json
+          curl --fail --location --retry 4 --retry-all-errors --silent --show-error "$base/linux-x64.tar.xz" -o output/linux-x64.tar.xz
+          python3 - <<'PY'
+          import hashlib, json, pathlib
+          root = pathlib.Path('output')
+          expected = json.loads((root/'linux-x64.checksums.json').read_text())['archive_sha256']
+          observed = hashlib.file_digest((root/'linux-x64.tar.xz').open('rb'), 'sha256').hexdigest()
+          if expected != observed:
+              raise SystemExit(f'checksum mismatch: expected={expected} observed={observed}')
+          print(f'Verified LLVM archive sha256={observed}')
+          PY
+      - name: Export dependency for local CubeCL CPU testing
+        uses: actions/upload-artifact@v4
+        with:
+          name: silero-tracel-llvm-23.1.0-4-linux-x64
+          path: output/
+          retention-days: 2
+          if-no-files-found: error
