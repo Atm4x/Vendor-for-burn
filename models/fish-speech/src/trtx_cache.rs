@@ -278,7 +278,10 @@ fn read_verified(path: &Path, key: &str, max_bytes: usize) -> std::io::Result<Op
     let mut expected_size = [0u8; 8];
     expected_size.copy_from_slice(&header[44..52]);
     let expected_size = u64::from_le_bytes(expected_size);
-    if expected_size == 0 || expected_size + HEADER_LEN as u64 != len {
+    if expected_size == 0
+        || expected_size > max_bytes as u64
+        || expected_size.checked_add(HEADER_LEN as u64) != Some(len)
+    {
         return Ok(None);
     }
     let mut bytes = Vec::with_capacity(expected_size as usize);
@@ -432,6 +435,28 @@ mod tests {
         assert_eq!(registry.resident_bytes().unwrap(), 0);
         fs::remove_dir_all(directory).unwrap();
     }
+    #[test]
+    fn forged_overflowing_length_in_cache_header_is_rebuilt_safely() {
+        let directory = std::env::temp_dir().join(format!(
+            "fish-engine-overflow-{}-{}",
+            std::process::id(),
+            NEXT_TEST.fetch_add(1, Ordering::Relaxed)
+        ));
+        let registry = EngineRegistry::new(&directory, 128).unwrap();
+        let identity = sample();
+        let key = identity.key().unwrap();
+        fs::create_dir_all(&directory).unwrap();
+        let mut corrupt = Vec::new();
+        corrupt.extend_from_slice(CACHE_FORMAT);
+        corrupt.extend_from_slice(&hex_sha256(&key).unwrap());
+        corrupt.extend_from_slice(&u64::MAX.to_le_bytes());
+        corrupt.extend_from_slice(&[0; 32]);
+        fs::write(directory.join(format!("{key}.rtxplan")), corrupt).unwrap();
+        let rebuilt = registry.get_or_build(&identity, || Ok(vec![42])).unwrap();
+        assert_eq!(&*rebuilt.bytes, &[42]);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn invalid_fingerprints_empty_builds_and_budget_are_rejected() {
         let mut identity = sample();
