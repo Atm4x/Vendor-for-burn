@@ -36,7 +36,7 @@ impl ModelConfig {
     }
 
     /// Reproduces the letter-mode `prepare_text_input` rules before accentuation.
-    pub fn prepare_text(&self, text: &str) -> Result<CleanText> {
+    pub fn prepare_text_fragment(&self, text: &str) -> Result<CleanText> {
         let text = text.to_lowercase().replace(['—', '–'], "–").replace('‑', "-");
         let allowed = self.symbols.chars().skip(3).chain(std::iter::once('^'))
             .collect::<std::collections::HashSet<_>>();
@@ -53,10 +53,15 @@ impl ModelConfig {
         let clean_sentence: String = sentence.chars().filter(|ch| {
             ('а'..='я').contains(ch) || *ch == '-' || *ch == ' '
         }).collect();
-        if !clean_sentence.chars().any(|ch| ('а'..='я').contains(&ch)) {
-            bail!("Text is empty after Silero normalization")
-        }
         Ok(CleanText { sentence, clean_sentence })
+    }
+
+    pub fn prepare_text(&self, text: &str) -> Result<CleanText> {
+        let cleaned = self.prepare_text_fragment(text)?;
+        if !cleaned.clean_sentence.chars().any(|ch| ('а'..='я').contains(&ch)) {
+            bail!("Text is empty after Silero normalization");
+        }
+        Ok(cleaned)
     }
 
     /// `preprocess_tacotron`: accentuation must be applied before this call.

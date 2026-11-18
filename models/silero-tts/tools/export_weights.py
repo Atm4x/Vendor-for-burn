@@ -93,6 +93,18 @@ def run(checkpoint: Path, output: Path) -> None:
             "model_max_length": tokenizer.model_max_length,
         },
     }
+    source_model = model_package.models[0]
+    controls = {
+        "point_id": source_model.point_id,
+        "comma_ids": list(source_model.comma_ids),
+        "punctuation_ids": list(source_model.punkt_symbols),
+        "pitch_mean_shift": list(source_model.mean_std_coef),
+        "sil_value": float(source_model.sil_value),
+    }
+    (output / "ssml-controls.json").write_text(
+        json.dumps(controls, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
     (output / "config.json").write_text(
         json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8"
     )

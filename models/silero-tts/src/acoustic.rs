@@ -1,4 +1,5 @@
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, ensure};
+use crate::ssml::{MergeInput, SileroControlConstants};
 use burn::tensor::{Device, Tensor, TensorData, Int, ops::{ConvOptions, AvgPoolOptions, PadMode}, module::{embedding, conv1d, linear, layer_norm, avg_pool1d}};
 
 use crate::{store::TensorStore, transformer::{TransformerBlock, TransformerStack}, predictors::ScalarPredictor};
@@ -146,6 +147,9 @@ impl AcousticModel {
                 ConvOptions::new([1], [1], [1], 1)).swap_dims(1, 2);
         }
         let expanded = self.regulator.expand(encoded, durations)?;
+        let expanded_length = expanded.dims()[1];
+        ensure!(expanded_length <= self.decoder.pos_encoding.dims()[0],
+            "Expanded Silero utterance exceeds acoustic positional encoding limit");
         let decoded = self.decoder.forward(expanded);
         Ok(linear(decoded, self.mel_weight.clone(), Some(self.mel_bias.clone())).swap_dims(1, 2))
     }
@@ -168,11 +172,99 @@ impl TextToMel {
         })
     }
 
+    /// TorchScript control path: pause substitution, duration scaling, pitch shift,
+    /// and silent mel frames. These controls are keyed by original symbol positions.
+    pub fn infer_with_controls(&self, symbols: &[i64], speaker_id: i64,
+        controls: &MergeInput, constants: &SileroControlConstants) -> Result<(Tensor<3>, Vec<f32>)> {
+        ensure!(!symbols.is_empty(), "Cannot synthesize empty tokens");
+        let len = symbols.len();
+        ensure!(len <= 5000, "Silero input exceeds positional encoding limit");
+        ensure!(controls.rates.len() == len && controls.pitches.len() == len,
+            "SSML control vectors must match symbol count");
+        ensure!(constants.pitch_mean_shift.get(speaker_id as usize).is_some(), "Missing pitch shift for voice");
+        ensure!(controls.pauses.keys().all(|k| *k < len), "SSML pause index exceeds symbol count");
+
+        let tokens = Tensor::<2, Int>::from_data(TensorData::new(symbols.to_vec(), [1, len]), &self.device);
+        let speakers = Tensor::<2, Int>::from_data(TensorData::new(vec![speaker_id], [1, 1]), &self.device);
+        let predictor = self.duration.forward(tokens.clone(), speakers.clone(), None, 1.0);
+        let base = (predictor.exp() - 1.0).clamp_min(0.0).into_data().try_to_vec::<f32>()?;
+        let mut raw = base.clone();
+
+        let support_ids: Vec<usize> = controls.pauses.keys().copied()
+            .filter(|k| constants.comma_ids.contains(&symbols[*k])).collect();
+        if !support_ids.is_empty() {
+            let mut point_symbols = symbols.to_vec();
+            for &index in &support_ids { point_symbols[index] = constants.point_id; }
+            let point_tokens = Tensor::<2, Int>::from_data(TensorData::new(point_symbols, [1, len]), &self.device);
+            let point_duration = self.duration.forward(point_tokens, speakers.clone(), None, 1.0);
+            let point = (point_duration.exp() - 1.0).clamp_min(0.0).into_data().try_to_vec::<f32>()?;
+            let comma_min = support_ids.iter().map(|&i| base[i]).fold(f32::INFINITY, f32::min);
+            let point_min = support_ids.iter().map(|&i| point[i]).fold(f32::INFINITY, f32::min);
+            let pause_length = support_ids.iter().map(|i| controls.pauses[i]).max().unwrap() as f32;
+            if comma_min <= point_min && pause_length > comma_min {
+                if pause_length >= point_min {
+                    raw = point;
+                } else {
+                    let point_weight = (pause_length - comma_min) / (point_min - comma_min);
+                    let comma_weight = 1.0 - point_weight;
+                    for (value, point_value) in raw.iter_mut().zip(&point) {
+                        *value = *value * comma_weight + *point_value * point_weight;
+                    }
+                }
+            }
+        }
+
+        let mut durations: Vec<f32> = raw.into_iter().enumerate()
+            .map(|(i, value)| value.round_ties_even() / controls.rates[i])
+            .map(|value| value.round_ties_even()).collect();
+        for (&index, &frames) in &controls.pauses { durations[index] = frames as f32; }
+        durations[0] = durations[0].min(5.0);
+        if len >= 2 {
+            durations[len - 1] = durations[len - 1].min(7.0);
+            durations[len - 2] = 13.0;
+        }
+        if len >= 3 { durations[len - 3] = durations[len - 3].min(13.0); }
+        ensure!(durations.iter().all(|d| d.is_finite() && *d >= 0.0), "Invalid duration after SSML controls");
+
+        let pitch = self.pitch.forward(tokens.clone(), speakers.clone(), None, 1.0)
+            .into_data().try_to_vec::<f32>()?;
+        let mean = constants.pitch_mean_shift[speaker_id as usize];
+        let pitch: Vec<f32> = pitch.into_iter().zip(&controls.pitches).map(|(value, &coef)| {
+            let value = if value.abs() < 0.001 { 0.0 } else { value };
+            let scaled = value * coef;
+            if scaled == 0.0 { 0.0 } else {
+                let shift_coef = if coef == 0.0 { 1.0 } else { coef };
+                scaled + (shift_coef - 1.0) * mean
+            }
+        }).collect();
+        let pitch = Tensor::<3>::from_data(TensorData::new(pitch, [1, 1, len]), &self.device);
+        let durations_tensor = Tensor::<2>::from_data(TensorData::new(durations.clone(), [1, len]), &self.device);
+        let mut mel = self.acoustic.forward(tokens, speakers, None, durations_tensor, pitch, None)?;
+
+        let [batch, channels, frames] = mel.dims();
+        let mut cursor = 0usize;
+        for (index, length) in durations.iter().enumerate() {
+            let frames_for_symbol = *length as usize;
+            if controls.pauses.contains_key(&index) {
+                let first = cursor + if frames_for_symbol > 10 { 10 } else { 0 };
+                let end = cursor + frames_for_symbol;
+                ensure!(end <= frames, "SSML pause exceeds mel length");
+                if first < end {
+                    let silence = Tensor::<3>::zeros([batch, channels, end - first], &self.device) + constants.sil_value;
+                    mel = mel.slice_assign([0..batch, 0..channels, first..end], silence);
+                }
+            }
+            cursor += frames_for_symbol;
+        }
+        Ok((mel, durations))
+    }
+
     /// Implements the default one-speaker acoustic inference without optional
     /// SSML, pause overrides, rate modifications, or explicit pitch coefficients.
     pub fn infer(&self, symbols: &[i64], speaker: i64) -> Result<(Tensor<3>, Vec<f32>)> {
         if symbols.is_empty() { bail!("Cannot infer empty text"); }
         let len = symbols.len();
+        ensure!(len <= 5000, "Silero input exceeds positional encoding limit");
         let input = Tensor::<2, Int>::from_data(TensorData::new(symbols.to_vec(), [1, len]), &self.device);
         let speaker = Tensor::<2, Int>::from_data(TensorData::new(vec![speaker], [1, 1]), &self.device);
         let log_duration = self.duration.forward(input.clone(), speaker.clone(), None, 1.0);

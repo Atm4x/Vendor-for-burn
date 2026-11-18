@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use burn::tensor::{Device, Tensor};
 use std::{collections::HashSet, fs, path::Path};
 
-use crate::{acoustic::TextToMel, accentor::{Accentor, AccentOptions}, homosolver::HomoSolver, frontend::ModelConfig, store::TensorStore, synthesis::Synthesizer};
+use crate::{acoustic::TextToMel, accentor::{Accentor, AccentOptions}, homosolver::HomoSolver, frontend::ModelConfig, store::TensorStore, synthesis::Synthesizer, ssml::{self, SileroControlConstants}};
 
 #[derive(Clone, Debug)]
 pub struct TextOptions {
@@ -34,6 +34,7 @@ pub struct SileroTts {
     homographs: HashSet<String>,
     homosolver: HomoSolver,
     synthesizer: Synthesizer,
+    control_constants: Option<SileroControlConstants>,
 }
 
 impl SileroTts {
@@ -47,7 +48,13 @@ impl SileroTts {
         let homographs = homographs.as_object()
             .ok_or_else(|| anyhow::anyhow!("Invalid homograph dictionary"))?
             .keys().cloned().collect();
+        let control_constants = match fs::read(model_dir.join("ssml-controls.json")) {
+            Ok(data) => Some(serde_json::from_slice(&data).context("Invalid Silero SSML control constants")?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
         Ok(Self {
+            control_constants,
             accentor: Accentor::load(model_dir, device)?,
             homosolver: HomoSolver::load(model_dir, device)?,
             homographs,
@@ -60,7 +67,11 @@ impl SileroTts {
     /// Full SileroStress frontend, including independently controlled homograph and ngram stages.
     pub fn accentuate_with_options(&self, text: &str, flags: &TextOptions) -> Result<String> {
         let cleaned = self.config.prepare_text(text)?;
-        let resolved = self.homosolver.accentuate(&cleaned.sentence,
+        self.accentuate_prepared(&cleaned.sentence, flags)
+    }
+
+    fn accentuate_prepared(&self, text: &str, flags: &TextOptions) -> Result<String> {
+        let resolved = self.homosolver.accentuate(text,
             flags.put_stress_homo, flags.put_yo_homo, flags.stress_single_vowel)?;
         let mut accent_flags = AccentOptions {
             put_stress: flags.put_accent,
@@ -94,6 +105,45 @@ impl SileroTts {
         flags: &TextOptions) -> Result<Vec<f32>> {
         let accented = self.accentuate_with_options(text, flags)?;
         self.infer_accented(&accented, speaker, sample_rate)
+    }
+
+    /// Original `<speak>` SSML entrypoint with nested prosody, sentence breaks,
+    /// pause overrides, and voice-specific F0 adjustment. The session stays loaded.
+    pub fn infer_ssml(&self, ssml: &str, speaker: &str, sample_rate: u32) -> Result<Vec<f32>> {
+        self.infer_ssml_with_options(ssml, speaker, sample_rate, &TextOptions::default())
+    }
+
+    pub fn infer_ssml_with_options(&self, ssml: &str, speaker: &str, sample_rate: u32,
+        flags: &TextOptions) -> Result<Vec<f32>> {
+        Ok(self.infer_ssml_with_durations(ssml, speaker, sample_rate, flags)?.0)
+    }
+
+    fn infer_ssml_with_durations(&self, ssml: &str, speaker: &str, sample_rate: u32,
+        flags: &TextOptions) -> Result<(Vec<f32>, Vec<f32>)> {
+        let speaker_id = self.config.validate_speaker(speaker)? as i64;
+        self.config.validate_sample_rate(sample_rate)?;
+        let constants = self.control_constants.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Missing ssml-controls.json; export model weights again"))?;
+        let segments = ssml::process_ssml(&self.config, ssml)?;
+        let prepared = segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ");
+        let accented = self.accentuate_prepared(&prepared, flags)?;
+        let merged = ssml::merge_segments(&segments, &accented)?;
+        let (ids, _) = self.config.encode_accented(&merged.text)?;
+        let (mel, durations) = self.acoustic.infer_with_controls(&ids, speaker_id, &merged, constants)?;
+        let pcm = self.synthesizer.forward(mel, sample_rate)?.into_data().try_to_vec::<f32>()?;
+        Ok((pcm, durations))
+    }
+
+    /// Reproduces Silero's original `symbol_durs` API by transforming matched
+    /// substrings into SSML breaks before normalization and accentuation.
+    pub fn infer_text_with_symbol_durations(&self, text: &str, speaker: &str,
+        sample_rate: u32, symbol_durs: &[(String, u32)], flags: &TextOptions) -> Result<Vec<f32>> {
+        let mut expanded = text.to_string();
+        for (symbol, duration) in symbol_durs {
+            if symbol.is_empty() { anyhow::bail!("Empty symbol_durs key"); }
+            expanded = expanded.replace(symbol, &format!("{symbol}<break time=\"{duration}ms\"/>"));
+        }
+        self.infer_ssml_with_options(&format!("<speak>{expanded}</speak>"), speaker, sample_rate, flags)
     }
 
     /// Recreates the original Russian frontend for input without unresolved homographs.
@@ -233,5 +283,72 @@ mod flags_parity {
             let actual = model.accentuate_with_options(&case.text, &flags).unwrap();
             assert_eq!(actual, case.accented, "Mismatch for {:?} with {:?}", case.text, case.options);
         }
+    }
+}
+
+#[cfg(all(test, feature = "reference-flex"))]
+mod ssml_parity {
+    use super::*;
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct Case {
+        ssml: String,
+        key: String,
+        durations: Vec<f32>,
+    }
+
+    #[test]
+    fn original_ssml_mel_with_prosody_and_breaks() {
+        let Ok(dir) = std::env::var("SILERO_PARITY_DIR") else { return };
+        let dir = std::path::Path::new(&dir);
+        let cases: Vec<Case> = serde_json::from_slice(&fs::read(dir.join("ssml-audio-parity.json")).unwrap()).unwrap();
+        let mel_reference = TensorStore::open(&dir.join("ssml-mel-parity.safetensors")).unwrap();
+        let model = SileroTts::load(dir, &Device::flex()).unwrap();
+        let constants = model.control_constants.as_ref().unwrap();
+        for case in cases {
+            let segments = ssml::process_ssml(&model.config, &case.ssml).unwrap();
+            let prepared = segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ");
+            let accented = model.accentuate_prepared(&prepared, &TextOptions::default()).unwrap();
+            let merged = ssml::merge_segments(&segments, &accented).unwrap();
+            let (ids, _) = model.config.encode_accented(&merged.text).unwrap();
+            let (mel, durations) = model.acoustic.infer_with_controls(&ids, 0, &merged, constants).unwrap();
+            assert_eq!(durations.len(), case.durations.len());
+            let duration_error = durations.iter().zip(&case.durations).map(|(a,b)| (a-b).abs()).fold(0.0f32, f32::max);
+            println!("SSML {}: duration max_abs={duration_error:.8}; mismatches={:?}", case.key,
+                durations.iter().zip(&case.durations).enumerate()
+                    .filter(|(_, (a, b))| (*a - *b).abs() > 0.1)
+                    .map(|(i, (a, b))| (i, *a, *b)).collect::<Vec<_>>());
+            assert!(duration_error < 0.1, "Duration parity failed: {duration_error}");
+            let key = case.key.replace("pcm_", "mel_");
+            let reference = mel_reference.float_data(&key).unwrap();
+            let got = mel.into_data().try_to_vec::<f32>().unwrap();
+            assert_eq!(got.len(), reference.len(), "Mel frame count differs: {}", case.key);
+            let mel_error = got.iter().zip(&reference).map(|(a,b)| (a-b).abs()).fold(0.0f32, f32::max);
+            println!("SSML {}: mel max_abs={mel_error:.8}, frames={}", case.key, got.len()/192);
+            assert!(mel_error < 0.005, "SSML mel parity failed for {}: {mel_error}", case.key);
+        }
+    }
+}
+
+#[cfg(all(test, feature = "reference-flex"))]
+mod ssml_pcm_parity {
+    use super::*;
+
+    #[test]
+    fn short_text_with_pause_produces_pytorch_pcm() {
+        let Ok(dir) = std::env::var("SILERO_PARITY_DIR") else { return };
+        let dir = std::path::Path::new(&dir);
+        let references: Vec<serde_json::Value> = serde_json::from_slice(
+            &fs::read(dir.join("ssml-audio-parity.json")).unwrap()).unwrap();
+        let case = references.iter().find(|case| case["key"] == "pcm_12").unwrap();
+        let audio = TensorStore::open(&dir.join("ssml-audio-parity.safetensors")).unwrap();
+        let expected = audio.float_data("pcm_12").unwrap();
+        let model = SileroTts::load(dir, &Device::flex()).unwrap();
+        let got = model.infer_ssml(case["ssml"].as_str().unwrap(), "aidar", 8000).unwrap();
+        assert_eq!(got.len(), expected.len());
+        let error = got.iter().zip(&expected).map(|(a,b)| (a-b).abs()).fold(0.0f32, f32::max);
+        println!("short SSML pcm_12 max_abs={error:.8}; samples={}", got.len());
+        assert!(error < 3e-3);
     }
 }

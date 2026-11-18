@@ -168,3 +168,50 @@ TorchScript INT8 embedding dequantization in the reference model.
 ```
 python tools/create_stress_flags_fixture.py v5_ru.pt /tmp/silero-assets
 ```
+
+## Cycle 4 — source-equivalent SSML and managed duration/pitch
+
+Added a native `xml-rs` SSML frontend and the original TorchScript inference
+controls without a Python dependency:
+
+- `src/ssml.rs`: `<speak>` root, nested `<prosody>`, `<break>`, `<p>` and
+  `<s>`, inherited rate/pitch, pauses, punctuation and word-based merging;
+  unsupported tags are ignored, matching the original non-recursive behavior.
+- `SileroTts::infer_ssml` and `infer_ssml_with_options` handle real text input;
+  `infer_text_with_symbol_durations` accepts an ordered list of substitutions.
+- `tools/export_weights.py` now writes `ssml-controls.json` from the actual
+  TorchScript graph: punctuation IDs, comma IDs, period ID, silence value and
+  each speaker's pitch correction. Re-export an existing checkpoint once.
+- Acoustic inference now reproduces duration-rate division with PyTorch's
+  ties-to-even rounding, comma-to-period pause interpolation, explicit pause
+  lengths, voice-specific pitch shifts, and mel-frame silencing. The earlier
+  no-SSML `infer_text` path remains unchanged.
+- Both symbol and expanded acoustic sequences are checked against the
+  checkpoint's 5000-position limits instead of allowing a positional-encoding
+  out-of-range panic.
+
+Original-checkpoint parity from local reference fixtures:
+
+- 13 SSML cases: parsed segments, cleaned text, complete token IDs, pause
+  positions, rate vectors and pitch vectors match the source Python.
+- Three full controlled acoustic cases: all duration frames match exactly;
+  maximum absolute mel errors are `8.34e-6`, `1.359e-5`, `7.15e-6`.
+- Full SSML-to-8 kHz PCM test with a 75 ms pause: 4500 samples and maximum
+  absolute error `1.191e-5` through the diagnostic Burn Flex backend.
+- For the supplied `v5_ru.pt`, the original Python package explicitly raises
+  `AssertionError: This model doesn't support return_ts` on `return_ts=True`.
+  Word timestamps are **not** an available original-model feature to port.
+
+Reproduce the source fixtures with:
+
+```
+python tools/create_ssml_fixture.py v5_ru.pt /tmp/silero-assets
+python tools/create_ssml_audio_fixture.py v5_ru.pt /tmp/silero-assets
+SILERO_PARITY_DIR=/tmp/silero-assets cargo test --offline --no-default-features --features reference-flex --lib
+```
+
+The default backend remains Burn/CubeCL; diagnostic Flex is optional and used
+only to execute numerical parity without the system-provided LLVM CPU runtime.
+CubeCL CPU compilation does not imply executed CubeCL parity. CUDA, Windows and
+performance remain a separate subsequent phase. The independent EXE/IPC worker
+lifecycle is not part of this functional graph-parity cycle.
