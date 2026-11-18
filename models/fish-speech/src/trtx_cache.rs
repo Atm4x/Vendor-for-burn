@@ -55,6 +55,19 @@ impl EngineIdentity {
         Ok(result)
     }
 
+    pub fn validate_blueprint(&self, blueprint: &TrtBlueprint) -> Result<(), EngineError> {
+        let mut digest = Sha256::new();
+        digest.update(b"fish-speech-trtx-blueprint-v2");
+        digest.update(format!("{blueprint:?}").as_bytes());
+        if self.graph_sha256 != format!("{:x}", digest.finalize()) {
+            return Err(EngineError::InvalidPlan(
+                "cache identity does not match the requested TensorRT blueprint".into(),
+            ));
+        }
+        self.key()?;
+        Ok(())
+    }
+
     pub fn key(&self) -> Result<String, EngineError> {
         for digest in [&self.model_sha256, &self.graph_sha256] {
             if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -151,6 +164,34 @@ impl EngineRegistry {
         });
         loaded.insert(key, Arc::clone(&entry));
         Ok(entry)
+    }
+
+    #[cfg(feature = "tensorrt-api")]
+    pub fn build_or_load_blueprint(
+        &self,
+        logger: &trtx::Logger,
+        blueprint: &TrtBlueprint,
+        identity: &EngineIdentity,
+        workspace_bytes: usize,
+    ) -> Result<Arc<CachedEngine>, EngineError> {
+        identity.validate_blueprint(blueprint)?;
+        self.get_or_build(identity, || {
+            crate::trtx_engine::build_serialized_blueprint(logger, blueprint, workspace_bytes)
+        })
+    }
+
+    #[cfg(feature = "tensorrt-api")]
+    pub fn with_cached_session<T>(
+        &self,
+        logger: &trtx::Logger,
+        blueprint: &TrtBlueprint,
+        identity: &EngineIdentity,
+        workspace_bytes: usize,
+        submit: impl FnOnce(&mut trtx::ExecutionContext<'_>) -> Result<T, EngineError>,
+        synchronize: impl FnOnce() -> Result<(), EngineError>,
+    ) -> Result<T, EngineError> {
+        let image = self.build_or_load_blueprint(logger, blueprint, identity, workspace_bytes)?;
+        crate::trtx_engine::with_engine_session(logger, &image.bytes, submit, synchronize)
     }
 
     pub fn evict_memory(&self) -> Result<(), EngineError> {
