@@ -143,7 +143,6 @@ fn push_text(out: &mut Vec<Parsed>, raw: &str, rate: f32, pitch: f32) {
 fn visit(node: &Node, rate: f32, pitch: f32) -> Result<Vec<Parsed>> {
     let mut parsed = Vec::new();
     if !node.text.is_empty() { push_text(&mut parsed, &node.text, rate, pitch); }
-    let mut last_tag: Option<&str> = None;
     for child in &node.children {
         match child.tag.as_str() {
             "break" => {
@@ -160,9 +159,7 @@ fn visit(node: &Node, rate: f32, pitch: f32) -> Result<Vec<Parsed>> {
                 let strength = if child.tag == "s" { "strong" } else { "x-strong" };
                 let mut child_parsed = visit(child, rate, pitch)?;
                 if let Some(last) = parsed.last_mut() {
-                    if !last.text.is_empty() || last_tag.is_some_and(|t| t != child.tag) || last_tag.is_none() {
-                        last.add_break(strength, strength_ms(strength).unwrap());
-                    }
+                    last.add_break(strength, strength_ms(strength).unwrap());
                 }
                 if let Some(last) = child_parsed.last_mut() {
                     last.add_break(strength, strength_ms(strength).unwrap());
@@ -171,7 +168,6 @@ fn visit(node: &Node, rate: f32, pitch: f32) -> Result<Vec<Parsed>> {
             }
             _ => (),
         }
-        last_tag = Some(child.tag.as_str());
         if !child.tail.is_empty() {
             let mut tail = child.tail.as_str();
             if let Some(first) = tail.chars().next() {
@@ -271,6 +267,22 @@ pub fn merge_segments(items: &[Segment], accented_full_text: &str) -> Result<Mer
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_paragraph_and_sentence_tags_match_original_checkpoint() {
+        let config = test_config();
+        for (source, expected_first_break, expected_last_break) in [
+            ("<speak>Да.<p></p><p></p>Мир.</speak>", Some(80), None),
+            ("<speak>Да.<s></s><s></s>Мир.</speak>", Some(24), None),
+            ("<speak><p>Да.</p><p></p><p>Мир.</p></speak>", Some(80), Some(80)),
+            ("<speak><s>Привет.</s><s>Мир.</s></speak>", Some(24), Some(24)),
+        ] {
+            let parsed = process_ssml(&config, source).unwrap();
+            assert_eq!(parsed.len(), 2);
+            assert_eq!(parsed[0].break_frames, expected_first_break);
+            assert_eq!(parsed[1].break_frames, expected_last_break);
+        }
+    }
 
     #[test]
     fn rejects_invalid_ssml() {

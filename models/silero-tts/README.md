@@ -254,3 +254,7 @@ features. The original supplied V5 checkpoint does not support `return_ts`.
 
 The importer does not claim support for arbitrary custom voice checkpoints:
 this particular `v5_ru.pt` exposes exactly five predefined speaker IDs.
+
+A follow-up source audit simplified consecutive empty `<p>` and `<s>` handling
+to match the original Python rule. Four checkpoint-derived SSML edge cases
+have explicit regression assertions. This changes no tensor backend behavior.
