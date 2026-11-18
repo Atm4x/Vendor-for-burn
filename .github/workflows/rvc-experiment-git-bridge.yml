@@ -63,3 +63,4 @@ jobs:
 # Stage100: one-shot full-history source bundle for local Conv2d / BN research 2026-11-15
 # Stage115: refresh PR2 full-history bundle for local Burn/CubeCL NCU audit 2026-11-16
 # Stage126: refresh requested current-HEAD bridge for local Conv1d/ImplicitGemm R&D 2026-11-17
+# Stage133: export exact PR2 HEAD for local CUDA acceleration audit 2026-11-18
