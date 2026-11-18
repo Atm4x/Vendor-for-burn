@@ -67,3 +67,39 @@ With the provided checkpoint (five spectral frames, 192 mel channels):
   24 kHz `7.12e-7`, 8 kHz `5.63e-7`.
 - These parity results are from diagnostic Burn Flex; the default execution backend
   remains CubeCL CPU. Results do not certify CPU/CUDA CubeCL numerical parity.
+
+## Cycle 2 — complete acoustic graph and PCM parity
+
+The complete acoustic FastPitch graph is implemented in native Burn/CubeCL
+Tensor API, including multi-head attention, four-layer duration and pitch
+predictors, four-layer Tacotron encoder, pitch/energy projections, length
+regulation, three-stage shortened decoder, and 192-channel mel projection.
+`SileroTts::load` creates a reusable session, and `infer_token_ids` executes
+all neural stages up to PCM for 8/24/48 kHz.
+
+An important TorchScript-specific behavior is that `shorten_layers.0` and
+`shorten_layers.1` are each fed the same downsampled tensor; only the second
+output contributes to the upsampled path. This differs from sequential blocks.
+The native code reproduces the effective TorchScript graph, not an assumed
+sequential FastPitch design.
+
+The diagnostic Flex parity tests use a real `v5_ru.pt` checkpoint and verify:
+
+- duration logits: maximum absolute error `4.77e-7`;
+- pitch: `4.32e-7`;
+- encoder: `5.45e-6`;
+- complete token-to-mel: `6.91e-6`;
+- full token-to-8kHz PCM (6800 samples): `1.69e-5`.
+
+The source of truth for native default inference is the checkpoint's TorchScript
+model. This cycle does **not** implement Accentor and HomoSolver, SSML/prosody
+modifiers, or standalone process IPC. `infer_accented` expects already stressed
+text. The CPU test environment does not have the native LLVM execution runtime;
+`cargo check` on CubeCL CPU is not a CubeCL execution parity claim.
+
+Reproduce acoustic fixtures and the parity tests:
+
+```
+python tools/create_acoustic_fixture.py /path/to/v5_ru.pt /tmp/silero-assets
+SILERO_PARITY_DIR=/tmp/silero-assets cargo test --offline --no-default-features --features reference-flex --lib
+```
