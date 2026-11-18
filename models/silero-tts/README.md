@@ -9,7 +9,8 @@ in the Git repository.
 
 - **Implemented:** checkpoint-to-SafeTensors converter for all three Silero
   networks (TTS / Accentor / HomoSolver), sidecar model metadata, complete
-  vocabulary, exception and homograph dictionaries, PQMF coefficients.
+  vocabulary, exception and homograph dictionaries, 126,523 Accentor ngrams,
+  PQMF coefficients.
 - **Implemented:** Russian letter-mode text filtering, symbol encoder,
   basic/WordPiece tokenizer, speaker/sample-rate validation.
 - **Implemented:** CubeCL tensor weight loading, ConvNeXt vocoder (8 blocks),
@@ -103,3 +104,7 @@ Reproduce acoustic fixtures and the parity tests:
 python tools/create_acoustic_fixture.py /path/to/v5_ru.pt /tmp/silero-assets
 SILERO_PARITY_DIR=/tmp/silero-assets cargo test --offline --no-default-features --features reference-flex --lib
 ```
+
+The exporter also persists `accentor-ngrams.json` (126,523 ngram IDs) from the
+TorchScript embedding module. This is essential for the upcoming native
+Accentor classifier and was missing from the initial export format.

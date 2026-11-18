@@ -46,6 +46,13 @@ def run(checkpoint: Path, output: Path) -> None:
         "analysis_6": pqmf.pqmf_6.H.detach().cpu().contiguous(),
     }, str(output / "pqmf.safetensors"))
 
+    ngrams = model_package.accentor.accentor.model.embedding.ngram_dict
+    if "UNK" not in ngrams or len(ngrams) == 0:
+        raise ValueError("Silero Accentor's subword ngram vocabulary is incomplete")
+    (output / "accentor-ngrams.json").write_text(
+        json.dumps(ngrams, ensure_ascii=False), encoding="utf-8"
+    )
+
     tokenizer = model_package.accentor.homosolver.tokenizer
     vocab = sorted(tokenizer.vocab.items(), key=lambda item: item[1])
     (output / "vocab.json").write_text(
