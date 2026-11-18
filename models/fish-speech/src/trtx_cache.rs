@@ -237,7 +237,9 @@ impl EngineRegistry {
     }
 
     pub fn resident_bytes(&self) -> Result<usize, EngineError> {
-        Ok(self.loaded.lock()
+        Ok(self
+            .loaded
+            .lock()
             .map_err(|_| EngineError::InvalidBindings("engine registry lock poisoned".into()))?
             .resident_bytes)
     }
@@ -247,7 +249,8 @@ impl EngineRegistry {
             .loaded
             .lock()
             .map_err(|_| EngineError::InvalidBindings("engine registry lock poisoned".into()))?
-            .entries.len())
+            .entries
+            .len())
     }
 }
 
@@ -411,7 +414,6 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
-
     #[test]
     fn bounded_resident_cache_evicts_without_invalidating_external_lease() {
         let directory = std::env::temp_dir().join(format!(
@@ -423,12 +425,18 @@ mod tests {
         let first_id = sample();
         let mut second_id = first_id.clone();
         second_id.shape_profile = "decode:t1".into();
-        let first = registry.get_or_build(&first_id, || Ok(vec![1, 2, 3, 4])).unwrap();
-        registry.get_or_build(&second_id, || Ok(vec![5, 6, 7, 8])).unwrap();
+        let first = registry
+            .get_or_build(&first_id, || Ok(vec![1, 2, 3, 4]))
+            .unwrap();
+        registry
+            .get_or_build(&second_id, || Ok(vec![5, 6, 7, 8]))
+            .unwrap();
         assert_eq!(registry.resident_engines().unwrap(), 1);
         assert_eq!(registry.resident_bytes().unwrap(), 4);
         assert_eq!(&*first.bytes, &[1, 2, 3, 4]);
-        registry.get_or_build(&first_id, || panic!("should load from disk")).unwrap();
+        registry
+            .get_or_build(&first_id, || panic!("should load from disk"))
+            .unwrap();
         assert_eq!(registry.resident_engines().unwrap(), 1);
         assert_eq!(registry.resident_bytes().unwrap(), 4);
         registry.evict_memory().unwrap();

@@ -1,8 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet};
 use fish_speech_core::{
     graph_ir::ScalarType,
     trtx_blueprint::{Binding, TrtBlueprint, TrtPrimitive},
 };
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineError {
@@ -55,20 +55,27 @@ fn tensor_bytes(shape: &[usize], dtype: ScalarType) -> Result<usize, EngineError
 
 impl EngineIoContract {
     pub fn from_blueprint(plan: &TrtBlueprint) -> Result<Self, EngineError> {
-        plan.validate().map_err(|e| EngineError::InvalidPlan(format!("{e:?}")))?;
+        plan.validate()
+            .map_err(|e| EngineError::InvalidPlan(format!("{e:?}")))?;
         let mut inputs = BTreeMap::new();
         let mut outputs = BTreeMap::new();
         let mut produced = BTreeMap::new();
         let mut input_ids = BTreeSet::new();
         for step in &plan.steps {
             if matches!(step.primitive, TrtPrimitive::Deferred { .. }) {
-                return Err(EngineError::InvalidPlan(format!("unsupported step: {}", step.name)));
+                return Err(EngineError::InvalidPlan(format!(
+                    "unsupported step: {}",
+                    step.name
+                )));
             }
             let size = tensor_bytes(&step.output_type.shape, step.output_type.dtype)?;
             if produced.insert(step.result, size).is_some() {
                 return Err(EngineError::InvalidPlan("duplicate tensor binding".into()));
             }
-            if matches!(step.primitive, TrtPrimitive::Input | TrtPrimitive::ConstantWeight) {
+            if matches!(
+                step.primitive,
+                TrtPrimitive::Input | TrtPrimitive::ConstantWeight
+            ) {
                 if inputs.insert(step.name.clone(), size).is_some() {
                     return Err(EngineError::InvalidPlan("duplicate input name".into()));
                 }
@@ -77,9 +84,12 @@ impl EngineIoContract {
         }
         for id in &plan.outputs {
             if input_ids.contains(id) {
-                return Err(EngineError::InvalidPlan("direct input output needs identity layer".into()));
+                return Err(EngineError::InvalidPlan(
+                    "direct input output needs identity layer".into(),
+                ));
             }
-            let size = *produced.get(id)
+            let size = *produced
+                .get(id)
                 .ok_or_else(|| EngineError::InvalidPlan("output producer missing".into()))?;
             let name = output_tensor_name(*id);
             if inputs.contains_key(&name) || outputs.insert(name, size).is_some() {
@@ -89,18 +99,27 @@ impl EngineIoContract {
         Ok(Self { inputs, outputs })
     }
 
-    pub fn validate_regions(&self, regions: &BTreeMap<String, DeviceRegion>) -> Result<(), EngineError> {
+    pub fn validate_regions(
+        &self,
+        regions: &BTreeMap<String, DeviceRegion>,
+    ) -> Result<(), EngineError> {
         if regions.len() != self.inputs.len() + self.outputs.len() {
             return Err(EngineError::InvalidBindings("wrong buffer count".into()));
         }
         for (name, min_bytes) in self.inputs.iter().chain(self.outputs.iter()) {
-            let region = regions.get(name)
+            let region = regions
+                .get(name)
                 .ok_or_else(|| EngineError::InvalidBindings(format!("missing {name}")))?;
             if region.address == 0 || region.bytes < *min_bytes {
-                return Err(EngineError::InvalidBindings(format!("insufficient allocation: {name}")));
+                return Err(EngineError::InvalidBindings(format!(
+                    "insufficient allocation: {name}"
+                )));
             }
         }
-        if regions.keys().any(|key| !self.inputs.contains_key(key) && !self.outputs.contains_key(key)) {
+        if regions
+            .keys()
+            .any(|key| !self.inputs.contains_key(key) && !self.outputs.contains_key(key))
+        {
             return Err(EngineError::InvalidBindings("unexpected buffer".into()));
         }
         Ok(())
@@ -120,12 +139,16 @@ pub fn build_serialized_blueprint(
     }
     let err = |e: trtx::Error| EngineError::TensorRt(e.to_string());
     let mut builder = Builder::new(logger).map_err(err)?;
-    let mut network = builder.create_network(network_flags::EXPLICIT_BATCH).map_err(err)?;
+    let mut network = builder
+        .create_network(network_flags::EXPLICIT_BATCH)
+        .map_err(err)?;
     crate::trtx_lowering::lower_blueprint(&mut network, plan)
         .map_err(|e| EngineError::TensorRt(format!("{e:?}")))?;
     let mut config = builder.create_builder_config().map_err(err)?;
     config.set_memory_pool_limit(MemoryPoolType::kWORKSPACE, workspace_bytes);
-    let serialized = builder.build_serialized_network(&mut network, &mut config).map_err(err)?;
+    let serialized = builder
+        .build_serialized_network(&mut network, &mut config)
+        .map_err(err)?;
     if serialized.is_empty() {
         return Err(EngineError::TensorRt("empty serialized engine".into()));
     }
@@ -149,11 +172,11 @@ pub unsafe fn enqueue_with_regions(
     }
     let err = |e: trtx::Error| EngineError::TensorRt(e.to_string());
     for name in contract.inputs.keys().chain(contract.outputs.keys()) {
-        unsafe { context.set_tensor_address(name, regions[name].address as *mut _) }.map_err(err)?;
+        unsafe { context.set_tensor_address(name, regions[name].address as *mut _) }
+            .map_err(err)?;
     }
     unsafe { context.enqueue_v3(stream) }.map_err(err)
 }
-
 
 fn finish_stream_batch<T>(
     submit: impl FnOnce() -> Result<T, EngineError>,
