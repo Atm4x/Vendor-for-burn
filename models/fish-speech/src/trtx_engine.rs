@@ -153,3 +153,72 @@ pub unsafe fn enqueue_with_regions(
     }
     unsafe { context.enqueue_v3(stream) }.map_err(err)
 }
+
+
+fn finish_stream_batch<T>(
+    submit: impl FnOnce() -> Result<T, EngineError>,
+    synchronize: impl FnOnce() -> Result<(), EngineError>,
+) -> Result<T, EngineError> {
+    let submitted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(submit));
+    let synchronized = synchronize();
+    let result = match submitted {
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
+    };
+    match (result, synchronized) {
+        (_, Err(error)) => Err(error),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(value), Ok(())) => Ok(value),
+    }
+}
+
+/// Reuses a deserialized engine and execution context throughout the caller's session.
+/// The synchronizer runs before context teardown, including after submission errors or panics.
+#[cfg(feature = "tensorrt-api")]
+pub fn with_engine_session<T>(
+    logger: &trtx::Logger,
+    serialized: &[u8],
+    submit: impl FnOnce(&mut trtx::ExecutionContext<'_>) -> Result<T, EngineError>,
+    synchronize: impl FnOnce() -> Result<(), EngineError>,
+) -> Result<T, EngineError> {
+    if serialized.is_empty() {
+        return Err(EngineError::InvalidPlan("empty serialized engine".into()));
+    }
+    let error = |e: trtx::Error| EngineError::TensorRt(e.to_string());
+    let mut runtime = trtx::Runtime::new(logger).map_err(error)?;
+    let mut engine = runtime.deserialize_cuda_engine(serialized).map_err(error)?;
+    let mut context = engine.create_execution_context().map_err(error)?;
+    finish_stream_batch(|| submit(&mut context), synchronize)
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn sync_runs_on_failure_and_panic() {
+        let synchronized = AtomicBool::new(false);
+        let error: Result<(), _> = finish_stream_batch(
+            || Err(EngineError::InvalidBindings("failed submission".into())),
+            || {
+                synchronized.store(true, Ordering::Relaxed);
+                Ok(())
+            },
+        );
+        assert!(error.is_err());
+        assert!(synchronized.load(Ordering::Relaxed));
+        synchronized.store(false, Ordering::Relaxed);
+        let panic = std::panic::catch_unwind(|| {
+            let _: Result<(), _> = finish_stream_batch(
+                || panic!("test panic"),
+                || {
+                    synchronized.store(true, Ordering::Relaxed);
+                    Ok(())
+                },
+            );
+        });
+        assert!(panic.is_err());
+        assert!(synchronized.load(Ordering::Relaxed));
+    }
+}
