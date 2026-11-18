@@ -21,7 +21,7 @@ impl Synthesizer {
         Ok(Self { vocoder, istft, pqmf2, pqmf6 })
     }
 
-    /// Mel must have shape `[batch, 80, frames]`. Returns PCM `[batch, samples]`.
+    /// Mel must have shape `[batch, 192, frames]`. Returns PCM `[batch, samples]`.
     pub fn forward(&self, mel: Tensor<3>, sample_rate: u32) -> Result<Tensor<2>> {
         if !matches!(sample_rate, 8000 | 24000 | 48000) {
             bail!("Silero supports 8000, 24000, 48000 Hz only");
@@ -39,5 +39,34 @@ impl Synthesizer {
         let audio = if limit <= 1.0 { audio } else { audio.tanh() };
         let [batch, _, length] = audio.dims();
         Ok(audio.slice([0..batch, 0..1, 0..length]).reshape([batch, length]))
+    }
+}
+
+#[cfg(all(test, feature = "reference-flex"))]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn actual_silero_v5_pcm_parity_all_sample_rates() {
+        let Ok(dir) = std::env::var("SILERO_PARITY_DIR") else { return };
+        let root = Path::new(&dir);
+        let device = Device::flex();
+        let weights = TensorStore::open(&root.join("tts.safetensors")).unwrap();
+        let filters = TensorStore::open(&root.join("pqmf.safetensors")).unwrap();
+        let reference = TensorStore::open(&root.join("parity.safetensors")).unwrap();
+        let model = Synthesizer::load(&weights, &filters, &device).unwrap();
+        let mel = reference.float("mel", &device).unwrap();
+        for sr in [48000, 24000, 8000] {
+            let got = model.forward(mel.clone(), sr).unwrap()
+                .into_data().try_to_vec::<f32>().unwrap();
+            let expected = reference.float::<2>(&format!("wave{sr}"), &device).unwrap()
+                .into_data().try_to_vec::<f32>().unwrap();
+            assert_eq!(got.len(),expected.len(), "sample count differs for {sr} Hz");
+            let max_abs = got.iter().zip(expected.iter())
+                .map(|(x,y)| (x-y).abs()).fold(0.0f32, f32::max);
+            println!("PCM {sr} Hz max_abs={max_abs:.9}");
+            assert!(max_abs < 1.0e-3, "PCM at {sr} Hz max_abs={max_abs:.9}");
+        }
     }
 }

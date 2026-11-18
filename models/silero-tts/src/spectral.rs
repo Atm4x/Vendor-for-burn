@@ -117,6 +117,9 @@ mod tests {
 
     #[test]
     fn irfft_dc_and_nyquist() {
+        #[cfg(feature = "reference-flex")]
+        let device = Device::flex();
+        #[cfg(all(not(feature = "reference-flex"), feature = "cubecl-cpu"))]
         let device = Device::cpu();
         let dft = RealInverseDft::new(8, &device).unwrap();
         let real = Tensor::from_data(TensorData::new(vec![8., 0., 0., 0., 8.], [1,1,5]), &device);

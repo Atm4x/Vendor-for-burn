@@ -35,7 +35,6 @@ impl ConvNeXtBlock {
 
     fn forward(&self, input: Tensor<3>) -> Tensor<3> {
         let channels = self.dwconv_weight.dims()[0];
-        let _ = channels;
         let x = conv1d(input.clone(), self.dwconv_weight.clone(), Some(self.dwconv_bias.clone()),
             ConvOptions::new([1], [3], [1], channels));
         let x = layer_norm(x.swap_dims(1,2), self.norm_weight.clone(), Some(self.norm_bias.clone()), 1e-6);
@@ -95,5 +94,30 @@ impl Vocoder {
         let mag = spectrum.clone().slice([0..batch, 0..bins, 0..frames]).exp().clamp_max(100.0);
         let phase = spectrum.slice([0..batch, bins..channels, 0..frames]);
         (mag, phase.clone().cos(), phase.sin())
+    }
+}
+
+#[cfg(all(test, feature = "reference-flex"))]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn actual_silero_v5_spectral_head_parity() {
+        let Ok(dir) = std::env::var("SILERO_PARITY_DIR") else { return };
+        let device = Device::flex();
+        let weights = TensorStore::open(&Path::new(&dir).join("tts.safetensors")).unwrap();
+        let reference = TensorStore::open(&Path::new(&dir).join("parity.safetensors")).unwrap();
+        let model = Vocoder::load(&weights, &device).unwrap();
+        let (mag, c, s) = model.forward(reference.float("mel", &device).unwrap());
+        for (name, prediction) in [("mag", mag), ("cos", c), ("sin", s)] {
+            let expected = reference.float::<3>(name, &device).unwrap()
+                .into_data().try_to_vec::<f32>().unwrap();
+            let got = prediction.into_data().try_to_vec::<f32>().unwrap();
+            let max_abs = got.iter().zip(expected.iter())
+                .map(|(x,y)| (x-y).abs()).fold(0.0f32, f32::max);
+            println!("{name}: max_abs={max_abs:.9}");
+            assert!(max_abs < 1.0e-3, "{name} max_abs={max_abs:.9}");
+        }
     }
 }

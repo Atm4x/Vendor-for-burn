@@ -7,12 +7,13 @@ publish = false
 
 [features]
 default = ["cubecl-cpu"]
-cubecl-cpu = ["burn/cpu"]
-cubecl-cuda = ["burn/cuda"]
-cubecl-wgpu = ["burn/wgpu"]
+cubecl-cpu = ["burn/cpu", "burn/cubecl"]
+cubecl-cuda = ["burn/cuda", "burn/cubecl"]
+cubecl-wgpu = ["burn/wgpu", "burn/cubecl"]
+reference-flex = ["burn/flex"]
 
 [dependencies]
-burn = { version = "=0.22.1", default-features = false, features = ["std", "cubecl"] }
+burn = { version = "=0.22.1", default-features = false, features = ["std"] }
 safetensors = "=0.8.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

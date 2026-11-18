@@ -46,7 +46,24 @@ that download for `cargo check`; it does not validate execution/linkage.
 
 1. Byte-exact export and metadata verification: converter runs successfully.
 2. Rust static compilation on CubeCL CPU: verified with offline `cargo check`.
-3. Runtime Rust-vs-PyTorch tensor parity: **pending**, not replaced by
-   compilation success.
+3. Rust-vs-PyTorch vocoder and PCM parity: **PASS on optional Flex reference backend**,
+   with real Silero V5 weights; 7 tests passed. CubeCL execution parity remains
+   unverified until native LLVM runtime is available.
 4. Full text-to-PCM Silero V5: **pending**.
 5. CUDA execution/benchmarking: **separate, later task**.
+
+## Parity reproduction
+
+```
+python tools/export_weights.py v5_ru.pt /tmp/silero-assets
+python tools/create_parity_fixture.py v5_ru.pt /tmp/silero-assets
+SILERO_PARITY_DIR=/tmp/silero-assets cargo test --offline --no-default-features --features reference-flex --lib -- --nocapture
+```
+
+With the provided checkpoint (five spectral frames, 192 mel channels):
+
+- Spectral head max absolute errors: magnitude `4.8637e-5`, cosine `3.4176e-5`, sine `4.7296e-5`.
+- Complete vocoder, iSTFT and PQMF max absolute PCM errors: 48 kHz `8.17e-7`,
+  24 kHz `7.12e-7`, 8 kHz `5.63e-7`.
+- These parity results are from diagnostic Burn Flex; the default execution backend
+  remains CubeCL CPU. Results do not certify CPU/CUDA CubeCL numerical parity.
