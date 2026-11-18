@@ -1,0 +1,38 @@
+name: Silero CubeCL Git Bridge Source Export
+
+on:
+  push:
+    branches:
+      - codex/silero-tts-cubecl-port-20261118
+    paths:
+      - .github/workflows/silero-source-export.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Export current branch with complete reachable history
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p export
+          git branch -f source-silero "$GITHUB_SHA"
+          git bundle create export/silero-source.bundle refs/heads/source-silero
+          git bundle verify export/silero-source.bundle
+          sha256sum export/silero-source.bundle > export/silero-source.bundle.sha256
+          printf '%s\n' "$GITHUB_SHA" > export/remote-head.sha
+      - uses: actions/upload-artifact@v4
+        with:
+          name: silero-cubecl-git-bridge
+          path: export/
+          retention-days: 2
+          compression-level: 0
