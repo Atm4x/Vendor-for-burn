@@ -113,6 +113,12 @@ fn conv_direct_impl<const N: usize>(
     let client = input.client.clone();
     let dtype = dtype_to_storage_type(out_dtype);
 
+    if !is_temporal && !spatial_pair && !spatial_quad && !spatial_reuse
+        && super::tiled_dense::try_launch(&input, &weight, bias.as_ref(), &out, &options)
+    {
+        return Ok(out);
+    }
+
     if is_temporal {
         let cout = weight.meta.shape()[0];
         let kernel = weight.meta.shape()[1];

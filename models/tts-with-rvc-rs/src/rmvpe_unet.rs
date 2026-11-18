@@ -5,7 +5,7 @@ struct BatchNorm2d {
     weight: Tensor<1>,
     bias: Tensor<1>,
     mean: Tensor<1>,
-    variance: Tensor<1>,
+    stddev: Tensor<1>,
 }
 
 impl BatchNorm2d {
@@ -18,12 +18,12 @@ impl BatchNorm2d {
         if channels[0] == 0 || bias.dims() != channels || mean.dims() != channels || variance.dims() != channels {
             return Err(format!("{prefix}: incompatible BatchNorm2d parameter dimensions"));
         }
-        Ok(Self { weight, bias, mean, variance })
+        Ok(Self { weight, bias, mean, stddev: (variance + 1e-5).sqrt() })
     }
 
     fn fuse_conv(self, mut conv: Conv2d) -> Conv2d {
         let channels = self.weight.dims()[0];
-        let scale = self.weight / (self.variance + 1e-5).sqrt();
+        let scale = self.weight / self.stddev;
         let offset = self.bias - self.mean * scale.clone();
         conv.weight = conv.weight * scale.clone().reshape([channels, 1, 1, 1]);
         conv.bias = Some(match conv.bias.take() {
@@ -35,7 +35,7 @@ impl BatchNorm2d {
 
     fn fuse_transpose(self, weight: Tensor<4>) -> (Tensor<4>, Tensor<1>) {
         let channels = self.weight.dims()[0];
-        let scale = self.weight / (self.variance + 1e-5).sqrt();
+        let scale = self.weight / self.stddev;
         let offset = self.bias - self.mean * scale.clone();
         (weight * scale.reshape([1, channels, 1, 1]), offset)
     }
@@ -45,7 +45,7 @@ impl BatchNorm2d {
         assert_eq!(input.dims()[1], channels, "BatchNorm2d channel mismatch");
         let shape = [1, channels, 1, 1];
         (input - self.mean.clone().reshape(shape))
-            / (self.variance.clone().reshape(shape) + 1e-5).sqrt()
+            / self.stddev.clone().reshape(shape)
             * self.weight.clone().reshape(shape)
             + self.bias.clone().reshape(shape)
     }

@@ -70,3 +70,6 @@ burn-onnx = "=0.22.0"
 [workspace]
 members = [".", "models/tts-with-rvc-rs"]
 resolver = "3"
+
+[patch.crates-io]
+burn-cubecl = { path = "vendor/burn-cubecl-0.22.1" }
