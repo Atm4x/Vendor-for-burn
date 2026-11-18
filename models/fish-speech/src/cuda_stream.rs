@@ -16,16 +16,33 @@ use fish_speech_core::{
     trtx_blueprint::{Binding, TrtBlueprint},
 };
 
+use crate::device_memory::{DeviceMemoryBudget, DeviceMemoryLease, DeviceMemoryUsage};
+
+#[derive(Debug)]
+struct CudaAllocation {
+    data: Mutex<CudaSlice<u8>>,
+    _reservation: DeviceMemoryLease,
+}
+
 #[derive(Debug, Clone)]
-pub struct CudaBuffer(pub Arc<Mutex<CudaSlice<u8>>>);
+pub struct CudaBuffer(Arc<CudaAllocation>);
+
+impl CudaBuffer {
+    fn from_allocation(data: CudaSlice<u8>, reservation: DeviceMemoryLease) -> Self {
+        Self(Arc::new(CudaAllocation {
+            data: Mutex::new(data),
+            _reservation: reservation,
+        }))
+    }
+}
 
 impl CudaBuffer {
     pub fn bytes(&self) -> usize {
-        self.0.lock().unwrap().num_bytes()
+        self.0.data.lock().unwrap().num_bytes()
     }
 
     pub fn address(&self, stream: &CudaStream) -> u64 {
-        let guard = self.0.lock().unwrap();
+        let guard = self.0.data.lock().unwrap();
         let (address, _record) = guard.device_ptr(stream);
         address
     }
@@ -67,17 +84,45 @@ pub struct CudaArDevice<F> {
     context: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     dispatch: F,
+    memory: DeviceMemoryBudget,
 }
 
 impl<F> CudaArDevice<F> {
     pub fn new(device_ordinal: usize, dispatch: F) -> Result<Self> {
+        Self::with_memory_budget(device_ordinal, usize::MAX, dispatch)
+    }
+
+    pub fn with_memory_budget(
+        device_ordinal: usize,
+        limit_bytes: usize,
+        dispatch: F,
+    ) -> Result<Self> {
+        let memory = DeviceMemoryBudget::new(limit_bytes)
+            .map_err(|_| FishError::InvalidConfig("CUDA memory budget must be positive"))?;
+        Self::with_shared_budget(device_ordinal, memory, dispatch)
+    }
+
+    pub fn with_shared_budget(
+        device_ordinal: usize,
+        memory: DeviceMemoryBudget,
+        dispatch: F,
+    ) -> Result<Self> {
         let context = CudaContext::new(device_ordinal).map_err(cuda_error)?;
         let stream = context.new_stream().map_err(cuda_error)?;
         Ok(Self {
             context,
             stream,
             dispatch,
+            memory,
         })
+    }
+
+    pub fn memory_usage(&self) -> DeviceMemoryUsage {
+        self.memory.usage()
+    }
+
+    pub fn memory_budget(&self) -> DeviceMemoryBudget {
+        self.memory.clone()
     }
 
     pub fn stream(&self) -> &Arc<CudaStream> {
@@ -96,8 +141,12 @@ impl<F> KvStreamDevice for CudaArDevice<F> {
         if bytes == 0 || bytes % 2 != 0 {
             return Err(invalid_geometry());
         }
+        let reservation = self
+            .memory
+            .reserve(bytes)
+            .map_err(|_| FishError::InvalidTransition("CUDA device memory budget exhausted"))?;
         let allocation = self.stream.alloc_zeros::<u8>(bytes).map_err(cuda_error)?;
-        Ok(CudaBuffer(Arc::new(Mutex::new(allocation))))
+        Ok(CudaBuffer::from_allocation(allocation, reservation))
     }
 
     fn copy_2d_async(
@@ -113,8 +162,8 @@ impl<F> KvStreamDevice for CudaArDevice<F> {
         }
         validate_kv_copy_geometry(geometry, destination.bytes(), source.bytes())?;
         self.context.bind_to_thread().map_err(cuda_error)?;
-        let mut dst_guard = destination.0.lock().unwrap();
-        let src_guard = source.0.lock().unwrap();
+        let mut dst_guard = destination.0.data.lock().unwrap();
+        let src_guard = source.0.data.lock().unwrap();
         let (dst, _dst_record) = dst_guard.device_ptr_mut(&self.stream);
         let (src, _src_record) = src_guard.device_ptr(&self.stream);
         let copy = CUDA_MEMCPY2D {
@@ -154,8 +203,12 @@ where
         if bytes == 0 {
             return Err(FishError::InvalidShape("CUDA output allocation is empty"));
         }
+        let reservation = self
+            .memory
+            .reserve(bytes)
+            .map_err(|_| FishError::InvalidTransition("CUDA device memory budget exhausted"))?;
         let allocation = unsafe { self.stream.alloc::<u8>(bytes) }.map_err(cuda_error)?;
-        Ok(CudaBuffer(Arc::new(Mutex::new(allocation))))
+        Ok(CudaBuffer::from_allocation(allocation, reservation))
     }
 
     fn enqueue_network(
