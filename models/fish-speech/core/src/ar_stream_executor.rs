@@ -23,7 +23,6 @@ where
 
 /// Stream-ordered submission coordinator. Owns physical caches across Slow/Fast calls and
 /// retains temporary device allocations until `reset_request` synchronizes the stream.
-/// The Linux prototype intentionally has no CUDA/TensorRT implementation of `ArStreamDevice`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScratchLimits {
     pub max_inflight_bytes: usize,
@@ -97,6 +96,49 @@ where
         Ok(bytes)
     }
 
+    fn preflight_external_inputs(
+        &self,
+        plan: &ArStreamPlan,
+        external: &BTreeMap<String, D::Buffer>,
+    ) -> Result<()> {
+        let cache_names = plan
+            .phases
+            .iter()
+            .filter_map(|phase| match phase {
+                ArStreamPhase::KvWrites(writes) => Some([
+                    writes.key.cache_name.as_str(),
+                    writes.value.cache_name.as_str(),
+                ]),
+                ArStreamPhase::Network(_) => None,
+            })
+            .flatten()
+            .collect::<BTreeSet<_>>();
+        let mut produced = BTreeSet::new();
+        for phase in &plan.phases {
+            match phase {
+                ArStreamPhase::Network(network) => {
+                    for step in &network.steps {
+                        if matches!(
+                            step.primitive,
+                            TrtPrimitive::Input | TrtPrimitive::ConstantWeight
+                        ) && !produced.contains(&step.result)
+                            && !cache_names.contains(step.name.as_str())
+                            && !external.contains_key(&step.name)
+                        {
+                            return Err(FishError::InvalidShape("missing AR segment device input"));
+                        }
+                    }
+                    produced.extend(network.outputs.iter().copied());
+                }
+                ArStreamPhase::KvWrites(writes) => {
+                    produced.insert(writes.key.updated_alias);
+                    produced.insert(writes.value.updated_alias);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn enqueue(
         &mut self,
         plan: &ArStreamPlan,
@@ -108,6 +150,12 @@ where
             ));
         }
         plan.validate()?;
+        self.kv
+            .preflight_writes(plan.phases.iter().filter_map(|phase| match phase {
+                ArStreamPhase::KvWrites(writes) => Some(writes),
+                ArStreamPhase::Network(_) => None,
+            }))?;
+        self.preflight_external_inputs(plan, external)?;
         let reservation = Self::scratch_bytes_for(plan)?;
         let expected = self
             .inflight_bytes
@@ -475,6 +523,120 @@ mod tests {
         assert!(executor.enqueue(&plan, &BTreeMap::new()).is_err());
         assert!(operations.borrow().is_empty());
         assert_eq!(executor.inflight_submissions(), 0);
+    }
+
+    #[test]
+    fn rejects_stale_kv_prefix_before_submitting_any_network() {
+        let config = FishModelConfig::synthetic_dual_ar_fixture();
+        let factory = TransformerIrFactory::new(&config).unwrap();
+        let prefill = ArStreamPlan::from_graph(&factory.slow_prefill(4).unwrap()).unwrap();
+        let decode = ArStreamPlan::from_graph(&factory.slow_decode(5).unwrap()).unwrap();
+        let first_cache = prefill
+            .phases
+            .iter()
+            .find_map(|phase| match phase {
+                ArStreamPhase::KvWrites(write) => Some(write.key.cache_name.as_str()),
+                _ => None,
+            })
+            .unwrap();
+        let operations = Rc::new(RefCell::new(Vec::new()));
+        let mut executor = ArStreamExecutor::new(FakeBackend {
+            operations: operations.clone(),
+        });
+        let external_for = |plan: &ArStreamPlan| {
+            let mut external = BTreeMap::new();
+            for phase in &plan.phases {
+                if let ArStreamPhase::Network(net) = phase {
+                    for step in &net.steps {
+                        if matches!(
+                            step.primitive,
+                            TrtPrimitive::Input | TrtPrimitive::ConstantWeight
+                        ) && !step.name.ends_with("_cache")
+                            && !step.name.ends_with("_updated")
+                        {
+                            external.entry(step.name.clone()).or_insert_with(|| {
+                                Rc::new(RefCell::new(vec![
+                                    0;
+                                    tensor_bytes(&step.output_type).unwrap()
+                                ]))
+                            });
+                        }
+                    }
+                }
+            }
+            external
+        };
+        let prefill_inputs = external_for(&prefill);
+        executor.enqueue(&prefill, &prefill_inputs).unwrap();
+        let before = operations.borrow().len();
+        let inflight = executor.inflight_submissions();
+        assert!(executor.enqueue(&prefill, &prefill_inputs).is_err());
+        assert_eq!(operations.borrow().len(), before);
+        assert_eq!(executor.inflight_submissions(), inflight);
+        assert_eq!(executor.cache_active_len(first_cache), Some(4));
+        executor.enqueue(&decode, &external_for(&decode)).unwrap();
+        assert!(operations.borrow().len() > before);
+    }
+
+    #[test]
+    fn missing_later_segment_input_rejected_before_first_enqueue() {
+        let config = FishModelConfig::synthetic_dual_ar_fixture();
+        let plan = ArStreamPlan::from_graph(
+            &TransformerIrFactory::new(&config)
+                .unwrap()
+                .slow_prefill(4)
+                .unwrap(),
+        )
+        .unwrap();
+        let first_network = match &plan.phases[0] {
+            ArStreamPhase::Network(network) => network,
+            _ => unreachable!(),
+        };
+        let first_inputs = first_network
+            .steps
+            .iter()
+            .filter(|step| {
+                matches!(
+                    step.primitive,
+                    TrtPrimitive::Input | TrtPrimitive::ConstantWeight
+                )
+            })
+            .map(|step| step.name.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut external = BTreeMap::new();
+        for phase in &plan.phases {
+            if let ArStreamPhase::Network(network) = phase {
+                for step in &network.steps {
+                    if matches!(
+                        step.primitive,
+                        TrtPrimitive::Input | TrtPrimitive::ConstantWeight
+                    ) && !step.name.ends_with("_cache")
+                        && !step.name.ends_with("_updated")
+                    {
+                        external.entry(step.name.clone()).or_insert_with(|| {
+                            Rc::new(RefCell::new(vec![
+                                0;
+                                tensor_bytes(&step.output_type).unwrap()
+                            ]))
+                        });
+                    }
+                }
+            }
+        }
+        let missing_later = external
+            .keys()
+            .find(|name| !first_inputs.contains(name.as_str()))
+            .cloned()
+            .expect("fixture needs an input first used in a later segment");
+        external.remove(&missing_later);
+        let operations = Rc::new(RefCell::new(Vec::new()));
+        let mut executor = ArStreamExecutor::new(FakeBackend {
+            operations: operations.clone(),
+        });
+        assert!(executor.enqueue(&plan, &external).is_err());
+        assert!(operations.borrow().is_empty());
+        assert_eq!(executor.inflight_submissions(), 0);
+        assert!(executor.cache_active_len("slow_layers.0.k_cache").is_none());
     }
 
     #[test]

@@ -116,6 +116,10 @@ where
         self.executor.inflight_submissions()
     }
 
+    pub fn cache_active_len(&self, name: &str) -> Option<usize> {
+        self.executor.cache_active_len(name)
+    }
+
     pub fn device_mut(&mut self) -> &mut CudaArDevice<F> {
         self.executor.device_mut()
     }

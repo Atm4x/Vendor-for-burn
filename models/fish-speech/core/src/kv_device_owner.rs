@@ -65,6 +65,55 @@ impl<D: KvStreamDevice> KvDeviceOwner<D> {
         Ok(())
     }
 
+    /// Validate an entire sequence of KV writes without allocating device buffers or
+    /// submitting network work. The projected lengths include writes in the same plan.
+    pub fn preflight_writes<'a>(
+        &self,
+        writes: impl IntoIterator<Item = &'a KvWriteBarrier>,
+    ) -> Result<()> {
+        if self.poisoned {
+            return Err(FishError::InvalidTransition(
+                "KV stream is poisoned; reset required",
+            ));
+        }
+        let mut projected = BTreeMap::<String, (usize, usize)>::new();
+        for pair in writes {
+            if pair.key.cache_name == pair.value.cache_name
+                || pair.key.geometry != pair.value.geometry
+                || pair.key.geometry.position != pair.position
+            {
+                return Err(FishError::InvalidShape(
+                    "KV K/V source destination mismatch",
+                ));
+            }
+            for transfer in [&pair.key, &pair.value] {
+                let (bytes, active_len) = projected
+                    .get(&transfer.cache_name)
+                    .copied()
+                    .or_else(|| {
+                        self.slots
+                            .get(&transfer.cache_name)
+                            .map(|slot| (slot.bytes, slot.active_len))
+                    })
+                    .unwrap_or((transfer.geometry.total_cache_bytes, 0));
+                if bytes != transfer.geometry.total_cache_bytes {
+                    return Err(FishError::InvalidShape("KV device cache shape changed"));
+                }
+                if active_len != pair.position {
+                    return Err(FishError::InvalidTransition(
+                        "KV write must append exactly after the active prefix",
+                    ));
+                }
+                let next = pair
+                    .position
+                    .checked_add(transfer.geometry.frames)
+                    .ok_or(FishError::InvalidShape("KV write position overflow"))?;
+                projected.insert(transfer.cache_name.clone(), (bytes, next));
+            }
+        }
+        Ok(())
+    }
+
     pub fn ensure_cache(&mut self, write: &KvTransfer) -> Result<()> {
         if self.poisoned {
             return Err(FishError::InvalidTransition(
