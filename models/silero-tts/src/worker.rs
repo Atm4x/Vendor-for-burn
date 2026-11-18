@@ -349,6 +349,16 @@ mod tests {
             .map(|line| serde_json::from_str::<Value>(line).unwrap()).collect()
     }
 
+    #[cfg(feature = "cubecl-cpu")]
+    #[test]
+    fn cubecl_cpu_executes_tensor_matmul() {
+        use burn::tensor::Tensor;
+        let device = Device::cpu();
+        let input = Tensor::<2>::from_floats([[1.0, 2.0], [3.0, 4.0]], &device);
+        let result = input.clone().matmul(input).into_data().try_to_vec::<f32>().unwrap();
+        assert_eq!(result, vec![7.0, 10.0, 15.0, 22.0]);
+    }
+
     #[test]
     fn capabilities_without_loading_tensor_runtime() {
         let responses = exchange("{\"command\":\"capabilities\",\"request_id\":\"caps\"}\n{\"command\":\"shutdown\",\"request_id\":\"end\"}\n");

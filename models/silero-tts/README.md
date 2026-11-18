@@ -312,3 +312,33 @@ active CubeCL kernels cannot yet be interrupted safely. A supervising Core
 should terminate/restart the worker to enforce an inference timeout. The stdin
 request frame limit is 1 MiB; oversized frames are rejected without losing
 the next request. All logging/errors must go to stderr, never protocol stdout.
+
+## Native CubeCL CPU bootstrap and verification
+
+The repository includes `.github/workflows/silero-cubecl-llvm-runtime.yml`, a
+one-shot dependency bridge that downloads the official Tracel LLVM 23.1.0-4
+Linux x64 archive on GitHub Actions, verifies it against the release checksum,
+and publishes the verified archive as a short-lived workflow artifact. This
+is an external **build dependency**, not a Silero model weight or alternate
+inference backend.
+
+To use the downloaded artifact locally, place its files in the bundler cache:
+
+```
+~/.cache/tracel/tracel-llvm-23.1.0-4-linux-x64.tar.xz
+~/.cache/tracel/tracel-llvm-23.1.0-4-linux-x64.checksums.json
+```
+
+Then build without `DOCS_RS` and without Flex:
+
+```
+TRACEL_LLVM_BUNDLER_SKIP_CHECKSUM_DOWNLOAD=1 \
+  cargo build --offline --no-default-features --features cubecl-cpu --bin silero-tts
+```
+
+The native CPU executable linked successfully with the verified LLVM package.
+The `worker::tests::cubecl_cpu_executes_tensor_matmul` test executes a real
+CubeCL CPU kernel and verifies the output `[7, 10, 15, 22]`; it passed on
+Linux x64. Tests using optional `reference-flex` are not CubeCL parity evidence.
+The real-weight CubeCL CPU inference smoke is a separate gate and must be
+recorded independently.
