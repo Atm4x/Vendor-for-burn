@@ -27,7 +27,7 @@ fn input_offset(
                 (shifted - padding) * input.stride(1),
             )
         } else {
-            (true, shifted * input.stride(1))
+            (true, (shifted - padding) * input.stride(1))
         }
     }
 }
@@ -44,6 +44,7 @@ fn dense_tiled_conv(
     dilation: usize,
     padding: usize,
     #[comptime] check_padding: bool,
+    first_tile: usize,
     out_per_group: usize,
     #[comptime] block: usize,
     #[comptime] grouped: bool,
@@ -51,7 +52,7 @@ fn dense_tiled_conv(
 ) {
     let x = UNIT_POS_X as usize;
     let y = UNIT_POS_Y as usize;
-    let row = CUBE_POS_Y as usize * block;
+    let row = (first_tile + CUBE_POS_Y as usize) * block;
     let col = CUBE_POS_X as usize * block;
     let batch = CUBE_POS_Z as usize;
     let mut length = output.shape(1);
@@ -143,7 +144,6 @@ fn dense_tiled_conv(
             }
             sync_cube();
         }
-
     }
     #[unroll]
     for i in 0..lanes {
@@ -220,35 +220,53 @@ pub(super) fn try_launch<const N: usize>(
     {
         return false;
     }
-    let grid = CubeCount::Static(
-        (cout / block) as u32,
-        length.div_ceil(block) as u32,
-        batch as u32,
-    );
-    dense_tiled_conv::launch(
-        &input.client,
-        grid,
-        CubeDim::new_2d(8, 8),
-        input
-            .required_address_type()
-            .max(weight.required_address_type())
-            .max(out.required_address_type())
-            .max(
-                bias.map(CubeTensor::required_address_type)
-                    .unwrap_or_default(),
-            ),
-        input.clone().into_tensor_arg(),
-        weight.clone().into_tensor_arg(),
-        bias.cloned().map(|b| b.into_buffer_arg()).into(),
-        out.clone().into_tensor_arg(),
-        options.stride[0],
-        options.dilation[0],
-        options.padding[0].0,
-        spatial || options.padding[0].0 != 0 || options.padding[0].1 != 0,
-        out_per_group,
-        block,
-        options.groups > 1,
-        spatial,
-    );
+    let launch = |first: usize, end: usize, check: bool| {
+        if end <= first {
+            return;
+        }
+        let grid = CubeCount::Static((cout / block) as u32, (end - first) as u32, batch as u32);
+        dense_tiled_conv::launch(
+            &input.client,
+            grid,
+            CubeDim::new_2d(8, 8),
+            input
+                .required_address_type()
+                .max(weight.required_address_type())
+                .max(out.required_address_type())
+                .max(
+                    bias.map(CubeTensor::required_address_type)
+                        .unwrap_or_default(),
+                ),
+            input.clone().into_tensor_arg(),
+            weight.clone().into_tensor_arg(),
+            bias.cloned().map(|b| b.into_buffer_arg()).into(),
+            out.clone().into_tensor_arg(),
+            options.stride[0],
+            options.dilation[0],
+            options.padding[0].0,
+            check,
+            first,
+            out_per_group,
+            block,
+            options.groups > 1,
+            spatial,
+        );
+    };
+    let tiles = length.div_ceil(block);
+    let (left, right) = options.padding[0];
+    if !spatial && length >= 4096 && (left != 0 || right != 0) {
+        let stride = options.stride[0];
+        let reach = (shape[1] - 1) * options.dilation[0];
+        let first = left.div_ceil(stride).div_ceil(block).min(tiles);
+        let valid = (input.meta.shape()[1] + left)
+            .saturating_sub(reach)
+            .div_ceil(stride);
+        let end = (valid.min(length) / block).max(first);
+        launch(0, first, true);
+        launch(first, end, false);
+        launch(end, tiles, true);
+    } else {
+        launch(0, tiles, spatial || left != 0 || right != 0);
+    }
     true
 }
