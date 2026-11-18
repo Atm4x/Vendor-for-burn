@@ -1,4 +1,5 @@
 name: Fish Speech Git Bridge Snapshot
+# Triggered after complete CONT6-CONT19 sync to verify published branch history.
 
 on:
   push:
