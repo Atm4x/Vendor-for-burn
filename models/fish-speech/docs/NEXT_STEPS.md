@@ -1,19 +1,18 @@
-# Next agent: Fish Speech 1.5 → Rust prototype CONT5
+# Fish Speech 1.5 — next implementation cycle after CONT7
 
-## Current verified state
+Read `CONT7_REPORT.md` and `CONT7_NEXT_AGENT_PROMPT.md` first. The local source was built from the Git Bridge snapshot at `e89871a0` plus user-supplied CONT5 and CONT6 snapshots; the remote branch later advanced to `218f920a`. Do not equate the old Git Bridge snapshot with the remote HEAD, or push this tree over newer commits without reconciliation. No CONT7 changes were pushed.
 
-Read `CONT4_REPORT.md` and `PROTOTYPE_PROGRESS.md` first. Linux Rust 1.100.0, source-only Fish Speech 1.5, no model checkpoints, no real TensorRT-RTX. **132/132 PASS**, 54% estimate of Linux prototype. The actual original source path is `vendor/Fish-speech-pipeline-main`.
+## Verified Linux status
 
-## Priority tasks without TensorRT SDK, model weights or GPU
+- Rust 1.100.0 offline: Core 143 PASS, outer 3 PASS, `tensorrt-mock` 7 PASS, exporter 5 PASS, source-PyTorch six-scenario Conv/Deconv/Linear fixture PASS, `tensorrt-api` cargo **check** PASS.
+- `src/trtx_lowering.rs` contains TensorRT calls for FishConv/TransConv and ConvNeXt Linear via 1x1 Conv2D, including SafeTensors F32 weight bindings. API compiled, **no TensorRT network built or executed**.
+- Firefly DAG has 420 nodes and 450 weight requirements; 171 nodes have typed Conv/Linear lowering. The other 249 nodes and full graph orchestration still require work.
+- GPU execution, full TTS, real checkpoint parity, TensorRT engine, Windows packaging, CUDA graphs, and performance results remain **NOT_TESTED_GPU / BLOCKED_ON_ARTIFACT**. No PyTorch/ONNX is part of intended Rust runtime.
 
-1. Connect typed Firefly IR with true provenance of weight keys, shapes and execution order. For encoder: mono/audio→logmel→ConvNeXtEncoder→two FishConv/ConvNeXt downsample stages→GroupedResidualFSQ. Decoder: grouped FSQ index→project_out per group→two FishTransConv/ConvNeXt upsample stages→HiFiGAN. No placeholder Firefly graph that cannot enumerate inputs/edges.
-2. Pin **vector-quantize-pytorch==1.14.24**. Current `fsq_cpu` implements index→code→project_out (with residual scaling), but only synthetic equation fixtures are validated. Obtain exact package source and test its real `GroupedResidualFSQ.get_output_from_indices()` with synthetic learned projection weights; add learned project_in+encode path.
-3. Investigate weight parametrization format (`weight_norm` uses `original0`, `original1`); design safe `.safetensors` exporter manifest, strict names/shapes and handling of `generator.` prefix. No actual model weights supplied.
-4. Implement reference-audio decoding/resampling interface (WAV and multiple sample rates) with CPU golden parity. `spectrogram_cpu` currently assumes mono 44.1kHz float input.
-5. Optional: procure offline Cargo vendor closure of attached `trtx` exact lockfile (including `autocxx 0.30.0`); only then compile true mock FFI. Do not request full SDK or claim GPU inference in Linux.
+## Priorities
 
-## Commands
+1. Add NCHW-safe TRT lowering for native activation/elementwise/residual/gamma/mask, LayerNorm channel variants, and FSQ; build full Firefly topological graph and preserve source numerical semantics.
+2. Validate exact checkpoint and config/tokenizer from Fish Speech 1.5, with provenance and license. Expand real Slow/Fast AR lowering, active-prefix KV cache, GPU sampling/EOS, reference pipeline and session orchestration.
+3. Windows GPU test on TensorRT-RTX 1.7 SDK with NVIDIA RTX hardware: real builder, per-layer numeric parity, end-to-end TTS, engine caching and benchmarking versus warmed matching original TorchInductor.
 
-`cd core && cargo test --offline && cargo test --offline --release && cargo fmt --check`
-
-Use the attached Rust 1.100.0 toolchain if system Rust is older. No `dotnet` builds; do not edit obsolete/legacy originals. Continue in new Rust modules; original Fish Python stays unmodified.
+Use Git Bridge artifact + offline vendor for local development; GitHub writes only via connector when ready to integrate, and do not edit unused legacy scripts.

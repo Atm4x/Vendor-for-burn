@@ -335,7 +335,7 @@ impl Op {
                 expect(
                     a.shape[1] == num_codebooks + 1
                         && args[2].shape == [num_codebooks * codebook_size, dim]
-                        && args[3].shape == [1024],
+                        && args[3].shape == [args[1].shape[0]],
                     "Fish token / embedding / semantic mask mismatch",
                 )?;
                 Ok(TensorType::new(
@@ -501,14 +501,14 @@ impl Op {
 
     pub fn lowering_status(&self) -> LoweringStatus {
         match self {
-            Op::FishEmbedding { .. } | Op::TokenEmbedding => LoweringStatus::NeedsDecomposition,
-            Op::KvUpdate { .. } | Op::KvPrefix { .. } | Op::GqaAttention { .. } => {
-                LoweringStatus::RequiresGpuValidation
-            }
-            Op::RmsNorm { .. } | Op::SplitQkv { .. } | Op::RoPe { .. } => {
-                LoweringStatus::NeedsDecomposition
+            Op::FishEmbedding { .. } => LoweringStatus::CandidateTrtPrimitive,
+            Op::KvUpdate { .. } => LoweringStatus::RequiresGpuValidation,
+            Op::GqaAttention { .. } => LoweringStatus::CandidateTrtPrimitive,
+            Op::TokenEmbedding | Op::SplitQkv { .. } | Op::RoPe { .. } | Op::KvPrefix { .. } => {
+                LoweringStatus::CandidateTrtPrimitive
             }
             Op::Identity
+            | Op::RmsNorm { .. }
             | Op::Linear
             | Op::LinearBias
             | Op::SiLu

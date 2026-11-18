@@ -53,6 +53,41 @@ pub struct Conv1dKernel {
 }
 
 impl Conv1dKernel {
+    pub fn view(&self) -> Conv1dView<'_> {
+        Conv1dView {
+            in_channels: self.in_channels,
+            out_channels: self.out_channels,
+            kernel_size: self.kernel_size,
+            stride: self.stride,
+            dilation: self.dilation,
+            groups: self.groups,
+            weights: &self.weights,
+            bias: self.bias.as_deref(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.view().validate()
+    }
+
+    pub fn forward(&self, input: &AudioTensor) -> Result<AudioTensor> {
+        self.view().forward(input)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Conv1dView<'a> {
+    pub in_channels: usize,
+    pub out_channels: usize,
+    pub kernel_size: usize,
+    pub stride: usize,
+    pub dilation: usize,
+    pub groups: usize,
+    pub weights: &'a [f32],
+    pub bias: Option<&'a [f32]>,
+}
+
+impl Conv1dView<'_> {
     pub fn validate(&self) -> Result<()> {
         if self.in_channels == 0
             || self.out_channels == 0
@@ -141,6 +176,39 @@ pub struct TransConv1dKernel {
 }
 
 impl TransConv1dKernel {
+    pub fn view(&self) -> TransConv1dView<'_> {
+        TransConv1dView {
+            in_channels: self.in_channels,
+            out_channels: self.out_channels,
+            kernel_size: self.kernel_size,
+            stride: self.stride,
+            dilation: self.dilation,
+            weights: &self.weights,
+            bias: self.bias.as_deref(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.view().validate()
+    }
+
+    pub fn forward(&self, input: &AudioTensor) -> Result<AudioTensor> {
+        self.view().forward(input)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TransConv1dView<'a> {
+    pub in_channels: usize,
+    pub out_channels: usize,
+    pub kernel_size: usize,
+    pub stride: usize,
+    pub dilation: usize,
+    pub weights: &'a [f32],
+    pub bias: Option<&'a [f32]>,
+}
+
+impl TransConv1dView<'_> {
     pub fn validate(&self) -> Result<()> {
         if self.in_channels == 0
             || self.out_channels == 0
@@ -265,11 +333,11 @@ fn erf_approx(value: f64) -> f64 {
     sign * (1.0 - p * (-x * x).exp())
 }
 
-fn gelu(x: f32) -> f32 {
+pub fn gelu(x: f32) -> f32 {
     (0.5 * x as f64 * (1.0 + erf_approx(x as f64 * std::f64::consts::FRAC_1_SQRT_2))) as f32
 }
 
-fn silu(x: f32) -> f32 {
+pub fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 

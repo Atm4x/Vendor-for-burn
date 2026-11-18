@@ -159,6 +159,112 @@ impl GroupedResidualFsqDecoder {
     }
 }
 
+/// CPU reference of the grouped ResidualFSQ encoder from vector-quantize-pytorch 1.14.24.
+/// Projections are the per-group `rvqs.{g}.project_in` weights, not project_out.
+#[derive(Debug, Clone)]
+pub struct GroupedResidualFsqEncoder {
+    pub codebook: FsqCodebook,
+    pub num_quantizers: usize,
+    pub projections: Vec<FsqGroupProjection>,
+}
+
+fn fsq_bound(value: f32, level: usize) -> f32 {
+    let half_l = (level - 1) as f32 * 1.001 / 2.0;
+    let offset = if level % 2 == 0 { 0.5 } else { 0.0 };
+    let shift = (offset / half_l).atanh();
+    (value + shift).tanh() * half_l - offset
+}
+
+impl GroupedResidualFsqEncoder {
+    pub fn validate(&self) -> Result<usize> {
+        let dims = self.codebook.levels.len();
+        if self.num_quantizers == 0 || self.projections.is_empty() {
+            return Err(FishError::InvalidShape(
+                "empty grouped residual FSQ encoder",
+            ));
+        }
+        let first = &self.projections[0];
+        if first.bias.len() != dims || first.weights.len() % dims != 0 {
+            return Err(FishError::InvalidShape("invalid FSQ project_in matrix"));
+        }
+        let width = first.weights.len() / dims;
+        if width == 0
+            || self.projections.iter().any(|projection| {
+                projection.bias.len() != dims || projection.weights.len() != width * dims
+            })
+        {
+            return Err(FishError::InvalidShape("inconsistent FSQ group widths"));
+        }
+        Ok(width)
+    }
+
+    /// Input: ConvNeXt encoded tensor [B, groups * dim_per_group, T].
+    /// Output: Fish's packed indices [B, groups * num_quantizers, T].
+    pub fn encode(&self, features: &AudioTensor) -> Result<Vec<i32>> {
+        let width = self.validate()?;
+        let groups = self.projections.len();
+        if features.channels != groups * width {
+            return Err(FishError::InvalidShape(
+                "FSQ project_in feature width mismatch",
+            ));
+        }
+        let channels = groups
+            .checked_mul(self.num_quantizers)
+            .ok_or(FishError::InvalidShape("FSQ index channel overflow"))?;
+        let size = features
+            .batch
+            .checked_mul(channels)
+            .and_then(|count| count.checked_mul(features.frames))
+            .ok_or(FishError::InvalidShape("FSQ output extent overflow"))?;
+        let mut indices = vec![0i32; size];
+        let dims = self.codebook.levels.len();
+        let mut residual = vec![0f32; dims];
+        let mut digits = vec![0usize; dims];
+        for batch in 0..features.batch {
+            for (group, projection) in self.projections.iter().enumerate() {
+                for frame in 0..features.frames {
+                    for (dim, value) in residual.iter_mut().enumerate() {
+                        let mut total = projection.bias[dim];
+                        for input in 0..width {
+                            let idx = ((batch * features.channels + group * width + input)
+                                * features.frames)
+                                + frame;
+                            total += projection.weights[dim * width + input] * features.data[idx];
+                        }
+                        if !total.is_finite() {
+                            return Err(FishError::InvalidShape("non-finite FSQ projected input"));
+                        }
+                        // ResidualFSQ.forward applies first_layer.bound(x) before its loop.
+                        *value = fsq_bound(total, self.codebook.levels[dim]);
+                    }
+                    for q in 0..self.num_quantizers {
+                        for (dim, &level) in self.codebook.levels.iter().enumerate() {
+                            let scale = ((level - 1) as f32).powi(-(q as i32));
+                            // FSQ.forward calls quantize(), which applies bound() once again.
+                            let bounded = fsq_bound(residual[dim] / scale, level);
+                            let rounded = bounded.round_ties_even();
+                            let half_width = (level / 2) as f32;
+                            let digit = (rounded + half_width) as isize;
+                            if digit < 0 || digit >= level as isize {
+                                return Err(FishError::InvalidShape(
+                                    "FSQ scalar index outside range",
+                                ));
+                            }
+                            digits[dim] = digit as usize;
+                            residual[dim] -= (rounded / half_width) * scale;
+                        }
+                        let index = self.codebook.encode_level_indices(&digits)?;
+                        indices[(batch * channels + group * self.num_quantizers + q)
+                            * features.frames
+                            + frame] = index;
+                    }
+                }
+            }
+        }
+        Ok(indices)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,8 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+fn f32_to_bf16(x: f32) -> u16 {
+    let bits = x.to_bits();
+    if x.is_nan() {
+        return ((bits >> 16) as u16) | 0x0040;
+    }
+    ((bits.wrapping_add(0x7fff + ((bits >> 16) & 1))) >> 16) as u16
+}
+
+use crate::ar_attention::{causal_gqa_cpu, GqaShape};
+use crate::ar_rotary::rotate_bhtd;
 use crate::cpu_ir::{NamedTensors, TensorData};
 use crate::error::{FishError, Result};
-use crate::graph_ir::{Graph, Op, Origin, TensorType, ValueId};
+use crate::graph_ir::{Graph, Op, Origin, QkvPart, TensorType, ValueId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Binding {
@@ -20,8 +30,39 @@ pub enum TrtPrimitive {
     ElementwiseProduct,
     ElementwiseSum,
     Identity,
+    CastToBf16,
+    RmsNorm {
+        epsilon_bits: u32,
+    },
     SliceLastSequenceToken,
-    Deferred { original: Op, reason: &'static str },
+    EmbeddingGather,
+    FishEmbedding {
+        num_codebooks: usize,
+        codebook_size: usize,
+        share_codebook_embeddings: bool,
+    },
+    SplitPackedQkv {
+        part: QkvPart,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+    },
+    RotaryInterleaved {
+        position: usize,
+        base_bits: u32,
+    },
+    KvActivePrefix {
+        active_len: usize,
+    },
+    GqaAttention {
+        position: usize,
+        q_heads: usize,
+        kv_heads: usize,
+    },
+    Deferred {
+        original: Op,
+        reason: &'static str,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +172,101 @@ impl TrtBlueprint {
                         output_type,
                     );
                 }
+                Op::FishEmbedding {
+                    num_codebooks,
+                    codebook_size,
+                    share_codebook_embeddings,
+                } => {
+                    push(
+                        node.name.clone(),
+                        TrtPrimitive::FishEmbedding {
+                            num_codebooks,
+                            codebook_size,
+                            share_codebook_embeddings,
+                        },
+                        args,
+                        result,
+                        output_type,
+                    );
+                }
+                Op::TokenEmbedding => {
+                    push(
+                        node.name.clone(),
+                        TrtPrimitive::EmbeddingGather,
+                        args,
+                        result,
+                        output_type,
+                    );
+                }
+                Op::SplitQkv {
+                    part,
+                    q_heads,
+                    kv_heads,
+                    head_dim,
+                } => {
+                    push(
+                        node.name.clone(),
+                        TrtPrimitive::SplitPackedQkv {
+                            part,
+                            q_heads,
+                            kv_heads,
+                            head_dim,
+                        },
+                        args,
+                        result,
+                        output_type,
+                    );
+                }
+                Op::RoPe {
+                    position,
+                    base_bits,
+                } => {
+                    push(
+                        node.name.clone(),
+                        TrtPrimitive::RotaryInterleaved {
+                            position,
+                            base_bits,
+                        },
+                        args,
+                        result,
+                        output_type,
+                    );
+                }
+                Op::GqaAttention {
+                    position,
+                    q_heads,
+                    kv_heads,
+                } => {
+                    push(
+                        node.name.clone(),
+                        TrtPrimitive::GqaAttention {
+                            position,
+                            q_heads,
+                            kv_heads,
+                        },
+                        args,
+                        result,
+                        output_type,
+                    );
+                }
+                Op::KvPrefix { active_len } => {
+                    push(
+                        node.name.clone(),
+                        TrtPrimitive::KvActivePrefix { active_len },
+                        args,
+                        result,
+                        output_type,
+                    );
+                }
+                Op::RmsNorm { epsilon_bits } => {
+                    push(
+                        node.name.clone(),
+                        TrtPrimitive::RmsNorm { epsilon_bits },
+                        args,
+                        result,
+                        output_type,
+                    );
+                }
                 Op::Mul | Op::Add | Op::Identity | Op::LastToken => {
                     let primitive = match node.op {
                         Op::Mul => TrtPrimitive::ElementwiseProduct,
@@ -143,16 +279,7 @@ impl TrtBlueprint {
                 }
                 other => {
                     let reason = match other {
-                        Op::FishEmbedding { .. } => "Fish semantic-gated multi-codebook lookup",
-                        Op::TokenEmbedding => {
-                            "token embedding gather, TRT shape/lifetime to verify"
-                        }
-                        Op::RmsNorm { .. } => "RMSNorm reduction and epsilon semantics",
-                        Op::SplitQkv { .. } => "QKV tensor split and reshape/transposition",
-                        Op::RoPe { .. } => "rotary frequency, complex pair ordering",
                         Op::KvUpdate { .. } => "external mutable KV buffers and update",
-                        Op::KvPrefix { .. } => "active prefix dynamic slice or bucket profile",
-                        Op::GqaAttention { .. } => "GQA masking/attention needs SDK validation",
                         _ => unreachable!(),
                     };
                     *deferred.entry(reason).or_insert(0) += 1;
@@ -232,6 +359,140 @@ impl TrtBlueprint {
                         }
                     };
                     let values = match step.primitive {
+                        TrtPrimitive::FishEmbedding {
+                            num_codebooks,
+                            codebook_size,
+                            share_codebook_embeddings,
+                        } => {
+                            let TensorData::I32(tokens) = &args[0].1 else {
+                                return Err(FishError::InvalidShape(
+                                    "FishEmbedding tokens must be I32",
+                                ));
+                            };
+                            let TensorData::I32(lut) = &args[3].1 else {
+                                return Err(FishError::InvalidShape(
+                                    "FishEmbedding gate LUT must be I32",
+                                ));
+                            };
+                            crate::ar_embedding::fish_embedding_cpu(
+                                tokens,
+                                args[0].0.shape[0],
+                                args[0].0.shape[2],
+                                num_codebooks,
+                                codebook_size,
+                                read(1)?,
+                                read(2)?,
+                                args[1].0.shape[1],
+                                lut,
+                                share_codebook_embeddings,
+                            )?
+                        }
+                        TrtPrimitive::EmbeddingGather => {
+                            let TensorData::I32(ids) = &args[0].1 else {
+                                return Err(FishError::InvalidShape(
+                                    "embedding indices must be I32",
+                                ));
+                            };
+                            let weights = read(1)?;
+                            let vocab = args[1].0.shape[0];
+                            let width = args[1].0.shape[1];
+                            let mut gathered = Vec::with_capacity(ids.len() * width);
+                            for &id in ids {
+                                let index = usize::try_from(id).map_err(|_| {
+                                    FishError::InvalidShape("negative embedding index")
+                                })?;
+                                if index >= vocab {
+                                    return Err(FishError::InvalidShape(
+                                        "embedding index outside vocab",
+                                    ));
+                                }
+                                gathered.extend_from_slice(
+                                    &weights[index * width..(index + 1) * width],
+                                );
+                            }
+                            gathered
+                        }
+                        TrtPrimitive::SplitPackedQkv {
+                            part,
+                            q_heads,
+                            kv_heads,
+                            head_dim,
+                        } => {
+                            let packed = read(0)?;
+                            let (batch, frames, total) =
+                                (args[0].0.shape[0], args[0].0.shape[1], args[0].0.shape[2]);
+                            let (heads, offset) = match part {
+                                QkvPart::Query => (q_heads, 0),
+                                QkvPart::Key => (kv_heads, q_heads * head_dim),
+                                QkvPart::Value => (kv_heads, (q_heads + kv_heads) * head_dim),
+                            };
+                            let mut out = vec![0f32; batch * heads * frames * head_dim];
+                            for batch_id in 0..batch {
+                                for head in 0..heads {
+                                    for frame in 0..frames {
+                                        let source = (batch_id * frames + frame) * total
+                                            + offset
+                                            + head * head_dim;
+                                        let destination =
+                                            ((batch_id * heads + head) * frames + frame) * head_dim;
+                                        out[destination..destination + head_dim]
+                                            .copy_from_slice(&packed[source..source + head_dim]);
+                                    }
+                                }
+                            }
+                            out
+                        }
+                        TrtPrimitive::GqaAttention {
+                            position,
+                            q_heads,
+                            kv_heads,
+                        } => {
+                            let q_shape = &args[0].0.shape;
+                            let kv_shape = &args[1].0.shape;
+                            causal_gqa_cpu(
+                                read(0)?,
+                                read(1)?,
+                                read(2)?,
+                                GqaShape {
+                                    batch: q_shape[0],
+                                    query_heads: q_heads,
+                                    kv_heads,
+                                    query_len: q_shape[2],
+                                    kv_len: kv_shape[2],
+                                    head_dim: q_shape[3],
+                                    first_position: position,
+                                },
+                            )?
+                        }
+                        TrtPrimitive::KvActivePrefix { active_len } => {
+                            let input = read(0)?;
+                            let shape = &args[0].0.shape;
+                            let (batch, heads, capacity, dim) =
+                                (shape[0], shape[1], shape[2], shape[3]);
+                            let mut output = vec![0f32; batch * heads * active_len * dim];
+                            for row in 0..batch * heads {
+                                let source = row * capacity * dim;
+                                let target = row * active_len * dim;
+                                output[target..target + active_len * dim]
+                                    .copy_from_slice(&input[source..source + active_len * dim]);
+                            }
+                            output
+                        }
+                        TrtPrimitive::RotaryInterleaved {
+                            position,
+                            base_bits,
+                        } => {
+                            let shape = &args[0].0.shape;
+                            rotate_bhtd(
+                                read(0)?,
+                                shape[0],
+                                shape[1],
+                                position,
+                                shape[2],
+                                shape[3],
+                                f32::from_bits(base_bits),
+                            )?
+                        }
                         TrtPrimitive::MatrixMultiplyTransposeRhs => {
                             let a = read(0)?;
                             let w = read(1)?;
@@ -273,6 +534,22 @@ impl TrtBlueprint {
                         TrtPrimitive::ElementwiseSum => {
                             read(0)?.iter().zip(read(1)?).map(|(a, b)| a + b).collect()
                         }
+                        TrtPrimitive::RmsNorm { epsilon_bits } => {
+                            let x = read(0)?;
+                            let gamma = read(1)?;
+                            let width = gamma.len();
+                            let mut out = Vec::with_capacity(x.len());
+                            for row in x.chunks_exact(width) {
+                                let mean = row.iter().map(|v| v * v).sum::<f32>() / width as f32;
+                                let inv = 1.0 / (mean + f32::from_bits(epsilon_bits)).sqrt();
+                                out.extend(row.iter().zip(gamma).map(|(v, w)| v * inv * w));
+                            }
+                            out
+                        }
+                        TrtPrimitive::CastToBf16 => read(0)?
+                            .iter()
+                            .map(|&x| f32::from_bits((f32_to_bf16(x) as u32) << 16))
+                            .collect(),
                         TrtPrimitive::Identity => read(0)?.to_vec(),
                         TrtPrimitive::SliceLastSequenceToken => {
                             let a = read(0)?;
@@ -371,6 +648,65 @@ mod tests {
     }
 
     #[test]
+    fn rms_norm_matches_pytorch_and_is_not_deferred() {
+        let mut graph = Graph::new(Stage::SlowDecode, None, None);
+        let input = graph
+            .input(
+                "x",
+                TensorType::new([1, 2, 4], ScalarType::F32, Layout::SequenceBtd),
+            )
+            .unwrap();
+        let weight = graph
+            .weight(
+                "gamma",
+                TensorType::new([4], ScalarType::F32, Layout::Plain),
+            )
+            .unwrap();
+        let y = graph
+            .emit(
+                "norm",
+                Op::RmsNorm {
+                    epsilon_bits: 1e-5f32.to_bits(),
+                },
+                &[input, weight],
+            )
+            .unwrap();
+        graph.output(y).unwrap();
+        let plan = TrtBlueprint::from_graph(&graph).unwrap();
+        plan.require_no_deferred_ops().unwrap();
+        assert!(matches!(
+            plan.steps[2].primitive,
+            TrtPrimitive::RmsNorm { .. }
+        ));
+        let mut bindings = NamedTensors::new();
+        bindings.insert(
+            "x".into(),
+            TensorData::F32(vec![1.25, -0.75, 2.5, -4.0, 0.002, 0.0, -0.003, 0.005]),
+        );
+        bindings.insert("gamma".into(), TensorData::F32(vec![0.25, -1.5, 0.8, 2.25]));
+        let output = plan.execute_cpu_reference(&bindings).unwrap();
+        let TensorData::F32(got) = &output["norm"] else {
+            panic!("expected FP32 RMSNorm")
+        };
+        let golden = include_str!("../fixtures/generate_rmsnorm_golden.txt")
+            .trim()
+            .split(',')
+            .map(|v| v.parse::<f32>().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(got.len(), golden.len());
+        for (actual, expected) in got.iter().zip(&golden) {
+            assert!(
+                (actual - expected).abs() <= 3e-6,
+                "RMSNorm mismatch: {actual} != {expected}"
+            );
+        }
+        assert!(TrtBlueprint::from_graph(&graph)
+            .unwrap()
+            .deferred
+            .is_empty());
+    }
+
+    #[test]
     fn full_ar_graph_reports_exact_deferred_blockers() {
         let config = FishModelConfig::synthetic_dual_ar_fixture();
         let factory = TransformerIrFactory::new(&config).unwrap();
@@ -383,6 +719,9 @@ mod tests {
             let plan = TrtBlueprint::from_graph(&graph).unwrap();
             plan.validate().unwrap();
             assert!(!plan.deferred.is_empty());
+            assert!(!plan
+                .deferred
+                .contains_key("RMSNorm reduction and epsilon semantics"));
             assert!(plan.require_no_deferred_ops().is_err());
             assert_eq!(plan.outputs.len(), graph.outputs.len());
             assert_eq!(plan.weight_count, graph.weight_requirements().len());
@@ -479,11 +818,19 @@ mod tests {
         let factory = TransformerIrFactory::new(&config).unwrap();
         let first = TrtBlueprint::from_graph(&factory.fast_decode(0).unwrap()).unwrap();
         let later = TrtBlueprint::from_graph(&factory.fast_decode(1).unwrap()).unwrap();
-        assert!(first.deferred.keys().any(|reason| reason.contains("GQA")));
-        assert!(later
+        assert!(first
+            .steps
+            .iter()
+            .any(|step| matches!(step.primitive, TrtPrimitive::GqaAttention { .. })));
+        assert!(first.deferred.keys().any(|reason| reason.contains("KV")));
+        assert!(!later
             .deferred
             .keys()
             .any(|reason| reason.contains("embedding gather")));
+        assert!(later
+            .steps
+            .iter()
+            .any(|step| step.primitive == TrtPrimitive::EmbeddingGather));
         assert!(first.require_no_deferred_ops().is_err());
         assert!(later.require_no_deferred_ops().is_err());
     }

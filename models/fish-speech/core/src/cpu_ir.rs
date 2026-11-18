@@ -98,53 +98,18 @@ fn eval(op: Op, args: &[&TensorData], ty: &[&TensorType]) -> Result<TensorData> 
             num_codebooks,
             codebook_size,
             share_codebook_embeddings,
-        } => {
-            let tokens = a.ints()?;
-            let word_weights = args[1].floats()?;
-            let codebook_weights = args[2].floats()?;
-            let semantic_ids = args[3].ints()?;
-            let (batch, frames, dim) = (ty[0].shape[0], ty[0].shape[2], ty[1].shape[1]);
-            let mut out = vec![0f32; batch * frames * dim];
-            for b in 0..batch {
-                for frame in 0..frames {
-                    let index = tokens[(b * (num_codebooks + 1)) * frames + frame];
-                    let word = usize::try_from(index)
-                        .map_err(|_| FishError::InvalidShape("negative semantic token"))?;
-                    if word >= ty[1].shape[0] {
-                        return Err(FishError::InvalidShape(
-                            "semantic token outside embedding vocabulary",
-                        ));
-                    }
-                    let condition = semantic_ids.contains(&index);
-                    let o = (b * frames + frame) * dim;
-                    for j in 0..dim {
-                        out[o + j] = word_weights[word * dim + j];
-                    }
-                    if condition {
-                        for c in 0..num_codebooks {
-                            let index = tokens[(b * (num_codebooks + 1) + 1 + c) * frames + frame];
-                            let code = usize::try_from(index)
-                                .map_err(|_| FishError::InvalidShape("negative acoustic code"))?;
-                            if code >= codebook_size {
-                                return Err(FishError::InvalidShape(
-                                    "acoustic code outside codebook",
-                                ));
-                            }
-                            let row = code
-                                + if share_codebook_embeddings {
-                                    c * codebook_size
-                                } else {
-                                    0
-                                };
-                            for j in 0..dim {
-                                out[o + j] += codebook_weights[row * dim + j];
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(TensorData::F32(out))
-        }
+        } => Ok(TensorData::F32(crate::ar_embedding::fish_embedding_cpu(
+            a.ints()?,
+            ty[0].shape[0],
+            ty[0].shape[2],
+            num_codebooks,
+            codebook_size,
+            args[1].floats()?,
+            args[2].floats()?,
+            ty[1].shape[1],
+            args[3].ints()?,
+            share_codebook_embeddings,
+        )?)),
         Op::TokenEmbedding => {
             let indices = a.ints()?;
             let weights = args[1].floats()?;
@@ -225,32 +190,15 @@ fn eval(op: Op, args: &[&TensorData], ty: &[&TensorType]) -> Result<TensorData> 
         Op::RoPe {
             position,
             base_bits,
-        } => {
-            let x = a.floats()?;
-            let (batch, heads, frames, dim) = (
-                ty[0].shape[0],
-                ty[0].shape[1],
-                ty[0].shape[2],
-                ty[0].shape[3],
-            );
-            let mut out = x.to_vec();
-            let base = f32::from_bits(base_bits);
-            for b in 0..batch {
-                for h in 0..heads {
-                    for t in 0..frames {
-                        for pair in 0..dim / 2 {
-                            let freq = 1.0 / base.powf((pair * 2) as f32 / dim as f32);
-                            let angle = (position + t) as f32 * freq;
-                            let (sin, cos) = angle.sin_cos();
-                            let ix = ((b * heads + h) * frames + t) * dim + 2 * pair;
-                            out[ix] = x[ix] * cos - x[ix + 1] * sin;
-                            out[ix + 1] = x[ix] * sin + x[ix + 1] * cos;
-                        }
-                    }
-                }
-            }
-            Ok(TensorData::F32(out))
-        }
+        } => Ok(TensorData::F32(crate::ar_rotary::rotate_bhtd(
+            a.floats()?,
+            ty[0].shape[0],
+            ty[0].shape[1],
+            position,
+            ty[0].shape[2],
+            ty[0].shape[3],
+            f32::from_bits(base_bits),
+        )?)),
         Op::KvUpdate { position } => {
             let mut cache = a.floats()?.to_vec();
             let update = args[1].floats()?;
@@ -266,7 +214,9 @@ fn eval(op: Op, args: &[&TensorData], ty: &[&TensorType]) -> Result<TensorData> 
                     for frame in 0..frames {
                         for d in 0..dim {
                             cache[((b * heads + h) * capacity + position + frame) * dim + d] =
-                                update[((b * heads + h) * frames + frame) * dim + d];
+                                crate::ar_rotary::bf16_frequency(
+                                    update[((b * heads + h) * frames + frame) * dim + d],
+                                );
                         }
                     }
                 }
@@ -296,50 +246,20 @@ fn eval(op: Op, args: &[&TensorData], ty: &[&TensorType]) -> Result<TensorData> 
             position,
             q_heads,
             kv_heads,
-        } => {
-            let q = a.floats()?;
-            let k = args[1].floats()?;
-            let v = args[2].floats()?;
-            let (batch, frames, hd, kv_len) = (
-                ty[0].shape[0],
-                ty[0].shape[2],
-                ty[0].shape[3],
-                ty[1].shape[2],
-            );
-            let mut out = vec![0f32; batch * frames * q_heads * hd];
-            for b in 0..batch {
-                for head in 0..q_heads {
-                    for frame in 0..frames {
-                        let kv_head = head / (q_heads / kv_heads);
-                        let visible = position + frame + 1;
-                        let mut scores = vec![0f32; visible];
-                        for j in 0..visible {
-                            let mut sum = 0f32;
-                            for d in 0..hd {
-                                sum += q[((b * q_heads + head) * frames + frame) * hd + d]
-                                    * k[((b * kv_heads + kv_head) * kv_len + j) * hd + d];
-                            }
-                            scores[j] = sum / (hd as f32).sqrt();
-                        }
-                        let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                        let mut denominator = 0f32;
-                        for score in &mut scores {
-                            *score = (*score - max).exp();
-                            denominator += *score;
-                        }
-                        for d in 0..hd {
-                            let mut sum = 0f32;
-                            for j in 0..visible {
-                                sum += scores[j] / denominator
-                                    * v[((b * kv_heads + kv_head) * kv_len + j) * hd + d];
-                            }
-                            out[(b * frames + frame) * (q_heads * hd) + head * hd + d] = sum;
-                        }
-                    }
-                }
-            }
-            Ok(TensorData::F32(out))
-        }
+        } => Ok(TensorData::F32(crate::ar_attention::causal_gqa_cpu(
+            a.floats()?,
+            args[1].floats()?,
+            args[2].floats()?,
+            crate::ar_attention::GqaShape {
+                batch: ty[0].shape[0],
+                query_heads: q_heads,
+                kv_heads,
+                query_len: ty[0].shape[2],
+                kv_len: ty[1].shape[2],
+                head_dim: ty[0].shape[3],
+                first_position: position,
+            },
+        )?)),
         Op::SiLu => Ok(TensorData::F32(
             a.floats()?.iter().map(|x| x / (1.0 + (-x).exp())).collect(),
         )),
@@ -371,6 +291,7 @@ fn eval(op: Op, args: &[&TensorData], ty: &[&TensorType]) -> Result<TensorData> 
 mod tests {
     use super::*;
     use crate::config::FishModelConfig;
+    use crate::graph::Stage;
     use crate::graph_ir::Layout;
     use crate::transformer_ir::TransformerIrFactory;
 
@@ -387,8 +308,8 @@ mod tests {
                             *item = 12;
                         }
                         TensorData::I32(values)
-                    } else if value.name == "semantic_token_ids" {
-                        TensorData::I32((0..1024).collect())
+                    } else if value.name == "semantic_membership_lut" {
+                        TensorData::I32(vec![1; count])
                     } else if value.ty.dtype == ScalarType::I32 {
                         TensorData::I32(vec![0; count])
                     } else if value.ty.layout == Layout::CacheBhtd {
@@ -446,6 +367,42 @@ mod tests {
             .unwrap()
             .iter()
             .all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn kv_update_casts_f32_to_bf16_before_attention() {
+        let mut graph = Graph::new(Stage::SlowDecode, None, None);
+        let cache = graph
+            .input(
+                "cache",
+                TensorType::new([1, 1, 4, 2], ScalarType::BF16, Layout::CacheBhtd),
+            )
+            .unwrap();
+        let fresh = graph
+            .input(
+                "fresh",
+                TensorType::new([1, 1, 1, 2], ScalarType::F32, Layout::HeadsBhtd),
+            )
+            .unwrap();
+        let out = graph
+            .emit("write", Op::KvUpdate { position: 1 }, &[cache, fresh])
+            .unwrap();
+        graph.output(out).unwrap();
+        let mut inputs = NamedTensors::new();
+        inputs.insert(
+            "cache".into(),
+            TensorData::F32(vec![0.0, 0.0, 0.0, 0.0, 37.0, 37.0, 37.0, 37.0]),
+        );
+        let value = f32::from_bits(0x3f81_8000);
+        inputs.insert("fresh".into(), TensorData::F32(vec![value, -value]));
+        let updated = CpuIrInterpreter::run(&graph, &inputs).unwrap();
+        let TensorData::F32(updated) = &updated["write"] else {
+            panic!("expected BF16 in F32 reference")
+        };
+        assert_eq!(
+            updated,
+            &[0.0, 0.0, 1.015625, -1.015625, 37.0, 37.0, 37.0, 37.0]
+        );
     }
 
     #[test]
@@ -588,7 +545,7 @@ mod tests {
             let sem = g
                 .input(
                     "sem",
-                    TensorType::new(vec![1024], ScalarType::I32, Layout::Plain),
+                    TensorType::new(vec![10], ScalarType::I32, Layout::Plain),
                 )
                 .unwrap();
             let out = g
@@ -610,8 +567,8 @@ mod tests {
                 TensorData::F32((0..10).map(|i| i as f32).collect()),
             );
             bind.insert("cb".into(), TensorData::F32(vec![0., 10., 20., 30.]));
-            let mut semantic = vec![-1; 1024];
-            semantic[0] = 5;
+            let mut semantic = vec![0; 10];
+            semantic[5] = 1;
             bind.insert("sem".into(), TensorData::I32(semantic));
             let result = CpuIrInterpreter::run(&g, &bind).unwrap();
             assert_eq!(
@@ -646,8 +603,8 @@ mod tests {
         bind.insert("q".into(), TensorData::F32(vec![1., 0.]));
         let result = CpuIrInterpreter::run(&g, &bind).unwrap();
         let data = result["y"].floats().unwrap();
-        assert!((data[0] - 1f32.cos()).abs() < 1e-6);
-        assert!((data[1] - 1f32.sin()).abs() < 1e-6);
+        assert!((data[0] - crate::ar_rotary::bf16_frequency(1f32.cos())).abs() < 1e-6);
+        assert!((data[1] - crate::ar_rotary::bf16_frequency(1f32.sin())).abs() < 1e-6);
     }
 
     #[test]

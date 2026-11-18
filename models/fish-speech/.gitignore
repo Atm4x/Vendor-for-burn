@@ -1,1 +1,5 @@
 /target
+/core/target
+__pycache__/
+*.pyc
+.venv/

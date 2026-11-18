@@ -253,8 +253,8 @@ impl<'a> TransformerIrFactory<'a> {
             &[c.num_codebooks * c.codebook_size, c.slow.dim],
         )?;
         let semantic_ids = b.graph.input(
-            "semantic_token_ids",
-            t(&[1024], ScalarType::I32, Layout::Plain),
+            "semantic_membership_lut",
+            t(&[c.vocab_size], ScalarType::I32, Layout::Plain),
         )?;
         let embedded = b.graph.emit(
             "semantic_and_codebook_embeddings",
@@ -284,6 +284,17 @@ impl<'a> TransformerIrFactory<'a> {
             b.linear("logits", normed, "output", c.vocab_size, false)?
         };
         b.graph.output(logits)?;
+        if c.kind == ModelKind::Naive {
+            let normalized = b.norm("codebook_norm", last, "codebook_norm.weight")?;
+            let codebook_logits = b.linear(
+                "codebook_logits",
+                normalized,
+                "codebook_output",
+                c.num_codebooks * c.codebook_size,
+                false,
+            )?;
+            b.graph.output(codebook_logits)?;
+        }
         b.graph.validate()?;
         Ok(b.graph)
     }
@@ -457,7 +468,7 @@ mod tests {
             .unwrap();
         let a = g.audit().unwrap();
         assert!(a.weight_count > 10);
-        assert!(a.counts[&LoweringStatus::RequiresGpuValidation] >= c.slow.layers * 5);
+        assert!(a.counts[&LoweringStatus::RequiresGpuValidation] >= c.slow.layers * 2);
         assert!(
             g.values
                 .iter()

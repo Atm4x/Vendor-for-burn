@@ -3,8 +3,35 @@
 
 pub use fish_speech_core::*;
 
+#[cfg(feature = "tensorrt-api")]
+mod trtx_ar_ops;
+pub mod trtx_cache;
+pub mod trtx_engine;
+#[cfg(feature = "tensorrt-api")]
+pub mod trtx_firefly_fsq;
+#[cfg(feature = "tensorrt-api")]
+pub mod trtx_firefly_mask;
+#[cfg(feature = "tensorrt-api")]
+pub mod trtx_firefly_network;
+#[cfg(feature = "tensorrt-api")]
+pub mod trtx_firefly_pointwise;
+#[cfg(feature = "tensorrt-api")]
+pub mod trtx_firefly_segment;
 #[cfg(any(feature = "tensorrt-mock", feature = "tensorrt-api"))]
 pub mod trtx_lowering;
 
-pub mod trtx_cache;
-pub mod trtx_engine;
+pub mod fish_tokenizer;
+pub mod model_config;
+pub mod model_runtime;
+pub mod reference_cache;
+pub mod reference_loader;
+pub mod request_queue;
+pub mod weighted_cpu;
+pub mod weighted_firefly;
+pub mod weights;
+
+#[cfg(feature = "cuda-driver")]
+pub mod cuda_stream;
+
+#[cfg(all(feature = "cuda-driver", feature = "tensorrt-api"))]
+pub mod cuda_trtx;
