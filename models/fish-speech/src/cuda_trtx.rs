@@ -2,15 +2,44 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use cudarc::driver::CudaStream;
 use fish_speech_core::{
+    ar_stream_plan::ArStreamPlan,
     error::{FishError, Result},
     trtx_blueprint::{Binding, TrtBlueprint, TrtPrimitive},
 };
 use trtx::ExecutionContext;
 
 use crate::{
-    cuda_stream::CudaBuffer,
+    ar_weight_bindings::required_ar_weights,
+    cuda_stream::{CudaArDevice, CudaBuffer},
     trtx_engine::{DeviceRegion, EngineIoContract},
+    weights::LoadedWeights,
 };
+
+pub fn upload_ar_weights<F>(
+    device: &mut CudaArDevice<F>,
+    plan: &ArStreamPlan,
+    checkpoint: &LoadedWeights,
+) -> Result<BTreeMap<String, CudaBuffer>> {
+    let required = required_ar_weights(plan)
+        .map_err(|_| FishError::InvalidShape("TensorRT AR weight plan invalid"))?;
+    let mut uploaded = BTreeMap::new();
+    let upload = (|| {
+        for (name, ty) in &required {
+            let bytes = checkpoint
+                .semantic_f32_upload_bytes(name, ty)
+                .map_err(|_| FishError::InvalidShape("TensorRT checkpoint weight incompatible"))?;
+            uploaded.insert(name.clone(), device.upload_tensor_bytes(ty, &bytes)?);
+        }
+        Ok(())
+    })();
+    let sync = device
+        .stream()
+        .synchronize()
+        .map_err(|_| FishError::InvalidTransition("CUDA weight upload synchronization failed"));
+    sync?;
+    upload?;
+    Ok(uploaded)
+}
 
 pub fn segment_regions(
     plan: &TrtBlueprint,

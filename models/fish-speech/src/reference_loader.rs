@@ -1,5 +1,6 @@
-use std::io::Cursor;
-use std::path::Path;
+use std::io::{Cursor, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use fish_speech_core::audio::SAMPLE_RATE;
 use fish_speech_core::reference_audio::{ReferenceMelInput, ReferenceMelPreprocessor};
@@ -14,6 +15,7 @@ use thiserror::Error;
 const MAX_SOURCE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_KERNEL_COEFFICIENTS: usize = 8 * 1024 * 1024;
 const MAX_DECODED_FRAMES: usize = 30 * 60 * 384_000;
+const MAX_TRANSCODED_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum ReferenceLoadError {
@@ -47,6 +49,7 @@ impl ReferencePcm {
 
 pub struct ReferenceAudioLoader {
     target_rate: usize,
+    external_ffmpeg: Option<PathBuf>,
 }
 
 impl Default for ReferenceAudioLoader {
@@ -57,7 +60,15 @@ impl Default for ReferenceAudioLoader {
 
 impl ReferenceAudioLoader {
     pub fn new(target_rate: usize) -> Self {
-        Self { target_rate }
+        Self {
+            target_rate,
+            external_ffmpeg: None,
+        }
+    }
+
+    pub fn with_ffmpeg(mut self, executable: impl Into<PathBuf>) -> Self {
+        self.external_ffmpeg = Some(executable.into());
+        self
     }
 
     pub fn load_path(&self, path: impl AsRef<Path>) -> Result<ReferencePcm> {
@@ -75,6 +86,19 @@ impl ReferenceAudioLoader {
                 "invalid source size or target rate",
             ));
         }
+        match self.decode_symphonia(bytes) {
+            Ok(pcm) => Ok(pcm),
+            Err(original_error) => match &self.external_ffmpeg {
+                Some(executable) => {
+                    let wav = transcode_to_wav(executable, bytes)?;
+                    self.decode_symphonia(&wav)
+                }
+                None => Err(original_error),
+            },
+        }
+    }
+
+    fn decode_symphonia(&self, bytes: &[u8]) -> Result<ReferencePcm> {
         let mss = MediaSourceStream::new(Box::new(Cursor::new(bytes.to_vec())), Default::default());
         let mut format = symphonia::default::get_probe()
             .probe(
@@ -168,6 +192,104 @@ impl ReferenceAudioLoader {
             source_channels,
         })
     }
+}
+
+fn transcode_to_wav(ffmpeg: &Path, source: &[u8]) -> Result<Vec<u8>> {
+    let mut child = Command::new(ffmpeg)
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-i",
+            "pipe:0",
+            "-map",
+            "0:a:0",
+            "-vn",
+            "-c:a",
+            "pcm_f32le",
+            "-f",
+            "wav",
+            "pipe:1",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| ReferenceLoadError::Decode(format!("FFmpeg unavailable: {e}")))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or(ReferenceLoadError::Invalid("failed to open FFmpeg input"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or(ReferenceLoadError::Invalid("failed to open FFmpeg output"))?;
+    let mut converted = Vec::new();
+    let output_result = std::thread::scope(|scope| {
+        let writer = scope.spawn(move || stdin.write_all(source));
+        let read_result = stdout
+            .by_ref()
+            .take(MAX_TRANSCODED_BYTES + 1)
+            .read_to_end(&mut converted);
+        if read_result.is_err() || converted.len() as u64 > MAX_TRANSCODED_BYTES {
+            let _ = child.kill();
+        }
+        let write_result = writer.join();
+        (read_result, write_result)
+    });
+    let status = child
+        .wait()
+        .map_err(|e| ReferenceLoadError::Decode(format!("FFmpeg wait failed: {e}")))?;
+    if converted.len() as u64 > MAX_TRANSCODED_BYTES {
+        return Err(ReferenceLoadError::Invalid(
+            "transcoded reference exceeds 512 MiB",
+        ));
+    }
+    output_result.0.map_err(ReferenceLoadError::Io)?;
+    if !status.success() || !matches!(output_result.1, Ok(Ok(()))) || converted.is_empty() {
+        return Err(ReferenceLoadError::Decode(
+            "FFmpeg could not decode the supplied reference audio".into(),
+        ));
+    }
+    seal_streamed_wav(&mut converted)?;
+    Ok(converted)
+}
+
+fn seal_streamed_wav(wav: &mut [u8]) -> Result<()> {
+    if wav.len() < 44 || &wav[..4] != b"RIFF" || &wav[8..12] != b"WAVE" {
+        return Err(ReferenceLoadError::Invalid(
+            "unexpected transcoded WAV header",
+        ));
+    }
+    let riff_len = u32::try_from(wav.len() - 8)
+        .map_err(|_| ReferenceLoadError::Invalid("transcoded WAV too large"))?;
+    wav[4..8].copy_from_slice(&riff_len.to_le_bytes());
+    let mut cursor = 12usize;
+    while cursor + 8 <= wav.len() {
+        let chunk_bytes = u32::from_le_bytes(wav[cursor + 4..cursor + 8].try_into().unwrap());
+        if &wav[cursor..cursor + 4] == b"data" {
+            if chunk_bytes != u32::MAX {
+                return Err(ReferenceLoadError::Invalid(
+                    "unexpected bounded WAV data chunk",
+                ));
+            }
+            let data_bytes = u32::try_from(wav.len() - cursor - 8)
+                .map_err(|_| ReferenceLoadError::Invalid("transcoded PCM too large"))?;
+            wav[cursor + 4..cursor + 8].copy_from_slice(&data_bytes.to_le_bytes());
+            return Ok(());
+        }
+        let advance = 8usize
+            .checked_add(chunk_bytes as usize)
+            .and_then(|n| n.checked_add((chunk_bytes & 1) as usize))
+            .ok_or(ReferenceLoadError::Invalid("invalid WAV chunk length"))?;
+        cursor = cursor
+            .checked_add(advance)
+            .ok_or(ReferenceLoadError::Invalid("invalid WAV chunk offset"))?;
+    }
+    Err(ReferenceLoadError::Invalid(
+        "missing transcoded WAV data chunk",
+    ))
 }
 
 pub fn resample_mono(pcm: &[f32], from: usize, to: usize) -> Result<Vec<f32>> {
@@ -301,6 +423,58 @@ mod tests {
             result.prepare_mel().unwrap().mels.frames,
             result.pcm.len() / 512
         );
+    }
+
+    #[test]
+    fn optional_ffmpeg_recovers_mp3_aac_and_asf_in_memory() {
+        if Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_err()
+        {
+            return;
+        }
+        let samples = (0..8_192)
+            .map(|i| [((i as f32 * 0.07).sin() * 22_000.0) as i16, 0])
+            .collect::<Vec<_>>();
+        let source = wav(44_100, 1, &samples);
+        for format in ["mp3", "adts", "asf", "mp4"] {
+            let mut encoder = Command::new("ffmpeg")
+                .args([
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "wav",
+                    "-i",
+                    "pipe:0",
+                ])
+                .args(if format == "mp4" {
+                    vec!["-c:a", "aac", "-movflags", "frag_keyframe+empty_moov"]
+                } else {
+                    vec![]
+                })
+                .args(["-f", format, "pipe:1"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            encoder.stdin.take().unwrap().write_all(&source).unwrap();
+            let compressed = encoder.wait_with_output().unwrap();
+            assert!(compressed.status.success(), "{format}");
+            let native = ReferenceAudioLoader::default().load_bytes(&compressed.stdout);
+            assert!(native.is_err(), "{format} should require the opt-in codec");
+            let decoded = ReferenceAudioLoader::default()
+                .with_ffmpeg("ffmpeg")
+                .load_bytes(&compressed.stdout)
+                .unwrap();
+            assert_eq!(decoded.sample_rate, 44_100, "{format}");
+            assert_eq!(decoded.source_channels, 1, "{format}");
+            assert!(decoded.pcm.len() >= 4096, "{format}");
+            assert!(decoded.pcm.iter().all(|v| v.is_finite()), "{format}");
+        }
     }
 
     #[test]

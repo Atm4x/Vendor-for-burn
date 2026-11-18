@@ -151,19 +151,17 @@ pub fn parse_checkpoint_config(json: &[u8]) -> Result<FishModelConfig> {
         qkv_bias: raw.attention_qkv_bias,
     };
     let fast = if kind == ModelKind::DualAr {
-        let dim = raw.fast_dim.filter(|v| *v > 0).unwrap_or(raw.dim);
-        let n_head = raw.fast_n_head.filter(|v| *v > 0).unwrap_or(raw.n_head);
-        let n_local_heads = raw
-            .fast_n_local_heads
-            .filter(|v| *v > 0)
-            .unwrap_or(local_heads);
-        if n_head == 0 || dim % n_head != 0 {
+        let dim = raw.fast_dim.unwrap_or(raw.dim);
+        let n_head = raw.fast_n_head.unwrap_or(raw.n_head);
+        let n_local_heads = raw.fast_n_local_heads.unwrap_or(local_heads);
+        if n_head == 0 || dim % n_head != 0 || n_local_heads == 0 {
             return Err(ModelConfigError::Invalid(
                 "invalid Fast AR head dimensions".into(),
             ));
         }
-        let effective_head_dim = raw.fast_head_dim.filter(|v| *v > 0).unwrap_or(head_dim);
-        if effective_head_dim != dim / n_head {
+        let inferred_head_dim = dim / n_head;
+        let effective_head_dim = raw.fast_head_dim.unwrap_or(inferred_head_dim);
+        if effective_head_dim != inferred_head_dim {
             return Err(ModelConfigError::Invalid(
                 "Fast AR head_dim differs from dim/n_head; unsupported checkpoint geometry".into(),
             ));
@@ -173,10 +171,7 @@ pub fn parse_checkpoint_config(json: &[u8]) -> Result<FishModelConfig> {
             n_heads: n_head,
             n_kv_heads: n_local_heads,
             layers: raw.n_fast_layer,
-            intermediate_size: raw
-                .fast_intermediate_size
-                .filter(|v| *v > 0)
-                .unwrap_or(slow.intermediate_size),
+            intermediate_size: raw.fast_intermediate_size.unwrap_or(slow.intermediate_size),
             qkv_bias: raw
                 .fast_attention_qkv_bias
                 .unwrap_or(raw.attention_qkv_bias),
@@ -246,12 +241,40 @@ mod tests {
     }
 
     #[test]
+    fn fast_ar_head_dimensions_derive_from_own_width() {
+        let parsed = parse_checkpoint_config(br#"{"model_type":"dual_ar","dim":128,"n_head":8,"n_local_heads":2,"n_layer":2,"fast_dim":96,"fast_n_head":12,"fast_n_local_heads":3,"n_fast_layer":3}"#).unwrap();
+        let fast = parsed.fast.unwrap();
+        assert_eq!(parsed.slow.head_dim(), 16);
+        assert_eq!(fast.head_dim(), 8);
+        assert_eq!(fast.qkv_width(), 144);
+    }
+
+    #[test]
+    fn explicit_invalid_fast_dimensions_are_not_treated_as_missing() {
+        for override_field in [
+            r#""fast_dim":0"#,
+            r#""fast_n_head":0"#,
+            r#""fast_n_local_heads":0"#,
+            r#""fast_head_dim":0"#,
+            r#""fast_intermediate_size":0"#,
+        ] {
+            let json = format!(
+                r#"{{"model_type":"dual_ar","dim":128,"n_head":8,"n_local_heads":2,"n_layer":2,"n_fast_layer":2,{override_field}}}"#
+            );
+            assert!(
+                parse_checkpoint_config(json.as_bytes()).is_err(),
+                "{override_field}"
+            );
+        }
+    }
+
+    #[test]
     fn invalid_head_and_unsupported_kind_fail() {
         for json in [
             r#"{"model_type":"dual_ar","dim":1000,"n_head":16}"#,
             r#"{"model_type":"naive","dim":64,"n_head":8,"head_dim":16}"#,
             r#"{"model_type":"llama3"}"#,
-            r#"{"model_type":"dual_ar","dim":64,"n_head":8,"fast_dim":128}"#,
+            r#"{"model_type":"dual_ar","dim":64,"n_head":8,"fast_dim":127}"#,
         ] {
             assert!(parse_checkpoint_config(json.as_bytes()).is_err());
         }

@@ -230,6 +230,65 @@ impl LoadedWeights {
         Ok(SafeTensors::deserialize(data)?.tensor(key)?)
     }
 
+    pub fn semantic_f32_upload_bytes(&self, key: &str, expected: &TensorType) -> Result<Vec<u8>> {
+        if self.manifest.component != "semantic" || expected.dtype != ScalarType::F32 {
+            return Err(WeightError::Invalid(format!(
+                "not a floating semantic TensorRT weight: {key}"
+            )));
+        }
+        let view = self.tensor(key)?;
+        if view.shape() != expected.shape {
+            return Err(WeightError::Invalid(format!(
+                "TensorRT weight shape mismatch: {key}"
+            )));
+        }
+        let count = expected
+            .shape
+            .iter()
+            .try_fold(1usize, |n, &d| n.checked_mul(d))
+            .ok_or_else(|| {
+                WeightError::Invalid(format!("TensorRT weight extent overflow: {key}"))
+            })?;
+        let mut output = Vec::with_capacity(count.checked_mul(4).ok_or_else(|| {
+            WeightError::Invalid(format!("TensorRT weight byte count overflow: {key}"))
+        })?);
+        let bytes = view.data();
+        match view.dtype() {
+            Dtype::F32 if bytes.len() == count * 4 => {
+                for sample in bytes.chunks_exact(4) {
+                    if !f32::from_le_bytes(sample.try_into().unwrap()).is_finite() {
+                        return Err(WeightError::Invalid(format!(
+                            "non-finite TensorRT weight: {key}"
+                        )));
+                    }
+                }
+                output.extend_from_slice(bytes);
+            }
+            Dtype::F16 | Dtype::BF16 if bytes.len() == count * 2 => {
+                for sample in bytes.chunks_exact(2) {
+                    let bits = u16::from_le_bytes(sample.try_into().unwrap());
+                    let value = if view.dtype() == Dtype::F16 {
+                        f16::from_bits(bits).to_f32()
+                    } else {
+                        bf16::from_bits(bits).to_f32()
+                    };
+                    if !value.is_finite() {
+                        return Err(WeightError::Invalid(format!(
+                            "non-finite TensorRT weight: {key}"
+                        )));
+                    }
+                    output.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+            _ => {
+                return Err(WeightError::Invalid(format!(
+                    "unsupported TensorRT weight dtype: {key}"
+                )));
+            }
+        }
+        Ok(output)
+    }
+
     fn cpu_f32_weights(
         &self,
         requirements: &BTreeMap<String, TensorType>,
@@ -575,6 +634,24 @@ mod tests {
             ),
         ]);
         let converted = weights.to_cpu_named_tensors(&req).unwrap();
+        for key in ["bf16", "f16"] {
+            let packed = weights.semantic_f32_upload_bytes(key, &req[key]).unwrap();
+            assert_eq!(
+                packed,
+                value
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert!(
+            weights
+                .semantic_f32_upload_bytes(
+                    "f16",
+                    &TensorType::new([4], ScalarType::F32, Layout::Plain)
+                )
+                .is_err()
+        );
         assert_eq!(converted["bf16"], TensorData::F32(value.to_vec()));
         assert_eq!(converted["f16"], TensorData::F32(value.to_vec()));
         fs::remove_dir_all(path).unwrap();

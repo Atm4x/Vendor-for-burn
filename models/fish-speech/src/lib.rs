@@ -20,6 +20,7 @@ pub mod trtx_firefly_segment;
 #[cfg(any(feature = "tensorrt-mock", feature = "tensorrt-api"))]
 pub mod trtx_lowering;
 
+pub mod ar_weight_bindings;
 pub mod device_memory;
 pub mod fish_tokenizer;
 pub mod model_config;

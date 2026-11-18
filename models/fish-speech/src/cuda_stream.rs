@@ -117,6 +117,21 @@ impl<F> CudaArDevice<F> {
         })
     }
 
+    pub fn upload_tensor_bytes(&mut self, ty: &TensorType, bytes: &[u8]) -> Result<CudaBuffer> {
+        let required = fish_speech_core::ar_stream_executor::tensor_bytes(ty)?;
+        if required == 0 || required != bytes.len() {
+            return Err(FishError::InvalidShape(
+                "CUDA upload tensor byte count mismatch",
+            ));
+        }
+        let reservation = self
+            .memory
+            .reserve(required)
+            .map_err(|_| FishError::InvalidTransition("CUDA device memory budget exhausted"))?;
+        let allocation = self.stream.clone_htod(bytes).map_err(cuda_error)?;
+        Ok(CudaBuffer::from_allocation(allocation, reservation))
+    }
+
     pub fn memory_usage(&self) -> DeviceMemoryUsage {
         self.memory.usage()
     }
