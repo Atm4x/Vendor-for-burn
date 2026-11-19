@@ -17,7 +17,7 @@ use crate::firefly_config::{FireflyConfig, FireflyConfigError};
 use crate::fish_tokenizer::{FishBpeTokenizer, FishTokenizerError};
 use crate::model_config::{ModelConfigError, parse_checkpoint_config};
 use crate::reference_cache::{CachePolicy, ReferenceBytes, ReferenceCache};
-use crate::reference_loader::ReferenceLoadError;
+use crate::reference_loader::{ReferenceAudioLoader, ReferenceLoadError};
 use crate::weighted_cpu::CpuSemanticGenerator;
 use crate::weighted_firefly::{CpuFireflyDecoder, CpuFireflyReferenceEncoder};
 use crate::weights::{LoadedWeights, WeightError};
@@ -115,6 +115,7 @@ impl LoadedFishArtifacts {
         let firefly_config_bytes = checked_file(&paths.firefly_config_source, MAX_CONFIG_BYTES)?;
         let tokenizer_bytes = checked_file(&paths.semantic_tokenizer, MAX_TOKENIZER_BYTES)?;
         let config = parse_checkpoint_config(&config_bytes)?;
+        let firefly_config = FireflyConfig::parse_supported(&firefly_config_bytes)?;
         let tokenizer_text = std::str::from_utf8(&tokenizer_bytes)
             .map_err(|_| ModelRuntimeError::Invalid("tokenizer.tiktoken is not UTF-8".into()))?;
         let tokenizer = FishBpeTokenizer::from_tiktoken_text(tokenizer_text)?;
@@ -145,7 +146,6 @@ impl LoadedFishArtifacts {
             ));
         }
         check_config_hash("firefly", &firefly_config_bytes, &firefly)?;
-        let firefly_config = FireflyConfig::parse_supported(&firefly_config_bytes)?;
         Ok(Self {
             config,
             firefly_config,
@@ -201,6 +201,13 @@ impl CpuFishModel {
 
     pub fn is_loaded(&self) -> bool {
         self.parts.is_some()
+    }
+
+    pub fn set_reference_audio_loader(&mut self, loader: ReferenceAudioLoader) -> Result<()> {
+        let parts = self.parts.as_mut().ok_or(ModelRuntimeError::Closed)?;
+        parts.reference_encoder.set_audio_loader(loader);
+        parts.cache.clear();
+        Ok(())
     }
 
     pub fn close(&mut self) {
@@ -394,7 +401,12 @@ mod tests {
     #[test]
     fn changed_firefly_config_rejected_before_cpu_model_creation() {
         let (root, paths) = fixture();
-        fs::write(&paths.firefly_config_source, b"edited Firefly").unwrap();
+        let original = fs::read(&paths.firefly_config_source).unwrap();
+        fs::write(
+            &paths.firefly_config_source,
+            [b" ".as_slice(), &original].concat(),
+        )
+        .unwrap();
         assert!(
             matches!(LoadedFishArtifacts::open(&paths), Err(ModelRuntimeError::Invalid(s)) if s.contains("firefly manifest"))
         );

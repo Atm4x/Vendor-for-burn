@@ -78,6 +78,7 @@ impl AcousticDecoder for CpuFireflyDecoder {
 
 pub struct CpuFireflyReferenceEncoder {
     weights: Arc<BTreeMap<String, Vec<f32>>>,
+    audio_loader: ReferenceAudioLoader,
 }
 
 impl CpuFireflyReferenceEncoder {
@@ -87,11 +88,16 @@ impl CpuFireflyReferenceEncoder {
         let weights = checkpoint.firefly_cpu_weights(&graph)?;
         Ok(Self {
             weights: Arc::new(weights),
+            audio_loader: ReferenceAudioLoader::default(),
         })
     }
 
+    pub fn set_audio_loader(&mut self, loader: ReferenceAudioLoader) {
+        self.audio_loader = loader;
+    }
+
     pub fn encode_reference_bytes(&self, audio: &[u8]) -> ReferenceResult<Vec<Vec<u32>>> {
-        let decoded = ReferenceAudioLoader::default().load_bytes(audio)?;
+        let decoded = self.audio_loader.load_bytes(audio)?;
         let (codes, _) = self
             .encode_mono(&decoded.pcm)
             .map_err(ReferenceLoadError::Mel)?;
@@ -137,6 +143,49 @@ mod tests {
     use safetensors::tensor::{Dtype, TensorView, serialize};
     use sha2::{Digest, Sha256};
     use std::fs;
+    use std::process::{Command, Stdio};
+
+    #[test]
+    fn configured_codec_reaches_reference_encoder_without_an_ffmpeg_global_default() {
+        if Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_err()
+        {
+            return;
+        }
+        let output = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=44100:duration=0.2",
+                "-f",
+                "mp3",
+                "pipe:1",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let mut encoder = CpuFireflyReferenceEncoder {
+            weights: Arc::new(BTreeMap::new()),
+            audio_loader: ReferenceAudioLoader::default(),
+        };
+        assert!(matches!(
+            encoder.encode_reference_bytes(&output.stdout),
+            Err(ReferenceLoadError::Decode(_))
+        ));
+        encoder.set_audio_loader(ReferenceAudioLoader::default().with_ffmpeg("ffmpeg"));
+        assert!(matches!(
+            encoder.encode_reference_bytes(&output.stdout),
+            Err(ReferenceLoadError::Mel(_))
+        ));
+    }
 
     fn digest(data: &[u8]) -> String {
         format!("{:x}", Sha256::digest(data))
