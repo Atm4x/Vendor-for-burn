@@ -5,6 +5,7 @@ use fish_speech_core::{
     cpu_ir::{NamedTensors, TensorData},
     error::{FishError, Result},
     graph_ir::{Graph, Op, Origin, QkvPart, ScalarType, TensorType},
+    graph_stream_plan::GraphExecutionPlan,
 };
 use half::bf16;
 use std::collections::BTreeMap;
@@ -59,8 +60,26 @@ fn supported(op: Op) -> bool {
     )
 }
 
+pub(super) fn is_cache_name(name: &str) -> bool {
+    name.ends_with(".k_cache") || name.ends_with(".v_cache")
+}
+
+pub(super) fn tensor_bytes(ty: &TensorType) -> Result<usize> {
+    count(ty)?
+        .checked_mul(match ty.dtype {
+            ScalarType::BF16 => 2,
+            _ => 4,
+        })
+        .ok_or(FishError::InvalidShape("CubeCL tensor byte count overflow"))
+}
+
+pub(super) fn validate_binding(ty: &TensorType, data: &TensorData) -> Result<()> {
+    verify_binding(ty, data)
+}
+
 pub struct CubeClGraph {
     graph: Graph,
+    execution: GraphExecutionPlan,
 }
 
 impl CubeClGraph {
@@ -94,11 +113,16 @@ impl CubeClGraph {
         }
         Ok(Self {
             graph: graph.clone(),
+            execution: GraphExecutionPlan::from_graph(graph)?,
         })
     }
 
     pub fn graph(&self) -> &Graph {
         &self.graph
+    }
+
+    pub fn execution(&self) -> &GraphExecutionPlan {
+        &self.execution
     }
 
     pub fn validate_inputs(&self, inputs: &NamedTensors) -> Result<()> {
@@ -117,6 +141,32 @@ impl CubeClGraph {
                 return Err(FishError::InvalidShape("unknown CubeCL graph input"));
             }
         }
+        self.validate_tokens(inputs)?;
+        Ok(())
+    }
+
+    /// Validate only request-owned inputs. KV buffers and immutable weights are owned by
+    /// the request and model respectively, never accepted from a caller at every step.
+    pub fn validate_runtime_inputs(&self, inputs: &NamedTensors) -> Result<()> {
+        for value in &self.graph.values {
+            if matches!(value.origin, Origin::Input) && !is_cache_name(&value.name) {
+                let data = inputs
+                    .get(&value.name)
+                    .ok_or(FishError::InvalidShape("missing CubeCL request input"))?;
+                verify_binding(&value.ty, data)?;
+            }
+        }
+        for name in inputs.keys() {
+            if !self.graph.values.iter().any(|value| {
+                value.name == *name && matches!(value.origin, Origin::Input) && !is_cache_name(name)
+            }) {
+                return Err(FishError::InvalidShape("unknown CubeCL request input"));
+            }
+        }
+        self.validate_tokens(inputs)
+    }
+
+    fn validate_tokens(&self, inputs: &NamedTensors) -> Result<()> {
         for node in &self.graph.nodes {
             match node.op {
                 Op::TokenEmbedding => {
@@ -190,17 +240,46 @@ pub struct CubeClGraphExecutor {
 }
 
 impl CubeClGraphExecutor {
+    pub(super) fn client(&self) -> &Client {
+        &self.client
+    }
+
     pub fn new(client: Client) -> Self {
         Self { client }
     }
 
     pub fn run(&self, compiled: &CubeClGraph, inputs: &NamedTensors) -> Result<NamedTensors> {
-        let graph = compiled.graph();
         compiled.validate_inputs(inputs)?;
+        self.ensure_bf16_supported(compiled)?;
+        let graph = compiled.graph();
+        let mut external = BTreeMap::new();
+        for value in &graph.values {
+            if matches!(value.origin, Origin::Input | Origin::Weight { .. }) {
+                external.insert(
+                    value.name.clone(),
+                    self.upload(&value.ty, &inputs[&value.name]),
+                );
+            }
+        }
+        let mut retained = Vec::new();
+        let outputs = self.execute_handles(compiled, &external, &mut retained)?;
+        let mut host = BTreeMap::new();
+        for id in &graph.outputs {
+            let value = &graph.values[id.0];
+            host.insert(
+                value.name.clone(),
+                self.read(&value.ty, &outputs[&value.name])?,
+            );
+        }
+        Ok(host)
+    }
+
+    pub(super) fn ensure_bf16_supported(&self, graph: &CubeClGraph) -> Result<()> {
         if graph
+            .graph
             .values
             .iter()
-            .any(|value| value.ty.dtype == ScalarType::BF16)
+            .any(|v| v.ty.dtype == ScalarType::BF16)
         {
             use cubecl::features::TypeUsage;
             let supported = bf16::supported_uses(&self.client);
@@ -211,94 +290,114 @@ impl CubeClGraphExecutor {
                 ));
             }
         }
+        Ok(())
+    }
+
+    pub(super) fn upload(&self, ty: &TensorType, data: &TensorData) -> Handle {
+        match (ty.dtype, data) {
+            (ScalarType::BF16, TensorData::F32(v)) => {
+                let halfs = v
+                    .iter()
+                    .copied()
+                    .map(half::bf16::from_f32)
+                    .collect::<Vec<_>>();
+                self.client.create_from_slice(bytemuck::cast_slice(&halfs))
+            }
+            (_, TensorData::F32(v)) => self.client.create_from_slice(bytemuck::cast_slice(v)),
+            (_, TensorData::I32(v)) => self.client.create_from_slice(bytemuck::cast_slice(v)),
+        }
+    }
+
+    pub(super) fn zeros(&self, ty: &TensorType) -> Result<Handle> {
+        let size = tensor_bytes(ty)?;
+        Ok(self.client.create_from_slice(&vec![0u8; size]))
+    }
+
+    pub(super) fn read(&self, ty: &TensorType, buffer: &Handle) -> Result<TensorData> {
+        let bytes = self
+            .client
+            .read_one(buffer.clone())
+            .map_err(|_| FishError::InvalidTransition("CubeCL device read failed"))?;
+        let data = match ty.dtype {
+            ScalarType::F32 => TensorData::F32(
+                bytes
+                    .chunks_exact(4)
+                    .map(|x| f32::from_le_bytes(x.try_into().expect("chunk size")))
+                    .collect(),
+            ),
+            ScalarType::I32 => TensorData::I32(
+                bytes
+                    .chunks_exact(4)
+                    .map(|x| i32::from_le_bytes(x.try_into().expect("chunk size")))
+                    .collect(),
+            ),
+            ScalarType::BF16 => TensorData::F32(
+                bytes
+                    .chunks_exact(2)
+                    .map(|x| {
+                        half::bf16::from_bits(u16::from_le_bytes(x.try_into().expect("chunk size")))
+                            .to_f32()
+                    })
+                    .collect(),
+            ),
+        };
+        verify_binding(ty, &data)?;
+        Ok(data)
+    }
+
+    /// Device-resident execution. The caller owns all handles in `retained` until
+    /// a stream synchronization; output handles can feed a later compiled graph.
+    pub(super) fn execute_handles(
+        &self,
+        compiled: &CubeClGraph,
+        external: &BTreeMap<String, Handle>,
+        retained: &mut Vec<Handle>,
+    ) -> Result<BTreeMap<String, Handle>> {
+        let graph = compiled.graph();
         let mut buffers = vec![None; graph.values.len()];
-        for (i, value) in graph.values.iter().enumerate() {
+        for (index, value) in graph.values.iter().enumerate() {
             if matches!(value.origin, Origin::Input | Origin::Weight { .. }) {
-                let data = &inputs[&value.name];
-                let buffer = match (value.ty.dtype, data) {
-                    (ScalarType::BF16, TensorData::F32(v)) => {
-                        let halfs = v
-                            .iter()
-                            .copied()
-                            .map(half::bf16::from_f32)
-                            .collect::<Vec<_>>();
-                        self.client.create_from_slice(bytemuck::cast_slice(&halfs))
-                    }
-                    (_, TensorData::F32(v)) => {
-                        self.client.create_from_slice(bytemuck::cast_slice(v))
-                    }
-                    (_, TensorData::I32(v)) => {
-                        self.client.create_from_slice(bytemuck::cast_slice(v))
-                    }
-                };
-                buffers[i] = Some(buffer);
+                let handle = external
+                    .get(&value.name)
+                    .ok_or(FishError::InvalidShape("missing CubeCL device binding"))?
+                    .clone();
+                retained.push(handle.clone());
+                buffers[index] = Some(handle);
             }
         }
-        for node in &graph.nodes {
-            let args = node
-                .inputs
-                .iter()
-                .map(|id| {
-                    buffers[id.0]
-                        .as_ref()
-                        .ok_or(FishError::InvalidShape("CubeCL missing graph dependency"))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let ty = &graph.values[node.result.0].ty;
-            let n = count(ty)?;
-            let output = if matches!(node.op, Op::Identity) {
-                args[0].clone()
-            } else {
-                let element_size = match ty.dtype {
-                    ScalarType::BF16 => 2,
-                    _ => 4,
+        for phase in compiled.execution().phases() {
+            for &node_index in phase.node_indices() {
+                let node = &graph.nodes[node_index];
+                let args = node
+                    .inputs
+                    .iter()
+                    .map(|id| {
+                        buffers[id.0]
+                            .as_ref()
+                            .ok_or(FishError::InvalidShape("CubeCL missing graph dependency"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let ty = &graph.values[node.result.0].ty;
+                let n = count(ty)?;
+                let output = if matches!(node.op, Op::Identity) {
+                    args[0].clone()
+                } else {
+                    let bytes = tensor_bytes(ty)?;
+                    let output = self.client.empty(bytes);
+                    retained.push(output.clone());
+                    self.dispatch(node.op, &args, &output, n, graph, node)?;
+                    output
                 };
-                let bytes = n.checked_mul(element_size).ok_or(FishError::InvalidShape(
-                    "CubeCL allocation byte count overflow",
-                ))?;
-                let output = self.client.empty(bytes);
-                self.dispatch(node.op, &args, &output, n, graph, node)?;
-                output
-            };
-            buffers[node.result.0] = Some(output);
+                buffers[node.result.0] = Some(output);
+            }
         }
         let mut results = BTreeMap::new();
         for id in &graph.outputs {
             let value = &graph.values[id.0];
-            let buffer = buffers[id.0]
+            let handle = buffers[id.0]
                 .as_ref()
                 .ok_or(FishError::InvalidShape("CubeCL missing graph output"))?;
-            let bytes = self
-                .client
-                .read_one(buffer.clone())
-                .map_err(|_| FishError::InvalidTransition("CubeCL device read failed"))?;
-            let data = match value.ty.dtype {
-                ScalarType::F32 => TensorData::F32(
-                    bytes
-                        .chunks_exact(4)
-                        .map(|x| f32::from_le_bytes(x.try_into().expect("chunk size")))
-                        .collect(),
-                ),
-                ScalarType::I32 => TensorData::I32(
-                    bytes
-                        .chunks_exact(4)
-                        .map(|x| i32::from_le_bytes(x.try_into().expect("chunk size")))
-                        .collect(),
-                ),
-                ScalarType::BF16 => TensorData::F32(
-                    bytes
-                        .chunks_exact(2)
-                        .map(|x| {
-                            half::bf16::from_bits(u16::from_le_bytes(
-                                x.try_into().expect("chunk size"),
-                            ))
-                            .to_f32()
-                        })
-                        .collect(),
-                ),
-            };
-            verify_binding(&value.ty, &data)?;
-            results.insert(value.name.clone(), data);
+            results.insert(value.name.clone(), handle.clone());
         }
         Ok(results)
     }

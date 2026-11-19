@@ -35,6 +35,7 @@ pub mod cpu_ir;
 pub mod cpu_weighted_ar;
 pub mod cpu_weighted_naive;
 pub mod graph_ir;
+pub mod graph_stream_plan;
 pub mod transformer_ir;
 
 pub mod shape_profiles;

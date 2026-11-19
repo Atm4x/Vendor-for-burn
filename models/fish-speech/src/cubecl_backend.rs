@@ -3,8 +3,12 @@
 
 mod kernels;
 mod runtime;
+mod session;
 
 pub use runtime::{CubeClGraph, CubeClGraphExecutor};
+pub use session::{
+    CubeClModel, CubeClPreparedModel, CubeClRequest, CubeClRequestCursor, CubeClRequestLimits,
+};
 
 #[cfg(test)]
 mod tests;

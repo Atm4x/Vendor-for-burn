@@ -1,0 +1,759 @@
+//! Model-scoped CubeCL weights and request-scoped stream-ordered KV ownership.
+//! This layer does not sample tokens or depend on TensorRT.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use cubecl::{prelude::*, server::Handle};
+use fish_speech_core::{
+    config::{FishModelConfig, ModelKind},
+    cpu_ir::NamedTensors,
+    error::{FishError, Result},
+    graph::Stage,
+    graph_ir::{Graph, Op, Origin, ScalarType, TensorType},
+    transformer_ir::TransformerIrFactory,
+};
+
+use super::{
+    CubeClGraph, CubeClGraphExecutor,
+    runtime::{is_cache_name, tensor_bytes, validate_binding},
+};
+
+const DEFAULT_MAX_PENDING_BYTES: usize = 512 * 1024 * 1024;
+const DEFAULT_MAX_KV_BYTES: usize = 256 * 1024 * 1024;
+const DEFAULT_MAX_PENDING_STEPS: usize = 128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CubeClRequestLimits {
+    pub max_pending_bytes: usize,
+    pub max_kv_bytes: usize,
+    pub max_pending_steps: usize,
+}
+
+impl Default for CubeClRequestLimits {
+    fn default() -> Self {
+        Self {
+            max_pending_bytes: DEFAULT_MAX_PENDING_BYTES,
+            max_kv_bytes: DEFAULT_MAX_KV_BYTES,
+            max_pending_steps: DEFAULT_MAX_PENDING_STEPS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CubeClRequestCursor {
+    pub slow_active_len: usize,
+    pub fast_active_len: usize,
+}
+
+impl CubeClRequestCursor {
+    pub fn validate_step(&self, graph: &Graph) -> Result<()> {
+        graph.validate()?;
+        let active = graph.active_kv_len.ok_or(FishError::InvalidShape(
+            "CubeCL autoregression requires an active KV prefix",
+        ))?;
+        let capacity = graph.kv_capacity.ok_or(FishError::InvalidShape(
+            "CubeCL autoregression requires a KV capacity",
+        ))?;
+        let expected_position = match graph.stage {
+            Stage::SlowPrefill if self.slow_active_len == 0 => 0,
+            Stage::SlowDecode if self.slow_active_len != 0 => self.slow_active_len,
+            Stage::FastDecode if self.slow_active_len > 0 => self.fast_active_len,
+            _ => {
+                return Err(FishError::InvalidTransition(
+                    "invalid CubeCL AR stage transition",
+                ));
+            }
+        };
+        let expected_active = match graph.stage {
+            Stage::SlowPrefill => active,
+            Stage::SlowDecode | Stage::FastDecode => expected_position
+                .checked_add(1)
+                .ok_or(FishError::InvalidShape("CubeCL prefix length overflow"))?,
+            _ => unreachable!(),
+        };
+        if active != expected_active || active > capacity {
+            return Err(FishError::InvalidTransition(
+                "CubeCL AR prefix not contiguous",
+            ));
+        }
+        let mut cache_updates = BTreeSet::new();
+        for node in &graph.nodes {
+            if let Op::KvUpdate { position } = node.op {
+                let cache = &graph.values[node.inputs[0].0];
+                if position != expected_position
+                    || !matches!(cache.origin, Origin::Input)
+                    || !is_cache_name(&cache.name)
+                    || !cache_updates.insert(cache.name.as_str())
+                    || !graph.outputs.contains(&node.result)
+                {
+                    return Err(FishError::InvalidShape(
+                        "CubeCL KV update must be a unique exported cache write at expected position",
+                    ));
+                }
+            }
+        }
+        if cache_updates.is_empty() {
+            return Err(FishError::InvalidShape("CubeCL AR graph lacks KV updates"));
+        }
+        Ok(())
+    }
+
+    fn advance(&mut self, graph: &Graph) {
+        let active = graph.active_kv_len.expect("validated active KV length");
+        match graph.stage {
+            Stage::SlowPrefill | Stage::SlowDecode => self.slow_active_len = active,
+            Stage::FastDecode => self.fast_active_len = active,
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn reset_fast(&mut self) {
+        self.fast_active_len = 0;
+    }
+}
+
+/// Preflight-only model plan collection. No GPU allocation or CubeCL runtime is needed.
+pub struct CubeClPreparedModel {
+    graphs: BTreeMap<String, CubeClGraph>,
+    weights: BTreeMap<String, TensorType>,
+    caches: BTreeMap<String, TensorType>,
+}
+
+impl CubeClPreparedModel {
+    pub fn compile(graphs: impl IntoIterator<Item = (String, Graph)>) -> Result<Self> {
+        let mut result = Self {
+            graphs: BTreeMap::new(),
+            weights: BTreeMap::new(),
+            caches: BTreeMap::new(),
+        };
+        for (name, graph) in graphs {
+            if name.is_empty() || result.graphs.contains_key(&name) {
+                return Err(FishError::InvalidConfig(
+                    "duplicate or empty CubeCL model plan key",
+                ));
+            }
+            let compiled = CubeClGraph::compile(&graph)?;
+            let mut has_cache_updates = false;
+            for node in &graph.nodes {
+                if matches!(node.op, Op::KvUpdate { .. }) {
+                    has_cache_updates = true;
+                    let cache = &graph.values[node.inputs[0].0];
+                    if !matches!(cache.origin, Origin::Input)
+                        || !is_cache_name(&cache.name)
+                        || !graph.outputs.contains(&node.result)
+                        || graph.values[node.result.0].ty != cache.ty
+                    {
+                        return Err(FishError::InvalidShape(
+                            "CubeCL KV writes must export a tensor matching the source cache",
+                        ));
+                    }
+                }
+            }
+            if !has_cache_updates {
+                return Err(FishError::InvalidShape("CubeCL AR plan has no KV updates"));
+            }
+            for value in &graph.values {
+                let requirements = match value.origin {
+                    Origin::Weight { .. } => Some(&mut result.weights),
+                    Origin::Input if is_cache_name(&value.name) => Some(&mut result.caches),
+                    _ => None,
+                };
+                if let Some(requirements) = requirements {
+                    if let Some(previous) =
+                        requirements.insert(value.name.clone(), value.ty.clone())
+                    {
+                        if previous != value.ty {
+                            return Err(FishError::InvalidShape(
+                                "CubeCL incompatible weight or cache tensor across plans",
+                            ));
+                        }
+                    }
+                }
+            }
+            result.graphs.insert(name, compiled);
+        }
+        if result.graphs.is_empty() {
+            return Err(FishError::InvalidConfig(
+                "CubeCL model has no compiled plans",
+            ));
+        }
+        Ok(result)
+    }
+
+    /// Build the Slow and Fast profiles for one request geometry. Positions are
+    /// specialized for now; dynamic position buckets are a later CubeCL optimization.
+    pub fn from_transformer(
+        config: &FishModelConfig,
+        prompt_len: usize,
+        max_new_tokens: usize,
+    ) -> Result<Self> {
+        if prompt_len == 0
+            || max_new_tokens == 0
+            || prompt_len >= config.max_seq_len
+            || max_new_tokens > config.max_seq_len - prompt_len
+        {
+            return Err(FishError::InvalidShape(
+                "invalid CubeCL Transformer profile bounds",
+            ));
+        }
+        // A large number of position-specialized graphs is not a production path.
+        if max_new_tokens > 64 {
+            return Err(FishError::Unsupported(
+                "CubeCL dynamic Slow decode profiles are not implemented; limit is 64 tokens",
+            ));
+        }
+        let factory = TransformerIrFactory::new(config)?;
+        let mut graphs = vec![("slow_prefill".into(), factory.slow_prefill(prompt_len)?)];
+        for active in (prompt_len + 1)..(prompt_len + max_new_tokens) {
+            graphs.push((
+                format!("slow_decode_{active}"),
+                factory.slow_decode(active)?,
+            ));
+        }
+        if config.kind == ModelKind::DualAr {
+            for step in 0..config.num_codebooks {
+                graphs.push((format!("fast_{step}"), factory.fast_decode(step)?));
+            }
+        }
+        Self::compile(graphs)
+    }
+
+    pub fn graph(&self, key: &str) -> Result<&CubeClGraph> {
+        self.graphs.get(key).ok_or(FishError::InvalidConfig(
+            "CubeCL model profile is not prepared",
+        ))
+    }
+
+    pub fn plan_count(&self) -> usize {
+        self.graphs.len()
+    }
+
+    pub fn weight_specs(&self) -> &BTreeMap<String, TensorType> {
+        &self.weights
+    }
+
+    pub fn cache_specs(&self) -> &BTreeMap<String, TensorType> {
+        &self.caches
+    }
+
+    pub fn validate_weights(&self, weights: &NamedTensors) -> Result<()> {
+        for (name, ty) in &self.weights {
+            let weight = weights.get(name).ok_or(FishError::InvalidShape(
+                "missing CubeCL model checkpoint weight",
+            ))?;
+            validate_binding(ty, weight)?;
+        }
+        if weights.len() != self.weights.len() {
+            return Err(FishError::InvalidShape(
+                "unknown CubeCL model checkpoint weight",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Immutable device weights shared between requests; no other backend resources are created.
+pub struct CubeClModel {
+    prepared: CubeClPreparedModel,
+    executor: CubeClGraphExecutor,
+    weights: BTreeMap<String, Handle>,
+}
+
+impl CubeClModel {
+    pub fn new(
+        client: Client,
+        prepared: CubeClPreparedModel,
+        weights: &NamedTensors,
+    ) -> Result<Self> {
+        prepared.validate_weights(weights)?;
+        let executor = CubeClGraphExecutor::new(client);
+        for compiled in prepared.graphs.values() {
+            executor.ensure_bf16_supported(compiled)?;
+        }
+        let mut device_weights = BTreeMap::new();
+        for (name, ty) in &prepared.weights {
+            device_weights.insert(name.clone(), executor.upload(ty, &weights[name]));
+        }
+        Ok(Self {
+            prepared,
+            executor,
+            weights: device_weights,
+        })
+    }
+
+    /// Upload semantic safetensors directly, one tensor at a time, avoiding a
+    /// complete intermediate F32 host checkpoint. F16/BF16 source weights are
+    /// converted to F32 using the existing validated checkpoint bridge.
+    pub fn from_checkpoint(
+        client: Client,
+        prepared: CubeClPreparedModel,
+        checkpoint: &crate::weights::LoadedWeights,
+    ) -> crate::weights::Result<Self> {
+        use crate::weights::WeightError;
+        use safetensors::Dtype;
+
+        if checkpoint.manifest().component != "semantic" {
+            return Err(WeightError::Invalid(
+                "CubeCL requires semantic model weights".into(),
+            ));
+        }
+        for (key, ty) in prepared.weight_specs() {
+            let view = checkpoint.tensor(key)?;
+            if view.shape() != ty.shape
+                || ty.dtype != ScalarType::F32
+                || !matches!(view.dtype(), Dtype::F32 | Dtype::F16 | Dtype::BF16)
+            {
+                return Err(WeightError::Invalid(format!(
+                    "CubeCL checkpoint weight dtype or shape mismatch: {key}"
+                )));
+            }
+        }
+        let executor = CubeClGraphExecutor::new(client);
+        for compiled in prepared.graphs.values() {
+            executor
+                .ensure_bf16_supported(compiled)
+                .map_err(|e| WeightError::Invalid(format!("CubeCL device unsupported: {e}")))?;
+        }
+        let mut weights = BTreeMap::new();
+        for (key, ty) in prepared.weight_specs() {
+            let bytes = checkpoint.semantic_f32_upload_bytes(key, ty)?;
+            weights.insert(key.clone(), executor.client().create_from_slice(&bytes));
+        }
+        Ok(Self {
+            prepared,
+            executor,
+            weights,
+        })
+    }
+
+    pub fn start_request(&self, limits: CubeClRequestLimits) -> Result<CubeClRequest<'_>> {
+        if limits.max_pending_bytes == 0
+            || limits.max_kv_bytes == 0
+            || limits.max_pending_steps == 0
+        {
+            return Err(FishError::InvalidConfig(
+                "CubeCL request limits must be positive",
+            ));
+        }
+        Ok(CubeClRequest {
+            model: self,
+            limits,
+            cursor: CubeClRequestCursor::default(),
+            caches: BTreeMap::new(),
+            retained: Vec::new(),
+            pending_bytes: 0,
+            pending_steps: 0,
+            kv_bytes: 0,
+            poisoned: false,
+        })
+    }
+
+    pub fn prepared(&self) -> &CubeClPreparedModel {
+        &self.prepared
+    }
+}
+
+pub struct CubeClRequest<'a> {
+    model: &'a CubeClModel,
+    limits: CubeClRequestLimits,
+    cursor: CubeClRequestCursor,
+    caches: BTreeMap<String, Handle>,
+    retained: Vec<Handle>,
+    pending_bytes: usize,
+    pending_steps: usize,
+    kv_bytes: usize,
+    poisoned: bool,
+}
+
+impl CubeClRequest<'_> {
+    pub fn cursor(&self) -> CubeClRequestCursor {
+        self.cursor
+    }
+
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    pub fn run(&mut self, key: &str, runtime: &NamedTensors) -> Result<NamedTensors> {
+        self.run_with_cancel(key, runtime, &mut || false)
+    }
+
+    /// Cancellation is checked before dispatch and after returning from device
+    /// readback. An in-flight cancellation poisons the request until an
+    /// explicit stream-synchronized reset; it never reuses speculative KV.
+    pub fn run_with_cancel(
+        &mut self,
+        key: &str,
+        runtime: &NamedTensors,
+        is_cancelled: &mut dyn FnMut() -> bool,
+    ) -> Result<NamedTensors> {
+        if self.poisoned {
+            return Err(FishError::InvalidTransition(
+                "CubeCL stream poisoned; reset required",
+            ));
+        }
+        if is_cancelled() {
+            return Err(FishError::InvalidTransition("synthesis cancelled"));
+        }
+        let result = self.run_inner(key, runtime)?;
+        if is_cancelled() {
+            self.poisoned = true;
+            return Err(FishError::InvalidTransition("synthesis cancelled"));
+        }
+        Ok(result)
+    }
+
+    fn run_inner(&mut self, key: &str, runtime: &NamedTensors) -> Result<NamedTensors> {
+        if self.poisoned {
+            return Err(FishError::InvalidTransition(
+                "CubeCL stream poisoned; reset required",
+            ));
+        }
+        let plan = self.model.prepared.graph(key)?;
+        plan.validate_runtime_inputs(runtime)?;
+        self.cursor.validate_step(plan.graph())?;
+        let graph = plan.graph();
+        let mut missing_kv = Vec::new();
+        for value in &graph.values {
+            if matches!(value.origin, Origin::Input) && is_cache_name(&value.name) {
+                if self.caches.contains_key(&value.name) {
+                    continue;
+                }
+                let expected_first = match graph.stage {
+                    Stage::SlowPrefill => true,
+                    Stage::FastDecode => self.cursor.fast_active_len == 0,
+                    _ => false,
+                };
+                if !expected_first {
+                    return Err(FishError::InvalidTransition(
+                        "CubeCL decode attempted without previous KV state",
+                    ));
+                }
+                missing_kv.push((value.name.clone(), value.ty.clone()));
+            }
+        }
+        let new_kv = missing_kv.iter().try_fold(0usize, |bytes, (_, ty)| {
+            bytes
+                .checked_add(tensor_bytes(ty)?)
+                .ok_or(FishError::InvalidShape("CubeCL KV byte count overflow"))
+        })?;
+        let projected_kv = self
+            .kv_bytes
+            .checked_add(new_kv)
+            .ok_or(FishError::InvalidShape("CubeCL KV byte count overflow"))?;
+        let scratch = graph
+            .values
+            .iter()
+            .filter(|v| matches!(v.origin, Origin::Node(_)))
+            .try_fold(0usize, |bytes, v| {
+                bytes
+                    .checked_add(tensor_bytes(&v.ty)?)
+                    .ok_or(FishError::InvalidShape(
+                        "CubeCL scratch byte count overflow",
+                    ))
+            })?;
+        let projected_pending =
+            self.pending_bytes
+                .checked_add(scratch)
+                .ok_or(FishError::InvalidShape(
+                    "CubeCL scratch byte count overflow",
+                ))?;
+        if projected_kv > self.limits.max_kv_bytes
+            || projected_pending > self.limits.max_pending_bytes
+            || self.pending_steps >= self.limits.max_pending_steps
+        {
+            return Err(FishError::InvalidTransition(
+                "CubeCL GPU memory or pending-submission budget exceeded",
+            ));
+        }
+        let mut inputs = self.model.weights.clone();
+        for value in &graph.values {
+            if matches!(value.origin, Origin::Input) && !is_cache_name(&value.name) {
+                inputs.insert(
+                    value.name.clone(),
+                    self.model.executor.upload(&value.ty, &runtime[&value.name]),
+                );
+            }
+        }
+        for (name, ty) in missing_kv {
+            self.caches.insert(name, self.model.executor.zeros(&ty)?);
+        }
+        self.kv_bytes = projected_kv;
+        for value in &graph.values {
+            if matches!(value.origin, Origin::Input) && is_cache_name(&value.name) {
+                inputs.insert(value.name.clone(), self.caches[&value.name].clone());
+            }
+        }
+        let result = self
+            .model
+            .executor
+            .execute_handles(plan, &inputs, &mut self.retained);
+        let outputs = match result {
+            Ok(outputs) => outputs,
+            Err(err) => {
+                self.poisoned = true;
+                self.pending_steps += 1;
+                self.pending_bytes = projected_pending;
+                return Err(err);
+            }
+        };
+        let mut next_caches = BTreeMap::new();
+        for node in &graph.nodes {
+            if let Op::KvUpdate { .. } = node.op {
+                let name = &graph.values[node.inputs[0].0].name;
+                next_caches.insert(
+                    name.clone(),
+                    outputs[&graph.values[node.result.0].name].clone(),
+                );
+            }
+        }
+        let cache_output_ids = graph
+            .nodes
+            .iter()
+            .filter_map(|node| matches!(node.op, Op::KvUpdate { .. }).then_some(node.result))
+            .collect::<BTreeSet<_>>();
+        let mut host = NamedTensors::new();
+        for output in &graph.outputs {
+            if cache_output_ids.contains(output) {
+                continue;
+            }
+            let value = &graph.values[output.0];
+            match self.model.executor.read(&value.ty, &outputs[&value.name]) {
+                Ok(data) => {
+                    host.insert(value.name.clone(), data);
+                }
+                Err(err) => {
+                    self.poisoned = true;
+                    self.pending_steps += 1;
+                    self.pending_bytes = projected_pending;
+                    return Err(err);
+                }
+            }
+        }
+        self.caches.extend(next_caches);
+        self.pending_steps += 1;
+        self.pending_bytes = projected_pending;
+        self.cursor.advance(graph);
+        Ok(host)
+    }
+
+    /// A new semantic token starts a fresh Fast AR history, without touching Slow KV.
+    /// Old handles remain retained until `retire_completed` synchronizes the stream.
+    pub fn reset_fast(&mut self) {
+        self.caches
+            .retain(|name, _| !name.starts_with("fast_layers."));
+        self.kv_bytes = self
+            .caches
+            .keys()
+            .filter_map(|key| self.model.prepared.caches.get(key))
+            .filter_map(|ty| tensor_bytes(ty).ok())
+            .sum();
+        self.cursor.reset_fast();
+    }
+
+    /// Explicitly wait for all outstanding submissions before retiring scratch handles.
+    pub async fn retire_completed(&mut self) -> Result<()> {
+        if self.model.executor.client().sync().await.is_err() {
+            self.poisoned = true;
+            return Err(FishError::InvalidTransition(
+                "CubeCL stream synchronization failed",
+            ));
+        }
+        self.retained.clear();
+        self.pending_steps = 0;
+        self.pending_bytes = 0;
+        Ok(())
+    }
+
+    pub async fn reset_request(&mut self) -> Result<()> {
+        self.retire_completed().await?;
+        self.caches.clear();
+        self.kv_bytes = 0;
+        self.cursor = CubeClRequestCursor::default();
+        self.poisoned = false;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fish_speech_core::{
+        config::FishModelConfig,
+        graph_ir::{Layout, ScalarType, TensorType},
+        transformer_ir::TransformerIrFactory,
+    };
+
+    #[test]
+    fn compiled_profiles_share_weight_specs_and_separate_slow_fast_kv() {
+        let config = FishModelConfig::synthetic_dual_ar_fixture();
+        let factory = TransformerIrFactory::new(&config).unwrap();
+        let plans = CubeClPreparedModel::compile([
+            ("prefill".into(), factory.slow_prefill(3).unwrap()),
+            ("decode4".into(), factory.slow_decode(4).unwrap()),
+            ("fast0".into(), factory.fast_decode(0).unwrap()),
+            ("fast1".into(), factory.fast_decode(1).unwrap()),
+        ])
+        .unwrap();
+        assert_eq!(plans.plan_count(), 4);
+        assert!(plans.weight_specs().len() > 30);
+        assert!(plans.cache_specs().contains_key("layers.0.k_cache"));
+        assert!(plans.cache_specs().contains_key("fast_layers.0.k_cache"));
+        assert_eq!(
+            plans.cache_specs()["layers.0.k_cache"].dtype,
+            ScalarType::BF16
+        );
+        assert!(plans.graph("missing").is_err());
+        let mut weights = NamedTensors::new();
+        for (name, ty) in plans.weight_specs() {
+            weights.insert(
+                name.clone(),
+                fish_speech_core::cpu_ir::TensorData::F32(vec![0.0; ty.shape.iter().product()]),
+            );
+        }
+        plans.validate_weights(&weights).unwrap();
+        weights.remove("norm.weight");
+        assert!(plans.validate_weights(&weights).is_err());
+        weights.insert(
+            "norm.weight".into(),
+            fish_speech_core::cpu_ir::TensorData::F32(vec![0.]),
+        );
+        assert!(plans.validate_weights(&weights).is_err());
+    }
+
+    #[test]
+    fn shape_conflicts_and_duplicate_profiles_fail_before_device_use() {
+        fn weighted_graph(width: usize) -> Graph {
+            let mut g = Graph::new(Stage::FastDecode, Some(1), Some(2));
+            let x = g
+                .input(
+                    "x",
+                    TensorType::new([1, 1, width], ScalarType::F32, Layout::SequenceBtd),
+                )
+                .unwrap();
+            let w = g
+                .weight(
+                    "weight",
+                    TensorType::new([width, width], ScalarType::F32, Layout::Plain),
+                )
+                .unwrap();
+            let y = g.emit("y", Op::Linear, &[x, w]).unwrap();
+            g.output(y).unwrap();
+            g
+        }
+        let a = weighted_graph(4);
+        assert!(
+            CubeClPreparedModel::compile([("same".into(), a.clone()), ("same".into(), a.clone())])
+                .is_err()
+        );
+        assert!(
+            CubeClPreparedModel::compile([("four".into(), a), ("eight".into(), weighted_graph(8))])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn request_cursor_enforces_prefill_decode_and_fast_reset() {
+        let config = FishModelConfig::synthetic_dual_ar_fixture();
+        let factory = TransformerIrFactory::new(&config).unwrap();
+        let prefill = factory.slow_prefill(3).unwrap();
+        let decode4 = factory.slow_decode(4).unwrap();
+        let decode5 = factory.slow_decode(5).unwrap();
+        let fast0 = factory.fast_decode(0).unwrap();
+        let fast1 = factory.fast_decode(1).unwrap();
+        let mut cursor = CubeClRequestCursor::default();
+        assert!(cursor.validate_step(&fast0).is_err());
+        assert!(cursor.validate_step(&decode4).is_err());
+        cursor.validate_step(&prefill).unwrap();
+        cursor.advance(&prefill);
+        assert_eq!(cursor.slow_active_len, 3);
+        assert!(cursor.validate_step(&prefill).is_err());
+        assert!(cursor.validate_step(&decode5).is_err());
+        cursor.validate_step(&decode4).unwrap();
+        cursor.advance(&decode4);
+        cursor.validate_step(&decode5).unwrap();
+        cursor.validate_step(&fast0).unwrap();
+        cursor.advance(&fast0);
+        assert_eq!(cursor.fast_active_len, 1);
+        assert!(cursor.validate_step(&fast0).is_err());
+        cursor.validate_step(&fast1).unwrap();
+        cursor.advance(&fast1);
+        cursor.reset_fast();
+        assert_eq!(cursor.fast_active_len, 0);
+        assert_eq!(cursor.slow_active_len, 4);
+        cursor.validate_step(&fast0).unwrap();
+    }
+
+    #[test]
+    fn automatic_dual_ar_and_naive_profiles_have_exact_position_keys() {
+        let dual = FishModelConfig::synthetic_dual_ar_fixture();
+        let profiles = CubeClPreparedModel::from_transformer(&dual, 3, 4).unwrap();
+        assert_eq!(profiles.plan_count(), dual.num_codebooks + 4);
+        assert!(profiles.graph("slow_prefill").is_ok());
+        for active in [4, 5, 6] {
+            assert_eq!(
+                profiles
+                    .graph(&format!("slow_decode_{active}"))
+                    .unwrap()
+                    .graph()
+                    .active_kv_len,
+                Some(active)
+            );
+        }
+        for i in 0..dual.num_codebooks {
+            assert!(profiles.graph(&format!("fast_{i}")).is_ok());
+        }
+        assert!(CubeClPreparedModel::from_transformer(&dual, 0, 2).is_err());
+        assert!(CubeClPreparedModel::from_transformer(&dual, 3, 65).is_err());
+        assert!(CubeClPreparedModel::from_transformer(&dual, 3, 0).is_err());
+
+        let mut naive = dual.clone();
+        naive.kind = ModelKind::Naive;
+        naive.fast = None;
+        naive.validate().unwrap();
+        let plans = CubeClPreparedModel::from_transformer(&naive, 3, 3).unwrap();
+        assert_eq!(plans.plan_count(), 3);
+        assert!(plans.graph("fast_0").is_err());
+        assert!(plans.graph("slow_decode_4").is_ok());
+        assert!(
+            plans
+                .graph("slow_prefill")
+                .unwrap()
+                .graph()
+                .values
+                .iter()
+                .any(|value| value.name == "codebook_logits")
+        );
+    }
+
+    #[test]
+    fn request_inputs_validate_without_loading_weights_every_step() {
+        let config = FishModelConfig::synthetic_dual_ar_fixture();
+        let graph = TransformerIrFactory::new(&config)
+            .unwrap()
+            .slow_decode(4)
+            .unwrap();
+        let plan = CubeClGraph::compile(&graph).unwrap();
+        let mut inputs = NamedTensors::new();
+        inputs.insert(
+            "tokens".into(),
+            fish_speech_core::cpu_ir::TensorData::I32(vec![0; config.num_codebooks + 1]),
+        );
+        inputs.insert(
+            "semantic_membership_lut".into(),
+            fish_speech_core::cpu_ir::TensorData::I32(vec![0; config.vocab_size]),
+        );
+        plan.validate_runtime_inputs(&inputs).unwrap();
+        inputs.insert(
+            "layers.0.k_cache".into(),
+            fish_speech_core::cpu_ir::TensorData::F32(vec![0.0]),
+        );
+        assert!(plan.validate_runtime_inputs(&inputs).is_err());
+        inputs.remove("layers.0.k_cache");
+        inputs.insert(
+            "tokens".into(),
+            fish_speech_core::cpu_ir::TensorData::I32(vec![-1; config.num_codebooks + 1]),
+        );
+        assert!(plan.validate_runtime_inputs(&inputs).is_err());
+    }
+}
