@@ -43,6 +43,16 @@ jobs:
           import json
           from pathlib import Path
 
+          private_key = Path("vendor/pem-rfc7468-1.0.0/tests/examples/ssh-id_ed25519.pem")
+          if private_key.is_file():
+              manifest = private_key.parents[2] / ".cargo-checksum.json"
+              source = json.loads(manifest.read_text())
+              removed = source["files"].pop("tests/examples/ssh-id_ed25519.pem", None)
+              if removed is None:
+                  raise RuntimeError("Unexpected vendored test fixture manifest")
+              private_key.unlink()
+              manifest.write_text(json.dumps(source, separators=(",", ":"), ensure_ascii=False))
+              print("Omitted upstream private-key test fixture from vendor package")
           drifted = []
           missing = []
           for package in sorted(Path("vendor").iterdir()):
