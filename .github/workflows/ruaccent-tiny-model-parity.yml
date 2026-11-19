@@ -17,7 +17,7 @@ jobs:
     timeout-minutes: 35
     env:
       HF_REVISION: b78ae5ea1e62beaf138bed1865cd8c3b0b5ca855
-      RUACCENT_TINY_WORKDIR: ${{ runner.temp }}/ruaccent-model
+      RUACCENT_TINY_WORKDIR: /tmp/ruaccent-model
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
