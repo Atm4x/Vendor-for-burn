@@ -109,9 +109,23 @@ def canonicalize(checkpoint, component: str):
     return result
 
 
+def validate_firefly_source_config(config_path: Path):
+    if config_path.suffix.lower() != ".json":
+        raise ValueError("Firefly exporter requires normalized JSON from normalize_firefly_config.py")
+    reference = json.loads((Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "firefly_1_5.json").read_text(encoding="utf-8"))
+    try:
+        supplied = json.loads(config_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeError) as exc:
+        raise ValueError("invalid normalized Firefly JSON configuration") from exc
+    if supplied != reference:
+        raise ValueError("Firefly config does not match the supported source variant")
+
+
 def export(checkpoint_path: Path, config_path: Path, destination: Path, component: str, source_license: str):
     if not source_license.strip():
         raise ValueError("source checkpoint license must be supplied explicitly")
+    if component == "firefly":
+        validate_firefly_source_config(config_path)
     source_sha = hash_file(checkpoint_path)
     config_sha = hash_file(config_path)
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True, mmap=True)

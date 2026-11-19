@@ -13,6 +13,7 @@ use fish_speech_core::tokenizer::SpecialTokens;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::firefly_config::{FireflyConfig, FireflyConfigError};
 use crate::fish_tokenizer::{FishBpeTokenizer, FishTokenizerError};
 use crate::model_config::{ModelConfigError, parse_checkpoint_config};
 use crate::reference_cache::{CachePolicy, ReferenceBytes, ReferenceCache};
@@ -30,6 +31,8 @@ pub enum ModelRuntimeError {
     Io(#[from] std::io::Error),
     #[error("semantic config: {0}")]
     Config(#[from] ModelConfigError),
+    #[error("Firefly config: {0}")]
+    FireflyConfig(#[from] FireflyConfigError),
     #[error("Fish tokenizer: {0}")]
     Tokenizer(#[from] FishTokenizerError),
     #[error("checkpoint: {0}")]
@@ -100,6 +103,7 @@ fn check_config_hash(component: &str, actual: &[u8], weights: &LoadedWeights) ->
 
 pub struct LoadedFishArtifacts {
     pub config: FishModelConfig,
+    pub firefly_config: FireflyConfig,
     pub tokenizer: FishBpeTokenizer,
     pub semantic: LoadedWeights,
     pub firefly: LoadedWeights,
@@ -141,8 +145,10 @@ impl LoadedFishArtifacts {
             ));
         }
         check_config_hash("firefly", &firefly_config_bytes, &firefly)?;
+        let firefly_config = FireflyConfig::parse_supported(&firefly_config_bytes)?;
         Ok(Self {
             config,
+            firefly_config,
             tokenizer,
             semantic,
             firefly,
@@ -329,9 +335,9 @@ mod tests {
         fs::create_dir_all(&sem).unwrap();
         fs::create_dir_all(&fire).unwrap();
         let json = br#"{"model_type":"naive","dim":16,"n_head":4,"n_local_heads":2,"n_layer":1,"vocab_size":1292,"num_codebooks":8,"codebook_size":1000,"max_seq_len":32}"#;
-        let firefly_config = b"original Firefly fixture config";
+        let firefly_config = include_bytes!("../tests/fixtures/firefly_1_5.json");
         fs::write(sem.join("config.json"), json).unwrap();
-        fs::write(fire.join("config.py"), firefly_config).unwrap();
+        fs::write(fire.join("config.json"), firefly_config).unwrap();
         let bpe = (0..=255u16)
             .map(|i| {
                 format!(
@@ -343,7 +349,7 @@ mod tests {
         fs::write(sem.join("tokenizer.tiktoken"), bpe).unwrap();
         make_manifest(&sem, "semantic", json);
         make_manifest(&fire, "firefly", firefly_config);
-        (root, ModelPaths::new(&sem, &fire, fire.join("config.py")))
+        (root, ModelPaths::new(&sem, &fire, fire.join("config.json")))
     }
 
     #[test]
@@ -364,6 +370,24 @@ mod tests {
         assert!(
             matches!(LoadedFishArtifacts::open(&paths), Err(ModelRuntimeError::Invalid(s)) if s.contains("semantic manifest"))
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unsupported_firefly_architecture_rejected_even_with_matching_manifest_hash() {
+        let (root, paths) = fixture();
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&fs::read(&paths.firefly_config_source).unwrap()).unwrap();
+        config["head"]["upsample_kernel_sizes"] = serde_json::json!([16, 16, 8, 2, 2]);
+        let config_bytes = serde_json::to_vec(&config).unwrap();
+        fs::write(&paths.firefly_config_source, &config_bytes).unwrap();
+        make_manifest(&paths.firefly_dir, "firefly", &config_bytes);
+        assert!(matches!(
+            LoadedFishArtifacts::open(&paths),
+            Err(ModelRuntimeError::FireflyConfig(
+                FireflyConfigError::Unsupported(_)
+            ))
+        ));
         fs::remove_dir_all(root).unwrap();
     }
 

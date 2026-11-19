@@ -14,6 +14,8 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
+from normalize_firefly_config import normalize_config
+
 
 class ResidualFsqParameterScaffold(nn.Module):
     def __init__(self, width: int):
@@ -57,7 +59,7 @@ def load_reference(source: Path):
     return firefly, fsq
 
 
-def source_weights(firefly, fsq):
+def source_weights(firefly, fsq, config):
     original_linspace = torch.linspace
     with torch.device("meta"), patch(
         "torch.linspace",
@@ -65,31 +67,12 @@ def source_weights(firefly, fsq):
             *args, **{**kwargs, "device": "cpu"}
         ),
     ):
-        backbone = firefly.ConvNeXtEncoder(
-            input_channels=160,
-            depths=[3, 3, 9, 3],
-            dims=[128, 256, 384, 512],
-            drop_path_rate=0.2,
-            kernel_size=7,
-        )
-        head = firefly.HiFiGANGenerator(
-            hop_length=512,
-            upsample_rates=(8, 8, 2, 2, 2),
-            upsample_kernel_sizes=(16, 16, 4, 4, 4),
-            resblock_kernel_sizes=(3, 7, 11),
-            resblock_dilation_sizes=((1, 3, 5),) * 3,
-            num_mels=512,
-            upsample_initial_channel=512,
-            pre_conv_kernel_size=13,
-            post_conv_kernel_size=13,
-        )
-        quantizer = fsq.DownsampleFiniteScalarQuantize(
-            input_dim=512,
-            n_groups=8,
-            n_codebooks=1,
-            levels=(8, 5, 5, 5),
-            downsample_factor=(2, 2),
-        )
+        def kwargs(component):
+            return {key: value for key, value in config[component].items() if key != "_target_"}
+
+        backbone = firefly.ConvNeXtEncoder(**kwargs("backbone"))
+        head = firefly.HiFiGANGenerator(**kwargs("head"))
+        quantizer = fsq.DownsampleFiniteScalarQuantize(**kwargs("quantizer"))
         model = firefly.FireflyArchitecture(
             backbone=backbone,
             head=head,
@@ -128,9 +111,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, required=True, help="Python vqgan/modules directory")
     parser.add_argument("--expected", type=Path, required=True, help="Rust --firefly-weight-shapes TSV")
+    parser.add_argument("--config", type=Path, required=True, help="Original static Python config.py")
     args = parser.parse_args()
     firefly, fsq = load_reference(args.source)
-    source = source_weights(firefly, fsq)
+    config = normalize_config(args.config.read_text(encoding="utf-8"))
+    source = source_weights(firefly, fsq, config)
     expected = expected_weights(args.expected)
     missing = {key: value for key, value in expected.items() if key not in source}
     extra = {key: value for key, value in source.items() if key not in expected}

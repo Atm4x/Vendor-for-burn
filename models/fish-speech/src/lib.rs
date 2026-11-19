@@ -23,6 +23,7 @@ pub mod trtx_lowering;
 pub mod ar_input_contract;
 pub mod ar_weight_bindings;
 pub mod device_memory;
+pub mod firefly_config;
 pub mod fish_tokenizer;
 pub mod model_config;
 pub mod model_runtime;

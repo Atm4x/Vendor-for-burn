@@ -50,9 +50,9 @@ class ExportCheckpointTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
             checkpoint = root / "firefly.pth"
-            config = root / "config.py"
+            config = root / "config.json"
             output = root / "exported"
-            config.write_text("FIREFLY_GAN_VQ_CONFIG = {}", encoding="utf-8")
+            config.write_bytes((Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "firefly_1_5.json").read_bytes())
             torch.save({"state_dict": {"generator.head.conv_pre.conv.weight": torch.randn(2, 3, 7),
                                       "optimizer.weight": torch.randn(2, 3)}}, checkpoint)
             manifest = export(checkpoint, config, output, "firefly", "test-fixture-license")
@@ -60,6 +60,17 @@ class ExportCheckpointTests(unittest.TestCase):
             self.assertTrue((output / "manifest.json").is_file())
             self.assertTrue((output / "firefly.safetensors").is_file())
             self.assertEqual(len(manifest["source_checkpoint_sha256"]), 64)
+
+    def test_unrecognized_firefly_variant_is_rejected_before_export(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            checkpoint = root / "firefly.pth"
+            config = root / "config.json"
+            torch.save({"generator.conv.weight": torch.ones(1, 1, 1)}, checkpoint)
+            config.write_text('{"_target_":"unexpected"}', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "not match"):
+                export(checkpoint, config, root / "exported", "firefly", "fixture")
+            self.assertFalse((root / "exported").exists())
 
     def test_unmatched_norm_is_rejected(self):
         with self.assertRaises(ValueError):
