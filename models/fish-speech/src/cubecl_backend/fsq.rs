@@ -289,16 +289,43 @@ impl CubeClFsqExecutor {
         features: &AudioTensor,
     ) -> Result<Vec<i32>> {
         let width = encoder.validate()?;
+        if features.channels != encoder.projections.len() * width
+            || features.data.iter().any(|v| !v.is_finite())
+        {
+            return Err(FishError::InvalidShape("invalid CubeCL FSQ input"));
+        }
+        let input = self
+            .client
+            .create_from_slice(bytemuck::cast_slice(&features.data));
+        self.encode_device(
+            encoder,
+            input,
+            features.batch,
+            features.channels,
+            features.frames,
+        )
+    }
+
+    /// Encodes a resident feature tensor without an intermediate CPU readback.
+    /// The caller owns the input handle and must retain it through completion.
+    pub(super) fn encode_device(
+        &self,
+        encoder: &GroupedResidualFsqEncoder,
+        input: cubecl::server::Handle,
+        batch: usize,
+        channels: usize,
+        frames: usize,
+    ) -> Result<Vec<i32>> {
+        let width = encoder.validate()?;
         let groups = encoder.projections.len();
         let dims = encoder.codebook.levels.len();
         let quantizers = encoder.num_quantizers;
-        if features.channels != groups * width || features.data.iter().any(|v| !v.is_finite()) {
-            return Err(FishError::InvalidShape(
-                "CubeCL FSQ feature extent or values invalid",
-            ));
+        if channels != groups * width {
+            return Err(FishError::InvalidShape("CubeCL FSQ feature width invalid"));
         }
-        let projected_len = checked_len(&[features.batch, groups, features.frames, dims])?;
-        let packed_len = checked_len(&[features.batch, groups, quantizers, features.frames])?;
+        let input_len = checked_len(&[batch, channels, frames])?;
+        let projected_len = checked_len(&[batch, groups, frames, dims])?;
+        let packed_len = checked_len(&[batch, groups, quantizers, frames])?;
         let digits_len = checked_len(&[projected_len, quantizers])?;
         let weights = encoder
             .projections
@@ -349,7 +376,6 @@ impl CubeClFsqExecutor {
             })
             .collect::<Vec<_>>();
         let client = &self.client;
-        let input = client.create_from_slice(bytemuck::cast_slice(&features.data));
         let w = client.create_from_slice(bytemuck::cast_slice(&weights));
         let b = client.create_from_slice(bytemuck::cast_slice(&bias));
         let l = client.create_from_slice(bytemuck::cast_slice(&levels));
@@ -364,7 +390,7 @@ impl CubeClFsqExecutor {
             client,
             launch_geometry(projected_len)?,
             CubeDim::new_1d(128),
-            unsafe { BufferArg::from_raw_parts(input, features.data.len()) },
+            unsafe { BufferArg::from_raw_parts(input, input_len) },
             unsafe { BufferArg::from_raw_parts(w, weights.len()) },
             unsafe { BufferArg::from_raw_parts(b, bias.len()) },
             unsafe { BufferArg::from_raw_parts(half.clone(), dims) },
@@ -372,7 +398,7 @@ impl CubeClFsqExecutor {
             unsafe { BufferArg::from_raw_parts(sh.clone(), dims) },
             unsafe { BufferArg::from_raw_parts(projected.clone(), projected_len) },
             unsafe { BufferArg::from_raw_parts(invalid.clone(), projected_len) },
-            features.frames,
+            frames,
             groups,
             width,
             dims,
@@ -401,7 +427,7 @@ impl CubeClFsqExecutor {
             unsafe { BufferArg::from_raw_parts(digits, digits_len) },
             unsafe { BufferArg::from_raw_parts(radix, dims) },
             unsafe { BufferArg::from_raw_parts(packed.clone(), packed_len) },
-            features.frames,
+            frames,
             groups,
             quantizers,
             dims,
@@ -646,5 +672,53 @@ mod tests {
         assert!(gpu().encode(&encoder, &bad).is_err());
         let bad = AudioTensor::new(1, 1, 1, vec![0.0]).unwrap();
         assert!(gpu().encode(&encoder, &bad).is_err());
+    }
+}
+
+#[cfg(all(test, feature = "cubecl-cpu"))]
+mod resident_tests {
+    use super::*;
+    use cubecl::Device;
+    use fish_speech_core::fsq_cpu::{FsqCodebook, FsqGroupProjection};
+
+    #[test]
+    fn resident_feature_encode_matches_cpu_and_uploaded_path() {
+        let client = Device::Cpu(Default::default()).client();
+        let backend = CubeClFsqExecutor::new(client.clone());
+        let encoder = GroupedResidualFsqEncoder {
+            codebook: FsqCodebook::new(&[8, 5, 5, 5]).unwrap(),
+            num_quantizers: 2,
+            projections: (0..2)
+                .map(|g| FsqGroupProjection {
+                    weights: (0..24)
+                        .map(|i| ((i * 19 + g * 7) % 37) as f32 / 100.0 - 0.2)
+                        .collect(),
+                    bias: vec![0.0; 4],
+                })
+                .collect(),
+        };
+        let features = AudioTensor::new(
+            2,
+            12,
+            7,
+            (0..168)
+                .map(|i| ((i * 13) % 47) as f32 / 23.0 - 1.0)
+                .collect(),
+        )
+        .unwrap();
+        let original = client.create_from_slice(bytemuck::cast_slice(&features.data));
+        let resident = backend
+            .encode_device(
+                &encoder,
+                original,
+                features.batch,
+                features.channels,
+                features.frames,
+            )
+            .unwrap();
+        let expected = encoder.encode(&features).unwrap();
+        let uploaded = backend.encode(&encoder, &features).unwrap();
+        assert_eq!(resident, expected);
+        assert_eq!(resident, uploaded);
     }
 }

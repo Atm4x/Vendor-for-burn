@@ -130,3 +130,41 @@ pub(super) fn layer_scale_residual_kernel(
         output[ABSOLUTE_POS] = original[ABSOLUTE_POS] + projected[ABSOLUTE_POS] * gamma[ch];
     }
 }
+
+#[cube(launch)]
+pub(super) fn channel_scale_kernel(
+    input: &[f32],
+    gamma: &[f32],
+    output: &mut [f32],
+    #[comptime] channels: usize,
+    #[comptime] frames: usize,
+) {
+    if ABSOLUTE_POS < output.len() {
+        let channel = (ABSOLUTE_POS / frames) % channels;
+        output[ABSOLUTE_POS] = input[ABSOLUTE_POS] * gamma[channel];
+    }
+}
+
+#[cube(launch)]
+pub(super) fn add_tensor_kernel(left: &[f32], right: &[f32], output: &mut [f32]) {
+    if ABSOLUTE_POS < output.len() {
+        output[ABSOLUTE_POS] = left[ABSOLUTE_POS] + right[ABSOLUTE_POS];
+    }
+}
+
+#[cube(launch)]
+pub(super) fn temporal_mask_kernel(
+    input: &[f32],
+    output: &mut [f32],
+    #[comptime] frames: usize,
+    #[comptime] valid_frames: usize,
+) {
+    if ABSOLUTE_POS < output.len() {
+        let frame = ABSOLUTE_POS % frames;
+        output[ABSOLUTE_POS] = if frame < valid_frames {
+            input[ABSOLUTE_POS]
+        } else {
+            0.0f32
+        };
+    }
+}

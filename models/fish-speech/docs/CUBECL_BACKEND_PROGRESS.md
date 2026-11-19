@@ -1,6 +1,6 @@
 # Fish Speech 1.5 — CubeCL implementation tracker
 
-Baseline: `codex/fish-speech`; updated during CONT45 (2026-11-19).
+Baseline: `codex/fish-speech`; updated during CONT46 (2026-11-19).
 
 **Meaning:** This is a checklist of implementation/verification gates, not a benchmark, a statement of GPU operability, or the percentage of the original Fish Speech functional port. The checklist denominator is fixed at **26 gates**, allocated C01=4, C02=6, C03=4, C04=4, C05=4, C06=4. A gate for numeric parity stays open until the actual CubeCL runtime executes and its results are compared with a reference. Pure graph compilation does not satisfy that gate.
 
@@ -41,7 +41,7 @@ Baseline: `codex/fish-speech`; updated during CONT45 (2026-11-19).
 ## C05 — CubeCL Firefly: 1/4
 
 - [x] Native grouped residual FSQ encode/decode, executed on CubeCL CPU and compared against Core CPU and existing Python-source-formula golden fixtures. Multi-batch, multi-group, multiple quantizer counts, ignored `-1` codes, malformed indices, non-finite inputs and 27 geometry combinations tested. Public `CubeClFsqExecutor` exposes encode and decode; CPU is a reference, never a compute fallback. These APIs currently transfer inputs/outputs to the host and do not yet integrate with the Firefly ConvNeXt/HiFiGAN graph.
-- [ ] ConvNeXt encoder and related transforms. CONT45 implements a native CubeCL ConvNeXt block (depthwise/grouped Conv1d, LayerNorm, two channel-linear layers, GELU, LayerScale, residual), a multi-block device-resident chain and generic grouped/downsampling Conv1d. Block parameters can be bound directly from the canonical Firefly Graph IR checkpoint keys. Synthetic actual CubeCL CPU parity covers five ConvNeXt profiles, three chained blocks, five grouped/downsampling convolutions, and one real reference-encoder graph profile. **Still open:** execute the entire ConvNeXt backbone and reference encoder DAG, including LogMel/masks, FSQ graph handoff and device-resident checkpoint ownership. Do not count a standalone block as a complete encoder.
+- [ ] ConvNeXt encoder and related transforms. CONT45 implemented native ConvNeXt and grouped/downsampling Conv1d. **CONT46 implements a complete 156-node reference encoder DAG from an explicit LogMel boundary through masks, backbone stages, feature downsampling and FSQ quantization.** Kernel execution is device-resident across ConvNeXt and FSQ, with readback only of final codes and FSQ error status. Both complete single-batch and two-batch synthetic checkpoint tests passed on CubeCL CPU; the final codes match Core CPU FSQ applied to reference features. Graph dependencies, checkpoint keys, dimensions and finite values are preflighted before dispatch. **Still open for this gate:** native CubeCL LogMel (the optional PCM entrypoint currently uses an explicit CPU preprocessor), reusable/model-scoped checkpoint weight handles, and full reference checkpoint parity. Do not interpret synthetic parity as actual-model acceptance.
 - [ ] HiFiGAN / ConvTranspose audio decoder.
 - [ ] Full reference encoding, audio output and numerical parity.
 
@@ -51,6 +51,23 @@ Baseline: `codex/fish-speech`; updated during CONT45 (2026-11-19).
 - [ ] Checkpoint + audio trace parity versus Python / TensorRT with fixed seeds.
 - [ ] Load/first-token/generation/RTF throughput and memory benchmarks.
 - [ ] Profiler-driven kernel optimization and resource lifetime acceptance.
+
+## Verification ledger — CONT46
+
+| Check | Status |
+| --- | --- |
+| Graph IR LogMel → downsample Conv1d → channel LayerNorm → ConvNeXt residual vs Core CPU reference | PASS: real CubeCL CPU kernel execution; synthetic 128-channel stage, all three intermediate boundaries |
+| Entire 156-node reference encoder DAG from external LogMel through FSQ encode | PASS: 1-batch synthetic checkpoint, FSQ codes match CPU FSQ on independently executed reference features |
+| Two-batch CPU LogMel preprocessing → device encoder → FSQ encode | PASS: explicit CPU transform boundary and native CubeCL feature/FSQ path |
+| Native FSQ encode accepts device-owned F32 handles without feature readback | PASS: 2 groups, 2 quantizers, 2 batches compared to CPU and uploaded path |
+| Deterministic preflight rejects missing/NaN/malformed checkpoint bindings and incompatible LogMel shapes | PASS |
+| Native CubeCL LogMel and real-checkpoint numeric parity | NOT IMPLEMENTED / NOT VERIFIED |
+| Windows CUDA, TRT branch integration and GPU throughput | NOT VERIFIED / UNCHANGED |
+| Full `cubecl-cpu` library regression | PASS: 102 passed, 4 ignored (both large encoder tests separately run and passed) |
+| Separate ignored full encoder tests | PASS: 1/1 for single batch, 1/1 for two batches |
+| `cubecl-backend` feature regression | PASS: 72 passed, 2 ignored |
+| Default library / Core library | PASS: 58 passed, 2 ignored / 208 passed, 2 ignored |
+| Rustfmt / git diff hygiene | PASS |
 
 ## Verification ledger — CONT45
 

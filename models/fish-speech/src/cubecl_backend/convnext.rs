@@ -422,3 +422,5 @@ impl CubeClConvNextExecutor {
 
 #[cfg(all(test, feature = "cubecl-cpu"))]
 mod tests;
+
+mod encoder;
