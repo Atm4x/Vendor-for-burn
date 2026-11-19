@@ -113,6 +113,25 @@ impl SileroTts {
         })
     }
 
+    /// Run the same Silero acoustic model with explicitly selected RUAccent text preparation.
+    /// Normal `text` requests always retain SileroStress; this method is opt-in.
+    #[cfg(feature = "ruaccent")]
+    pub fn infer_text_with_ruaccent(
+        &self,
+        text: &str,
+        speaker: &str,
+        sample_rate: u32,
+        ruaccent: &mut ruaccent_rs::RuAccent,
+    ) -> Result<Vec<f32>> {
+        let speaker_id = self.config.validate_speaker(speaker)? as i64;
+        self.config.validate_sample_rate(sample_rate)?;
+        longform::infer_text_chunks(text, sample_rate, |fragment| {
+            let prepared = self.config.prepare_text(fragment)?;
+            let accented = ruaccent.process_all(&prepared.sentence);
+            self.infer_accented_single(&accented, speaker_id, sample_rate)
+        })
+    }
+
     /// Original `<speak>` SSML entrypoint with nested prosody, sentence breaks,
     /// pause overrides, and voice-specific F0 adjustment. The session stays loaded.
     pub fn infer_ssml(&self, ssml: &str, speaker: &str, sample_rate: u32) -> Result<Vec<f32>> {

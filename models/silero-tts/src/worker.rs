@@ -79,6 +79,7 @@ pub fn capabilities() -> Value {
         "speaker_names": ["aidar", "baya", "kseniya", "eugene", "xenia"],
         "sample_rates": [8000, 24000, 48000],
         "inference_inputs": ["text", "ssml", "accented", "symbol_durations"],
+        "optional_text_providers": if cfg!(feature = "ruaccent") { vec!["ruaccent"] } else { vec![] },
         "outputs": ["inline_f32le", "wav_file"],
         "cancel_supported": false,
         "persistent_weights": true,
@@ -97,6 +98,8 @@ pub fn capabilities() -> Value {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Input {
     Text { text: String, #[serde(default)] options: TextOptions },
+    #[cfg(feature = "ruaccent")]
+    RuaccentText { text: String },
     Ssml { ssml: String, #[serde(default)] options: TextOptions },
     Accented { text: String },
     SymbolDurations {
@@ -128,6 +131,10 @@ pub enum Request {
         model_dir: PathBuf,
         backend: BackendName,
         #[serde(default)] device_index: usize,
+        #[cfg(feature = "ruaccent")]
+        ruaccent_dir: Option<PathBuf>,
+        #[cfg(feature = "ruaccent")]
+        ruaccent_omograph_model: Option<String>,
     },
     Warmup {
         request_id: String,
@@ -194,6 +201,8 @@ struct Loaded {
     device_index: usize,
     warmed: bool,
     successful_inferences: u64,
+    #[cfg(feature = "ruaccent")]
+    ruaccent: Option<ruaccent_rs::RuAccent>,
 }
 
 #[derive(Default)]
@@ -219,7 +228,14 @@ impl Worker {
     fn execute(&mut self, request: Request) -> Result<(Value, bool)> {
         match request {
             Request::Capabilities { .. } => Ok((capabilities(), false)),
-            Request::Load { model_dir, backend, device_index, .. } => {
+            Request::Load {
+                model_dir, backend, device_index,
+                #[cfg(feature = "ruaccent")]
+                ruaccent_dir,
+                #[cfg(feature = "ruaccent")]
+                ruaccent_omograph_model,
+                ..
+            } => {
                 if self.loaded.is_some() {
                     bail!("A model is already loaded; unload before loading a different model");
                 }
@@ -228,7 +244,28 @@ impl Worker {
                     .with_context(|| format!("Model directory is inaccessible: {}", model_dir.display()))?;
                 let model = SileroTts::load(&canonical, &device)
                     .with_context(|| format!("Loading model from {}", canonical.display()))?;
-                self.loaded = Some(Loaded { model, model_dir: canonical, backend, device_index, warmed: false, successful_inferences: 0 });
+                #[cfg(feature = "ruaccent")]
+                let ruaccent = match ruaccent_dir {
+                    Some(path) => {
+                        let path = path.canonicalize().with_context(|| {
+                            format!("RUAccent model directory is inaccessible: {}", path.display())
+                        })?;
+                        Some(ruaccent_rs::RuAccent::load_with_omograph(
+                            &path, ruaccent_omograph_model.as_deref().unwrap_or("tiny"),
+                        ).map_err(|e| anyhow::anyhow!("RUAccent initialization failed: {e}"))?)
+                    },
+                    None => {
+                        anyhow::ensure!(ruaccent_omograph_model.is_none(),
+                            "ruaccent_omograph_model requires ruaccent_dir");
+                        None
+                    }
+                };
+                self.loaded = Some(Loaded {
+                    model, model_dir: canonical, backend, device_index,
+                    warmed: false, successful_inferences: 0,
+                    #[cfg(feature = "ruaccent")]
+                    ruaccent,
+                });
                 Ok((self.status(), false))
             }
             Request::Warmup { text, speaker, sample_rate, .. } => {
@@ -246,6 +283,13 @@ impl Worker {
                 let start = Instant::now();
                 let samples = match input {
                     Input::Text { text, options } => loaded.model.infer_text_with_options(&text, &speaker, sample_rate, &options)?,
+                    #[cfg(feature = "ruaccent")]
+                    Input::RuaccentText { text } => {
+                        let ruaccent = loaded.ruaccent.as_mut().context(
+                            "RUAccent not loaded: supply ruaccent_dir in the load request",
+                        )?;
+                        loaded.model.infer_text_with_ruaccent(&text, &speaker, sample_rate, ruaccent)?
+                    },
                     Input::Ssml { ssml, options } => loaded.model.infer_ssml_with_options(&ssml, &speaker, sample_rate, &options)?,
                     Input::Accented { text } => loaded.model.infer_accented(&text, &speaker, sample_rate)?,
                     Input::SymbolDurations { text, durations, options } => loaded.model.infer_text_with_symbol_durations(&text, &speaker, sample_rate, &durations, &options)?,
@@ -344,6 +388,28 @@ pub fn serve<R: BufRead, W: Write>(mut reader: R, mut writer: W) -> io::Result<(
         if shutdown { break; }
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "ruaccent"))]
+mod ruaccent_protocol_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_provider_is_opt_in() {
+        let req: Request = serde_json::from_str(r#"{"command":"infer","request_id":"ra","speaker":"aidar","sample_rate":8000,"input":{"kind":"ruaccent_text","text":"На двери замок."}}"#).unwrap();
+        assert!(matches!(req, Request::Infer { input: Input::RuaccentText { .. }, .. }));
+        let original: Request = serde_json::from_str(r#"{"command":"infer","request_id":"old","speaker":"aidar","sample_rate":8000,"input":{"kind":"text","text":"На двери замок."}}"#).unwrap();
+        assert!(matches!(original, Request::Infer { input: Input::Text { .. }, .. }));
+        assert_eq!(capabilities()["optional_text_providers"][0], "ruaccent");
+    }
+
+    #[test]
+    fn optional_model_pack_is_not_loaded_by_default() {
+        let legacy: Request = serde_json::from_str(r#"{"command":"load","request_id":"old","backend":"flex","model_dir":"/tmp/silero"}"#).unwrap();
+        assert!(matches!(legacy, Request::Load { ruaccent_dir: None, ruaccent_omograph_model: None, .. }));
+        let selected: Request = serde_json::from_str(r#"{"command":"load","request_id":"new","backend":"flex","model_dir":"/tmp/silero","ruaccent_dir":"/tmp/ruaccent","ruaccent_omograph_model":"tiny"}"#).unwrap();
+        assert!(matches!(selected, Request::Load { ruaccent_dir: Some(_), .. }));
+    }
 }
 
 #[cfg(test)]
