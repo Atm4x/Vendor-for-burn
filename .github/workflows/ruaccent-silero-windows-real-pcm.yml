@@ -25,7 +25,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --quiet torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install --quiet 'safetensors>=0.4,<1' 'huggingface_hub[hf_xet]>=0.34,<1'
+          python -m pip install --quiet 'numpy>=1.26,<3' 'safetensors>=0.4,<1' 'huggingface_hub[hf_xet]>=0.34,<1'
           mkdir -p "$RUNNER_TEMP/model-assets/silero" "$RUNNER_TEMP/model-assets/ruaccent" "$RUNNER_TEMP/evidence"
           curl -fL --retry 3 --retry-delay 2 \
             https://models.silero.ai/models/tts/ru/v5_ru.pt -o "$RUNNER_TEMP/v5_ru.pt"
