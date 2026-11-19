@@ -76,6 +76,9 @@ jobs:
     needs: prepare-models
     runs-on: windows-2025
     timeout-minutes: 55
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
