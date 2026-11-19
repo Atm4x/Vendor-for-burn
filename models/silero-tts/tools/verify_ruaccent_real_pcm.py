@@ -21,6 +21,9 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
+    sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
+
     report = {"checks": [], "errors": [], "passed": False}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()
