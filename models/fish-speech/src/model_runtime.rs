@@ -169,6 +169,41 @@ impl LoadedFishArtifacts {
     }
 }
 
+#[cfg(feature = "cubecl-backend")]
+impl FishModel<crate::cubecl_backend::CubeClSemanticGenerator> {
+    pub fn open_cubecl(
+        paths: &ModelPaths,
+        client: cubecl::prelude::Client,
+        seed: u64,
+        mode: SelectionMode,
+        limits: crate::cubecl_backend::CubeClRequestLimits,
+    ) -> Result<Self> {
+        LoadedFishArtifacts::open(paths)?.into_cubecl_model(client, seed, mode, limits)
+    }
+}
+
+#[cfg(feature = "cubecl-backend")]
+impl LoadedFishArtifacts {
+    pub fn into_cubecl_model(
+        self,
+        client: cubecl::prelude::Client,
+        seed: u64,
+        mode: SelectionMode,
+        limits: crate::cubecl_backend::CubeClRequestLimits,
+    ) -> Result<FishModel<crate::cubecl_backend::CubeClSemanticGenerator>> {
+        let generator = crate::cubecl_backend::CubeClSemanticGenerator::new(
+            client,
+            self.config.clone(),
+            self.semantic,
+            self.tokenizer.special_tokens(),
+            seed,
+            mode,
+            limits,
+        )?;
+        FishModel::from_components(self.config, self.tokenizer, self.firefly, generator)
+    }
+}
+
 struct FishModelParts<G> {
     config: FishModelConfig,
     special: SpecialTokens,
@@ -184,6 +219,9 @@ pub struct FishModel<G> {
 }
 
 pub type CpuFishModel = FishModel<CpuSemanticGenerator>;
+
+#[cfg(feature = "cubecl-backend")]
+pub type CubeClFishModel = FishModel<crate::cubecl_backend::CubeClSemanticGenerator>;
 
 impl FishModel<CpuSemanticGenerator> {
     pub fn open(paths: &ModelPaths, seed: u64, mode: SelectionMode) -> Result<Self> {

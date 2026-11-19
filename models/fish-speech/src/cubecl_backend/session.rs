@@ -565,6 +565,33 @@ impl CubeClRequest<'_> {
         Ok(())
     }
 
+    /// Synchronous retirement for the synchronous `SemanticGenerator` boundary.
+    /// A wake-capable parker is used rather than spinning on a pending device future.
+    pub fn retire_blocking(&mut self) -> Result<()> {
+        use std::future::Future;
+        use std::sync::Arc;
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct ThreadWake(std::thread::Thread);
+        impl Wake for ThreadWake {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        let waker: Waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
+        let mut context = Context::from_waker(&waker);
+        let mut pending = std::pin::pin!(self.retire_completed());
+        loop {
+            match pending.as_mut().poll(&mut context) {
+                Poll::Ready(result) => return result,
+                Poll::Pending => std::thread::park(),
+            }
+        }
+    }
+
     pub async fn reset_request(&mut self) -> Result<()> {
         self.retire_completed().await?;
         self.caches.clear();
@@ -572,6 +599,14 @@ impl CubeClRequest<'_> {
         self.cursor = CubeClRequestCursor::default();
         self.poisoned = false;
         Ok(())
+    }
+}
+
+impl Drop for CubeClRequest<'_> {
+    fn drop(&mut self) {
+        if self.pending_steps != 0 {
+            let _ = self.retire_blocking();
+        }
     }
 }
 

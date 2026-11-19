@@ -1,10 +1,10 @@
 # Fish Speech 1.5 — CubeCL implementation tracker
 
-Baseline: `codex/fish-speech`; updated during CONT37 (2026-11-19).
+Baseline: `codex/fish-speech`; updated during CONT38 (2026-11-19).
 
 **Meaning:** This is a checklist of implementation/verification gates, not a benchmark, a statement of GPU operability, or the percentage of the original Fish Speech functional port. The checklist denominator is fixed at **26 gates**, allocated C01=4, C02=6, C03=4, C04=4, C05=4, C06=4. A gate for numeric parity stays open until the actual CubeCL runtime executes and its results are compared with a reference. Pure graph compilation does not satisfy that gate.
 
-**Overall: 10/26 = 38.5% implementation gates**. CubeCL numerical execution: unverified. CubeCL CUDA/Windows inference: unverified.
+**Overall: 11/26 = 42.3% implementation gates**. CubeCL numerical execution: unverified. CubeCL CUDA/Windows inference: unverified.
 
 ## C01 — bootstrap: 3/4
 
@@ -24,12 +24,12 @@ Baseline: `codex/fish-speech`; updated during CONT37 (2026-11-19).
 
 **C02 caveats:** implementations currently use correctness-first scalar reference kernels and host-staged graph bindings. This is not a persistent KV device owner, an optimized attention engine or a streaming generation backend. `TokenEmbedding` and `FishEmbedding` currently require external token IDs; device-generated indices are rejected at compile time pending a device-side error channel. Reuse of RoPE coefficient uploads should be optimized after numerical verification.
 
-## C03 — stream-ordered CubeCL autoregression: 2/4
+## C03 — stream-ordered CubeCL autoregression: 3/4
 
 - [ ] Backend-neutral execution plan/segments (decouple `ArStreamDevice` from `TrtBlueprint`). `GraphExecutionPlan` is now backend-neutral and used by CubeCL, but the old TensorRT-specific trait is retained and still requires consolidation.
 - [x] Reusable model-scoped weight uploads, compiled graph cache and device buffer lifetime. `CubeClPreparedModel`/`CubeClModel` own prepared profiles and one-time device weight handles; direct `LoadedWeights` upload is supported.
 - [x] Request-scoped KV, synchronization, cancellation and rollback/reset semantics. `CubeClRequest` preserves BF16 device cache handles and retains scratch until async stream synchronization; cancellation and post-enqueue failures poison the request. Runtime execution still requires hardware testing.
-- [ ] Native CubeCL `SemanticGenerator` for DualAR and Naive behind the existing TTS API.
+- [x] Native CubeCL `SemanticGenerator` for DualAR and Naive behind the existing TTS API. `CubeClSemanticGenerator` dispatches to `CubeClRequest` and the shared Core DualAR/Naive controllers; CPU host sampling/readback remains pending C04. Public `CubeClFishModel`/`open_cubecl` are available.
 
 ## C04 — complete generation: 0/4
 
@@ -52,15 +52,15 @@ Baseline: `codex/fish-speech`; updated during CONT37 (2026-11-19).
 - [ ] Load/first-token/generation/RTF throughput and memory benchmarks.
 - [ ] Profiler-driven kernel optimization and resource lifetime acceptance.
 
-## Verification ledger — CONT37
+## Verification ledger — CONT38
 
 | Check | Status |
 | --- | --- |
-| `cargo test --offline --locked --features cubecl-backend --lib` | PASS: 69 library tests, 2 ignored |
+| `cargo test --offline --locked --features cubecl-backend --lib` | PASS: 72 library tests, 2 ignored |
 | `cargo test --offline --locked --lib` | PASS: 58 tests, 2 ignored |
-| `cargo test --offline --locked --manifest-path core/Cargo.toml --lib` | PASS: 204 tests, 2 ignored |
+| `cargo test --offline --locked --manifest-path core/Cargo.toml --lib` | PASS: 206 tests, 2 ignored |
 | `cargo check --offline --locked --features 'cubecl-backend cuda-driver tensorrt-api'` | PASS |
 | `cargo fmt --all -- --check`; `git diff --check` | PASS |
 | Actual CubeCL numerical execution, CUDA kernel launch, Windows RTX | NOT RUN / NOT CONFIRMED |
 
-Existing TensorRT-RTX remains untouched. The user's successful TensorRT run involved unpushed changes not inspected here. The current C03 work is a model/request ownership and execution-plan contract, not a verified TensorRT/CubeCL parity result.
+The new shared Naive controller is used by CPU and CubeCL. TensorRT execution remains untouched; the older `ArStreamDevice` still has its `TrtBlueprint` coupling and is the final C03 structural gate. CubeCL currently transfers logits and Fast context through the host (C04). The user's local TensorRT fixes have not been supplied or modified.

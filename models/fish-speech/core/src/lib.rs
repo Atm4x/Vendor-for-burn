@@ -22,6 +22,7 @@ pub mod kv;
 pub mod kv_device;
 pub mod kv_device_owner;
 pub mod math;
+pub mod naive_generation;
 pub mod prompt;
 pub mod reference_audio;
 pub mod sampling;

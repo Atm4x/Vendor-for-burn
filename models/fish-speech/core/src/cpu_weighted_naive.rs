@@ -3,6 +3,7 @@ use crate::conversation::EncodedConversation;
 use crate::cpu_ir::{NamedTensors, TensorData};
 use crate::cpu_weighted_ar::{checked_i32_tokens, run_weighted_graph, SelectionMode};
 use crate::error::{FishError, Result};
+use crate::naive_generation::{generate_naive_ar, NaiveArBackend, NaiveArForward};
 use crate::sampling::{greedy, logits_to_probs, SamplingParams, SessionRng};
 use crate::synthesis::SemanticGenerator;
 use crate::transformer_ir::TransformerIrFactory;
@@ -63,15 +64,6 @@ impl CpuWeightedNaive {
         })
     }
 
-    fn draw(&mut self, logits: &[f32], history: &[usize], params: SamplingParams) -> Result<u32> {
-        let probs = logits_to_probs(logits, history, params)?;
-        let id = match self.mode {
-            SelectionMode::Greedy => greedy(&probs)?,
-            SelectionMode::Sample => self.rng.sample_exponential_race(&probs)?,
-        };
-        u32::try_from(id).map_err(|_| FishError::InvalidShape("sample ID overflows u32"))
-    }
-
     pub fn generate_columns(
         &mut self,
         prompt: &EncodedConversation,
@@ -88,120 +80,87 @@ impl CpuWeightedNaive {
         params: SamplingParams,
         is_cancelled: &mut dyn FnMut() -> bool,
     ) -> Result<Vec<Vec<u32>>> {
-        params.validate()?;
-        let channels = self.config.num_codebooks + 1;
-        if prompt.channels.len() != channels
-            || prompt.channels[0].is_empty()
-            || prompt.vq_positions.len() != prompt.channels[0].len()
-            || prompt
-                .channels
-                .iter()
-                .any(|c| c.len() != prompt.channels[0].len())
-        {
-            return Err(FishError::InvalidShape("invalid Naive prompt"));
-        }
-        let prompt_len = prompt.channels[0].len();
-        if prompt_len >= self.config.max_seq_len {
-            return Err(FishError::InvalidPosition {
-                position: prompt_len,
-                capacity: self.config.max_seq_len,
-            });
-        }
-        let remaining = self.config.max_seq_len - prompt_len;
-        let limit = if max_new_tokens == 0 {
-            remaining
-        } else {
-            max_new_tokens.min(remaining)
+        let factory = TransformerIrFactory::new(&self.config)?;
+        let mut backend = CpuNaiveBackend {
+            factory,
+            weights: &self.weights,
+            semantic_lut: &self.semantic_lut,
+            slow_cache: NamedTensors::new(),
         };
-        let config = self.config.clone();
-        let factory = TransformerIrFactory::new(&config)?;
-        let mut slow_cache = NamedTensors::new();
-        let mut generated: Vec<Vec<u32>> = vec![Vec::new(); channels];
-        for i in 0..limit {
-            if is_cancelled() {
-                return Err(FishError::InvalidTransition("synthesis cancelled"));
-            }
-            let graph = if i == 0 {
-                factory.slow_prefill(prompt_len)?
-            } else {
-                factory.slow_decode(prompt_len + i)?
-            };
-            let mut inputs = NamedTensors::new();
-            let tokens: Vec<i32> = if i == 0 {
-                checked_i32_tokens(prompt.channels.iter().flatten().copied())?
-            } else {
-                checked_i32_tokens(generated.iter().map(|c| *c.last().unwrap()))?
-            };
-            inputs.insert("tokens".into(), TensorData::I32(tokens));
-            inputs.insert(
-                "semantic_membership_lut".into(),
-                TensorData::I32(self.semantic_lut.clone()),
-            );
-            let output = run_weighted_graph(&self.weights, &graph, &inputs, &mut slow_cache)?;
-            let TensorData::F32(semantic_logits) = output
-                .get("logits")
-                .ok_or(FishError::InvalidShape("Naive semantic logits missing"))?
-            else {
-                return Err(FishError::InvalidShape(
-                    "Naive semantic logits dtype invalid",
-                ));
-            };
-            let main = SamplingParams {
-                temperature: 0.1,
-                top_p: 0.1,
-                repetition_penalty: 1.0,
-            };
-            let semantic = self.draw(semantic_logits, &[], main)?;
-            let TensorData::F32(codebook_logits) = output
-                .get("codebook_logits")
-                .ok_or(FishError::InvalidShape("Naive acoustic logits missing"))?
-            else {
-                return Err(FishError::InvalidShape(
-                    "Naive acoustic logits dtype invalid",
-                ));
-            };
-            if codebook_logits.len() != self.config.num_codebooks * self.config.codebook_size {
-                return Err(FishError::InvalidShape(
-                    "Naive acoustic logits shape invalid",
-                ));
-            }
-            let mut row = vec![semantic];
-            for cb in 0..self.config.num_codebooks {
-                if is_cancelled() {
-                    return Err(FishError::InvalidTransition("synthesis cancelled"));
-                }
-                let prior = if i == 0 {
-                    Vec::new()
-                } else {
-                    let mut window: Vec<usize> = generated[cb + 1]
-                        .iter()
-                        .skip(1)
-                        .rev()
-                        .take(16)
-                        .copied()
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                        .map(|x| x as usize)
-                        .collect();
-                    window.resize(16, 0);
-                    window
+        let mode = self.mode;
+        let rng = &mut self.rng;
+        generate_naive_ar(
+            &self.config,
+            &mut backend,
+            prompt,
+            max_new_tokens,
+            self.eos_id,
+            params,
+            &mut |logits, history, params| {
+                let probabilities = logits_to_probs(logits, history, params)?;
+                let token = match mode {
+                    SelectionMode::Greedy => greedy(&probabilities)?,
+                    SelectionMode::Sample => rng.sample_exponential_race(&probabilities)?,
                 };
-                let stride = self.config.codebook_size;
-                row.push(self.draw(
-                    &codebook_logits[cb * stride..(cb + 1) * stride],
-                    &prior,
-                    params,
-                )?);
-            }
-            for (dst, token) in generated.iter_mut().zip(row) {
-                dst.push(token);
-            }
-            if semantic == self.eos_id {
-                break;
-            }
-        }
-        Ok(generated)
+                u32::try_from(token).map_err(|_| FishError::InvalidShape("sample ID overflows u32"))
+            },
+            is_cancelled,
+        )
+    }
+}
+
+struct CpuNaiveBackend<'a> {
+    factory: TransformerIrFactory<'a>,
+    weights: &'a NamedTensors,
+    semantic_lut: &'a [i32],
+    slow_cache: NamedTensors,
+}
+
+impl CpuNaiveBackend<'_> {
+    fn forward(
+        &mut self,
+        graph: crate::graph_ir::Graph,
+        tokens: Vec<i32>,
+    ) -> Result<NaiveArForward> {
+        let mut inputs = NamedTensors::new();
+        inputs.insert("tokens".into(), TensorData::I32(tokens));
+        inputs.insert(
+            "semantic_membership_lut".into(),
+            TensorData::I32(self.semantic_lut.to_vec()),
+        );
+        let output = run_weighted_graph(self.weights, &graph, &inputs, &mut self.slow_cache)?;
+        let semantic_logits = match output.get("logits") {
+            Some(TensorData::F32(v)) => v.clone(),
+            _ => return Err(FishError::InvalidShape("Naive semantic logits missing")),
+        };
+        let acoustic_logits = match output.get("codebook_logits") {
+            Some(TensorData::F32(v)) => v.clone(),
+            _ => return Err(FishError::InvalidShape("Naive acoustic logits missing")),
+        };
+        Ok(NaiveArForward {
+            semantic_logits,
+            acoustic_logits,
+        })
+    }
+}
+
+impl NaiveArBackend for CpuNaiveBackend<'_> {
+    fn slow_prefill(&mut self, prompt: &EncodedConversation) -> Result<NaiveArForward> {
+        self.forward(
+            self.factory.slow_prefill(prompt.length())?,
+            checked_i32_tokens(prompt.channels.iter().flatten().copied())?,
+        )
+    }
+
+    fn slow_decode(
+        &mut self,
+        previous_column: &[u32],
+        active_len: usize,
+    ) -> Result<NaiveArForward> {
+        self.forward(
+            self.factory.slow_decode(active_len)?,
+            checked_i32_tokens(previous_column.iter().copied())?,
+        )
     }
 }
 

@@ -1,10 +1,12 @@
 //! Independent CubeCL Graph IR executor for Fish Speech.
-//! Streaming autoregression and model-scoped device ownership are not implemented yet.
+//! Graph execution, model-scoped weights and DualAR/Naive generation are independent of TensorRT.
 
+mod generation;
 mod kernels;
 mod runtime;
 mod session;
 
+pub use generation::CubeClSemanticGenerator;
 pub use runtime::{CubeClGraph, CubeClGraphExecutor};
 pub use session::{
     CubeClModel, CubeClPreparedModel, CubeClRequest, CubeClRequestCursor, CubeClRequestLimits,
