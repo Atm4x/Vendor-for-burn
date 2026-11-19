@@ -126,9 +126,9 @@ impl SileroTts {
         let speaker_id = self.config.validate_speaker(speaker)? as i64;
         self.config.validate_sample_rate(sample_rate)?;
         longform::infer_text_chunks(text, sample_rate, |fragment| {
-            let prepared = self.config.prepare_text(fragment)?;
-            let accented = ruaccent.process_all(&prepared.sentence);
-            self.infer_accented_single(&accented, speaker_id, sample_rate)
+            let accented = ruaccent.process_all(fragment);
+            let prepared = self.config.prepare_text(&accented)?;
+            self.infer_accented_single(&prepared.sentence, speaker_id, sample_rate)
         })
     }
 
@@ -502,5 +502,28 @@ mod multispeaker_ssml_parity {
             println!("voice {name}: mel max_abs={max_abs:.8}; frames={}", got.len()/192);
             assert!(max_abs < 0.003, "SSML mel parity failed for speaker {name}");
         }
+    }
+}
+
+#[cfg(all(test, feature = "ruaccent", feature = "reference-flex"))]
+mod ruaccent_real_model_regression {
+    use super::*;
+
+    #[test]
+    fn preserves_capitalized_context_before_neural_accentuation() {
+        let (Ok(silero_dir), Ok(ruaccent_dir)) = (
+            std::env::var("SILERO_RUACCENT_INTEGRATION_DIR"),
+            std::env::var("RUACCENT_TINY_WORKDIR"),
+        ) else {
+            return;
+        };
+        let silero = SileroTts::load(Path::new(&silero_dir), &Device::flex()).unwrap();
+        let mut ruaccent = ruaccent_rs::RuAccent::load(Path::new(&ruaccent_dir)).unwrap();
+        let original = "На двери висит замок.";
+        assert_eq!(ruaccent.process_all(original), "На дв+ери вис+ит зам+ок.");
+        assert_eq!(ruaccent.process_all(&original.to_lowercase()), "на двер+и вис+ит зам+ок.");
+        let actual = silero.infer_text_with_ruaccent(original, "aidar", 8000, &mut ruaccent).unwrap();
+        let expected = silero.infer_accented("на дв+ери вис+ит зам+ок.", "aidar", 8000).unwrap();
+        assert_eq!(actual, expected);
     }
 }
