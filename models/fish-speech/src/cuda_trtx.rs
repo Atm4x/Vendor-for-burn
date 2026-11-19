@@ -43,7 +43,7 @@ fn upload_required_weights<F>(
     let upload = (|| {
         for (name, ty) in required {
             let bytes = checkpoint
-                .semantic_f32_upload_bytes(name, ty)
+                .semantic_upload_bytes(name, ty)
                 .map_err(|_| FishError::InvalidShape("TensorRT checkpoint weight incompatible"))?;
             uploaded.insert(name.clone(), device.upload_tensor_bytes(ty, &bytes)?);
         }
@@ -266,7 +266,7 @@ pub(crate) fn prepare_resident_cuda_ar(
             let key = identity
                 .key()
                 .map_err(|_| FishError::InvalidShape("TensorRT AR engine key invalid"))?;
-            prepared.entry(key).or_insert((network, identity));
+            prepared.entry(key).or_insert((network.as_ref(), identity));
         }
     }
 
@@ -344,7 +344,16 @@ impl ResidentTrtContexts {
                     Some(resident.allocator(memory, scratch_pool)?),
                 )
             })?;
-            resident.insert(key, image.bytes.as_ref(), memory, scratch_pool)?;
+            resident.insert_with_graph(
+                key,
+                image.bytes.as_ref(),
+                memory,
+                scratch_pool,
+                config
+                    .build_flags
+                    .split(',')
+                    .any(|flag| flag.trim() == "cuda-graph"),
+            )?;
         }
         Ok(resident)
     }
@@ -429,15 +438,36 @@ impl ResidentTrtContexts {
         memory: &DeviceMemoryBudget,
         scratch_pool: &CudaScratchPool,
     ) -> std::result::Result<(), EngineError> {
+        self.insert_with_graph(key, image, memory, scratch_pool, false)
+    }
+
+    fn insert_with_graph(
+        &mut self,
+        key: String,
+        image: &[u8],
+        memory: &DeviceMemoryBudget,
+        scratch_pool: &CudaScratchPool,
+        capture: bool,
+    ) -> std::result::Result<(), EngineError> {
         let trt_error = |e: trtx::Error| EngineError::TensorRt(e.to_string());
         let mut engine = self
             .runtime
             .deserialize_cuda_engine(image)
             .map_err(trt_error)?;
         let required = engine.device_memory_size_v2().map_err(trt_error)?;
-        let mut execution = engine
-            .create_execution_context_user_managed()
-            .map_err(trt_error)?;
+        let mut execution = if capture {
+            let mut options = engine.create_runtime_config().map_err(trt_error)?;
+            options.set_execution_context_allocation_strategy(
+                trtx::ExecutionContextAllocationStrategy::kUSER_MANAGED,
+            );
+            options
+                .set_cuda_graph_strategy(trtx::CudaGraphStrategy::kWHOLE_GRAPH_CAPTURE)
+                .map_err(trt_error)?;
+            engine.create_execution_context_with_config(std::rc::Rc::new(options))
+        } else {
+            engine.create_execution_context_user_managed()
+        }
+        .map_err(trt_error)?;
         if required != 0 {
             let size = i64::try_from(required).map_err(|_| {
                 EngineError::InvalidPlan("TensorRT context memory exceeds i64".into())
@@ -504,28 +534,88 @@ pub(crate) fn with_resident_cuda_ar_session<T>(
             .bind_to_thread()
             .map_err(|e| EngineError::TensorRt(e.to_string()))?;
         let result = (|| {
+            let mut segments = BTreeMap::new();
+            for plan in plans {
+                for phase in &plan.phases {
+                    let ArStreamPhase::Network(network) = phase else {
+                        continue;
+                    };
+                    let key = EngineIdentity::for_blueprint(
+                        network,
+                        config.model_sha256,
+                        config.gpu_identity,
+                        config.tensorrt_version,
+                        config.driver_version,
+                        config.precision,
+                        config.shape_profile,
+                        config.build_flags,
+                    )
+                    .and_then(|identity| identity.key())
+                    .map_err(|_| EngineError::InvalidPlan("invalid resident blueprint".into()))?;
+                    let contract = EngineIoContract::from_blueprint(network)?;
+                    let mut bindings = Vec::new();
+                    let execution = resident.contexts.get_mut(&key).ok_or_else(|| {
+                        EngineError::InvalidPlan("missing prepared context".into())
+                    })?;
+                    for step in &network.steps {
+                        match step.primitive {
+                            TrtPrimitive::ConstantWeight => {
+                                let buffer = weights
+                                    .get(&step.name)
+                                    .filter(|b| b.bytes() >= contract.inputs[&step.name])
+                                    .ok_or_else(|| {
+                                        EngineError::InvalidBindings(step.name.clone())
+                                    })?;
+                                unsafe {
+                                    execution.set_tensor_address(
+                                        &step.name,
+                                        buffer.address(&stream) as *mut _,
+                                    )
+                                }
+                                .map_err(|e| EngineError::TensorRt(e.to_string()))?;
+                            }
+                            TrtPrimitive::Input => bindings.push((
+                                step.result,
+                                step.name.clone(),
+                                contract.inputs[&step.name],
+                            )),
+                            _ => {}
+                        }
+                    }
+                    for &binding in &network.outputs {
+                        let name = crate::trtx_engine::output_tensor_name(binding);
+                        bindings.push((binding, name.clone(), contract.outputs[&name]));
+                    }
+                    segments.insert(Arc::as_ptr(network), (key, bindings));
+                }
+            }
             let dispatch: ResidentArDispatch<'_> = Box::new(|plan, buffers, stream| {
-                let identity = EngineIdentity::for_blueprint(
-                    plan,
-                    config.model_sha256,
-                    config.gpu_identity,
-                    config.tensorrt_version,
-                    config.driver_version,
-                    config.precision,
-                    config.shape_profile,
-                    config.build_flags,
-                )
-                .map_err(|_| FishError::InvalidShape("TensorRT request graph mismatch"))?;
-                let key = identity
-                    .key()
-                    .map_err(|_| FishError::InvalidShape("TensorRT engine lookup failed"))?;
+                let (key, bindings) =
+                    segments
+                        .get(&std::ptr::from_ref(plan))
+                        .ok_or(FishError::InvalidShape(
+                            "blueprint outside prepared request",
+                        ))?;
                 let execution = resident
                     .contexts
-                    .get_mut(&key)
+                    .get_mut(key)
                     .ok_or(FishError::InvalidShape(
                         "TensorRT graph is not prepared for the resident session",
                     ))?;
-                unsafe { enqueue_trt_segment(execution, plan, buffers, stream) }
+                for (binding, name, bytes) in bindings {
+                    let buffer = buffers
+                        .get(binding)
+                        .filter(|buf| buf.bytes() >= *bytes)
+                        .ok_or(FishError::InvalidShape(
+                            "missing or undersized resident binding",
+                        ))?;
+                    unsafe { execution.set_tensor_address(name, buffer.address(stream) as *mut _) }
+                        .map_err(|_| {
+                            FishError::InvalidTransition("TensorRT tensor binding failed")
+                        })?;
+                }
+                unsafe { execution.enqueue_v3(stream.cu_stream().cast()) }
+                    .map_err(|_| FishError::InvalidTransition("TensorRT segment enqueue failed"))
             });
             let device = CudaArDevice::with_context_stream(
                 Arc::clone(&device),

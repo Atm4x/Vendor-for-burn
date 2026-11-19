@@ -80,10 +80,18 @@ extern "C" __global__ void fish_fast_sample(
         }
     }
 
+    __shared__ double warp_sums[32];
+    float maximum = score[0];
+    double partial = 0.0;
+    for (int i = tid; i < vocabulary; i += blockDim.x)
+        partial += exp(static_cast<double>(score[i] - maximum));
+    for (int offset = 16; offset; offset >>= 1)
+        partial += __shfl_down_sync(0xffffffff, partial, offset);
+    if ((tid & 31) == 0) warp_sums[tid >> 5] = partial;
+    __syncthreads();
     if (tid != 0) return;
     double total = 0.0;
-    float maximum = score[0];
-    for (int i = 0; i < vocabulary; ++i) total += exp(static_cast<double>(score[i] - maximum));
+    for (int i = 0; i < blockDim.x / 32; ++i) total += warp_sums[i];
     if (!(total > 0.0) || !isfinite(total)) {
         *output_token = 0;
         output_column[codebook] = -1;

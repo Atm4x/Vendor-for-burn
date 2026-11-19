@@ -192,7 +192,6 @@ where
                 "KV stream poisoned; reset required",
             ));
         }
-        plan.validate()?;
         for phase in &plan.phases {
             if let ArStreamPhase::KvWrites(writes) = phase {
                 self.kv.ensure_cache(&writes.key)?;

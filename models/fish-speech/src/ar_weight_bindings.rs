@@ -18,7 +18,7 @@ pub fn required_ar_weights(plan: &ArStreamPlan) -> Result<BTreeMap<String, Tenso
                 if step.primitive != TrtPrimitive::ConstantWeight {
                     continue;
                 }
-                if step.output_type.dtype != ScalarType::F32 {
+                if !matches!(step.output_type.dtype, ScalarType::F32 | ScalarType::BF16) {
                     return Err(WeightError::Invalid(format!(
                         "unsupported TensorRT AR weight dtype: {}",
                         step.name

@@ -74,10 +74,28 @@ extern "C" __global__ void fish_semantic_sample(
         return;
     }
     float maximum = maxima[0];
+    // Retain the upper tail per lane. Use it only when it covers the full nucleus.
+    constexpr int slots = 12;
+    __shared__ uint32_t candidate_keys[slots][256];
+    __shared__ double candidate_mass[slots][256];
+    __shared__ int compact;
+    if (tid == 0) compact = 1;
+    __syncthreads();
+    int candidates = 0;
+    double retained = 0.0;
     double local_total = 0.0;
     for (int i = tid; i < vocabulary; i += static_cast<int>(blockDim.x)) {
         float v = fish_semantic_adjust(logits[i], history_mask[i], repetition_penalty);
-        local_total += exp(static_cast<double>(v - maximum));
+        double mass = exp(static_cast<double>(v - maximum));
+        local_total += mass;
+        if (top_p < 1.0f && v >= maximum - 8.0f) {
+            if (candidates < slots) {
+                candidate_keys[candidates][tid] = fish_semantic_order(v);
+                candidate_mass[candidates][tid] = mass;
+            }
+            ++candidates;
+            retained += mass;
+        }
     }
     sums[tid] = local_total;
     __syncthreads();
@@ -95,6 +113,17 @@ extern "C" __global__ void fish_semantic_sample(
         return;
     }
 
+    if (top_p < 1.0f) {
+        if (candidates > slots) atomicExch(&compact, 0);
+        sums[tid] = retained;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride; stride >>= 1) {
+            if (tid < stride) sums[tid] += sums[tid + stride];
+            __syncthreads();
+        }
+        if (tid == 0 && sums[0] <= target_mass) compact = 0;
+        __syncthreads();
+    }
     // Exact float-score radix threshold: 32 scans, O(32 * vocabulary), not O(V^2).
     if (top_p < 1.0f) {
         uint64_t low = 0, high = 0xffffffffULL;
@@ -102,7 +131,12 @@ extern "C" __global__ void fish_semantic_sample(
             if (tid == 0) midpoint = static_cast<uint32_t>((low + high + 1ULL) / 2ULL);
             __syncthreads();
             double local_mass = 0.0;
-            for (int i = tid; i < vocabulary; i += static_cast<int>(blockDim.x)) {
+            if (compact && midpoint <= fish_semantic_order(maximum - 8.0f)) {
+                local_mass = tid == 0 ? total_mass : 0.0;
+            } else if (compact) {
+                for (int c = 0; c < candidates; ++c)
+                    if (candidate_keys[c][tid] >= midpoint) local_mass += candidate_mass[c][tid];
+            } else for (int i = tid; i < vocabulary; i += static_cast<int>(blockDim.x)) {
                 float v = fish_semantic_adjust(logits[i], history_mask[i], repetition_penalty);
                 if (fish_semantic_order(v) >= midpoint)
                     local_mass += exp(static_cast<double>(v - maximum));

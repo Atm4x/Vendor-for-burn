@@ -41,7 +41,9 @@ pub struct CudaRuntimeOptions {
     pub gpu_identity: String,
     pub tensorrt_version: String,
     pub driver_version: String,
+    /// Use "mixed-bf16" for DualAR BF16 matrix projections with FP32 residuals.
     pub precision: String,
+    /// Comma-separated cache/build flags. "cuda-graph" enables TensorRT segment capture.
     pub build_flags: String,
 }
 
@@ -249,7 +251,10 @@ impl CudaSemanticGenerator {
                 "CUDA request exceeds configured decode token limit",
             ));
         }
-        let plans = PreparedDualArPlans::new(&self.config, prompt.length(), max_new_tokens)?;
+        let mut plans = PreparedDualArPlans::new(&self.config, prompt.length(), max_new_tokens)?;
+        if self.options.precision == "mixed-bf16" {
+            plans.use_bf16_projections();
+        }
         self.validate_plan_weights(&plans)?;
         Ok(plans)
     }
@@ -367,7 +372,15 @@ impl CudaSemanticGenerator {
         let weights = &self.checkpoint.manifest().tensors;
         self.prepared
             .get_or_prepare(prompt.length(), max_new_tokens, || {
-                let plans = PreparedCudaArPlans::new(config, prompt.length(), max_new_tokens)?;
+                let mut plans = PreparedCudaArPlans::new(config, prompt.length(), max_new_tokens)?;
+                if self.options.precision == "mixed-bf16" {
+                    match &mut plans {
+                        PreparedCudaArPlans::Dual(dual) => dual.use_bf16_projections(),
+                        PreparedCudaArPlans::Naive(_) => {
+                            return Err(FishError::Unsupported("mixed-bf16 requires DualAR"));
+                        }
+                    }
+                }
                 validate_ar_plan_weights(&plans.ar_plans(), weights)?;
                 Ok(plans)
             })

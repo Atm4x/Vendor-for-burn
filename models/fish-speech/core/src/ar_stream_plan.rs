@@ -24,7 +24,7 @@ pub struct KvWriteBarrier {
 
 #[derive(Debug, Clone)]
 pub enum ArStreamPhase {
-    Network(TrtBlueprint),
+    Network(std::sync::Arc<TrtBlueprint>),
     KvWrites(KvWriteBarrier),
 }
 
@@ -204,7 +204,7 @@ impl ArStreamPlan {
                         weight_count,
                     };
                     subgraph.validate()?;
-                    phases.push(ArStreamPhase::Network(subgraph));
+                    phases.push(ArStreamPhase::Network(subgraph.into()));
                 }
             }
         }

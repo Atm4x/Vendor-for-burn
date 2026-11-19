@@ -113,6 +113,35 @@ impl PreparedDualArPlans {
         })
     }
 
+    pub(crate) fn use_bf16_projections(&mut self) {
+        use fish_speech_core::trtx_blueprint::TrtPrimitive;
+        for graph in std::iter::once(&mut self.slow_prefill)
+            .chain(self.slow_decode.values_mut())
+            .chain(&mut self.fast_decode)
+        {
+            for phase in &mut graph.plan.phases {
+                let ArStreamPhase::Network(network) = phase else {
+                    continue;
+                };
+                let network = Arc::make_mut(network);
+                let matrices: std::collections::BTreeSet<_> = network
+                    .steps
+                    .iter()
+                    .filter(|step| step.primitive == TrtPrimitive::MatrixMultiplyTransposeRhs)
+                    .map(|step| step.arguments[1])
+                    .collect();
+                for step in &mut network.steps {
+                    if step.primitive == TrtPrimitive::ConstantWeight
+                        && matrices.contains(&step.result)
+                        && !step.name.contains("embedding")
+                    {
+                        step.output_type.dtype = ScalarType::BF16;
+                    }
+                }
+            }
+        }
+    }
+
     pub(crate) fn ar_plans(&self) -> Vec<&ArStreamPlan> {
         let mut plans = vec![&self.slow_prefill.plan];
         plans.extend(self.slow_decode.values().map(|item| &item.plan));
@@ -644,6 +673,30 @@ mod tests {
         assert_eq!(plans.slow_decode_profiles.locate(1, 32).unwrap().0, 0);
         assert_eq!(plans.slow_decode_profiles.locate(1, 33).unwrap().0, 1);
         assert_eq!(plans.slow_decode_profiles.locate(1, 65).unwrap().0, 2);
+    }
+
+    #[test]
+    fn mixed_projections_share_decode_networks_and_preserve_logits_dtype() {
+        let config = FishModelConfig::synthetic_dual_ar_fixture();
+        let mut plans = PreparedDualArPlans::new(&config, 4, 3).unwrap();
+        plans.use_bf16_projections();
+        let weights = crate::ar_input_contract::collect_ar_weight_types(&plans.ar_plans()).unwrap();
+        assert_eq!(weights["embeddings.weight"].dtype, ScalarType::F32);
+        assert_eq!(
+            weights["layers.0.attention.wqkv.weight"].dtype,
+            ScalarType::BF16
+        );
+        assert_eq!(
+            output_type(&plans.slow_prefill, "logits").unwrap().dtype,
+            ScalarType::F32
+        );
+        let template = &plans.slow_decode[&32].plan;
+        let positioned = positioned_slow_decode(template, 5, 32).unwrap();
+        for (original, actual) in template.phases.iter().zip(&positioned.phases) {
+            if let (ArStreamPhase::Network(a), ArStreamPhase::Network(b)) = (original, actual) {
+                assert!(Arc::ptr_eq(a, b));
+            }
+        }
     }
 
     #[test]
