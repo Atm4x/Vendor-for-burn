@@ -20,10 +20,19 @@ Stage the model files yourself, outside GitHub / CI artifacts:
 - `model/index.index`: optional 768-dimensional FAISS IVF index
 
 ```powershell
-.\rvc-worker.exe --ipc-stdio --backend cuda --model-id rvc_v2_crazymita --model-dir 'D:\AIData\Models\RVC\CrazyMita' --input-dir 'D:\AIData\WorkerInput' --output-dir 'D:\AIData\WorkerOutput' --batch-size 8
+.\rvc-worker.exe --ipc-stdio --backend cuda --gpu-id pci:0000:01:00.0 --model-id rvc_v2_crazymita --model-dir 'D:\AIData\Models\RVC\CrazyMita' --input-dir 'D:\AIData\WorkerInput' --output-dir 'D:\AIData\WorkerOutput' --batch-size 8
 ```
 
 `--backend` is mandatory: `cpu`, `cuda`, `wgpu`; it never silently falls back.
+`--gpu-id` is an optional physical GPU selector (`pci:0000:01:00.0`, or on Windows
+`luid:<16 hex digits>`). When set, the worker resolves exactly one device from
+its requested backend and refuses missing or ambiguous matches; it never
+reverts to GPU 0. The same selector is supported by the `tts-with-rvc-rs`
+CLI (`--device cuda|wgpu --gpu-id ...`), which can enumerate GPUs with
+`list-gpus cuda|wgpu`. On Windows the resolver queries the OS for PCI
+bus/device/function using the reported adapter LUID when WGPU lacks PCI.
+The PCI address is a topology identifier, not a permanent hardware serial.
+An omitted `--gpu-id` preserves the previous backend default.
 All directories must be existing absolute, real directories (no symlink at their
 root). A package must fix the model ID and its assets; the `load` request cannot
 switch the model or backend. The host owns filesystem permissions of the input

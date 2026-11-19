@@ -8,7 +8,7 @@ use tts_with_rvc_rs::{TextFrontFixture, attention::AttentionFixture, encoder::En
 fn run() -> Result<(), String> {
     let mut args = env::args().skip(1);
     let command = args.next().ok_or("missing command")?;
-    if matches!(command.as_str(), "convert" | "convert-batch" | "doctor" | "help" | "--help" | "-h") {
+    if matches!(command.as_str(), "convert" | "convert-batch" | "doctor" | "list-gpus" | "help" | "--help" | "-h") {
         return user_cli::run_named(&command, args);
     }
     if command == "nvtx-status" {

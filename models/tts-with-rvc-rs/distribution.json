@@ -3,6 +3,7 @@
   "rvc_contract_version": 1,
   "model_id_prefix": "rvc_v2_",
   "service": "voice_conversion",
+  "physical_gpu_selector": ["pci", "windows_luid"],
   "execution_variants": [
     "burn_cubecl_cuda_fp32",
     "burn_cubecl_wgpu_fp32",

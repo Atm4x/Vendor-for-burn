@@ -22,6 +22,7 @@ pub const MAX_SOURCE: u64 = 64 * 1024 * 1024;
 pub struct LaunchConfig {
     pub model_id: String,
     pub backend: String,
+    pub gpu_id: Option<String>,
     pub model_dir: PathBuf,
     pub input_dir: PathBuf,
     pub output_dir: PathBuf,
@@ -42,6 +43,12 @@ impl LaunchConfig {
         }
         if !matches!(self.backend.as_str(), "cpu" | "cuda" | "wgpu") {
             return Err("unsupported backend".into());
+        }
+        if let Some(id) = &self.gpu_id {
+            if self.backend == "cpu" {
+                return Err("--gpu-id is only supported for cuda or wgpu".into());
+            }
+            id.parse::<gpu_device_resolver::GpuId>().map_err(|e| e.to_string())?;
         }
         if !(1..=32).contains(&self.batch_size) {
             return Err("batch_size must be 1..=32".into());
@@ -129,7 +136,7 @@ impl WorkerEngine for NativeRvcEngine {
             .model_asset("rmvpe.pt", true)?
             .ok_or("rmvpe.pt missing")?;
         let index = config.model_asset("index.index", false)?;
-        let device = runtime_backend::selected_device(&config.backend)?;
+        let device = runtime_backend::selected_physical_device(&config.backend, config.gpu_id.as_deref())?;
         let model = RvcV2Inferencer::load(
             &voice.to_string_lossy(),
             &hubert.to_string_lossy(),
@@ -194,6 +201,7 @@ impl<E: WorkerEngine> Worker<E> {
                     "kind": "voice_conversion", "formats": ["wav"],
                     "output_formats": ["wav"], "output_sample_rate_hz": 40_000,
                     "max_source_bytes": MAX_SOURCE,
+                    "physical_gpu_selectors": ["pci", "windows_luid"],
                     "parameters": ["index_rate", "pitch_shift_semitones", "rms_mix_rate"],
                 },
             })),
@@ -201,6 +209,7 @@ impl<E: WorkerEngine> Worker<E> {
                 "phase": if self.warm { "ready" } else if self.engine.is_some() { "loaded" } else { "started" },
                 "model_id": self.config.model_id,
                 "backend": self.config.backend,
+                "gpu_id": self.config.gpu_id,
                 "variant": match self.config.backend.as_str() {
                     "cuda" => "burn_cubecl_cuda_fp32",
                     "wgpu" => "burn_cubecl_wgpu_fp32",
@@ -365,6 +374,7 @@ pub fn parse_launch(mut args: impl Iterator<Item = String>) -> Result<LaunchConf
     }
     let mut model_id = None;
     let mut backend = None;
+    let mut gpu_id = None;
     let mut model_dir = None;
     let mut input_dir = None;
     let mut output_dir = None;
@@ -374,6 +384,7 @@ pub fn parse_launch(mut args: impl Iterator<Item = String>) -> Result<LaunchConf
         match flag.as_str() {
             "--model-id" if model_id.is_none() => model_id = Some(value),
             "--backend" if backend.is_none() => backend = Some(value),
+            "--gpu-id" if gpu_id.is_none() => gpu_id = Some(value),
             "--model-dir" if model_dir.is_none() => model_dir = Some(absolute_directory(value)?),
             "--input-dir" if input_dir.is_none() => input_dir = Some(absolute_directory(value)?),
             "--output-dir" if output_dir.is_none() => output_dir = Some(absolute_directory(value)?),
@@ -390,6 +401,7 @@ pub fn parse_launch(mut args: impl Iterator<Item = String>) -> Result<LaunchConf
     let config = LaunchConfig {
         model_id: model_id.ok_or("missing --model-id")?,
         backend: backend.ok_or("missing --backend")?,
+        gpu_id,
         model_dir: model_dir.ok_or("missing --model-dir")?,
         input_dir: input_dir.ok_or("missing --input-dir")?,
         output_dir: output_dir.ok_or("missing --output-dir")?,
@@ -446,7 +458,7 @@ pub fn serve<E: WorkerEngine>(
 
 pub fn run_native(args: impl Iterator<Item = String>) -> Result<(), String> {
     let config = parse_launch(args)?;
-    let _ = runtime_backend::selected_device(&config.backend)?;
+    let _ = runtime_backend::selected_physical_device(&config.backend, config.gpu_id.as_deref())?;
     serve::<NativeRvcEngine>(config, io::stdin().lock(), io::stdout().lock())
 }
 
@@ -481,11 +493,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn gpu_id_is_validated_and_cpu_does_not_accept_one() {
+        let path = std::env::temp_dir();
+        let mut config = config(&path);
+        config.gpu_id = Some("pci:0000:01:00.0".into());
+        assert!(config.validate().unwrap_err().contains("only supported"));
+        config.backend = "cuda".into();
+        assert!(config.validate().is_ok());
+        config.gpu_id = Some("not-a-physical-gpu".into());
+        assert!(config.validate().unwrap_err().contains("invalid physical"));
+    }
+
     const ID: &str = "d693ac39-dd75-48f8-b5fb-5db199110159";
     fn config(root: &Path) -> LaunchConfig {
         LaunchConfig {
             model_id: "rvc_v2_test".into(),
             backend: "cpu".into(),
+            gpu_id: None,
             model_dir: root.into(),
             input_dir: root.into(),
             output_dir: root.into(),

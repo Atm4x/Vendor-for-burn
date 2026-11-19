@@ -3137,6 +3137,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpu-device-resolver"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6541,6 +6549,7 @@ dependencies = [
  "burn-cubecl",
  "burn-flex",
  "cubek",
+ "gpu-device-resolver",
  "half",
  "pytorch-reader",
  "rayon",

@@ -68,7 +68,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 burn-onnx = "=0.22.0"
 
 [workspace]
-members = [".", "models/tts-with-rvc-rs"]
+members = [".", "models/tts-with-rvc-rs", "crates/gpu-device-resolver"]
 resolver = "3"
 
 [patch.crates-io]

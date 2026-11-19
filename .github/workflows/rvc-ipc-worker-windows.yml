@@ -6,6 +6,12 @@ on:
       - experiment/conv-kernel-rnd-stage33-20261110
     paths:
       - 'models/tts-with-rvc-rs/src/worker.rs'
+      - 'models/tts-with-rvc-rs/src/runtime_backend.rs'
+      - 'models/tts-with-rvc-rs/src/user_cli.rs'
+      - 'models/tts-with-rvc-rs/Cargo.toml'
+      - 'crates/gpu-device-resolver/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - 'models/tts-with-rvc-rs/src/conversion.rs'
       - 'models/tts-with-rvc-rs/src/audio_io.rs'
       - 'models/tts-with-rvc-rs/src/bin/rvc-worker.rs'
@@ -55,6 +61,12 @@ jobs:
           Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
           python tools/restore_vendor_checksums.py --zerocopy-archive $archive
           if ($LASTEXITCODE -ne 0) { throw 'Vendor restore failed' }
+      - name: Validate physical GPU resolver contracts on Windows
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo test --locked --offline -p gpu-device-resolver --features 'cuda,wgpu' --lib
+          if ($LASTEXITCODE -ne 0) { throw 'Physical GPU resolver Windows tests failed' }
       - name: Verify typed Rust IPC lifecycle and WAV helpers
         shell: pwsh
         run: |
@@ -82,6 +94,7 @@ jobs:
           Copy-Item target/release/rvc-worker.exe $out
           Copy-Item target/release/tts-with-rvc-rs.exe $out
           Copy-Item models/tts-with-rvc-rs/IPC_STDIO_WORKER.md $out
+          Copy-Item crates/gpu-device-resolver/README.md (Join-Path $out GPU_DEVICE_RESOLVER_README.md)
           Copy-Item models/tts-with-rvc-rs/distribution.json $out
           Copy-Item models/tts-with-rvc-rs/package_windows.ps1 $out
           Copy-Item models/tts-with-rvc-rs/smoke_worker.py $out

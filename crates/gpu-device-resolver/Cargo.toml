@@ -1,0 +1,19 @@
+[package]
+name = "gpu-device-resolver"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+description = "Exact physical GPU selector for Burn/CubeCL devices"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = ["cpu"]
+cpu = ["burn/cpu"]
+cuda = ["burn/cuda"]
+wgpu = ["burn/wgpu"]
+
+[dependencies]
+burn = { version = "=0.22.1", default-features = false, features = ["std", "cubecl"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Wdk_Graphics_Direct3D", "Win32_Foundation"] }

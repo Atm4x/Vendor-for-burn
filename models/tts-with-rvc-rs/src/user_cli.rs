@@ -50,9 +50,12 @@ Usage:
   tts-with-rvc-rs convert --model voice.pth --hubert hubert_base.pt --rmvpe rmvpe.pt --input source.wav --output converted.wav [options]
   tts-with-rvc-rs convert-batch --model voice.pth --hubert hubert_base.pt --rmvpe rmvpe.pt --manifest jobs.json [options]
   tts-with-rvc-rs doctor
+  tts-with-rvc-rs list-gpus cuda|wgpu
 Options:
   --index FILE             FAISS IVF index (.index); omit to disable retrieval
   --device cpu|cuda|wgpu  Select a compiled backend (default cpu); never silently falls back
+  --gpu-id pci:0000:01:00.0  Bind exactly to one physical GPU; no fallback
+  --gpu-id luid:<16 hex digits>  Optional Windows session-local GPU selector
   --batch-size N           Tensor batch size 1..32 (default 2)
   --index-rate R           FAISS mix 0..1 (default 0.75 with index, else 0)
   --pitch N                Pitch shift, semitones (default 0)
@@ -71,7 +74,7 @@ fn parse_options(args: impl Iterator<Item=String>) -> Result<HashMap<String,Stri
     let mut args = args;
     while let Some(key) = args.next() {
         if !matches!(key.as_str(), "--model" | "--hubert" | "--rmvpe" | "--input" | "--output" | "--manifest" |
-            "--index" | "--device" | "--batch-size" | "--index-rate" | "--pitch" | "--rms-mix" |
+            "--index" | "--device" | "--gpu-id" | "--batch-size" | "--index-rate" | "--pitch" | "--rms-mix" |
             "--core-frames" | "--overlap-frames" | "--context-frames") {
             return Err(format!("unknown argument {key}; run --help"));
         }
@@ -95,6 +98,20 @@ where T::Err: std::fmt::Display {
 
 pub(crate) fn run_named(command: &str, args: impl Iterator<Item=String>) -> Result<(),String> {
     if matches!(command,"help" | "--help" | "-h") {print!("{USAGE}"); return Ok(());}
+    if command == "list-gpus" {
+        let backend = args.collect::<Vec<_>>();
+        if backend.len() != 1 { return Err("usage: list-gpus cuda|wgpu".into()); }
+        let backend = backend[0].parse::<gpu_device_resolver::Backend>().map_err(|e|e.to_string())?;
+        let available = gpu_device_resolver::enumerate(backend).map_err(|e|e.to_string())?;
+        for gpu in available {
+            println!("id={} name={} pci={} luid={}",
+                gpu.id.map(|id| id.to_string()).unwrap_or_else(|| "unavailable".into()),
+                gpu.name,
+                gpu.pci_address.map(|v|v.to_string()).unwrap_or_else(|| "none".into()),
+                gpu.windows_luid.map(|l|l.iter().map(|v|format!("{v:02x}")).collect::<String>()).unwrap_or_else(||"none".into()));
+        }
+        return Ok(());
+    }
     if command == "doctor" {
         if args.count() != 0 {return Err("doctor takes no arguments".into());}
         println!("RVC native Rust/Burn; tensor batching supported");
@@ -109,7 +126,10 @@ pub(crate) fn run_named(command: &str, args: impl Iterator<Item=String>) -> Resu
         return Ok(());
     }
     let map = parse_options(args)?;
-    let device = selected_device(map.get("--device").map(String::as_str).unwrap_or("cpu"))?;
+    let device = tts_with_rvc_rs::runtime_backend::selected_physical_device(
+        map.get("--device").map(String::as_str).unwrap_or("cpu"),
+        map.get("--gpu-id").map(String::as_str),
+    )?;
     let voice = required(&map,"--model")?;
     let hubert = required(&map,"--hubert")?;
     let rmvpe = required(&map,"--rmvpe")?;
