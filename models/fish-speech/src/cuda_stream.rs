@@ -411,7 +411,7 @@ impl<F> KvStreamDevice for CudaArDevice<F> {
     }
 }
 
-impl<F> ArStreamDevice<TrtBlueprint> for CudaArDevice<F>
+impl<F> ArStreamDevice<Arc<TrtBlueprint>> for CudaArDevice<F>
 where
     F: FnMut(&TrtBlueprint, &BTreeMap<Binding, CudaBuffer>, &Arc<CudaStream>) -> Result<()>,
 {
@@ -456,7 +456,7 @@ where
 
     fn enqueue_network(
         &mut self,
-        plan: &TrtBlueprint,
+        plan: &Arc<TrtBlueprint>,
         buffers: &BTreeMap<Binding, Self::Buffer>,
     ) -> Result<()> {
         self.context.bind_to_thread().map_err(cuda_error)?;

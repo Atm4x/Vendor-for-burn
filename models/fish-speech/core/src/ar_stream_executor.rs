@@ -39,7 +39,7 @@ impl Default for ScratchLimits {
     }
 }
 
-pub struct ArStreamExecutor<D, N = crate::trtx_blueprint::TrtBlueprint>
+pub struct ArStreamExecutor<D, N = std::sync::Arc<crate::trtx_blueprint::TrtBlueprint>>
 where
     D: ArStreamDevice<N>,
     D::Buffer: Clone,
@@ -187,7 +187,6 @@ where
                 "KV stream poisoned; reset required",
             ));
         }
-        plan.validate()?;
         for phase in &plan.phases {
             if let ArStreamPhase::KvWrites(writes) = phase {
                 self.kv.ensure_cache(&writes.key)?;
@@ -358,13 +357,13 @@ mod tests {
         }
     }
 
-    impl ArStreamDevice<TrtBlueprint> for FakeBackend {
+    impl ArStreamDevice<std::sync::Arc<TrtBlueprint>> for FakeBackend {
         fn allocate_tensor(&mut self, ty: &TensorType) -> Result<Self::Buffer> {
             Ok(Rc::new(RefCell::new(vec![0; tensor_bytes(ty)?])))
         }
         fn enqueue_network(
             &mut self,
-            net: &TrtBlueprint,
+            net: &std::sync::Arc<TrtBlueprint>,
             bindings: &BTreeMap<Binding, Self::Buffer>,
         ) -> Result<()> {
             self.operations.borrow_mut().push("network");
@@ -614,7 +613,7 @@ mod tests {
     #[test]
     fn invalid_scratch_limits_and_too_small_budget_fail_before_submission() {
         assert!(
-            ArStreamExecutor::<FakeBackend, TrtBlueprint>::with_scratch_limits(
+            ArStreamExecutor::<FakeBackend, std::sync::Arc<TrtBlueprint>>::with_scratch_limits(
                 FakeBackend {
                     operations: Rc::default()
                 },

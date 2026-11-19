@@ -52,6 +52,7 @@ pub fn parameterize_slow_decode(plan: &mut ArStreamPlan, capacity: usize) -> Res
         let ArStreamPhase::Network(network) = phase else {
             continue;
         };
+        let network = std::sync::Arc::make_mut(network);
         let mut built = Vec::with_capacity(network.steps.len() + 3);
         let mut rotary = None;
         let mut mask = None;

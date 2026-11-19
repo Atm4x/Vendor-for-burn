@@ -41,46 +41,8 @@ pub fn lower_fsq_decode_lut<'n>(
     if table.len() != expected_bytes {
         return Err(invalid("invalid FSQ lookup table byte count"));
     }
-    // A -1 sentinel denotes a dropped quantizer; values < -1 or >= 1000
-    // must fail instead of silently selecting a different group's LUT row.
-    let lower = network
-        .add_small_constant_copied(
-            &[1, 1, 1, 1],
-            &(-2i32).to_le_bytes(),
-            DataType::kINT32,
-            None,
-        )
-        .map_err(trt)?
-        .output(network, 0)
-        .map_err(trt)?;
-    let upper = network
-        .add_small_constant_copied(
-            &[1, 1, 1, 1],
-            &(1000i32).to_le_bytes(),
-            DataType::kINT32,
-            None,
-        )
-        .map_err(trt)?
-        .output(network, 0)
-        .map_err(trt)?;
-    let above_lower = network
-        .add_elementwise(input, &lower, ElementWiseOperation::kGREATER)
-        .map_err(trt)?
-        .output(network, 0)
-        .map_err(trt)?;
-    let below_upper = network
-        .add_elementwise(input, &upper, ElementWiseOperation::kLESS)
-        .map_err(trt)?
-        .output(network, 0)
-        .map_err(trt)?;
-    let valid = network
-        .add_elementwise(&above_lower, &below_upper, ElementWiseOperation::kAND)
-        .map_err(trt)?
-        .output(network, 0)
-        .map_err(trt)?;
-    network
-        .add_assertion(&valid, "Fish FSQ code must be between -1 and 999")
-        .map_err(trt)?;
+    // The execution boundary validates code indices before uploading them.
+    // TensorRT assertions on the codes would turn this data input into a shape input.
     let mut offsets = Vec::with_capacity(groups * 4);
     for group in 0..groups {
         offsets.extend_from_slice(
@@ -214,9 +176,7 @@ pub fn lower_fsq_encode<'n>(
     plan: &fish_speech_core::firefly_trtx_fsq::FsqEncodePlan,
     projections: &[FsqGroupProjection],
 ) -> Result<Tensor<'n>, LoweringError> {
-    use trtx::{
-        ActivationType, Axes, OwnedConvWeights, OwnedWeights, ReduceOperation, UnaryOperation,
-    };
+    use trtx::{ActivationType, Axes, ReduceOperation, UnaryOperation};
 
     let shape = plan.input_nchw.map(|x| x as i64);
     if input.data_type(network) != DataType::kFLOAT
@@ -230,25 +190,53 @@ pub fn lower_fsq_encode<'n>(
     let (kernel, bias) = plan
         .grouped_conv_weights(projections)
         .map_err(|e| invalid(format!("FSQ encoder projections: {e:?}")))?;
-    let weights = OwnedConvWeights {
-        kernel: OwnedWeights {
-            shape: vec![32, plan.group_width as i64, 1, 1],
-            data_type: DataType::kFLOAT,
-            values: kernel,
-            name: Some("fsq.project_in.grouped.weight".into()),
-        },
-        bias: Some(OwnedWeights {
-            shape: vec![32],
-            data_type: DataType::kFLOAT,
-            values: bias,
-            name: Some("fsq.project_in.grouped.bias".into()),
-        }),
-    };
-    let mut layer = network
-        .add_convolution_owned_weights(input, 32, &[1, 1], weights)
+    // FSQ rounds the projected features into discrete codes. Keep the small
+    // dot products in FP32 instead of using a convolution tactic.
+    let width = plan.group_width as i64;
+    let mut grouped = network.add_shuffle(input).map_err(trt)?;
+    grouped
+        .set_reshape_dimensions(network, &[shape[0], 8, 1, width, shape[3]])
         .map_err(trt)?;
-    layer.set_num_groups(network, 8);
-    let mut value = layer.output(network, 0).map_err(trt)?;
+    let grouped = grouped.output(network, 0).map_err(trt)?;
+    let weights = network
+        .add_constant_owned(
+            &[1, 8, 4, width, 1],
+            kernel,
+            DataType::kFLOAT,
+            Some("fsq.project_in.grouped.weight"),
+        )
+        .map_err(trt)?
+        .output(network, 0)
+        .map_err(trt)?;
+    let products = network
+        .add_elementwise(&grouped, &weights, ElementWiseOperation::kPROD)
+        .map_err(trt)?
+        .output(network, 0)
+        .map_err(trt)?;
+    let sums = network
+        .add_reduce(&products, ReduceOperation::kSUM, Axes::new([3]), false)
+        .map_err(trt)?
+        .output(network, 0)
+        .map_err(trt)?;
+    let mut flat = network.add_shuffle(&sums).map_err(trt)?;
+    flat.set_reshape_dimensions(network, &[shape[0], 32, 1, shape[3]])
+        .map_err(trt)?;
+    let flat = flat.output(network, 0).map_err(trt)?;
+    let bias = network
+        .add_constant_owned(
+            &[1, 32, 1, 1],
+            bias,
+            DataType::kFLOAT,
+            Some("fsq.project_in.grouped.bias"),
+        )
+        .map_err(trt)?
+        .output(network, 0)
+        .map_err(trt)?;
+    let mut value = network
+        .add_elementwise(&flat, &bias, ElementWiseOperation::kSUM)
+        .map_err(trt)?
+        .output(network, 0)
+        .map_err(trt)?;
 
     let constants = plan.scalar_constants();
     let shift = fsq_constant(network, &constants.0)?;

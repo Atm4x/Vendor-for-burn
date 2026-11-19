@@ -14,7 +14,6 @@ use fish_speech_core::{
     transformer_ir::TransformerIrFactory,
     trtx_blueprint::{Binding, TrtBlueprint},
 };
-use trtx::Logger;
 
 use crate::{
     cuda_fast_sampling::{
@@ -25,7 +24,10 @@ use crate::{
         upload_semantic_history,
     },
     cuda_stream::{CudaBuffer, CudaScratchPool},
-    cuda_trtx::{CachedArDispatchConfig, WeightedCudaArSession, with_resident_cuda_ar_session},
+    cuda_trtx::{
+        CachedArDispatchConfig, ResidentCudaAr, WeightedCudaArSession,
+        with_resident_cuda_ar_session,
+    },
     device_memory::DeviceMemoryBudget,
     dynamic_decode::{
         KV_MASK, ROPE_COS, ROPE_SIN, decode_control_bytes, parameterize_slow_decode,
@@ -109,6 +111,35 @@ impl PreparedDualArPlans {
             prompt_len,
             max_new_tokens,
         })
+    }
+
+    pub(crate) fn use_bf16_projections(&mut self) {
+        use fish_speech_core::trtx_blueprint::TrtPrimitive;
+        for graph in std::iter::once(&mut self.slow_prefill)
+            .chain(self.slow_decode.values_mut())
+            .chain(&mut self.fast_decode)
+        {
+            for phase in &mut graph.plan.phases {
+                let ArStreamPhase::Network(network) = phase else {
+                    continue;
+                };
+                let network = Arc::make_mut(network);
+                let matrices: std::collections::BTreeSet<_> = network
+                    .steps
+                    .iter()
+                    .filter(|step| step.primitive == TrtPrimitive::MatrixMultiplyTransposeRhs)
+                    .map(|step| step.arguments[1])
+                    .collect();
+                for step in &mut network.steps {
+                    if step.primitive == TrtPrimitive::ConstantWeight
+                        && matrices.contains(&step.result)
+                        && !step.name.contains("embedding")
+                    {
+                        step.output_type.dtype = ScalarType::BF16;
+                    }
+                }
+            }
+        }
     }
 
     pub(crate) fn ar_plans(&self) -> Vec<&ArStreamPlan> {
@@ -555,9 +586,9 @@ fn validate_cuda_generation_request(
 /// reference, retaining TensorRT contexts and KV caches for the entire request. This blocks at
 /// each sampled logits boundary, not at each TensorRT network segment.
 #[allow(clippy::too_many_arguments)]
-pub fn generate_prepared_cuda_dual_ar(
+pub(crate) fn generate_prepared_cuda_dual_ar(
     registry: &EngineRegistry,
-    logger: &Logger,
+    resident: &mut Option<ResidentCudaAr>,
     config: CachedArDispatchConfig<'_>,
     model: &FishModelConfig,
     prompt: &EncodedConversation,
@@ -588,7 +619,7 @@ pub fn generate_prepared_cuda_dual_ar(
     let references = plans.ar_plans();
     with_resident_cuda_ar_session(
         registry,
-        logger,
+        resident,
         config,
         &references,
         checkpoint,
@@ -642,6 +673,30 @@ mod tests {
         assert_eq!(plans.slow_decode_profiles.locate(1, 32).unwrap().0, 0);
         assert_eq!(plans.slow_decode_profiles.locate(1, 33).unwrap().0, 1);
         assert_eq!(plans.slow_decode_profiles.locate(1, 65).unwrap().0, 2);
+    }
+
+    #[test]
+    fn mixed_projections_share_decode_networks_and_preserve_logits_dtype() {
+        let config = FishModelConfig::synthetic_dual_ar_fixture();
+        let mut plans = PreparedDualArPlans::new(&config, 4, 3).unwrap();
+        plans.use_bf16_projections();
+        let weights = crate::ar_input_contract::collect_ar_weight_types(&plans.ar_plans()).unwrap();
+        assert_eq!(weights["embeddings.weight"].dtype, ScalarType::F32);
+        assert_eq!(
+            weights["layers.0.attention.wqkv.weight"].dtype,
+            ScalarType::BF16
+        );
+        assert_eq!(
+            output_type(&plans.slow_prefill, "logits").unwrap().dtype,
+            ScalarType::F32
+        );
+        let template = &plans.slow_decode[&32].plan;
+        let positioned = positioned_slow_decode(template, 5, 32).unwrap();
+        for (original, actual) in template.phases.iter().zip(&positioned.phases) {
+            if let (ArStreamPhase::Network(a), ArStreamPhase::Network(b)) = (original, actual) {
+                assert!(Arc::ptr_eq(a, b));
+            }
+        }
     }
 
     #[test]

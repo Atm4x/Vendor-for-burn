@@ -63,3 +63,6 @@ pub mod cuda_naive_generation;
 
 #[cfg(feature = "cubecl-backend")]
 pub mod cubecl_backend;
+
+#[cfg(all(feature = "cuda-driver", feature = "tensorrt-api"))]
+mod cuda_firefly;

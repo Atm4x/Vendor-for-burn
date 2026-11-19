@@ -230,6 +230,30 @@ impl LoadedWeights {
         Ok(SafeTensors::deserialize(data)?.tensor(key)?)
     }
 
+    pub(crate) fn semantic_upload_bytes(
+        &self,
+        key: &str,
+        expected: &TensorType,
+    ) -> Result<Vec<u8>> {
+        if expected.dtype != ScalarType::BF16 {
+            return self.semantic_f32_upload_bytes(key, expected);
+        }
+        let mut fp32 = expected.clone();
+        fp32.dtype = ScalarType::F32;
+        let data = self.semantic_f32_upload_bytes(key, &fp32)?;
+        let mut packed = Vec::with_capacity(data.len() / 2);
+        for chunk in data.chunks_exact(4) {
+            let value = bf16::from_f32(f32::from_le_bytes(chunk.try_into().unwrap()));
+            if !value.is_finite() {
+                return Err(WeightError::Invalid(format!(
+                    "weight exceeds BF16 range: {key}"
+                )));
+            }
+            packed.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+        Ok(packed)
+    }
+
     pub fn semantic_f32_upload_bytes(&self, key: &str, expected: &TensorType) -> Result<Vec<u8>> {
         if self.manifest.component != "semantic" || expected.dtype != ScalarType::F32 {
             return Err(WeightError::Invalid(format!(

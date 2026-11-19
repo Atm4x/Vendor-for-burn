@@ -8,7 +8,7 @@ use fish_speech_core::error::FishError;
 use fish_speech_core::prompt::ReferenceExample;
 use fish_speech_core::synthesis::SemanticGenerator;
 use fish_speech_core::synthesis::{
-    SynthesisEvent, SynthesisRequest, SynthesisSample, synthesize_with_events,
+    AcousticDecoder, SynthesisEvent, SynthesisRequest, SynthesisSample, synthesize_with_events,
 };
 use fish_speech_core::tokenizer::SpecialTokens;
 use sha2::{Digest, Sha256};
@@ -204,18 +204,42 @@ impl LoadedFishArtifacts {
     }
 }
 
-struct FishModelParts<G> {
+pub(crate) enum ModelReferenceEncoder {
+    Cpu(CpuFireflyReferenceEncoder),
+    #[cfg(all(feature = "cuda-driver", feature = "tensorrt-api"))]
+    Cuda(Box<crate::cuda_firefly::CudaFireflyReferenceEncoder>),
+}
+
+impl ModelReferenceEncoder {
+    fn set_audio_loader(&mut self, loader: ReferenceAudioLoader) {
+        match self {
+            Self::Cpu(encoder) => encoder.set_audio_loader(loader),
+            #[cfg(all(feature = "cuda-driver", feature = "tensorrt-api"))]
+            Self::Cuda(encoder) => encoder.set_audio_loader(loader),
+        }
+    }
+
+    fn encode(&mut self, bytes: &[u8]) -> std::result::Result<Vec<Vec<u32>>, ReferenceLoadError> {
+        match self {
+            Self::Cpu(encoder) => encoder.encode_reference_bytes(bytes),
+            #[cfg(all(feature = "cuda-driver", feature = "tensorrt-api"))]
+            Self::Cuda(encoder) => encoder.encode_reference_bytes(bytes),
+        }
+    }
+}
+
+struct FishModelParts<G, D> {
     config: FishModelConfig,
     special: SpecialTokens,
     tokenizer: FishBpeTokenizer,
     generator: G,
-    decoder: CpuFireflyDecoder,
-    reference_encoder: CpuFireflyReferenceEncoder,
+    decoder: D,
+    reference_encoder: ModelReferenceEncoder,
     cache: ReferenceCache<Vec<Vec<u32>>>,
 }
 
-pub struct FishModel<G> {
-    parts: Option<FishModelParts<G>>,
+pub struct FishModel<G, D = CpuFireflyDecoder> {
+    parts: Option<FishModelParts<G, D>>,
 }
 
 pub type CpuFishModel = FishModel<CpuSemanticGenerator>;
@@ -242,10 +266,25 @@ impl<G: SemanticGenerator> FishModel<G> {
         firefly: LoadedWeights,
         generator: G,
     ) -> Result<Self> {
-        let special = tokenizer.special_tokens().clone();
         let decoder = CpuFireflyDecoder::from_checkpoint(&firefly)?;
-        let reference_encoder = CpuFireflyReferenceEncoder::from_checkpoint(&firefly)?;
-        Ok(Self {
+        let encoder =
+            ModelReferenceEncoder::Cpu(CpuFireflyReferenceEncoder::from_checkpoint(&firefly)?);
+        Ok(Self::from_backends(
+            config, tokenizer, generator, decoder, encoder,
+        ))
+    }
+}
+
+impl<G: SemanticGenerator, D: AcousticDecoder> FishModel<G, D> {
+    pub(crate) fn from_backends(
+        config: FishModelConfig,
+        tokenizer: FishBpeTokenizer,
+        generator: G,
+        decoder: D,
+        reference_encoder: ModelReferenceEncoder,
+    ) -> Self {
+        let special = *tokenizer.special_tokens();
+        Self {
             parts: Some(FishModelParts {
                 config,
                 special,
@@ -255,7 +294,7 @@ impl<G: SemanticGenerator> FishModel<G> {
                 reference_encoder,
                 cache: ReferenceCache::default(),
             }),
-        })
+        }
     }
 
     pub fn is_loaded(&self) -> bool {
@@ -283,11 +322,9 @@ impl<G: SemanticGenerator> FishModel<G> {
         policy: CachePolicy,
     ) -> Result<Vec<ReferenceExample>> {
         let parts = self.parts.as_mut().ok_or(ModelRuntimeError::Closed)?;
-        let items = parts.reference_encoder.encode_references_cached(
-            &mut parts.cache,
-            references,
-            policy,
-        )?;
+        let items = parts.cache.load_by_hash(references, policy, |audio| {
+            parts.reference_encoder.encode(audio)
+        })?;
         Ok(items
             .into_iter()
             .map(|reference| ReferenceExample {

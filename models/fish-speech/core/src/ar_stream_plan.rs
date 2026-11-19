@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use crate::error::{FishError, Result};
 use crate::graph_ir::{Graph, Op, ScalarType, TensorType};
@@ -50,6 +53,18 @@ impl ArNetworkSegment for TrtBlueprint {
     }
 }
 
+impl<N: ArNetworkSegment> ArNetworkSegment for Arc<N> {
+    fn validate_segment(&self) -> Result<()> {
+        self.as_ref().validate_segment()
+    }
+    fn external_inputs(&self) -> Vec<(Binding, &str)> {
+        self.as_ref().external_inputs()
+    }
+    fn outputs(&self) -> Result<Vec<(Binding, &TensorType)>> {
+        self.as_ref().outputs()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct KvTransfer {
     pub source: Binding,
@@ -68,19 +83,19 @@ pub struct KvWriteBarrier {
 }
 
 #[derive(Debug, Clone)]
-pub enum ArStreamPhase<N = TrtBlueprint> {
+pub enum ArStreamPhase<N = Arc<TrtBlueprint>> {
     Network(N),
     KvWrites(KvWriteBarrier),
 }
 
 #[derive(Debug, Clone)]
-pub struct ArStreamPlan<N = TrtBlueprint> {
+pub struct ArStreamPlan<N = Arc<TrtBlueprint>> {
     pub phases: Vec<ArStreamPhase<N>>,
     pub cache_aliases: BTreeMap<Binding, Binding>,
     pub final_outputs: Vec<Binding>,
 }
 
-impl ArStreamPlan<TrtBlueprint> {
+impl ArStreamPlan<Arc<TrtBlueprint>> {
     pub fn from_graph(graph: &Graph) -> Result<Self> {
         let original = TrtBlueprint::from_graph(graph)?;
         let mut catalogue = BTreeMap::<Binding, TrtStep>::new();
@@ -249,7 +264,7 @@ impl ArStreamPlan<TrtBlueprint> {
                         weight_count,
                     };
                     subgraph.validate()?;
-                    phases.push(ArStreamPhase::Network(subgraph));
+                    phases.push(ArStreamPhase::Network(subgraph.into()));
                 }
             }
         }
