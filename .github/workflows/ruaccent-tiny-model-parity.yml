@@ -1,0 +1,122 @@
+name: RUAccent native tiny model parity
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/silero-tts-cubecl-port-20261118
+    paths:
+      - .github/workflows/ruaccent-tiny-model-parity.yml
+
+permissions:
+  contents: read
+
+jobs:
+  parity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      HF_REVISION: b78ae5ea1e62beaf138bed1865cd8c3b0b5ca855
+      RUACCENT_TINY_WORKDIR: ${{ runner.temp }}/ruaccent-model
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.100.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Fetch only the licensed tiny ONNX pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet 'huggingface_hub[hf_xet]>=0.34,<1'
+          mkdir -p "$RUNNER_TEMP/evidence"
+          python - <<'PY'
+          import json, os, pathlib
+          from huggingface_hub import snapshot_download
+          revision = os.environ['HF_REVISION']
+          target = os.environ['RUACCENT_TINY_WORKDIR']
+          snapshot_download(
+              'ruaccent/accentuator',
+              revision=revision,
+              local_dir=target,
+              allow_patterns=[
+                  'dictionary/*.json.gz',
+                  'nn/nn_accent/*',
+                  'nn/nn_stress_usage_predictor/*',
+                  'nn/nn_yo_homograph_resolver/*',
+                  'nn/nn_omograph/tiny/*',
+              ],
+          )
+          required = [
+              'dictionary/accents.json.gz', 'dictionary/omographs.json.gz',
+              'dictionary/yo_words.json.gz', 'dictionary/yo_homographs.json.gz',
+              'nn/nn_accent/model.onnx', 'nn/nn_accent/config.json', 'nn/nn_accent/vocab.txt',
+              'nn/nn_stress_usage_predictor/model.onnx',
+              'nn/nn_stress_usage_predictor/tokenizer.json',
+              'nn/nn_yo_homograph_resolver/model.onnx',
+              'nn/nn_yo_homograph_resolver/tokenizer.json',
+              'nn/nn_omograph/tiny/model.onnx',
+              'nn/nn_omograph/tiny/tokenizer.json',
+          ]
+          missing=[f for f in required if not (pathlib.Path(target)/f).is_file()]
+          report={'repository':'ruaccent/accentuator','revision':revision,
+                  'files':{f:(pathlib.Path(target)/f).stat().st_size for f in required if f not in missing},
+                  'missing':missing}
+          pathlib.Path(os.environ['RUNNER_TEMP'],'evidence','model-manifest.json').write_text(
+              json.dumps(report,indent=2))
+          if missing: raise RuntimeError('missing model files: '+repr(missing))
+          PY
+      - name: Install ONNX Runtime shared library
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ort"
+          curl -fL --retry 3 --retry-delay 2 \
+            https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-linux-x64-1.22.0.tgz \
+            -o "$RUNNER_TEMP/ort.tgz"
+          tar xf "$RUNNER_TEMP/ort.tgz" -C "$RUNNER_TEMP/ort" --strip-components=1
+          test -f "$RUNNER_TEMP/ort/lib/libonnxruntime.so.1.22.0"
+          echo "ORT_DYLIB_PATH=$RUNNER_TEMP/ort/lib/libonnxruntime.so.1.22.0" >> "$GITHUB_ENV"
+      - name: Build and verify all neural golden fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp -a models/ruaccent "$RUNNER_TEMP/ruaccent-test"
+          cd "$RUNNER_TEMP/ruaccent-test"
+          cargo test --locked --features onnx -- --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/evidence/cargo-model-tests.log"
+      - name: Exercise persistent JSONL worker against real model
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, pathlib, subprocess
+          exe=pathlib.Path(os.environ['RUNNER_TEMP'])/'ruaccent-test/target/debug/ruaccent-worker'
+          assert exe.is_file(), str(exe)
+          requests=[
+            {'command':'load','request_id':'1','model_dir':os.environ['RUACCENT_TINY_WORKDIR']},
+            {'command':'process','request_id':'2','text':'На двери висит замок.'},
+            {'command':'process','request_id':'3','text':'Он все понял и ушел.'},
+            {'command':'status','request_id':'4'},
+            {'command':'shutdown','request_id':'5'},
+          ]
+          p=subprocess.run([str(exe)],input=''.join(json.dumps(r,ensure_ascii=False)+'\n' for r in requests),
+                           text=True,capture_output=True,timeout=180)
+          result={'exit_code':p.returncode,'stderr':p.stderr[-6000:],
+                  'responses':[json.loads(x) for x in p.stdout.splitlines()]}
+          pathlib.Path(os.environ['RUNNER_TEMP'],'evidence','worker.json').write_text(
+              json.dumps(result,ensure_ascii=False,indent=2))
+          assert p.returncode==0, result
+          assert len(result['responses'])==len(requests), result
+          assert all(x['ok'] for x in result['responses']), result
+          assert result['responses'][1]['data']['text']=='На дв+ери вис+ит зам+ок.',result
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ruaccent-tiny-model-parity-evidence
+          path: ${{ runner.temp }}/evidence/
+          retention-days: 7
+          if-no-files-found: warn
