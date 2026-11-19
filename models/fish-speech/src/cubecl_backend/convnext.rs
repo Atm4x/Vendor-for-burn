@@ -102,6 +102,19 @@ impl CubeClConvNextExecutor {
         conv: &Conv1dKernel,
         retained: &mut Vec<Handle>,
     ) -> Result<Handle> {
+        self.launch_conv_bound(source, batch, channels, frames, conv, retained, None)
+    }
+
+    fn launch_conv_bound(
+        &self,
+        source: &Handle,
+        batch: usize,
+        channels: usize,
+        frames: usize,
+        conv: &Conv1dKernel,
+        retained: &mut Vec<Handle>,
+        device_params: Option<(Handle, Handle)>,
+    ) -> Result<Handle> {
         conv.validate()?;
         if conv.in_channels != channels {
             return Err(FishError::InvalidShape("CubeCL Conv1d channel mismatch"));
@@ -112,12 +125,11 @@ impl CubeClConvNextExecutor {
             fish_conv_padding(frames, conv.kernel_size, conv.stride, conv.dilation)?;
         let output_len = extent(&[batch, conv.out_channels, out_frames])?;
         let client = &self.client;
-        let weights = client.create_from_slice(bytemuck::cast_slice(&conv.weights));
-        let bias = conv
-            .bias
-            .clone()
-            .unwrap_or_else(|| vec![0.0; conv.out_channels]);
-        let biases = client.create_from_slice(bytemuck::cast_slice(&bias));
+        let bias = conv.bias.clone().unwrap_or_else(|| vec![0.0; conv.out_channels]);
+        let (weights, biases) = device_params.unwrap_or_else(|| {
+            (client.create_from_slice(bytemuck::cast_slice(&conv.weights)),
+             client.create_from_slice(bytemuck::cast_slice(&bias)))
+        });
         let output = client.empty(output_len * 4);
         retained.extend([weights.clone(), biases.clone(), output.clone()]);
         grouped_conv_kernel::launch(
@@ -424,3 +436,5 @@ impl CubeClConvNextExecutor {
 mod tests;
 
 mod encoder;
+
+pub use encoder::CubeClPreparedFireflyEncoder;

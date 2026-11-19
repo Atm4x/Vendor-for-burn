@@ -185,6 +185,22 @@ fn fsq_pack_kernel(
     }
 }
 
+/// Immutable device-scoped FSQ projection and quantizer constants.
+pub(crate) struct CubeClPreparedFsqEncode {
+    weights: cubecl::server::Handle,
+    bias: cubecl::server::Handle,
+    levels: cubecl::server::Handle,
+    bases: cubecl::server::Handle,
+    half_width: cubecl::server::Handle,
+    offset: cubecl::server::Handle,
+    shift: cubecl::server::Handle,
+    scales: cubecl::server::Handle,
+    groups: usize,
+    dims: usize,
+    quantizers: usize,
+    width: usize,
+}
+
 /// Stateless FSQ backend. Data stays on the device across projection, quantization and packing;
 /// only the public result and error status are read to the host.
 pub struct CubeClFsqExecutor {
@@ -308,6 +324,8 @@ impl CubeClFsqExecutor {
 
     /// Encodes a resident feature tensor without an intermediate CPU readback.
     /// The caller owns the input handle and must retain it through completion.
+    /// Encodes a resident feature tensor without an intermediate CPU readback.
+    /// The caller owns the input handle and must retain it through completion.
     pub(super) fn encode_device(
         &self,
         encoder: &GroupedResidualFsqEncoder,
@@ -316,17 +334,15 @@ impl CubeClFsqExecutor {
         channels: usize,
         frames: usize,
     ) -> Result<Vec<i32>> {
+        let prepared = self.prepare_encode_device(encoder)?;
+        self.encode_device_prepared(&prepared, input, batch, channels, frames)
+    }
+
+    pub(super) fn prepare_encode_device(&self, encoder: &GroupedResidualFsqEncoder) -> Result<CubeClPreparedFsqEncode> {
         let width = encoder.validate()?;
         let groups = encoder.projections.len();
         let dims = encoder.codebook.levels.len();
         let quantizers = encoder.num_quantizers;
-        if channels != groups * width {
-            return Err(FishError::InvalidShape("CubeCL FSQ feature width invalid"));
-        }
-        let input_len = checked_len(&[batch, channels, frames])?;
-        let projected_len = checked_len(&[batch, groups, frames, dims])?;
-        let packed_len = checked_len(&[batch, groups, quantizers, frames])?;
-        let digits_len = checked_len(&[projected_len, quantizers])?;
         let weights = encoder
             .projections
             .iter()
@@ -376,14 +392,41 @@ impl CubeClFsqExecutor {
             })
             .collect::<Vec<_>>();
         let client = &self.client;
-        let w = client.create_from_slice(bytemuck::cast_slice(&weights));
-        let b = client.create_from_slice(bytemuck::cast_slice(&bias));
-        let l = client.create_from_slice(bytemuck::cast_slice(&levels));
-        let radix = client.create_from_slice(bytemuck::cast_slice(&bases));
-        let half = client.create_from_slice(bytemuck::cast_slice(&half_width));
-        let off = client.create_from_slice(bytemuck::cast_slice(&offset));
-        let sh = client.create_from_slice(bytemuck::cast_slice(&shift));
-        let sc = client.create_from_slice(bytemuck::cast_slice(&scales));
+        Ok(CubeClPreparedFsqEncode {
+            weights: client.create_from_slice(bytemuck::cast_slice(&weights)),
+            bias: client.create_from_slice(bytemuck::cast_slice(&bias)),
+            levels: client.create_from_slice(bytemuck::cast_slice(&levels)),
+            bases: client.create_from_slice(bytemuck::cast_slice(&bases)),
+            half_width: client.create_from_slice(bytemuck::cast_slice(&half_width)),
+            offset: client.create_from_slice(bytemuck::cast_slice(&offset)),
+            shift: client.create_from_slice(bytemuck::cast_slice(&shift)),
+            scales: client.create_from_slice(bytemuck::cast_slice(&scales)),
+            groups, dims, quantizers, width,
+        })
+    }
+
+    /// Encodes resident feature tensors using request-local scratch and pre-uploaded parameters.
+    pub(super) fn encode_device_prepared(
+        &self,
+        prepared: &CubeClPreparedFsqEncode,
+        input: cubecl::server::Handle,
+        batch: usize,
+        channels: usize,
+        frames: usize,
+    ) -> Result<Vec<i32>> {
+        let CubeClPreparedFsqEncode {
+            weights: w, bias: b, levels: l, bases: radix, half_width: half,
+            offset: off, shift: sh, scales: sc, groups, dims, quantizers, width
+        } = prepared;
+        let (groups, dims, quantizers, width) = (*groups, *dims, *quantizers, *width);
+        if channels != groups * width {
+            return Err(FishError::InvalidShape("CubeCL FSQ feature width invalid"));
+        }
+        let input_len = checked_len(&[batch, channels, frames])?;
+        let projected_len = checked_len(&[batch, groups, frames, dims])?;
+        let packed_len = checked_len(&[batch, groups, quantizers, frames])?;
+        let digits_len = checked_len(&[projected_len, quantizers])?;
+        let client = &self.client;
         let projected = client.empty(projected_len * 4);
         let invalid = client.create_from_slice(&vec![0u8; projected_len * 4]);
         fsq_project_kernel::launch(
@@ -391,8 +434,8 @@ impl CubeClFsqExecutor {
             launch_geometry(projected_len)?,
             CubeDim::new_1d(128),
             unsafe { BufferArg::from_raw_parts(input, input_len) },
-            unsafe { BufferArg::from_raw_parts(w, weights.len()) },
-            unsafe { BufferArg::from_raw_parts(b, bias.len()) },
+            unsafe { BufferArg::from_raw_parts(w.clone(), groups * dims * width) },
+            unsafe { BufferArg::from_raw_parts(b.clone(), groups * dims) },
             unsafe { BufferArg::from_raw_parts(half.clone(), dims) },
             unsafe { BufferArg::from_raw_parts(off.clone(), dims) },
             unsafe { BufferArg::from_raw_parts(sh.clone(), dims) },
@@ -409,11 +452,11 @@ impl CubeClFsqExecutor {
             launch_geometry(projected_len)?,
             CubeDim::new_1d(128),
             unsafe { BufferArg::from_raw_parts(projected, projected_len) },
-            unsafe { BufferArg::from_raw_parts(l, dims) },
-            unsafe { BufferArg::from_raw_parts(half, dims) },
-            unsafe { BufferArg::from_raw_parts(off, dims) },
-            unsafe { BufferArg::from_raw_parts(sh, dims) },
-            unsafe { BufferArg::from_raw_parts(sc, scales.len()) },
+            unsafe { BufferArg::from_raw_parts(l.clone(), dims) },
+            unsafe { BufferArg::from_raw_parts(half.clone(), dims) },
+            unsafe { BufferArg::from_raw_parts(off.clone(), dims) },
+            unsafe { BufferArg::from_raw_parts(sh.clone(), dims) },
+            unsafe { BufferArg::from_raw_parts(sc.clone(), quantizers * dims) },
             unsafe { BufferArg::from_raw_parts(digits.clone(), digits_len) },
             unsafe { BufferArg::from_raw_parts(invalid.clone(), projected_len) },
             quantizers,
@@ -425,7 +468,7 @@ impl CubeClFsqExecutor {
             launch_geometry(packed_len)?,
             CubeDim::new_1d(128),
             unsafe { BufferArg::from_raw_parts(digits, digits_len) },
-            unsafe { BufferArg::from_raw_parts(radix, dims) },
+            unsafe { BufferArg::from_raw_parts(radix.clone(), dims) },
             unsafe { BufferArg::from_raw_parts(packed.clone(), packed_len) },
             frames,
             groups,

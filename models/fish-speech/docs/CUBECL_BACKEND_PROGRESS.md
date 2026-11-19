@@ -1,10 +1,10 @@
 # Fish Speech 1.5 — CubeCL implementation tracker
 
-Baseline: `codex/fish-speech`; updated during CONT46 (2026-11-19).
+Baseline: `codex/fish-speech`; updated during CONT47 (2026-11-20).
 
 **Meaning:** This is a checklist of implementation/verification gates, not a benchmark, a statement of GPU operability, or the percentage of the original Fish Speech functional port. The checklist denominator is fixed at **26 gates**, allocated C01=4, C02=6, C03=4, C04=4, C05=4, C06=4. A gate for numeric parity stays open until the actual CubeCL runtime executes and its results are compared with a reference. Pure graph compilation does not satisfy that gate.
 
-**Overall: 18/26 = 69.2% implementation gates**. Real CubeCL CPU numerical execution: verified against `CpuIrInterpreter` for synthetic operator fixtures. CubeCL CUDA/Windows inference: unverified.
+**Overall: 19/26 = 73.1% implementation gates**. Real CubeCL CPU numerical execution: verified against `CpuIrInterpreter` for synthetic operator fixtures. CubeCL CUDA/Windows inference: unverified.
 
 ## C01 — bootstrap: 4/4
 
@@ -38,10 +38,11 @@ Baseline: `codex/fish-speech`; updated during CONT46 (2026-11-19).
 - [x] Device-resident token forwarding across Slow/Naive/Fast graphs, with request-owned sampled I32 handles, host-validated token shadows, sampled EOS readback, and controlled async scratch lifetime. Synthetic end-to-end generation passed for DualAR and Naive in greedy and stochastic top-p, including first-frame EOS and cancellation before the next frame on CubeCL CPU. Selected IDs still synchronize with CPU for session control and final trace; they are not uploaded back into the next graph. CUDA/Windows still unverified.
 - [ ] End-to-end CubeCL semantic generation + CPU Firefly, compared with the CPU trace.
 
-## C05 — CubeCL Firefly: 1/4
+## C05 — CubeCL Firefly: 2/4
 
 - [x] Native grouped residual FSQ encode/decode, executed on CubeCL CPU and compared against Core CPU and existing Python-source-formula golden fixtures. Multi-batch, multi-group, multiple quantizer counts, ignored `-1` codes, malformed indices, non-finite inputs and 27 geometry combinations tested. Public `CubeClFsqExecutor` exposes encode and decode; CPU is a reference, never a compute fallback. These APIs currently transfer inputs/outputs to the host and do not yet integrate with the Firefly ConvNeXt/HiFiGAN graph.
-- [ ] ConvNeXt encoder and related transforms. CONT45 implemented native ConvNeXt and grouped/downsampling Conv1d. **CONT46 implements a complete 156-node reference encoder DAG from an explicit LogMel boundary through masks, backbone stages, feature downsampling and FSQ quantization.** Kernel execution is device-resident across ConvNeXt and FSQ, with readback only of final codes and FSQ error status. Both complete single-batch and two-batch synthetic checkpoint tests passed on CubeCL CPU; the final codes match Core CPU FSQ applied to reference features. Graph dependencies, checkpoint keys, dimensions and finite values are preflighted before dispatch. **Still open for this gate:** native CubeCL LogMel (the optional PCM entrypoint currently uses an explicit CPU preprocessor), reusable/model-scoped checkpoint weight handles, and full reference checkpoint parity. Do not interpret synthetic parity as actual-model acceptance.
+- [x] Native ConvNeXt encoder and related transforms: CONT45/46 provided the complete 156-node reference encoder DAG from LogMel to resident FSQ. CONT47 replaces the CPU LogMel boundary with native CubeCL reflect padding, Hann window, 11-stage radix-2 FFT, magnitude, Slaney mel projection and logarithm. The PCM → CubeCL LogMel → full encoder → FSQ route now executes on CubeCL CPU with synthetic checkpoint and matches the Core-LogMel path's final codes. `CubeClPreparedFireflyEncoder` owns the Graph IR profile, immutable model-scoped GPU handles for all encoder checkpoint weights, reusable FFT/mel constants, and prepared FSQ parameter buffers; successive requests allocate only scratch/activations. CPU-reference parity has been measured for PCM lengths 1024/2048/3073, a graph encoder prefix, complete 156-node PCM→FSQ and repeated prepared calls. **Not yet verified:** real Fish Speech checkpoint parity, Windows CUDA or GPU throughput. Prepared profiles currently have fixed batch=1 and fixed LogMel frame count; FFT kernels are correctness-first rather than optimized. These limitations are covered by the final audio/parity gate and C06.
+
 - [ ] HiFiGAN / ConvTranspose audio decoder.
 - [ ] Full reference encoding, audio output and numerical parity.
 
@@ -51,6 +52,21 @@ Baseline: `codex/fish-speech`; updated during CONT46 (2026-11-19).
 - [ ] Checkpoint + audio trace parity versus Python / TensorRT with fixed seeds.
 - [ ] Load/first-token/generation/RTF throughput and memory benchmarks.
 - [ ] Profiler-driven kernel optimization and resource lifetime acceptance.
+
+## Verification ledger — CONT47
+
+| Check | Status |
+| --- | --- |
+| Native CubeCL radix-2 FFT / reflect / Hann / Slaney filter / log against Core `FishLogMel` | PASS: 1024, 2048, 3073 samples; numerical tolerance 0.025 absolute |
+| Invalid PCM input (too short, Inf/NaN) | PASS: rejected before device dispatch |
+| PCM → CubeCL LogMel → Graph IR downsampling/norm, no intermediate LogMel readback | PASS: numerical parity with CPU-LogMel entrypoint |
+| Entire 156-node PCM → CubeCL LogMel/Encoder → FSQ codes | PASS: full standalone ignored test, 1/1, synthetic checkpoint |
+| Prepared model reuses encoder+FSQ parameters for successive PCM requests | PASS: full standalone ignored test, 1/1, same final codes and NaN rejection |
+| Full `cubecl-cpu` library regression | PASS: 105 passed, 6 ignored; two new full-encoder tests separately PASS |
+| `cubecl-backend` feature regression | PASS: 72 passed, 2 ignored |
+| Default library / Core library | PASS: 58 passed, 2 ignored / 208 passed, 2 ignored |
+| Formatting and diff hygiene | PASS |
+| Windows CUDA, optimized FFT, real checkpoint parity and full synthesis audio | NOT VERIFIED |
 
 ## Verification ledger — CONT46
 

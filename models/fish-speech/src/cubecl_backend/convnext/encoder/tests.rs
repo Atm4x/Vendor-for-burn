@@ -283,3 +283,69 @@ fn cpu_logmel_boundary_feeds_batched_device_encoder() {
             .is_err()
     );
 }
+
+#[test]
+fn cubecl_pcm_logmel_feeds_reference_encoder_graph_without_host_mel() {
+    use fish_speech_core::spectrogram_cpu::FishLogMel;
+    use super::super::super::logmel::CubeClLogMel;
+    let pcm: Vec<f32> = (0..2048)
+        .map(|i| ((i as f64 * std::f64::consts::TAU * 431.0 / 44_100.0).sin() * 0.25) as f32)
+        .collect();
+    let graph = FireflyGraph::reference_encode(1, pcm.len()).unwrap();
+    let stop = "backbone.downsample_layers.0.1";
+    let checkpoint = checkpoint_for_prefix(&graph, stop);
+    let client = Device::Cpu(Default::default()).client();
+    let gpu = CubeClConvNextExecutor::new(client.clone());
+    let frontend = CubeClLogMel::new(client);
+    let actual = gpu
+        .reference_features_until_from_cubecl_pcm(&frontend, &graph, &checkpoint, &pcm, stop)
+        .unwrap();
+    let mel = FishLogMel::new().transform_mono(&pcm).unwrap();
+    let expected = gpu.reference_features_until(&graph, &checkpoint, &mel, stop).unwrap();
+    assert_eq!(actual.data.len(), expected.data.len());
+    for (i, (&a, &b)) in actual.data.iter().zip(expected.data.iter()).enumerate() {
+        assert!((a - b).abs() <= 0.015, "prefix at {i}: {a} vs {b}");
+    }
+}
+
+#[test]
+#[ignore = "full 156-node CubeCL CPU encoder+FSQ with FFT JIT requires an explicit run"]
+fn complete_native_pcm_to_fsq_agrees_with_reference_logmel_path() {
+    use super::super::super::logmel::CubeClLogMel;
+    use fish_speech_core::spectrogram_cpu::FishLogMel;
+    let pcm: Vec<f32> = (0..3073)
+        .map(|i| ((i as f64 * std::f64::consts::TAU * 350.0 / 44_100.0).sin() * 0.2) as f32)
+        .collect();
+    let graph = FireflyGraph::reference_encode(1, pcm.len()).unwrap();
+    let checkpoint = checkpoint_for_prefix(&graph, "quantizer.fsq_encode");
+    let client = Device::Cpu(Default::default()).client();
+    let gpu = CubeClConvNextExecutor::new(client.clone());
+    let front = CubeClLogMel::new(client);
+    let actual = gpu.reference_encode_from_cubecl_pcm(&front, &checkpoint, &pcm).unwrap();
+    let expected = gpu.reference_encode_from_mel(
+        &graph, &checkpoint, &FishLogMel::new().transform_mono(&pcm).unwrap(),
+    ).unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+#[ignore = "full 156-node prepared Firefly model must compile full CPU JIT explicitly"]
+fn prepared_firefly_model_reuses_weights_across_pcm_requests() {
+    use super::super::super::logmel::CubeClLogMel;
+    let pcm: Vec<f32> = (0..3073)
+        .map(|i| ((i as f64 * std::f64::consts::TAU * 270.0 / 44_100.0).sin() * 0.18) as f32)
+        .collect();
+    let graph = FireflyGraph::reference_encode(1, pcm.len()).unwrap();
+    let checkpoint = checkpoint_for_prefix(&graph, "quantizer.fsq_encode");
+    let client = Device::Cpu(Default::default()).client();
+    let normal = CubeClConvNextExecutor::new(client.clone());
+    let frontend = CubeClLogMel::new(client.clone());
+    let expected = normal.reference_encode_from_cubecl_pcm(&frontend, &checkpoint, &pcm).unwrap();
+    let prepared = CubeClPreparedFireflyEncoder::new(client, graph, checkpoint).unwrap();
+    assert!(prepared.prepared_weight_count() > 100);
+    assert_eq!(prepared.encode_mono_pcm(&pcm).unwrap(), expected);
+    assert_eq!(prepared.encode_mono_pcm(&pcm).unwrap(), expected);
+    let mut invalid = pcm.clone();
+    invalid[101] = f32::NAN;
+    assert!(prepared.encode_mono_pcm(&invalid).is_err());
+}
