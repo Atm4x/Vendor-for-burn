@@ -16,34 +16,189 @@ use fish_speech_core::{
     trtx_blueprint::{Binding, TrtBlueprint},
 };
 
-use crate::device_memory::{DeviceMemoryBudget, DeviceMemoryLease, DeviceMemoryUsage};
+use crate::{
+    device_memory::{DeviceMemoryBudget, DeviceMemoryLease, DeviceMemoryUsage},
+    scratch_pool::BoundedScratchPool,
+};
 
-#[derive(Debug)]
-struct CudaAllocation {
-    data: Mutex<CudaSlice<u8>>,
+struct CachedCudaScratch {
+    data: CudaSlice<u8>,
+    reservation: DeviceMemoryLease,
+    completion_stream: Arc<CudaStream>,
+}
+
+#[derive(Clone)]
+pub struct CudaScratchPool {
+    ordinal: usize,
+    cached: Arc<Mutex<BoundedScratchPool<CachedCudaScratch>>>,
+}
+
+impl CudaScratchPool {
+    pub fn new(ordinal: usize, capacity_bytes: usize) -> Self {
+        Self {
+            ordinal,
+            cached: Arc::new(Mutex::new(BoundedScratchPool::new(capacity_bytes))),
+        }
+    }
+
+    pub fn cached_bytes(&self) -> usize {
+        self.cached
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cached_bytes()
+    }
+
+    pub fn clear(&self) -> Result<()> {
+        let entries = self
+            .cached
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain();
+        let mut failed = false;
+        for entry in entries {
+            if entry.completion_stream.synchronize().is_err() {
+                failed = true;
+                std::mem::forget(entry);
+            }
+        }
+        if failed {
+            Err(FishError::InvalidTransition(
+                "CUDA scratch retirement failed",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn take(
+        &self,
+        bytes: usize,
+        receiving_stream: &Arc<CudaStream>,
+    ) -> Result<Option<CachedCudaScratch>> {
+        let old = self
+            .cached
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take(bytes);
+        if old.as_ref().is_some_and(|cached| {
+            !Arc::ptr_eq(&cached.completion_stream, receiving_stream)
+                && cached.completion_stream.synchronize().is_err()
+        }) {
+            std::mem::forget(old);
+            return Err(FishError::InvalidTransition(
+                "CUDA scratch reuse synchronization failed",
+            ));
+        }
+        Ok(old)
+    }
+
+    fn offer(&self, entry: CachedCudaScratch) {
+        let bytes = entry.data.num_bytes();
+        let (_, evicted) = self
+            .cached
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(bytes, entry);
+        for old in evicted {
+            if old.completion_stream.synchronize().is_err() {
+                std::mem::forget(old);
+            }
+        }
+    }
+}
+
+pub struct CudaWorkspace {
+    data: CudaSlice<u8>,
     _reservation: DeviceMemoryLease,
 }
 
-#[derive(Debug, Clone)]
+impl CudaWorkspace {
+    pub fn allocate(
+        stream: &Arc<CudaStream>,
+        memory: &DeviceMemoryBudget,
+        bytes: usize,
+    ) -> Result<Self> {
+        let reservation = memory.reserve(bytes).map_err(|_| {
+            FishError::InvalidTransition("TensorRT context memory budget exhausted")
+        })?;
+        let data = unsafe { stream.alloc::<u8>(bytes) }.map_err(cuda_error)?;
+        Ok(Self {
+            data,
+            _reservation: reservation,
+        })
+    }
+
+    pub fn region(&self, stream: &CudaStream) -> (usize, usize) {
+        (
+            self.data.device_ptr(stream).0 as usize,
+            self.data.num_bytes(),
+        )
+    }
+}
+
+struct ScratchRecycle {
+    pool: CudaScratchPool,
+    stream: Arc<CudaStream>,
+}
+
+struct CudaAllocation {
+    data: Mutex<Option<CudaSlice<u8>>>,
+    reservation: Option<DeviceMemoryLease>,
+    recycle: Option<ScratchRecycle>,
+}
+
+impl Drop for CudaAllocation {
+    fn drop(&mut self) {
+        if let Some(recycle) = self.recycle.take() {
+            let data = self
+                .data
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let (Some(data), Some(reservation)) = (data, self.reservation.take()) {
+                recycle.pool.offer(CachedCudaScratch {
+                    data,
+                    reservation,
+                    completion_stream: recycle.stream,
+                });
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct CudaBuffer(Arc<CudaAllocation>);
 
 impl CudaBuffer {
     fn from_allocation(data: CudaSlice<u8>, reservation: DeviceMemoryLease) -> Self {
+        Self::from_scratch(data, reservation, None)
+    }
+
+    fn from_scratch(
+        data: CudaSlice<u8>,
+        reservation: DeviceMemoryLease,
+        recycle: Option<ScratchRecycle>,
+    ) -> Self {
         Self(Arc::new(CudaAllocation {
-            data: Mutex::new(data),
-            _reservation: reservation,
+            data: Mutex::new(Some(data)),
+            reservation: Some(reservation),
+            recycle,
         }))
     }
-}
 
-impl CudaBuffer {
     pub fn bytes(&self) -> usize {
-        self.0.data.lock().unwrap().num_bytes()
+        self.0
+            .data
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("live CUDA buffer")
+            .num_bytes()
     }
 
     pub fn address(&self, stream: &CudaStream) -> u64 {
         let guard = self.0.data.lock().unwrap();
-        let (address, _record) = guard.device_ptr(stream);
+        let (address, _record) = guard.as_ref().expect("live CUDA buffer").device_ptr(stream);
         address
     }
 }
@@ -85,6 +240,7 @@ pub struct CudaArDevice<F> {
     stream: Arc<CudaStream>,
     dispatch: F,
     memory: DeviceMemoryBudget,
+    scratch_pool: Option<CudaScratchPool>,
 }
 
 impl<F> CudaArDevice<F> {
@@ -118,12 +274,33 @@ impl<F> CudaArDevice<F> {
     ) -> Result<Self> {
         context.bind_to_thread().map_err(cuda_error)?;
         let stream = context.new_stream().map_err(cuda_error)?;
+        Self::with_context_stream(context, stream, memory, dispatch)
+    }
+
+    pub fn with_context_stream(
+        context: Arc<CudaContext>,
+        stream: Arc<CudaStream>,
+        memory: DeviceMemoryBudget,
+        dispatch: F,
+    ) -> Result<Self> {
+        context.bind_to_thread().map_err(cuda_error)?;
         Ok(Self {
             context,
             stream,
             dispatch,
             memory,
+            scratch_pool: None,
         })
+    }
+
+    pub fn with_scratch_pool(mut self, pool: CudaScratchPool) -> Result<Self> {
+        if pool.ordinal != self.context.ordinal() {
+            return Err(FishError::InvalidConfig(
+                "CUDA scratch pool device mismatch",
+            ));
+        }
+        self.scratch_pool = Some(pool);
+        Ok(self)
     }
 
     pub fn upload_tensor_bytes(&mut self, ty: &TensorType, bytes: &[u8]) -> Result<CudaBuffer> {
@@ -143,7 +320,10 @@ impl<F> CudaArDevice<F> {
 
     pub fn download_tensor_bytes(&mut self, buffer: &CudaBuffer) -> Result<Vec<u8>> {
         let guard = buffer.0.data.lock().unwrap();
-        let downloaded = self.stream.clone_dtoh(&*guard).map_err(cuda_error);
+        let downloaded = self
+            .stream
+            .clone_dtoh(guard.as_ref().expect("live CUDA buffer"))
+            .map_err(cuda_error);
         self.stream.synchronize().map_err(cuda_error)?;
         downloaded
     }
@@ -195,8 +375,14 @@ impl<F> KvStreamDevice for CudaArDevice<F> {
         self.context.bind_to_thread().map_err(cuda_error)?;
         let mut dst_guard = destination.0.data.lock().unwrap();
         let src_guard = source.0.data.lock().unwrap();
-        let (dst, _dst_record) = dst_guard.device_ptr_mut(&self.stream);
-        let (src, _src_record) = src_guard.device_ptr(&self.stream);
+        let (dst, _dst_record) = dst_guard
+            .as_mut()
+            .expect("live CUDA buffer")
+            .device_ptr_mut(&self.stream);
+        let (src, _src_record) = src_guard
+            .as_ref()
+            .expect("live CUDA buffer")
+            .device_ptr(&self.stream);
         let copy = CUDA_MEMCPY2D {
             srcXInBytes: 0,
             srcY: 0,
@@ -234,12 +420,38 @@ where
         if bytes == 0 {
             return Err(FishError::InvalidShape("CUDA output allocation is empty"));
         }
-        let reservation = self
-            .memory
-            .reserve(bytes)
-            .map_err(|_| FishError::InvalidTransition("CUDA device memory budget exhausted"))?;
+        if let Some(pool) = &self.scratch_pool {
+            if let Some(cached) = pool.take(bytes, &self.stream)? {
+                return Ok(CudaBuffer::from_scratch(
+                    cached.data,
+                    cached.reservation,
+                    Some(ScratchRecycle {
+                        pool: pool.clone(),
+                        stream: Arc::clone(&self.stream),
+                    }),
+                ));
+            }
+        }
+        let reservation = match self.memory.reserve(bytes) {
+            Ok(lease) => lease,
+            Err(_) => {
+                if let Some(pool) = &self.scratch_pool {
+                    pool.clear()?;
+                }
+                self.memory.reserve(bytes).map_err(|_| {
+                    FishError::InvalidTransition("CUDA device memory budget exhausted")
+                })?
+            }
+        };
         let allocation = unsafe { self.stream.alloc::<u8>(bytes) }.map_err(cuda_error)?;
-        Ok(CudaBuffer::from_allocation(allocation, reservation))
+        Ok(CudaBuffer::from_scratch(
+            allocation,
+            reservation,
+            self.scratch_pool.as_ref().map(|pool| ScratchRecycle {
+                pool: pool.clone(),
+                stream: Arc::clone(&self.stream),
+            }),
+        ))
     }
 
     fn enqueue_network(

@@ -22,7 +22,7 @@ use crate::{
         CudaSemanticSampler, allocate_semantic_result, parse_semantic_result,
         upload_semantic_history,
     },
-    cuda_stream::CudaBuffer,
+    cuda_stream::{CudaBuffer, CudaScratchPool},
     cuda_trtx::{CachedArDispatchConfig, WeightedCudaArSession, with_resident_cuda_ar_session},
     device_memory::DeviceMemoryBudget,
     dynamic_decode::{
@@ -224,6 +224,7 @@ pub fn generate_prepared_cuda_naive(
     checkpoint: &LoadedWeights,
     device_ordinal: usize,
     memory: DeviceMemoryBudget,
+    scratch_pool: CudaScratchPool,
     semantic_lut: &[i32],
     eos_id: u32,
     sampling: SamplingParams,
@@ -243,6 +244,7 @@ pub fn generate_prepared_cuda_naive(
         checkpoint,
         device_ordinal,
         memory,
+        scratch_pool,
         |session| {
             generate_naive_with_session(
                 model,

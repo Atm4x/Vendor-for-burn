@@ -261,6 +261,55 @@ impl EngineRegistry {
         crate::trtx_engine::with_resident_engine_sessions(logger, &borrowed, submit, synchronize)
     }
 
+    #[cfg(feature = "tensorrt-api")]
+    pub fn with_resident_sessions_managed<T, A>(
+        &self,
+        logger: &trtx::Logger,
+        plans: &[(&TrtBlueprint, EngineIdentity)],
+        workspace_bytes: usize,
+        make_allocator: impl Fn() -> Result<
+            std::pin::Pin<Box<trtx::interfaces::GpuAllocator>>,
+            EngineError,
+        >,
+        allocate: impl FnMut(usize) -> Result<(crate::trtx_engine::DeviceRegion, A), EngineError>,
+        submit: impl FnOnce(&mut BTreeMap<String, trtx::ExecutionContext<'_>>) -> Result<T, EngineError>,
+        synchronize: impl FnOnce() -> Result<(), EngineError>,
+    ) -> Result<T, EngineError> {
+        if plans.is_empty() {
+            return Err(EngineError::InvalidPlan("no TensorRT AR networks".into()));
+        }
+        let mut images = BTreeMap::new();
+        for (plan, identity) in plans {
+            let key = identity.key()?;
+            if !images.contains_key(&key) {
+                identity.validate_blueprint(plan)?;
+                let image = self.get_or_build(identity, || {
+                    crate::trtx_engine::build_serialized_blueprint_budgeted(
+                        logger,
+                        plan,
+                        workspace_bytes,
+                        Some(make_allocator()?),
+                    )
+                })?;
+                images.insert(key, image);
+            } else {
+                identity.validate_blueprint(plan)?;
+            }
+        }
+        let borrowed = images
+            .iter()
+            .map(|(key, image)| (key.as_str(), image.bytes.as_ref()))
+            .collect::<Vec<_>>();
+        crate::trtx_engine::with_resident_engine_sessions_managed(
+            logger,
+            &borrowed,
+            Some(make_allocator()?),
+            allocate,
+            submit,
+            synchronize,
+        )
+    }
+
     pub fn evict_memory(&self) -> Result<(), EngineError> {
         self.loaded
             .lock()

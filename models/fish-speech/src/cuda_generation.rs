@@ -24,7 +24,7 @@ use crate::{
         CudaSemanticSampler, allocate_semantic_result, parse_semantic_result,
         upload_semantic_history,
     },
-    cuda_stream::CudaBuffer,
+    cuda_stream::{CudaBuffer, CudaScratchPool},
     cuda_trtx::{CachedArDispatchConfig, WeightedCudaArSession, with_resident_cuda_ar_session},
     device_memory::DeviceMemoryBudget,
     dynamic_decode::{
@@ -565,6 +565,7 @@ pub fn generate_prepared_cuda_dual_ar(
     checkpoint: &LoadedWeights,
     device_ordinal: usize,
     memory: DeviceMemoryBudget,
+    scratch_pool: CudaScratchPool,
     semantic_lut: &[i32],
     semantic_begin_id: u32,
     eos_id: u32,
@@ -593,6 +594,7 @@ pub fn generate_prepared_cuda_dual_ar(
         checkpoint,
         device_ordinal,
         memory,
+        scratch_pool,
         |session| {
             let mut backend = CudaDualArBackend::new(session, plans, semantic_lut, seed)?;
             let mut rng = SessionRng::new(seed);

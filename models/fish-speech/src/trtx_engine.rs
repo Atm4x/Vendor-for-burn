@@ -132,6 +132,16 @@ pub fn build_serialized_blueprint(
     plan: &TrtBlueprint,
     workspace_bytes: usize,
 ) -> Result<Vec<u8>, EngineError> {
+    build_serialized_blueprint_budgeted(logger, plan, workspace_bytes, None)
+}
+
+#[cfg(feature = "tensorrt-api")]
+pub fn build_serialized_blueprint_budgeted(
+    logger: &trtx::Logger,
+    plan: &TrtBlueprint,
+    workspace_bytes: usize,
+    allocator: Option<std::pin::Pin<Box<trtx::interfaces::GpuAllocator>>>,
+) -> Result<Vec<u8>, EngineError> {
     use trtx::{Builder, MemoryPoolType, builder::network_flags};
     EngineIoContract::from_blueprint(plan)?;
     if workspace_bytes == 0 {
@@ -139,6 +149,9 @@ pub fn build_serialized_blueprint(
     }
     let err = |e: trtx::Error| EngineError::TensorRt(e.to_string());
     let mut builder = Builder::new(logger).map_err(err)?;
+    if let Some(allocator) = allocator {
+        builder.set_gpu_allocator(allocator);
+    }
     let mut network = builder
         .create_network(network_flags::EXPLICIT_BATCH)
         .map_err(err)?;
@@ -251,6 +264,70 @@ pub fn with_resident_engine_sessions<T>(
         contexts.insert(key.clone(), engine.create_execution_context().map_err(err)?);
     }
     finish_stream_batch(|| submit(&mut contexts), synchronize)
+}
+
+/// Creates request-scoped TensorRT contexts with caller-owned, budgeted device memory.
+/// Allocations outlive the contexts and the final stream synchronization.
+#[cfg(any(feature = "tensorrt-api", feature = "tensorrt-mock"))]
+pub fn with_resident_engine_sessions_managed<T, A>(
+    logger: &trtx::Logger,
+    images: &[(&str, &[u8])],
+    gpu_allocator: Option<std::pin::Pin<Box<trtx::interfaces::GpuAllocator>>>,
+    mut allocate: impl FnMut(usize) -> Result<(DeviceRegion, A), EngineError>,
+    submit: impl FnOnce(&mut BTreeMap<String, trtx::ExecutionContext<'_>>) -> Result<T, EngineError>,
+    synchronize: impl FnOnce() -> Result<(), EngineError>,
+) -> Result<T, EngineError> {
+    if images.is_empty() {
+        return Err(EngineError::InvalidPlan(
+            "no resident engines requested".into(),
+        ));
+    }
+    let mut names = BTreeSet::new();
+    for (key, bytes) in images {
+        if key.is_empty() || bytes.is_empty() || !names.insert(*key) {
+            return Err(EngineError::InvalidPlan(
+                "invalid resident engine list".into(),
+            ));
+        }
+    }
+    let err = |e: trtx::Error| EngineError::TensorRt(e.to_string());
+    let mut runtime = trtx::Runtime::new(logger).map_err(err)?;
+    if let Some(allocator) = gpu_allocator {
+        runtime.set_gpu_allocator(allocator);
+    }
+    let mut engines = Vec::with_capacity(images.len());
+    for (key, bytes) in images {
+        engines.push((
+            (*key).to_owned(),
+            runtime.deserialize_cuda_engine(bytes).map_err(err)?,
+        ));
+    }
+    let mut workspaces = Vec::new();
+    let mut contexts = BTreeMap::new();
+    for (key, engine) in &mut engines {
+        let required = engine.device_memory_size_v2().map_err(err)?;
+        let mut context = engine
+            .create_execution_context_user_managed()
+            .map_err(err)?;
+        if required != 0 {
+            let size = i64::try_from(required).map_err(|_| {
+                EngineError::InvalidPlan("TensorRT context memory exceeds i64".into())
+            })?;
+            let (region, workspace) = allocate(required)?;
+            if region.address == 0 || region.bytes < required {
+                return Err(EngineError::InvalidBindings(
+                    "TensorRT workspace allocation too small".into(),
+                ));
+            }
+            unsafe { context.set_device_memory_v2(region.address as *mut _, size) };
+            workspaces.push(workspace);
+        }
+        contexts.insert(key.clone(), context);
+    }
+    let result = finish_stream_batch(|| submit(&mut contexts), synchronize);
+    drop(contexts);
+    drop(workspaces);
+    result
 }
 
 #[cfg(test)]

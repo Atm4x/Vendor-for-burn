@@ -5,6 +5,8 @@ pub use fish_speech_core::*;
 
 #[cfg(feature = "tensorrt-api")]
 mod trtx_ar_ops;
+#[cfg(all(feature = "cuda-driver", feature = "tensorrt-api"))]
+pub mod trtx_budget_allocator;
 pub mod trtx_cache;
 pub mod trtx_engine;
 #[cfg(feature = "tensorrt-api")]
@@ -30,6 +32,7 @@ pub mod model_runtime;
 pub mod reference_cache;
 pub mod reference_loader;
 pub mod request_queue;
+pub mod scratch_pool;
 pub mod weighted_cpu;
 pub mod weighted_firefly;
 pub mod weights;

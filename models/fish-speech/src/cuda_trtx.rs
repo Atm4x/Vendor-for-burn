@@ -16,8 +16,9 @@ use trtx::ExecutionContext;
 
 use crate::{
     ar_input_contract::{ArInputContract, collect_ar_weight_types},
-    cuda_stream::{CudaArDevice, CudaBuffer},
+    cuda_stream::{CudaArDevice, CudaBuffer, CudaScratchPool, CudaWorkspace},
     device_memory::DeviceMemoryBudget,
+    trtx_budget_allocator::BudgetedTrtAllocator,
     trtx_cache::{EngineIdentity, EngineRegistry},
     trtx_engine::{DeviceRegion, EngineError, EngineIoContract},
     weights::LoadedWeights,
@@ -206,6 +207,7 @@ pub fn with_resident_cuda_ar_session<T>(
     checkpoint: &LoadedWeights,
     device_ordinal: usize,
     memory: DeviceMemoryBudget,
+    scratch_pool: CudaScratchPool,
     run: impl for<'session> FnOnce(
         &mut WeightedCudaArSession<ResidentArDispatch<'session>>,
     ) -> Result<T>,
@@ -240,11 +242,37 @@ pub fn with_resident_cuda_ar_session<T>(
     }
     let context = CudaContext::new(device_ordinal)
         .map_err(|_| FishError::InvalidTransition("CUDA device context initialization failed"))?;
+    context
+        .bind_to_thread()
+        .map_err(|_| FishError::InvalidTransition("CUDA context bind failed"))?;
+    let stream = context
+        .new_stream()
+        .map_err(|_| FishError::InvalidTransition("CUDA request stream creation failed"))?;
+    let pool_for_submit = scratch_pool.clone();
     registry
-        .with_resident_sessions(
+        .with_resident_sessions_managed(
             logger,
             &prepared,
             config.workspace_bytes,
+            || {
+                trtx::interfaces::GpuAllocator::new(Box::new(BudgetedTrtAllocator::new(
+                    Arc::clone(&context),
+                    memory.clone(),
+                    scratch_pool.clone(),
+                )))
+                .map_err(|e| EngineError::TensorRt(e.to_string()))
+            },
+            |bytes| {
+                let allocation = CudaWorkspace::allocate(&stream, &memory, bytes)
+                    .or_else(|_| {
+                        scratch_pool.clear()?;
+                        CudaWorkspace::allocate(&stream, &memory, bytes)
+                    })
+                    .map_err(|e| EngineError::TensorRt(e.to_string()))?;
+                let (address, size) = allocation.region(&stream);
+                let region = DeviceRegion::new(address, size)?;
+                Ok((region, allocation))
+            },
             |contexts| {
                 let dispatch: ResidentArDispatch<'_> = Box::new(|plan, buffers, stream| {
                     let identity = EngineIdentity::for_blueprint(
@@ -266,8 +294,14 @@ pub fn with_resident_cuda_ar_session<T>(
                     ))?;
                     unsafe { enqueue_trt_segment(context, plan, buffers, stream) }
                 });
-                let device = CudaArDevice::with_context(context, memory, dispatch)
-                    .map_err(|error| EngineError::TensorRt(error.to_string()))?;
+                let device = CudaArDevice::with_context_stream(
+                    Arc::clone(&context),
+                    Arc::clone(&stream),
+                    memory.clone(),
+                    dispatch,
+                )
+                .and_then(|device| device.with_scratch_pool(pool_for_submit))
+                .map_err(|error| EngineError::TensorRt(error.to_string()))?;
                 let mut session = WeightedCudaArSession::open(device, plans, checkpoint)
                     .map_err(|error| EngineError::TensorRt(error.to_string()))?;
                 let outcome = catch_unwind(AssertUnwindSafe(|| run(&mut session)));
@@ -281,7 +315,11 @@ pub fn with_resident_cuda_ar_session<T>(
                     }
                 }
             },
-            || Ok(()),
+            || {
+                stream
+                    .synchronize()
+                    .map_err(|e| EngineError::TensorRt(e.to_string()))
+            },
         )
         .map_err(|_| FishError::InvalidTransition("resident TensorRT AR session failed"))
 }

@@ -356,6 +356,40 @@ impl<'engine> CudaEngine<'engine> {
         self.tensor_data_type(name)
     }
 
+    /// Maximum device bytes required for a user-managed execution context.
+    pub fn device_memory_size_v2(&self) -> Result<usize> {
+        #[cfg(not(feature = "mock_runtime"))]
+        {
+            let bytes = self.inner.getDeviceMemorySizeV2();
+            usize::try_from(bytes).map_err(|_| {
+                Error::Runtime("Invalid TensorRT context device memory size".to_string())
+            })
+        }
+        #[cfg(feature = "mock_runtime")]
+        {
+            Ok(0)
+        }
+    }
+
+    /// Creates an execution context without TensorRT allocating its device memory.
+    /// The caller must provide a sufficiently sized device region before enqueue.
+    pub fn create_execution_context_user_managed(
+        &'_ mut self,
+    ) -> Result<ExecutionContext<'engine>> {
+        #[cfg(not(feature = "mock_runtime"))]
+        {
+            use crate::ExecutionContext;
+            let context_ptr = self.inner.pin_mut().createExecutionContext(
+                nvinfer1::ExecutionContextAllocationStrategy::kUSER_MANAGED,
+            );
+            Ok(unsafe { ExecutionContext::from_ptr(context_ptr, None)? })
+        }
+        #[cfg(feature = "mock_runtime")]
+        {
+            Ok(unsafe { ExecutionContext::from_ptr(std::ptr::null_mut(), None)? })
+        }
+    }
+
     /// See [nvinfer1::ICudaEngine::createExecutionContext]
     pub fn create_execution_context(&'_ mut self) -> Result<ExecutionContext<'engine>> {
         #[cfg(not(feature = "mock_runtime"))]

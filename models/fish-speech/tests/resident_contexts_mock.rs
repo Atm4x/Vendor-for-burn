@@ -85,3 +85,35 @@ fn malformed_resident_plan_rejected_before_runtime() {
         assert!(matches!(result, Err(EngineError::InvalidPlan(_))));
     }
 }
+
+#[test]
+fn user_managed_context_path_retains_owned_memory_until_sync() {
+    use fish_speech_vendor::trtx_engine::with_resident_engine_sessions_managed;
+    let logger = trtx::Logger::stderr().unwrap();
+    let syncs = Cell::new(0);
+    let allocations = Cell::new(0);
+    let result = with_resident_engine_sessions_managed(
+        &logger,
+        &[("prefill", &[1, 2][..]), ("decode", &[3, 4][..])],
+        None,
+        |_bytes| {
+            allocations.set(allocations.get() + 1);
+            Err::<(fish_speech_vendor::trtx_engine::DeviceRegion, ()), _>(
+                EngineError::InvalidBindings("mock context should require zero workspace".into()),
+            )
+        },
+        |contexts| {
+            assert_eq!(contexts.len(), 2);
+            assert_eq!(syncs.get(), 0);
+            Ok(2)
+        },
+        || {
+            syncs.set(syncs.get() + 1);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(result, 2);
+    assert_eq!(syncs.get(), 1);
+    assert_eq!(allocations.get(), 0);
+}
