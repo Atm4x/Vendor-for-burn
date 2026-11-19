@@ -34,6 +34,25 @@ jobs:
           rsync -a --ignore-existing "$RUNNER_TEMP/ruaccent-upstream/vendor/" vendor/
           test -f vendor/tokenizers-0.22.2/.cargo-checksum.json
           test -f vendor/fst-0.4.7/.cargo-checksum.json
+          # Test-only third-party private-key examples are rejected by GitHub push protection.
+          # Remove only fixtures from newly added crates; never bypass push protection.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          fixture_roots = [
+              Path('vendor/pem-rfc7468-1.0.0/tests/examples'),
+              Path('vendor/openssl-0.10.81/test'),
+              Path('vendor/ureq-3.4.0/src/unversioned/transport/testdata'),
+          ]
+          for root in fixture_roots:
+              if root.is_dir():
+                  removed = 0
+                  for file in root.rglob('*'):
+                      if file.is_file() and file.suffix.lower() in ('.pem', '.key'):
+                          file.unlink()
+                          removed += 1
+                  print('Pruned third-party test key fixtures:', root, removed)
+          PY
       - name: Audit and reconcile existing vendored checksum metadata
         shell: bash
         run: |
@@ -66,6 +85,20 @@ jobs:
               for relative, expected in data.get("files", {}).items():
                   file = package / relative
                   if not file.is_file():
+                      # Only missing test-key fixtures in the three explicit third-party crates
+                      # are permitted. All other missing paths remain a hard failure.
+                      is_test_key = (
+                          file.suffix.lower() in ('.pem', '.key')
+                          and (
+                              (package.name == 'pem-rfc7468-1.0.0' and relative.startswith('tests/examples/'))
+                              or (package.name == 'openssl-0.10.81' and relative.startswith('test/'))
+                              or (package.name == 'ureq-3.4.0' and relative.startswith('src/unversioned/transport/testdata/'))
+                          )
+                      )
+                      if is_test_key:
+                          del data['files'][relative]
+                          count += 1
+                          continue
                       missing.append(str(file))
                       continue
                   actual = hashlib.sha256(file.read_bytes()).hexdigest()
