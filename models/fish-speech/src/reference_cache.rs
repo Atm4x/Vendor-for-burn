@@ -235,9 +235,8 @@ mod tests {
     #[test]
     fn id_cache_loads_lab_and_respects_policy() {
         let root = std::env::temp_dir().join(format!(
-            "fish-ref-test-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("id")
+            "fish-ref-test-id-cache-{}",
+            std::process::id()
         ));
         let path = root.join("voice");
         std::fs::create_dir_all(&path).unwrap();

@@ -116,16 +116,28 @@ pub fn lower_blueprint(
                 .map_err(trt)?
                 .output(network, 0)
                 .map_err(trt)?,
-            TrtPrimitive::MatrixMultiplyTransposeRhs => network
-                .add_matrix_multiply(
+            TrtPrimitive::MatrixMultiplyTransposeRhs => {
+                let lhs_shape = args[0].dimensions(network).map_err(trt)?;
+                let rhs_shape = args[1].dimensions(network).map_err(trt)?;
+                let padded_rhs = if rhs_shape.len() < lhs_shape.len() {
+                    let mut shape = vec![1; lhs_shape.len() - rhs_shape.len()];
+                    shape.extend(rhs_shape);
+                    let mut shuffle = network.add_shuffle(args[1]).map_err(trt)?;
+                    shuffle.set_reshape_dimensions(network, &shape).map_err(trt)?;
+                    Some(shuffle.output(network, 0).map_err(trt)?)
+                } else {
+                    None
+                };
+                network.add_matrix_multiply(
                     args[0],
                     MatrixOperation::kNONE,
-                    args[1],
+                    padded_rhs.as_ref().unwrap_or(args[1]),
                     MatrixOperation::kTRANSPOSE,
                 )
                 .map_err(trt)?
                 .output(network, 0)
-                .map_err(trt)?,
+                .map_err(trt)?
+            }
             TrtPrimitive::RmsNorm { epsilon_bits } => {
                 let shape = args[0].dimensions(network).map_err(trt)?;
                 let gamma_shape = args[1].dimensions(network).map_err(trt)?;

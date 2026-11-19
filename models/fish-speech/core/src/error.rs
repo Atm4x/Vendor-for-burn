@@ -9,6 +9,7 @@ pub enum FishError {
     InvalidShape(&'static str),
     InvalidSampling(&'static str),
     Unsupported(&'static str),
+    Backend(String),
 }
 
 impl Display for FishError {
@@ -21,6 +22,7 @@ impl Display for FishError {
             Self::InvalidTransition(msg) => write!(f, "invalid state transition: {msg}"),
             Self::InvalidShape(msg) => write!(f, "invalid tensor shape: {msg}"),
             Self::InvalidSampling(msg) => write!(f, "invalid sampling parameters: {msg}"),
+            Self::Backend(msg) => write!(f, "backend error: {msg}"),
             Self::Unsupported(msg) => write!(f, "unsupported: {msg}"),
         }
     }

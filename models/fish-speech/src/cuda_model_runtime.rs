@@ -4,9 +4,8 @@ use std::{
     sync::Arc,
 };
 
-use cudarc::driver::CudaContext;
 use fish_speech_core::{
-    ar_stream_plan::{ArStreamPhase, ArStreamPlan},
+    ar_stream_plan::ArStreamPlan,
     config::{FishModelConfig, ModelKind},
     conversation::EncodedConversation,
     cpu_weighted_ar::SelectionMode,
@@ -15,7 +14,6 @@ use fish_speech_core::{
     synthesis::SemanticGenerator,
     tokenizer::{SEMANTIC_TOKEN_COUNT, SpecialTokens},
 };
-use trtx::Logger;
 
 use crate::{
     ar_weight_bindings::required_ar_weights,
@@ -23,13 +21,11 @@ use crate::{
     cuda_generation::{PreparedDualArPlans, generate_prepared_cuda_dual_ar},
     cuda_naive_generation::{PreparedNaiveArPlans, generate_prepared_cuda_naive},
     cuda_semantic_sampling::CudaSemanticSampler,
-    cuda_stream::{CudaScratchPool, CudaWorkspace},
-    cuda_trtx::CachedArDispatchConfig,
+    cuda_stream::CudaScratchPool,
+    cuda_trtx::{CachedArDispatchConfig, ResidentCudaAr, prepare_resident_cuda_ar},
     device_memory::DeviceMemoryBudget,
     model_runtime::{FishModel, LoadedFishArtifacts, ModelPaths, ModelRuntimeError, Result},
-    trtx_budget_allocator::BudgetedTrtAllocator,
-    trtx_cache::{EngineIdentity, EngineRegistry},
-    trtx_engine::{DeviceRegion, EngineError},
+    trtx_cache::EngineRegistry,
     weights::{LoadedWeights, TensorEntry},
 };
 
@@ -162,6 +158,7 @@ fn normalized_naive_tokens(
 }
 
 pub struct CudaSemanticGenerator {
+    resident: Option<ResidentCudaAr>,
     config: FishModelConfig,
     checkpoint: LoadedWeights,
     options: CudaRuntimeOptions,
@@ -238,6 +235,7 @@ impl CudaSemanticGenerator {
             seed,
             chunk_index: 0,
             prepared: PreparedPlanCache::default(),
+            resident: None,
         })
     }
 
@@ -277,8 +275,7 @@ impl CudaSemanticGenerator {
         validate_plan_weight_manifest(plans, &self.checkpoint.manifest().tensors)
     }
 
-    /// Compiles and deserializes all request engine profiles, then loads the CUDA samplers.
-    /// Execution contexts are request-scoped and are not retained across warmup and inference.
+    /// Prepares and retains TensorRT contexts for the request geometry.
     pub fn warmup_request(
         &mut self,
         prompt: &EncodedConversation,
@@ -290,82 +287,48 @@ impl CudaSemanticGenerator {
             requested_new_tokens
         };
         let plans = self.cached_request(prompt, tokens)?;
-        let context = CudaContext::new(self.options.device_ordinal)
-            .map_err(|_| FishError::InvalidTransition("CUDA warmup context failed"))?;
-        context
-            .bind_to_thread()
-            .map_err(|_| FishError::InvalidTransition("CUDA warmup context bind failed"))?;
+        let config = Self::dispatch_config(&self.options, self.config.kind, &self.checkpoint);
+        let count = prepare_resident_cuda_ar(
+            &mut self.resident,
+            &self.registry,
+            &config,
+            &plans.ar_plans(),
+            &self.checkpoint,
+            self.options.device_ordinal,
+            &self.memory,
+            &self.scratch_pool,
+        )?;
+        let context = cudarc::driver::CudaContext::new(self.options.device_ordinal)
+            .map_err(|e| FishError::Backend(format!("CUDA warmup context: {e}")))?;
         let _fast = CudaFastSampler::new(&context)?;
         let _semantic = CudaSemanticSampler::new(&context)?;
-        let logger = Logger::stderr()
-            .map_err(|_| FishError::InvalidTransition("TensorRT warmup logger failed"))?;
-        let mut entries = BTreeMap::new();
-        for plan in plans.ar_plans() {
-            for phase in &plan.phases {
-                let ArStreamPhase::Network(blueprint) = phase else {
-                    continue;
-                };
-                let identity = EngineIdentity::for_blueprint(
-                    blueprint,
-                    &self.checkpoint.manifest().source_checkpoint_sha256,
-                    &self.options.gpu_identity,
-                    &self.options.tensorrt_version,
-                    &self.options.driver_version,
-                    &self.options.precision,
-                    match self.config.kind {
-                        ModelKind::DualAr => "source-1.5-bucketed-slow-v1",
-                        ModelKind::Naive => "source-1.5-naive-bucketed-v1",
-                    },
-                    &self.options.build_flags,
-                )
-                .map_err(|_| FishError::InvalidShape("invalid warmup TensorRT identity"))?;
-                let key = identity
-                    .key()
-                    .map_err(|_| FishError::InvalidShape("invalid warmup engine key"))?;
-                entries.entry(key).or_insert((blueprint, identity));
-            }
+        Ok(count)
+    }
+
+    fn dispatch_config<'a>(
+        options: &'a CudaRuntimeOptions,
+        kind: ModelKind,
+        checkpoint: &'a LoadedWeights,
+    ) -> CachedArDispatchConfig<'a> {
+        CachedArDispatchConfig {
+            model_sha256: &checkpoint.manifest().source_checkpoint_sha256,
+            gpu_identity: &options.gpu_identity,
+            tensorrt_version: &options.tensorrt_version,
+            driver_version: &options.driver_version,
+            precision: &options.precision,
+            shape_profile: match kind {
+                ModelKind::DualAr => "source-1.5-bucketed-slow-v1",
+                ModelKind::Naive => "source-1.5-naive-bucketed-v1",
+            },
+            build_flags: &options.build_flags,
+            workspace_bytes: options.workspace_bytes,
         }
-        let prepared = entries.into_values().collect::<Vec<_>>();
-        let stream = context
-            .new_stream()
-            .map_err(|_| FishError::InvalidTransition("CUDA warmup stream creation failed"))?;
-        let memory = &self.memory;
-        self.registry
-            .with_resident_sessions_managed(
-                &logger,
-                &prepared,
-                self.options.workspace_bytes,
-                || {
-                    trtx::interfaces::GpuAllocator::new(Box::new(BudgetedTrtAllocator::new(
-                        Arc::clone(&context),
-                        memory.clone(),
-                        self.scratch_pool.clone(),
-                    )))
-                    .map_err(|e| EngineError::TensorRt(e.to_string()))
-                },
-                |bytes| {
-                    let allocation = CudaWorkspace::allocate(&stream, memory, bytes)
-                        .or_else(|_| {
-                            self.scratch_pool.clear()?;
-                            CudaWorkspace::allocate(&stream, memory, bytes)
-                        })
-                        .map_err(|e| EngineError::TensorRt(e.to_string()))?;
-                    let (address, size) = allocation.region(&stream);
-                    Ok((DeviceRegion::new(address, size)?, allocation))
-                },
-                |contexts| Ok(contexts.len()),
-                || {
-                    stream
-                        .synchronize()
-                        .map_err(|e| EngineError::TensorRt(e.to_string()))
-                },
-            )
-            .map_err(|_| FishError::InvalidTransition("TensorRT engine warmup failed"))
     }
 
     /// Releases cached CPU plans, serialized TensorRT engines and idle GPU scratch allocations.
-    /// Active generation is excluded by `&mut self`; per-request contexts have already retired.
+    /// Active generation is excluded by the mutable model borrow.
     pub fn unload(&mut self) -> Result<()> {
+        self.resident = None;
         self.scratch_pool
             .clear()
             .map_err(|e| ModelRuntimeError::Invalid(format!("GPU scratch unload: {e}")))?;
@@ -471,26 +434,12 @@ impl SemanticGenerator for CudaSemanticGenerator {
             max_new_tokens
         };
         let plans = self.cached_request(prompt, max_new_tokens)?;
-        let logger = Logger::stderr()
-            .map_err(|_| FishError::InvalidTransition("TensorRT logger initialization failed"))?;
-        let config = CachedArDispatchConfig {
-            model_sha256: &self.checkpoint.manifest().source_checkpoint_sha256,
-            gpu_identity: &self.options.gpu_identity,
-            tensorrt_version: &self.options.tensorrt_version,
-            driver_version: &self.options.driver_version,
-            precision: &self.options.precision,
-            shape_profile: match self.config.kind {
-                ModelKind::DualAr => "source-1.5-bucketed-slow-v1",
-                ModelKind::Naive => "source-1.5-naive-bucketed-v1",
-            },
-            build_flags: &self.options.build_flags,
-            workspace_bytes: self.options.workspace_bytes,
-        };
+        let config = Self::dispatch_config(&self.options, self.config.kind, &self.checkpoint);
         let seed = self.seed.wrapping_add(self.chunk_index);
         let result = match plans.as_ref() {
             PreparedCudaArPlans::Dual(plans) => generate_prepared_cuda_dual_ar(
                 &self.registry,
-                &logger,
+                &mut self.resident,
                 config,
                 &self.config,
                 prompt,
@@ -508,7 +457,7 @@ impl SemanticGenerator for CudaSemanticGenerator {
             ),
             PreparedCudaArPlans::Naive(plans) => generate_prepared_cuda_naive(
                 &self.registry,
-                &logger,
+                &mut self.resident,
                 config,
                 &self.config,
                 prompt,
@@ -531,7 +480,8 @@ impl SemanticGenerator for CudaSemanticGenerator {
     }
 }
 
-pub type CudaFishModel = FishModel<CudaSemanticGenerator>;
+pub use crate::cuda_firefly::CudaFireflyDecoder;
+pub type CudaFishModel = FishModel<CudaSemanticGenerator, CudaFireflyDecoder>;
 
 impl LoadedFishArtifacts {
     pub fn into_cuda_model(
@@ -541,6 +491,9 @@ impl LoadedFishArtifacts {
         mode: SelectionMode,
     ) -> Result<CudaFishModel> {
         let special = self.tokenizer.special_tokens().clone();
+        let device = options.device_ordinal;
+        let workspace_bytes = options.workspace_bytes;
+        let max_frames = options.max_profiled_new_tokens;
         let generator = CudaSemanticGenerator::new(
             self.config.clone(),
             self.semantic,
@@ -549,11 +502,28 @@ impl LoadedFishArtifacts {
             seed,
             mode,
         )?;
-        FishModel::from_components(self.config, self.tokenizer, self.firefly, generator)
+        let weights = Arc::new(self.firefly);
+        let runtime = crate::cuda_firefly::FireflyRuntimeOptions {
+            device,
+            workspace_bytes,
+            memory: generator.memory.clone(),
+            scratch: generator.scratch_pool.clone(),
+        };
+        let decoder = CudaFireflyDecoder::new(Arc::clone(&weights), runtime.clone(), max_frames);
+        let encoder = crate::model_runtime::ModelReferenceEncoder::Cuda(Box::new(
+            crate::cuda_firefly::CudaFireflyReferenceEncoder::new(weights, runtime),
+        ));
+        Ok(FishModel::from_backends(
+            self.config,
+            self.tokenizer,
+            generator,
+            decoder,
+            encoder,
+        ))
     }
 }
 
-impl FishModel<CudaSemanticGenerator> {
+impl CudaFishModel {
     pub fn open_cuda(
         paths: &ModelPaths,
         options: CudaRuntimeOptions,

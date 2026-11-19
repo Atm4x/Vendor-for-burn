@@ -33,11 +33,7 @@ impl CudaSemanticSampler {
                 ptx.clone()
             } else {
                 let ptx = compile_ptx(include_str!("cuda_semantic_sampling.cu"))
-                    .map_err(|_| {
-                        FishError::InvalidTransition(
-                            "CUDA semantic sampler NVRTC compilation unavailable",
-                        )
-                    })?
+                    .map_err(|error| FishError::Backend(format!("CUDA semantic sampler NVRTC: {error:?}")))?
                     .to_src();
                 *cached = Some(ptx.clone());
                 ptx

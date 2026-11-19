@@ -14,7 +14,6 @@ use fish_speech_core::{
     transformer_ir::TransformerIrFactory,
     trtx_blueprint::{Binding, TrtBlueprint},
 };
-use trtx::Logger;
 
 use crate::{
     cuda_fast_sampling::{
@@ -25,7 +24,10 @@ use crate::{
         upload_semantic_history,
     },
     cuda_stream::{CudaBuffer, CudaScratchPool},
-    cuda_trtx::{CachedArDispatchConfig, WeightedCudaArSession, with_resident_cuda_ar_session},
+    cuda_trtx::{
+        CachedArDispatchConfig, ResidentCudaAr, WeightedCudaArSession,
+        with_resident_cuda_ar_session,
+    },
     device_memory::DeviceMemoryBudget,
     dynamic_decode::{
         KV_MASK, ROPE_COS, ROPE_SIN, decode_control_bytes, parameterize_slow_decode,
@@ -555,9 +557,9 @@ fn validate_cuda_generation_request(
 /// reference, retaining TensorRT contexts and KV caches for the entire request. This blocks at
 /// each sampled logits boundary, not at each TensorRT network segment.
 #[allow(clippy::too_many_arguments)]
-pub fn generate_prepared_cuda_dual_ar(
+pub(crate) fn generate_prepared_cuda_dual_ar(
     registry: &EngineRegistry,
-    logger: &Logger,
+    resident: &mut Option<ResidentCudaAr>,
     config: CachedArDispatchConfig<'_>,
     model: &FishModelConfig,
     prompt: &EncodedConversation,
@@ -588,7 +590,7 @@ pub fn generate_prepared_cuda_dual_ar(
     let references = plans.ar_plans();
     with_resident_cuda_ar_session(
         registry,
-        logger,
+        resident,
         config,
         &references,
         checkpoint,

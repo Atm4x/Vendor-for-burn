@@ -1,5 +1,11 @@
+#ifdef __CUDACC_RTC__
+using uint32_t = unsigned int;
+using uint64_t = unsigned long long;
+#define INFINITY (__int_as_float(0x7f800000))
+#else
 #include <math.h>
 #include <stdint.h>
+#endif
 
 __device__ __forceinline__ uint64_t fish_mix64(uint64_t x) {
     x += 0x9e3779b97f4a7c15ULL;

@@ -84,6 +84,9 @@ pub fn define_firefly_network(
         vec![(spec.external_node_id, input)],
         checkpoint,
     )?;
+    output
+        .set_name(network, "waveform")
+        .map_err(|e| LoweringError::TensorRt(e.to_string()))?;
     network.mark_output(&output);
     Ok(spec)
 }

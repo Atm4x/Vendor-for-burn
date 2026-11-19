@@ -71,11 +71,7 @@ impl CudaFastSampler {
                 compiled.clone()
             } else {
                 let compiled = compile_ptx(include_str!("cuda_fast_sampling.cu"))
-                    .map_err(|_| {
-                        FishError::InvalidTransition(
-                            "CUDA Fast sampler NVRTC compilation unavailable",
-                        )
-                    })?
+                    .map_err(|error| FishError::Backend(format!("CUDA Fast sampler NVRTC: {error:?}")))?
                     .to_src();
                 *cached = Some(compiled.clone());
                 compiled
