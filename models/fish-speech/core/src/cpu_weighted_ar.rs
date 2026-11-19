@@ -1,4 +1,6 @@
-use crate::ar_generation::{generate_dual_ar, DualArBackend, DualArTrace, SlowArForward};
+use crate::ar_generation::{
+    generate_dual_ar, DualArBackend, DualArTrace, SlowArForward, SlowArLogits,
+};
 use crate::config::{FishModelConfig, ModelKind};
 use crate::conversation::EncodedConversation;
 use crate::cpu_ir::{CpuIrInterpreter, NamedTensors, TensorData};
@@ -172,7 +174,7 @@ impl CpuDualArBackend<'_> {
             .ok_or(FishError::InvalidShape("slow Fast-AR context missing"))?
             .clone();
         Ok(SlowArForward {
-            logits,
+            logits: SlowArLogits::Host(logits),
             fast_context,
         })
     }

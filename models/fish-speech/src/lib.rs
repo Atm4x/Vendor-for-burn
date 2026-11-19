@@ -47,6 +47,9 @@ pub mod cuda_generation;
 mod cuda_fast_sampling;
 
 #[cfg(all(feature = "cuda-driver", feature = "tensorrt-api"))]
+mod cuda_semantic_sampling;
+
+#[cfg(all(feature = "cuda-driver", feature = "tensorrt-api"))]
 pub mod cuda_model_runtime;
 
 #[cfg(all(feature = "cuda-driver", feature = "tensorrt-api"))]

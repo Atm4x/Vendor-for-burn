@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use cudarc::driver::CudaStream;
 use fish_speech_core::{
-    ar_generation::{DualArBackend, DualArTrace, SlowArForward, generate_dual_ar},
+    ar_generation::{DualArBackend, DualArTrace, SlowArForward, SlowArLogits, generate_dual_ar},
     ar_stream_plan::{ArStreamPhase, ArStreamPlan},
     config::{FishModelConfig, ModelKind},
     conversation::EncodedConversation,
@@ -19,6 +19,10 @@ use trtx::Logger;
 use crate::{
     cuda_fast_sampling::{
         CudaFastSampler, allocate_token, parse_column, upload_column, upload_history_mask,
+    },
+    cuda_semantic_sampling::{
+        CudaSemanticSampler, allocate_semantic_result, parse_semantic_result,
+        upload_semantic_history,
     },
     cuda_stream::CudaBuffer,
     cuda_trtx::{CachedArDispatchConfig, WeightedCudaArSession, with_resident_cuda_ar_session},
@@ -123,6 +127,9 @@ where
     plans: &'a PreparedDualArPlans,
     semantic_lut: CudaBuffer,
     fast_sampler: CudaFastSampler,
+    semantic_sampler: CudaSemanticSampler,
+    slow_logits: Option<CudaBuffer>,
+    semantic_steps: u64,
     seed: u64,
     fast_columns: u64,
 }
@@ -149,11 +156,15 @@ where
             .collect::<Vec<_>>();
         let lut = session.upload_runtime_input(&vocab, &bytes)?;
         let fast_sampler = CudaFastSampler::new(session.device_mut().context())?;
+        let semantic_sampler = CudaSemanticSampler::new(session.device_mut().context())?;
         Ok(Self {
             session,
             plans,
             semantic_lut: lut,
             fast_sampler,
+            semantic_sampler,
+            slow_logits: None,
+            semantic_steps: 0,
             seed,
             fast_columns: 0,
         })
@@ -195,9 +206,16 @@ where
         }
         let result = self.session.enqueue(&graph.plan, &runtime)?;
         let context = named_output(graph, &result, "fast_context")?;
-        let logits = self.read_logits(graph, &result, "logits")?;
+        let logits = named_output(graph, &result, "logits")?;
+        let ty = output_type(graph, "logits")?;
+        if ty.dtype != ScalarType::F32 || ty.shape != [1, 1, self.plans.config.vocab_size] {
+            return Err(FishError::InvalidShape(
+                "CUDA semantic logits geometry mismatch",
+            ));
+        }
+        self.slow_logits = Some(logits);
         Ok(SlowArForward {
-            logits,
+            logits: SlowArLogits::DevicePending,
             fast_context: context,
         })
     }
@@ -283,6 +301,45 @@ where
             outputs: template.outputs.clone(),
         };
         self.slow(&plan, previous_column, Some((active_len, bucket_end)))
+    }
+
+    fn sample_semantic(
+        &mut self,
+        logits: &SlowArLogits,
+        history: &[usize],
+        params: SamplingParams,
+        eos_id: u32,
+        _host_sample: &mut dyn FnMut(&[f32], &[usize], SamplingParams) -> Result<u32>,
+    ) -> Result<(u32, bool)> {
+        if !matches!(logits, SlowArLogits::DevicePending) {
+            return Err(FishError::InvalidTransition(
+                "CUDA semantic logits were not device resident",
+            ));
+        }
+        let tensor = self.slow_logits.take().ok_or(FishError::InvalidTransition(
+            "CUDA semantic logits were not produced",
+        ))?;
+        let vocabulary = self.plans.config.vocab_size;
+        let history_mask = upload_semantic_history(self.session, vocabulary, history)?;
+        let result = allocate_semantic_result(self.session)?;
+        self.session.retain_cuda_buffer(tensor.clone());
+        self.session.retain_cuda_buffer(history_mask.clone());
+        self.session.retain_cuda_buffer(result.clone());
+        let stream = self.session.device_mut().stream().clone();
+        self.semantic_sampler.enqueue(
+            &stream,
+            &tensor,
+            &history_mask,
+            vocabulary,
+            params,
+            self.seed,
+            self.semantic_steps,
+            eos_id,
+            &result,
+        )?;
+        self.semantic_steps = self.semantic_steps.wrapping_add(1);
+        let bytes = self.session.read_output_bytes(&result)?;
+        parse_semantic_result(&bytes, vocabulary, eos_id)
     }
 
     fn reset_fast(&mut self) -> Result<()> {

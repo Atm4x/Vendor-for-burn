@@ -4,8 +4,13 @@ use crate::error::{FishError, Result};
 use crate::sampling::SamplingParams;
 use crate::session::{initial_acoustic_code, GenerationSession, Phase};
 
+pub enum SlowArLogits {
+    Host(Vec<f32>),
+    DevicePending,
+}
+
 pub struct SlowArForward<C> {
-    pub logits: Vec<f32>,
+    pub logits: SlowArLogits,
     pub fast_context: C,
 }
 
@@ -23,6 +28,22 @@ pub trait DualArBackend {
         previous_column: &[u32],
         active_len: usize,
     ) -> Result<SlowArForward<Self::FastContext>>;
+    fn sample_semantic(
+        &mut self,
+        logits: &SlowArLogits,
+        history: &[usize],
+        params: SamplingParams,
+        eos_id: u32,
+        host_sample: &mut dyn FnMut(&[f32], &[usize], SamplingParams) -> Result<u32>,
+    ) -> Result<(u32, bool)> {
+        let SlowArLogits::Host(logits) = logits else {
+            return Err(FishError::InvalidTransition(
+                "device logits require backend sampling",
+            ));
+        };
+        let token = host_sample(logits, history, params)?;
+        Ok((token, token == eos_id))
+    }
     fn reset_fast(&mut self) -> Result<()>;
     fn prime_fast(&mut self, context: Self::FastContext) -> Result<()>;
     fn decode_fast(&mut self, codebook_index: usize, previous_code: u32) -> Result<Vec<f32>>;
@@ -132,7 +153,13 @@ where
                 .map(|&token| token as usize)
                 .collect()
         };
-        let semantic = sample(&slow.logits, &history, params)?;
+        let (semantic, eos_on_device) =
+            backend.sample_semantic(&slow.logits, &history, params, eos_id, sample)?;
+        if eos_on_device != (semantic == eos_id) {
+            return Err(FishError::InvalidSampling(
+                "semantic EOS flag disagrees with token",
+            ));
+        }
         session.begin_semantic_step()?;
         backend.reset_fast()?;
         trace.fast_resets += 1;
@@ -204,7 +231,7 @@ mod tests {
         fn slow_prefill(&mut self, prompt: &EncodedConversation) -> Result<SlowArForward<usize>> {
             self.steps.push(format!("prefill:{}", prompt.length()));
             Ok(SlowArForward {
-                logits: vec![0., 1.],
+                logits: SlowArLogits::Host(vec![0., 1.]),
                 fast_context: 11,
             })
         }
@@ -215,7 +242,7 @@ mod tests {
         ) -> Result<SlowArForward<usize>> {
             self.steps.push(format!("slow:{active_len}:{previous:?}"));
             Ok(SlowArForward {
-                logits: vec![1., 0.],
+                logits: SlowArLogits::Host(vec![1., 0.]),
                 fast_context: 22,
             })
         }
@@ -231,6 +258,124 @@ mod tests {
             self.steps.push(format!("fast:{index}:{previous}"));
             Ok(vec![0., 1., 0.])
         }
+    }
+
+    struct DeviceScriptedBackend {
+        steps: Vec<String>,
+        token: u32,
+        eos_flag: bool,
+    }
+
+    impl DualArBackend for DeviceScriptedBackend {
+        type FastContext = usize;
+
+        fn slow_prefill(&mut self, _prompt: &EncodedConversation) -> Result<SlowArForward<usize>> {
+            self.steps.push("device-prefill".into());
+            Ok(SlowArForward {
+                logits: SlowArLogits::DevicePending,
+                fast_context: 11,
+            })
+        }
+        fn slow_decode(
+            &mut self,
+            _previous: &[u32],
+            _active_len: usize,
+        ) -> Result<SlowArForward<usize>> {
+            self.steps.push("device-decode".into());
+            Ok(SlowArForward {
+                logits: SlowArLogits::DevicePending,
+                fast_context: 22,
+            })
+        }
+        fn sample_semantic(
+            &mut self,
+            logits: &SlowArLogits,
+            _history: &[usize],
+            _params: SamplingParams,
+            _eos_id: u32,
+            _host_sample: &mut dyn FnMut(&[f32], &[usize], SamplingParams) -> Result<u32>,
+        ) -> Result<(u32, bool)> {
+            assert!(matches!(logits, SlowArLogits::DevicePending));
+            self.steps.push("device-semantic".into());
+            Ok((self.token, self.eos_flag))
+        }
+        fn reset_fast(&mut self) -> Result<()> {
+            self.steps.push("reset".into());
+            Ok(())
+        }
+        fn prime_fast(&mut self, _context: usize) -> Result<()> {
+            self.steps.push("prime".into());
+            Ok(())
+        }
+        fn decode_fast(&mut self, _index: usize, _previous: u32) -> Result<Vec<f32>> {
+            self.steps.push("fast".into());
+            Ok(vec![0., 1., 0.])
+        }
+    }
+
+    #[test]
+    fn device_semantic_eos_finishes_after_acoustic_column_without_host_logits() {
+        let mut backend = DeviceScriptedBackend {
+            steps: Vec::new(),
+            token: 1,
+            eos_flag: true,
+        };
+        let mut trace = DualArTrace::default();
+        let output = generate_dual_ar(
+            &config(),
+            &mut backend,
+            &prompt(),
+            3,
+            1,
+            1,
+            SamplingParams::default(),
+            &mut |logits, _, _| {
+                assert_eq!(logits.len(), 3, "host semantic sampling is forbidden");
+                Ok(1)
+            },
+            &mut trace,
+            &mut || false,
+        )
+        .unwrap();
+        assert_eq!(output[0], vec![1]);
+        assert_eq!(
+            backend.steps,
+            [
+                "device-prefill",
+                "device-semantic",
+                "reset",
+                "prime",
+                "fast",
+                "fast"
+            ]
+        );
+    }
+
+    #[test]
+    fn inconsistent_device_eos_is_rejected_before_fast_ar() {
+        let mut backend = DeviceScriptedBackend {
+            steps: Vec::new(),
+            token: 1,
+            eos_flag: false,
+        };
+        let mut trace = DualArTrace::default();
+        let result = generate_dual_ar(
+            &config(),
+            &mut backend,
+            &prompt(),
+            3,
+            1,
+            1,
+            SamplingParams::default(),
+            &mut |logits, _, _| {
+                assert_eq!(logits.len(), 3, "host semantic sampling is forbidden");
+                Ok(1)
+            },
+            &mut trace,
+            &mut || false,
+        );
+        assert!(matches!(result, Err(FishError::InvalidSampling(_))));
+        assert_eq!(backend.steps, ["device-prefill", "device-semantic"]);
     }
 
     fn config() -> FishModelConfig {
