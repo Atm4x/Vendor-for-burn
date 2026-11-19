@@ -22,7 +22,9 @@ use fish_speech_core::{
 use super::{
     CubeClGraph, CubeClGraphExecutor,
     runtime::{is_cache_name, tensor_bytes, validate_binding},
-    sampling::{greedy_device_token, top_p_device_token},
+    sampling::{
+        greedy_device_token_with_handle, pack_selected_token_kernel, top_p_device_token_with_handle,
+    },
 };
 
 const DEFAULT_MAX_PENDING_BYTES: usize = 512 * 1024 * 1024;
@@ -124,12 +126,29 @@ pub struct CubeClDeviceTensor {
     ty: TensorType,
     handle: Handle,
     request_id: u64,
+    verified_tokens: Option<Vec<i32>>,
 }
 
 impl CubeClDeviceTensor {
     pub fn shape_elements(&self) -> usize {
         self.ty.shape.iter().product()
     }
+
+    pub(super) fn checked_token_shadow(&self, expected: &[i32]) -> Result<()> {
+        if self.verified_tokens.as_deref() != Some(expected) {
+            return Err(FishError::InvalidTransition(
+                "CubeCL device tokens differ from host trace",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct CubeClSampledToken {
+    pub(super) token: u32,
+    handle: Handle,
+    request_id: u64,
 }
 
 pub struct CubeClRunResult {
@@ -371,6 +390,7 @@ impl CubeClModel {
             pending_steps: 0,
             kv_bytes: 0,
             poisoned: false,
+            last_sample: None,
         })
     }
 
@@ -390,6 +410,7 @@ pub struct CubeClRequest<'a> {
     pending_steps: usize,
     kv_bytes: usize,
     poisoned: bool,
+    last_sample: Option<CubeClSampledToken>,
 }
 
 impl CubeClRequest<'_> {
@@ -480,7 +501,8 @@ impl CubeClRequest<'_> {
                 "CubeCL GPU sampler pending budget exceeded",
             ));
         }
-        let result = greedy_device_token(
+        self.last_sample = None;
+        let result = greedy_device_token_with_handle(
             self.model.executor.client(),
             &logits.handle,
             total,
@@ -493,10 +515,20 @@ impl CubeClRequest<'_> {
         );
         self.pending_steps += 1;
         self.pending_bytes = projected;
-        if result.is_err() {
-            self.poisoned = true;
+        match result {
+            Ok((token, eos, handle)) => {
+                self.last_sample = Some(CubeClSampledToken {
+                    token,
+                    handle,
+                    request_id: self.request_id,
+                });
+                Ok((token, eos))
+            }
+            Err(error) => {
+                self.poisoned = true;
+                Err(error)
+            }
         }
-        result
     }
 
     pub fn sample_top_p(
@@ -551,7 +583,8 @@ impl CubeClRequest<'_> {
                 "CubeCL GPU sampler pending budget exceeded",
             ));
         }
-        let sampled = top_p_device_token(
+        self.last_sample = None;
+        let sampled = top_p_device_token_with_handle(
             self.model.executor.client(),
             &logits.handle,
             total,
@@ -565,10 +598,123 @@ impl CubeClRequest<'_> {
         );
         self.pending_steps += 1;
         self.pending_bytes = projected;
-        if sampled.is_err() {
-            self.poisoned = true;
+        match sampled {
+            Ok((token, eos, handle)) => {
+                self.last_sample = Some(CubeClSampledToken {
+                    token,
+                    handle,
+                    request_id: self.request_id,
+                });
+                Ok((token, eos))
+            }
+            Err(error) => {
+                self.poisoned = true;
+                Err(error)
+            }
         }
-        sampled
+    }
+
+    pub(super) fn take_sampled(&mut self, expected: u32) -> Result<CubeClSampledToken> {
+        let selected = self.last_sample.take().ok_or(FishError::InvalidTransition(
+            "CubeCL selected token has no device handle",
+        ))?;
+        if selected.request_id != self.request_id || selected.token != expected {
+            return Err(FishError::InvalidTransition(
+                "CubeCL selected token identity mismatch",
+            ));
+        }
+        Ok(selected)
+    }
+
+    /// Pack already validated sampled IDs into a complete Fish token column.
+    /// A derived initial acoustic code is computed from the semantic device token.
+    pub(super) fn pack_token_column(
+        &mut self,
+        sources: &[(&CubeClSampledToken, bool)],
+        host_tokens: &[u32],
+        semantic_begin: u32,
+        codebook_size: usize,
+        ty: TensorType,
+    ) -> Result<CubeClDeviceTensor> {
+        if self.poisoned {
+            return Err(FishError::InvalidTransition(
+                "CubeCL stream poisoned; reset required",
+            ));
+        }
+        if sources.is_empty() || sources.len() != host_tokens.len() || codebook_size == 0 {
+            return Err(FishError::InvalidShape(
+                "CubeCL token column has invalid length",
+            ));
+        }
+        let begin = i32::try_from(semantic_begin)
+            .map_err(|_| FishError::InvalidShape("CubeCL semantic start exceeds i32"))?;
+        let mut verified = Vec::with_capacity(sources.len());
+        for ((selected, derived), &host) in sources.iter().zip(host_tokens) {
+            if selected.request_id != self.request_id {
+                return Err(FishError::InvalidTransition(
+                    "CubeCL token belongs to another request",
+                ));
+            }
+            let value = if *derived {
+                selected.token.saturating_sub(semantic_begin)
+            } else {
+                selected.token
+            };
+            if value != host || value > i32::MAX as u32 {
+                return Err(FishError::InvalidTransition(
+                    "CubeCL host/device token column mismatch",
+                ));
+            }
+            if *derived && (value as usize >= codebook_size || selected.token != sources[0].0.token)
+            {
+                return Err(FishError::InvalidShape(
+                    "CubeCL semantic-derived acoustic code invalid",
+                ));
+            }
+            verified.push(value as i32);
+        }
+        if ty.dtype != ScalarType::I32 || ty.shape.iter().product::<usize>() != verified.len() {
+            return Err(FishError::InvalidShape(
+                "CubeCL packed token type or shape mismatch",
+            ));
+        }
+        let scratch = verified
+            .len()
+            .checked_mul(4)
+            .ok_or(FishError::InvalidShape("CubeCL token scratch overflow"))?;
+        let projected = self
+            .pending_bytes
+            .checked_add(scratch)
+            .ok_or(FishError::InvalidShape("CubeCL token scratch overflow"))?;
+        if projected > self.limits.max_pending_bytes
+            || self.pending_steps >= self.limits.max_pending_steps
+        {
+            return Err(FishError::InvalidTransition(
+                "CubeCL token column pending budget exceeded",
+            ));
+        }
+        let output = self.model.executor.client().empty(scratch);
+        for (index, (selected, derived)) in sources.iter().enumerate() {
+            pack_selected_token_kernel::launch(
+                self.model.executor.client(),
+                CubeCount::Static(1, 1, 1),
+                CubeDim::new_1d(1),
+                unsafe { BufferArg::from_raw_parts(selected.handle.clone(), 2) },
+                unsafe { BufferArg::from_raw_parts(output.clone(), verified.len()) },
+                index,
+                *derived,
+                begin,
+            );
+        }
+        self.retained.push(output.clone());
+        self.pending_bytes = projected;
+        self.pending_steps += 1;
+        Ok(CubeClDeviceTensor {
+            ty,
+            handle: output,
+            request_id: self.request_id,
+            verified_tokens: Some(verified),
+        })
     }
 
     pub fn run_selected(
@@ -611,7 +757,32 @@ impl CubeClRequest<'_> {
             .iter()
             .map(|(name, tensor)| (name.clone(), tensor.ty.clone()))
             .collect();
-        plan.validate_runtime_bindings(runtime, &device_types)?;
+        let mut validation_inputs = runtime.clone();
+        for name in ["tokens", "previous_acoustic_code"] {
+            if let Some(tokens) = device_inputs.get(name) {
+                if runtime.contains_key(name) {
+                    return Err(FishError::InvalidShape(
+                        "CubeCL token has duplicate host and device bindings",
+                    ));
+                }
+                if tokens.ty.dtype != ScalarType::I32 {
+                    return Err(FishError::InvalidShape(
+                        "CubeCL forwarded token dtype must be I32",
+                    ));
+                }
+                let ids = tokens
+                    .verified_tokens
+                    .as_ref()
+                    .ok_or(FishError::InvalidTransition(
+                        "CubeCL device tokens lack validated sampled origin",
+                    ))?;
+                validation_inputs.insert(
+                    name.into(),
+                    fish_speech_core::cpu_ir::TensorData::I32(ids.clone()),
+                );
+            }
+        }
+        plan.validate_runtime_bindings(&validation_inputs, &device_types)?;
         self.cursor.validate_step(plan.graph())?;
         let graph = plan.graph();
         if let Some(selected) = host_readbacks {
@@ -743,6 +914,7 @@ impl CubeClRequest<'_> {
                     ty: value.ty.clone(),
                     handle: handle.clone(),
                     request_id: self.request_id,
+                    verified_tokens: None,
                 },
             );
             if host_readbacks.is_none_or(|selected| selected.contains(&value.name.as_str())) {
@@ -826,6 +998,7 @@ impl CubeClRequest<'_> {
         self.caches.clear();
         self.kv_bytes = 0;
         self.cursor = CubeClRequestCursor::default();
+        self.last_sample = None;
         self.poisoned = false;
         Ok(())
     }

@@ -9,6 +9,7 @@ use fish_speech_core::{
     cpu_ir::{NamedTensors, TensorData},
     cpu_weighted_ar::SelectionMode,
     error::{FishError, Result},
+    graph_ir::{Layout, ScalarType, TensorType},
     naive_generation::{NaiveArBackend, NaiveArForward, generate_naive_ar},
     sampling::{SamplingParams, SessionRng},
     synthesis::SemanticGenerator,
@@ -17,6 +18,7 @@ use fish_speech_core::{
 
 use super::session::{
     CubeClDeviceTensor, CubeClModel, CubeClPreparedModel, CubeClRequest, CubeClRequestLimits,
+    CubeClSampledToken,
 };
 use crate::weights::LoadedWeights;
 
@@ -83,15 +85,29 @@ struct CubeClDualArBackend<'a, 'b> {
     mode: SelectionMode,
     rng: &'a mut SessionRng,
     pending_semantic: Option<CubeClDeviceTensor>,
+    pending_semantic_token: Option<CubeClSampledToken>,
+    pending_column: Option<CubeClDeviceTensor>,
+    semantic_begin_id: u32,
 }
 
 impl CubeClDualArBackend<'_, '_> {
-    fn slow(&mut self, key: &str, tokens: Vec<i32>) -> Result<SlowArForward<CubeClDeviceTensor>> {
+    fn slow(
+        &mut self,
+        key: &str,
+        tokens: Vec<i32>,
+        device_tokens: Option<CubeClDeviceTensor>,
+    ) -> Result<SlowArForward<CubeClDeviceTensor>> {
         if self.request.cursor().fast_active_len > 0 {
             self.request.retire_blocking()?;
         }
         let mut inputs = NamedTensors::new();
-        inputs.insert("tokens".into(), TensorData::I32(tokens));
+        let mut devices = std::collections::BTreeMap::new();
+        if let Some(tensor) = device_tokens {
+            tensor.checked_token_shadow(&tokens)?;
+            devices.insert("tokens".into(), tensor);
+        } else {
+            inputs.insert("tokens".into(), TensorData::I32(tokens));
+        }
         inputs.insert(
             "semantic_membership_lut".into(),
             TensorData::I32(self.semantic_lut.to_vec()),
@@ -99,7 +115,7 @@ impl CubeClDualArBackend<'_, '_> {
         let readbacks: &[&str] = &[];
         let outputs = self
             .request
-            .run_selected(key, &inputs, &Default::default(), readbacks)?;
+            .run_selected(key, &inputs, &devices, readbacks)?;
         self.pending_semantic = Some(
             outputs
                 .device
@@ -134,6 +150,7 @@ impl DualArBackend for CubeClDualArBackend<'_, '_> {
         self.slow(
             "slow_prefill",
             checked_tokens(prompt.channels.iter().flatten().copied())?,
+            None,
         )
     }
 
@@ -142,9 +159,16 @@ impl DualArBackend for CubeClDualArBackend<'_, '_> {
         previous_column: &[u32],
         active_len: usize,
     ) -> Result<SlowArForward<CubeClDeviceTensor>> {
+        let device = self
+            .pending_column
+            .take()
+            .ok_or(FishError::InvalidTransition(
+                "CubeCL DualAR slow decode has no sampled device token column",
+            ))?;
         self.slow(
             &format!("slow_decode_{active_len}"),
             checked_tokens(previous_column.iter().copied())?,
+            Some(device),
         )
     }
 
@@ -168,7 +192,7 @@ impl DualArBackend for CubeClDualArBackend<'_, '_> {
                     .ok_or(FishError::InvalidTransition(
                         "CubeCL semantic sampler has no pending logits",
                     ))?;
-                match self.mode {
+                let selection = match self.mode {
                     SelectionMode::Greedy => self.request.sample_greedy(
                         &pending,
                         0,
@@ -186,7 +210,9 @@ impl DualArBackend for CubeClDualArBackend<'_, '_> {
                         eos_id,
                         self.rng,
                     ),
-                }
+                }?;
+                self.pending_semantic_token = Some(self.request.take_sampled(selection.0)?);
+                Ok(selection)
             }
         }
     }
@@ -226,7 +252,15 @@ impl DualArBackend for CubeClDualArBackend<'_, '_> {
         on_codebook: &mut dyn FnMut(usize) -> Result<()>,
         is_cancelled: &mut dyn FnMut() -> bool,
     ) -> Result<Vec<u32>> {
+        let semantic = self
+            .pending_semantic_token
+            .take()
+            .ok_or(FishError::InvalidTransition(
+                "CubeCL Fast AR lacks semantic device token",
+            ))?;
         let mut codes = vec![initial];
+        let mut selections = vec![(semantic.clone(), false), (semantic.clone(), true)];
+        let fast_type = TensorType::new([1, 1], ScalarType::I32, Layout::Plain);
         for (index, history) in histories.iter().enumerate() {
             if is_cancelled() {
                 return Err(FishError::InvalidTransition("synthesis cancelled"));
@@ -234,15 +268,21 @@ impl DualArBackend for CubeClDualArBackend<'_, '_> {
             let codebook = index + 1;
             let previous = *codes.last().expect("Fast AR initial code present");
             let token = {
-                let mut inputs = NamedTensors::new();
-                inputs.insert(
-                    "previous_acoustic_code".into(),
-                    TensorData::I32(checked_tokens([previous])?),
-                );
+                let inputs = NamedTensors::new();
+                let previous_source = selections.last().expect("Fast code 0 present");
+                let device_previous = self.request.pack_token_column(
+                    &[(&previous_source.0, previous_source.1)],
+                    &[previous],
+                    self.semantic_begin_id,
+                    codebook_size,
+                    fast_type.clone(),
+                )?;
+                let mut devices = std::collections::BTreeMap::new();
+                devices.insert("previous_acoustic_code".into(), device_previous);
                 let outputs = self.request.run_selected(
                     &format!("fast_{codebook}"),
                     &inputs,
-                    &Default::default(),
+                    &devices,
                     &[],
                 )?;
                 let device_logits =
@@ -285,9 +325,24 @@ impl DualArBackend for CubeClDualArBackend<'_, '_> {
                     "Fast AR sample exceeds codebook size",
                 ));
             }
+            let sampled = self.request.take_sampled(token)?;
+            selections.push((sampled, false));
             codes.push(token);
             on_codebook(codebook)?;
         }
+        let mut complete = vec![semantic.token];
+        complete.extend(codes.iter().copied());
+        let refs = selections
+            .iter()
+            .map(|(s, derived)| (s, *derived))
+            .collect::<Vec<_>>();
+        self.pending_column = Some(self.request.pack_token_column(
+            &refs,
+            &complete,
+            self.semantic_begin_id,
+            codebook_size,
+            TensorType::new([1, complete.len(), 1], ScalarType::I32, Layout::TokensBct),
+        )?);
         Ok(codes)
     }
 }
@@ -301,22 +356,32 @@ struct CubeClNaiveBackend<'a, 'b> {
     rng: &'a mut SessionRng,
     pending_semantic: Option<CubeClDeviceTensor>,
     pending_acoustic: Option<CubeClDeviceTensor>,
+    sampled_column: Vec<CubeClSampledToken>,
 }
 
 impl CubeClNaiveBackend<'_, '_> {
-    fn forward(&mut self, key: &str, tokens: Vec<i32>) -> Result<NaiveArForward> {
+    fn forward(
+        &mut self,
+        key: &str,
+        tokens: Vec<i32>,
+        device_tokens: Option<CubeClDeviceTensor>,
+    ) -> Result<NaiveArForward> {
         if self.request.cursor().slow_active_len > 0 {
             self.request.retire_blocking()?;
         }
         let mut input = NamedTensors::new();
-        input.insert("tokens".into(), TensorData::I32(tokens));
+        let mut devices = std::collections::BTreeMap::new();
+        if let Some(tensor) = device_tokens {
+            tensor.checked_token_shadow(&tokens)?;
+            devices.insert("tokens".into(), tensor);
+        } else {
+            input.insert("tokens".into(), TensorData::I32(tokens));
+        }
         input.insert(
             "semantic_membership_lut".into(),
             TensorData::I32(self.semantic_lut.to_vec()),
         );
-        let output = self
-            .request
-            .run_selected(key, &input, &Default::default(), &[])?;
+        let output = self.request.run_selected(key, &input, &devices, &[])?;
         let semantic = output.device.get("logits").ok_or(FishError::InvalidShape(
             "CubeCL Naive device semantic logits missing",
         ))?;
@@ -367,6 +432,7 @@ impl NaiveArBackend for CubeClNaiveBackend<'_, '_> {
         self.forward(
             "slow_prefill",
             checked_tokens(prompt.channels.iter().flatten().copied())?,
+            None,
         )
     }
 
@@ -375,10 +441,26 @@ impl NaiveArBackend for CubeClNaiveBackend<'_, '_> {
         previous_column: &[u32],
         active_len: usize,
     ) -> Result<NaiveArForward> {
-        self.forward(
-            &format!("slow_decode_{active_len}"),
-            checked_tokens(previous_column.iter().copied())?,
-        )
+        let ids = checked_tokens(previous_column.iter().copied())?;
+        if self.sampled_column.len() != ids.len() {
+            return Err(FishError::InvalidTransition(
+                "CubeCL Naive sampled column incomplete",
+            ));
+        }
+        let refs = self
+            .sampled_column
+            .iter()
+            .map(|sample| (sample, false))
+            .collect::<Vec<_>>();
+        let device = self.request.pack_token_column(
+            &refs,
+            previous_column,
+            0,
+            self.codebook_logits_len,
+            TensorType::new([1, ids.len(), 1], ScalarType::I32, Layout::TokensBct),
+        )?;
+        self.sampled_column.clear();
+        self.forward(&format!("slow_decode_{active_len}"), ids, Some(device))
     }
 
     fn sample_semantic(
@@ -393,7 +475,10 @@ impl NaiveArBackend for CubeClNaiveBackend<'_, '_> {
             .ok_or(FishError::InvalidTransition(
                 "CubeCL Naive semantic logits not pending",
             ))?;
-        self.select(&logits, 0, self.vocab_size, &[], params, u32::MAX)
+        let token = self.select(&logits, 0, self.vocab_size, &[], params, i32::MAX as u32)?;
+        self.sampled_column.clear();
+        self.sampled_column.push(self.request.take_sampled(token)?);
+        Ok(token)
     }
 
     fn sample_acoustic(
@@ -417,7 +502,16 @@ impl NaiveArBackend for CubeClNaiveBackend<'_, '_> {
             .ok_or(FishError::InvalidShape(
                 "CubeCL Naive acoustic offset overflow",
             ))?;
-        self.select(&logits, offset, codebook_size, history, params, u32::MAX)
+        let token = self.select(
+            &logits,
+            offset,
+            codebook_size,
+            history,
+            params,
+            i32::MAX as u32,
+        )?;
+        self.sampled_column.push(self.request.take_sampled(token)?);
+        Ok(token)
     }
 }
 
@@ -529,6 +623,9 @@ impl CubeClSemanticGenerator {
                     mode: self.mode,
                     rng: &mut self.rng,
                     pending_semantic: None,
+                    pending_semantic_token: None,
+                    pending_column: None,
+                    semantic_begin_id: self.semantic_begin_id,
                 };
                 generate_dual_ar(
                     &self.config,
@@ -557,6 +654,7 @@ impl CubeClSemanticGenerator {
                     rng: &mut self.rng,
                     pending_semantic: None,
                     pending_acoustic: None,
+                    sampled_column: Vec::new(),
                 };
                 generate_naive_ar(
                     &self.config,
@@ -654,5 +752,326 @@ mod tests {
         output.insert("logits".into(), TensorData::I32(vec![1, 2]));
         assert!(float_output(&output, "logits", 2).is_err());
         assert!(float_output(&output, "missing", 2).is_err());
+    }
+}
+
+#[cfg(all(test, feature = "cubecl-cpu"))]
+mod device_chain_tests {
+    use super::*;
+    use cubecl::Device;
+
+    fn fixture(kind: ModelKind) -> FishModelConfig {
+        let mut c = FishModelConfig::synthetic_dual_ar_fixture();
+        c.slow.dim = 8;
+        c.slow.n_heads = 2;
+        c.slow.n_kv_heads = 1;
+        c.slow.layers = 1;
+        c.slow.intermediate_size = 16;
+        if let Some(fast) = c.fast.as_mut() {
+            *fast = c.slow.clone();
+        }
+        c.vocab_size = 16;
+        c.num_codebooks = 2;
+        c.codebook_size = 8;
+        c.max_seq_len = 6;
+        c.kind = kind;
+        if kind == ModelKind::Naive {
+            c.fast = None;
+        }
+        c
+    }
+
+    fn prepared(config: &FishModelConfig) -> CubeClModel {
+        let plans = CubeClPreparedModel::from_transformer(config, 2, 2).unwrap();
+        let mut weights = NamedTensors::new();
+        for (name, ty) in plans.weight_specs() {
+            weights.insert(
+                name.clone(),
+                TensorData::F32(vec![0.0; ty.shape.iter().product()]),
+            );
+        }
+        CubeClModel::new(Device::Cpu(Default::default()).client(), plans, &weights).unwrap()
+    }
+
+    fn prompt(config: &FishModelConfig) -> EncodedConversation {
+        EncodedConversation {
+            channels: vec![vec![1, 2]; config.num_codebooks + 1],
+            vq_positions: vec![false; 2],
+        }
+    }
+
+    #[test]
+    fn dual_ar_runs_two_full_frames_with_forwarded_device_codes() {
+        let config = fixture(ModelKind::DualAr);
+        let model = prepared(&config);
+        let mut request = model.start_request(CubeClRequestLimits::default()).unwrap();
+        let mut rng = SessionRng::new(9);
+        let mut backend = CubeClDualArBackend {
+            request: &mut request,
+            semantic_lut: &[0; 16],
+            codebook_size: 8,
+            vocab_size: 16,
+            mode: SelectionMode::Greedy,
+            rng: &mut rng,
+            pending_semantic: None,
+            pending_semantic_token: None,
+            pending_column: None,
+            semantic_begin_id: 0,
+        };
+        let mut trace = DualArTrace::default();
+        let output = generate_dual_ar(
+            &config,
+            &mut backend,
+            &prompt(&config),
+            2,
+            0,
+            15,
+            SamplingParams::default(),
+            &mut |_, _, _| panic!("host logits should not be read"),
+            &mut trace,
+            &mut || false,
+        )
+        .unwrap();
+        assert_eq!(output, vec![vec![0, 0]; 3]);
+        assert_eq!(trace.slow_active_lengths, [2, 3]);
+        assert_eq!(trace.fast_resets, 2);
+        request.retire_blocking().unwrap();
+        assert!(!request.is_poisoned());
+    }
+
+    #[test]
+    fn naive_runs_two_full_frames_with_forwarded_device_codes() {
+        let config = fixture(ModelKind::Naive);
+        let model = prepared(&config);
+        let mut request = model.start_request(CubeClRequestLimits::default()).unwrap();
+        let mut rng = SessionRng::new(9);
+        let mut backend = CubeClNaiveBackend {
+            request: &mut request,
+            semantic_lut: &[0; 16],
+            vocab_size: 16,
+            codebook_logits_len: 16,
+            mode: SelectionMode::Greedy,
+            rng: &mut rng,
+            pending_semantic: None,
+            pending_acoustic: None,
+            sampled_column: Vec::new(),
+        };
+        let output = generate_naive_ar(
+            &config,
+            &mut backend,
+            &prompt(&config),
+            2,
+            15,
+            SamplingParams::default(),
+            &mut |_, _, _| panic!("host logits should not be read"),
+            &mut || false,
+        )
+        .unwrap();
+        assert_eq!(output, vec![vec![0, 0]; 3]);
+        request.retire_blocking().unwrap();
+        assert!(!request.is_poisoned());
+    }
+
+    #[test]
+    fn stochastic_device_chain_runs_two_frames_for_both_ar_variants() {
+        for kind in [ModelKind::DualAr, ModelKind::Naive] {
+            let mut config = fixture(kind);
+            config.codebook_size = 16;
+            let model = prepared(&config);
+            let mut request = model.start_request(CubeClRequestLimits::default()).unwrap();
+            let mut rng = SessionRng::new(41);
+            let params = SamplingParams {
+                temperature: 0.8,
+                top_p: 0.75,
+                repetition_penalty: 1.3,
+            };
+            // EOS is deliberately outside the synthetic vocabulary to force two chained steps.
+            let generated = if kind == ModelKind::DualAr {
+                let mut backend = CubeClDualArBackend {
+                    request: &mut request,
+                    semantic_lut: &[0; 16],
+                    codebook_size: 16,
+                    vocab_size: 16,
+                    mode: SelectionMode::Sample,
+                    rng: &mut rng,
+                    pending_semantic: None,
+                    pending_semantic_token: None,
+                    pending_column: None,
+                    semantic_begin_id: 0,
+                };
+                generate_dual_ar(
+                    &config,
+                    &mut backend,
+                    &prompt(&config),
+                    2,
+                    0,
+                    16,
+                    params,
+                    &mut |_, _, _| panic!("host sampler used"),
+                    &mut DualArTrace::default(),
+                    &mut || false,
+                )
+                .unwrap()
+            } else {
+                let mut backend = CubeClNaiveBackend {
+                    request: &mut request,
+                    semantic_lut: &[0; 16],
+                    vocab_size: 16,
+                    codebook_logits_len: 32,
+                    mode: SelectionMode::Sample,
+                    rng: &mut rng,
+                    pending_semantic: None,
+                    pending_acoustic: None,
+                    sampled_column: Vec::new(),
+                };
+                generate_naive_ar(
+                    &config,
+                    &mut backend,
+                    &prompt(&config),
+                    2,
+                    16,
+                    params,
+                    &mut |_, _, _| panic!("host sampler used"),
+                    &mut || false,
+                )
+                .unwrap()
+            };
+            assert_eq!(generated.len(), 3);
+            for tokens in &generated {
+                assert_eq!(tokens.len(), 2);
+                assert!(tokens.iter().all(|&word| word < 16));
+            }
+            request.retire_blocking().unwrap();
+        }
+    }
+
+    #[test]
+    fn greedy_eos_stops_after_first_forwarded_frame() {
+        for kind in [ModelKind::DualAr, ModelKind::Naive] {
+            let config = fixture(kind);
+            let model = prepared(&config);
+            let mut request = model.start_request(CubeClRequestLimits::default()).unwrap();
+            let mut rng = SessionRng::new(3);
+            let params = SamplingParams::default();
+            let generated = if kind == ModelKind::DualAr {
+                let mut backend = CubeClDualArBackend {
+                    request: &mut request,
+                    semantic_lut: &[0; 16],
+                    codebook_size: 8,
+                    vocab_size: 16,
+                    mode: SelectionMode::Greedy,
+                    rng: &mut rng,
+                    pending_semantic: None,
+                    pending_semantic_token: None,
+                    pending_column: None,
+                    semantic_begin_id: 0,
+                };
+                generate_dual_ar(
+                    &config,
+                    &mut backend,
+                    &prompt(&config),
+                    2,
+                    0,
+                    0,
+                    params,
+                    &mut |_, _, _| panic!("host sampler used"),
+                    &mut DualArTrace::default(),
+                    &mut || false,
+                )
+                .unwrap()
+            } else {
+                let mut backend = CubeClNaiveBackend {
+                    request: &mut request,
+                    semantic_lut: &[0; 16],
+                    vocab_size: 16,
+                    codebook_logits_len: 16,
+                    mode: SelectionMode::Greedy,
+                    rng: &mut rng,
+                    pending_semantic: None,
+                    pending_acoustic: None,
+                    sampled_column: Vec::new(),
+                };
+                generate_naive_ar(
+                    &config,
+                    &mut backend,
+                    &prompt(&config),
+                    2,
+                    0,
+                    params,
+                    &mut |_, _, _| panic!("host sampler used"),
+                    &mut || false,
+                )
+                .unwrap()
+            };
+            assert_eq!(generated, vec![vec![0]; 3]);
+            request.retire_blocking().unwrap();
+        }
+    }
+    #[test]
+    fn cancellation_between_frames_does_not_reuse_speculative_device_tokens() {
+        for kind in [ModelKind::DualAr, ModelKind::Naive] {
+            let config = fixture(kind);
+            let model = prepared(&config);
+            let mut request = model.start_request(CubeClRequestLimits::default()).unwrap();
+            let mut rng = SessionRng::new(21);
+            let mut calls = 0;
+            let mut cancelled = || {
+                calls += 1;
+                calls > if kind == ModelKind::DualAr { 2 } else { 3 }
+            };
+            let result = if kind == ModelKind::DualAr {
+                let mut backend = CubeClDualArBackend {
+                    request: &mut request,
+                    semantic_lut: &[0; 16],
+                    codebook_size: 8,
+                    vocab_size: 16,
+                    mode: SelectionMode::Greedy,
+                    rng: &mut rng,
+                    pending_semantic: None,
+                    pending_semantic_token: None,
+                    pending_column: None,
+                    semantic_begin_id: 0,
+                };
+                generate_dual_ar(
+                    &config,
+                    &mut backend,
+                    &prompt(&config),
+                    2,
+                    0,
+                    15,
+                    SamplingParams::default(),
+                    &mut |_, _, _| panic!("host sampler used"),
+                    &mut DualArTrace::default(),
+                    &mut cancelled,
+                )
+            } else {
+                let mut backend = CubeClNaiveBackend {
+                    request: &mut request,
+                    semantic_lut: &[0; 16],
+                    vocab_size: 16,
+                    codebook_logits_len: 16,
+                    mode: SelectionMode::Greedy,
+                    rng: &mut rng,
+                    pending_semantic: None,
+                    pending_acoustic: None,
+                    sampled_column: Vec::new(),
+                };
+                generate_naive_ar(
+                    &config,
+                    &mut backend,
+                    &prompt(&config),
+                    2,
+                    15,
+                    SamplingParams::default(),
+                    &mut |_, _, _| panic!("host sampler used"),
+                    &mut cancelled,
+                )
+            };
+            assert!(matches!(
+                result,
+                Err(FishError::InvalidTransition("synthesis cancelled"))
+            ));
+            request.retire_blocking().unwrap();
+        }
     }
 }

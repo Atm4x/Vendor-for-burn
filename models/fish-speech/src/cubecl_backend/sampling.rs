@@ -45,7 +45,7 @@ fn greedy_token_kernel(
     }
 }
 
-pub(super) fn greedy_device_token(
+pub(super) fn greedy_device_token_with_handle(
     client: &Client,
     logits: &Handle,
     total: usize,
@@ -55,7 +55,7 @@ pub(super) fn greedy_device_token(
     params: SamplingParams,
     eos_id: u32,
     retained: &mut Vec<Handle>,
-) -> Result<(u32, bool)> {
+) -> Result<(u32, bool, Handle)> {
     params.validate()?;
     let end = offset
         .checked_add(vocabulary)
@@ -110,7 +110,28 @@ pub(super) fn greedy_device_token(
             "CubeCL GPU sampler returned invalid token or EOS",
         ));
     }
-    Ok((token as u32, flag != 0))
+    Ok((
+        token as u32,
+        flag != 0,
+        retained.last().expect("sampler result retained").clone(),
+    ))
+}
+
+pub(super) fn greedy_device_token(
+    client: &Client,
+    logits: &Handle,
+    total: usize,
+    offset: usize,
+    vocabulary: usize,
+    history: &[usize],
+    params: SamplingParams,
+    eos_id: u32,
+    retained: &mut Vec<Handle>,
+) -> Result<(u32, bool)> {
+    greedy_device_token_with_handle(
+        client, logits, total, offset, vocabulary, history, params, eos_id, retained,
+    )
+    .map(|(token, eos, _)| (token, eos))
 }
 
 #[cube(launch)]
@@ -272,7 +293,7 @@ fn top_p_token_kernel(
     }
 }
 
-pub(super) fn top_p_device_token(
+pub(super) fn top_p_device_token_with_handle(
     client: &Client,
     logits: &Handle,
     total: usize,
@@ -283,7 +304,7 @@ pub(super) fn top_p_device_token(
     eos_id: u32,
     rng: &mut fish_speech_core::sampling::SessionRng,
     retained: &mut Vec<Handle>,
-) -> Result<(u32, bool)> {
+) -> Result<(u32, bool, Handle)> {
     params.validate()?;
     let end = offset
         .checked_add(vocabulary)
@@ -350,7 +371,53 @@ pub(super) fn top_p_device_token(
             "CubeCL GPU top-p sampler invalid token or EOS",
         ));
     }
-    Ok((token as u32, flag != 0))
+    Ok((
+        token as u32,
+        flag != 0,
+        retained.last().expect("sampler result retained").clone(),
+    ))
+}
+
+pub(super) fn top_p_device_token(
+    client: &Client,
+    logits: &Handle,
+    total: usize,
+    offset: usize,
+    vocabulary: usize,
+    history: &[usize],
+    params: SamplingParams,
+    eos_id: u32,
+    rng: &mut fish_speech_core::sampling::SessionRng,
+    retained: &mut Vec<Handle>,
+) -> Result<(u32, bool)> {
+    top_p_device_token_with_handle(
+        client, logits, total, offset, vocabulary, history, params, eos_id, rng, retained,
+    )
+    .map(|(token, eos, _)| (token, eos))
+}
+
+/// Copy the validated selection to the next graph without staging the token through CPU.
+/// Each source is the two-element [token, EOS] sampler output.
+#[cube(launch)]
+pub(super) fn pack_selected_token_kernel(
+    sampled: &[i32],
+    output: &mut [i32],
+    #[comptime] position: usize,
+    #[comptime] derive_initial: bool,
+    semantic_begin: i32,
+) {
+    if ABSOLUTE_POS == 0 {
+        let word = sampled[0];
+        output[position] = if derive_initial {
+            if word >= semantic_begin {
+                word - semantic_begin
+            } else {
+                0i32
+            }
+        } else {
+            word
+        };
+    }
 }
 
 #[cfg(all(test, feature = "cubecl-cpu"))]
@@ -473,6 +540,58 @@ mod tests {
                 &mut retained,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn cubecl_sampled_tokens_remain_device_resident_across_a_column_pack() {
+        let client = Device::Cpu(Default::default()).client();
+        let semantic = client.create_from_slice(bytemuck::cast_slice(&[501i32, 0]));
+        let acoustic1 = client.create_from_slice(bytemuck::cast_slice(&[6i32, 0]));
+        let acoustic2 = client.create_from_slice(bytemuck::cast_slice(&[11i32, 0]));
+        let output = client.empty(4 * 4);
+        for (index, (handle, derived)) in [
+            (&semantic, false),
+            (&semantic, true),
+            (&acoustic1, false),
+            (&acoustic2, false),
+        ]
+        .iter()
+        .enumerate()
+        {
+            pack_selected_token_kernel::launch(
+                &client,
+                CubeCount::Static(1, 1, 1),
+                CubeDim::new_1d(1),
+                unsafe { BufferArg::from_raw_parts((*handle).clone(), 2) },
+                unsafe { BufferArg::from_raw_parts(output.clone(), 4) },
+                index,
+                *derived,
+                500i32,
+            );
+        }
+        let bytes = client.read_one(output).unwrap();
+        let ids = bytes
+            .chunks_exact(4)
+            .map(|chunk| i32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(ids, [501, 1, 6, 11]);
+
+        let first_underflow = client.create_from_slice(bytemuck::cast_slice(&[17i32, 1]));
+        let out = client.empty(4);
+        pack_selected_token_kernel::launch(
+            &client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(1),
+            unsafe { BufferArg::from_raw_parts(first_underflow, 2) },
+            unsafe { BufferArg::from_raw_parts(out.clone(), 1) },
+            0,
+            true,
+            500i32,
+        );
+        assert_eq!(
+            i32::from_le_bytes(client.read_one(out).unwrap()[..4].try_into().unwrap()),
+            0
         );
     }
 

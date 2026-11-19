@@ -159,13 +159,22 @@ impl CubeClGraph {
         for value in &self.graph.values {
             if matches!(value.origin, Origin::Input) && !is_cache_name(&value.name) {
                 if let Some(ty) = device_types.get(&value.name) {
-                    if value.name != "fast_context"
+                    let forwarded_tokens =
+                        matches!(value.name.as_str(), "tokens" | "previous_acoustic_code")
+                            && ty.dtype == ScalarType::I32;
+                    if (!forwarded_tokens && value.name != "fast_context")
                         || *ty != value.ty
-                        || inputs.contains_key(&value.name)
+                        || (inputs.contains_key(&value.name) && !forwarded_tokens)
                     {
                         return Err(FishError::InvalidShape(
                             "invalid CubeCL device input binding",
                         ));
+                    }
+                    if forwarded_tokens {
+                        let shadow = inputs.get(&value.name).ok_or(FishError::InvalidShape(
+                            "CubeCL forwarded tokens require validated host shadow",
+                        ))?;
+                        verify_binding(&value.ty, shadow)?;
                     }
                 } else {
                     let data = inputs
