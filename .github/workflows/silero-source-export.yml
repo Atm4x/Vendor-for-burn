@@ -36,3 +36,4 @@ jobs:
           path: export/
           retention-days: 2
           compression-level: 0
+          if-no-files-found: error
