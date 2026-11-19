@@ -60,3 +60,6 @@ mod dynamic_decode;
 
 #[cfg(all(feature = "cuda-driver", feature = "tensorrt-api"))]
 pub mod cuda_naive_generation;
+
+#[cfg(feature = "cubecl-backend")]
+pub mod cubecl_backend;

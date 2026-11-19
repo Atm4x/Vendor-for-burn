@@ -9,8 +9,12 @@ default = []
 cuda-driver = ["dep:cudarc"]
 tensorrt-mock = ["dep:trtx", "dep:trtx-sys", "trtx/mock"]
 tensorrt-api = ["dep:trtx", "dep:trtx-sys"]
+cubecl-backend = ["dep:cubecl"]
+cubecl-cpu = ["cubecl-backend", "cubecl/cpu"]
+cubecl-cuda = ["cubecl-backend", "cubecl/cuda"]
 
 [dependencies]
+cubecl = { version = "=0.11.3", optional = true, default-features = false, features = ["std"] }
 fish-speech-core-prototype = { path = "core" }
 bytemuck = "1.25"
 cudarc = { version = "=0.19.10", optional = true, default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-12090"] }
