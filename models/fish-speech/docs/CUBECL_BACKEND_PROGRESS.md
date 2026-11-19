@@ -1,10 +1,10 @@
 # Fish Speech 1.5 — CubeCL implementation tracker
 
-Baseline: `codex/fish-speech`; updated during CONT43 (2026-11-19).
+Baseline: `codex/fish-speech`; updated during CONT44 (2026-11-19).
 
 **Meaning:** This is a checklist of implementation/verification gates, not a benchmark, a statement of GPU operability, or the percentage of the original Fish Speech functional port. The checklist denominator is fixed at **26 gates**, allocated C01=4, C02=6, C03=4, C04=4, C05=4, C06=4. A gate for numeric parity stays open until the actual CubeCL runtime executes and its results are compared with a reference. Pure graph compilation does not satisfy that gate.
 
-**Overall: 17/26 = 65.4% implementation gates**. Real CubeCL CPU numerical execution: verified against `CpuIrInterpreter` for synthetic operator fixtures. CubeCL CUDA/Windows inference: unverified.
+**Overall: 18/26 = 69.2% implementation gates**. Real CubeCL CPU numerical execution: verified against `CpuIrInterpreter` for synthetic operator fixtures. CubeCL CUDA/Windows inference: unverified.
 
 ## C01 — bootstrap: 4/4
 
@@ -38,9 +38,9 @@ Baseline: `codex/fish-speech`; updated during CONT43 (2026-11-19).
 - [x] Device-resident token forwarding across Slow/Naive/Fast graphs, with request-owned sampled I32 handles, host-validated token shadows, sampled EOS readback, and controlled async scratch lifetime. Synthetic end-to-end generation passed for DualAR and Naive in greedy and stochastic top-p, including first-frame EOS and cancellation before the next frame on CubeCL CPU. Selected IDs still synchronize with CPU for session control and final trace; they are not uploaded back into the next graph. CUDA/Windows still unverified.
 - [ ] End-to-end CubeCL semantic generation + CPU Firefly, compared with the CPU trace.
 
-## C05 — CubeCL Firefly: 0/4
+## C05 — CubeCL Firefly: 1/4
 
-- [ ] FSQ encode/decode.
+- [x] Native grouped residual FSQ encode/decode, executed on CubeCL CPU and compared against Core CPU and existing Python-source-formula golden fixtures. Multi-batch, multi-group, multiple quantizer counts, ignored `-1` codes, malformed indices, non-finite inputs and 27 geometry combinations tested. Public `CubeClFsqExecutor` exposes encode and decode; CPU is a reference, never a compute fallback. These APIs currently transfer inputs/outputs to the host and do not yet integrate with the Firefly ConvNeXt/HiFiGAN graph.
 - [ ] ConvNeXt encoder and related transforms.
 - [ ] HiFiGAN / ConvTranspose audio decoder.
 - [ ] Full reference encoding, audio output and numerical parity.
@@ -52,7 +52,20 @@ Baseline: `codex/fish-speech`; updated during CONT43 (2026-11-19).
 - [ ] Load/first-token/generation/RTF throughput and memory benchmarks.
 - [ ] Profiler-driven kernel optimization and resource lifetime acceptance.
 
-## Verification ledger — CONT43
+## Verification ledger — CONT44
+
+| Check | Status |
+| --- | --- |
+| CubeCL CPU grouped residual FSQ encode/decode against Rust reference and golden fixtures | PASS |
+| 27 group/quantizer/frame combinations plus negative cases | PASS |
+| CubeCL CPU library | PASS: 94 passed, 2 ignored |
+| CubeCL feature library | PASS: 72 passed, 2 ignored |
+| Default library | PASS: 58 passed, 2 ignored |
+| Core library | PASS: 208 passed, 2 ignored |
+| Formatting and diff check | PASS |
+| Original Python package execution / real weights / Windows CUDA | NOT VERIFIED |
+
+## Historical verification — CONT43
 
 | Check | Status |
 | --- | --- |
