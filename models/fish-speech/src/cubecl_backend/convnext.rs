@@ -445,3 +445,5 @@ mod tests;
 mod encoder;
 
 pub use encoder::CubeClPreparedFireflyEncoder;
+
+pub(crate) use decoder::CubeClFireflyReferenceEncoder;

@@ -2,7 +2,10 @@
 
 use super::*;
 use crate::weights::{LoadedWeights, Result as WeightResult, WeightError};
-use fish_speech_core::{audio::FIREFLY_GROUPS, synthesis::AcousticDecoder};
+use fish_speech_core::{
+    audio::{FIREFLY_GROUPS, FIREFLY_LEVELS},
+    synthesis::AcousticDecoder,
+};
 use std::sync::Arc;
 
 /// A model-scoped adapter for the standard synthesis pipeline.
@@ -96,5 +99,72 @@ impl CubeClFireflyCodec {
 
     pub fn decoder_mut(&mut self) -> &mut CubeClFireflyAcousticDecoder {
         &mut self.decoder
+    }
+}
+
+pub(crate) struct CubeClFireflyReferenceEncoder {
+    client: Client,
+    checkpoint: Arc<LoadedWeights>,
+    loader: crate::reference_loader::ReferenceAudioLoader,
+    prepared: Option<(usize, usize, CubeClPreparedFireflyEncoder)>,
+}
+
+impl CubeClFireflyReferenceEncoder {
+    pub(crate) fn new(client: Client, checkpoint: Arc<LoadedWeights>) -> Self {
+        Self {
+            client,
+            checkpoint,
+            loader: Default::default(),
+            prepared: None,
+        }
+    }
+
+    pub(crate) fn set_audio_loader(
+        &mut self,
+        loader: crate::reference_loader::ReferenceAudioLoader,
+    ) {
+        self.loader = loader;
+        self.prepared = None;
+    }
+
+    pub(crate) fn encode_reference_bytes(
+        &mut self,
+        audio: &[u8],
+    ) -> crate::reference_loader::Result<Vec<Vec<u32>>> {
+        use crate::reference_loader::ReferenceLoadError;
+        let pcm = self.loader.load_bytes(audio)?.pcm;
+        if self
+            .prepared
+            .as_ref()
+            .is_none_or(|(samples, _, _)| *samples != pcm.len())
+        {
+            let graph = FireflyGraph::reference_encode(1, pcm.len())?;
+            let valid = graph.valid_frames;
+            let weights = self
+                .checkpoint
+                .firefly_cpu_weights(&graph)
+                .map_err(|error| {
+                    FishError::Backend(format!("CubeCL Firefly encoder weights: {error}"))
+                })?;
+            let encoder = CubeClPreparedFireflyEncoder::new(self.client.clone(), graph, weights)?;
+            self.prepared = Some((pcm.len(), valid, encoder));
+        }
+        let (_, valid, encoder) = self.prepared.as_ref().expect("reference encoder prepared");
+        let encoded = encoder.encode_mono_pcm(&pcm)?;
+        let stride = encoded.len() / FIREFLY_GROUPS;
+        let codebook_size = FIREFLY_LEVELS.iter().product::<usize>() as i32;
+        if stride < *valid
+            || stride == 0
+            || encoded.len() % FIREFLY_GROUPS != 0
+            || encoded.iter().any(|&id| !(0..codebook_size).contains(&id))
+        {
+            return Err(ReferenceLoadError::from(FishError::InvalidShape(
+                "CubeCL Firefly returned invalid reference codes",
+            )));
+        }
+        Ok(encoded
+            .chunks_exact(stride)
+            .map(|row| row[..*valid].iter().map(|&id| id as u32).collect())
+            .collect())
     }
 }

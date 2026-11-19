@@ -3,7 +3,10 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -14,20 +17,25 @@ use fish_speech_core::{
     cpu_ir::NamedTensors,
     error::{FishError, Result},
     graph::Stage,
-    graph_ir::{Graph, Op, Origin, ScalarType, TensorType},
+    graph_ir::{Graph, Layout, Op, Origin, ScalarType, TensorType},
     sampling::SamplingParams,
     transformer_ir::TransformerIrFactory,
 };
 
 use super::{
     CubeClGraph, CubeClGraphExecutor,
-    runtime::{is_cache_name, tensor_bytes, validate_binding},
+    runtime::{is_cache_name, validate_binding},
     sampling::{
-        greedy_device_token_with_handle, pack_selected_token_kernel, top_p_device_token_with_handle,
+        decode_sample, enqueue_greedy, enqueue_top_p, greedy_device_token_with_handle,
+        pack_selected_token_kernel, top_p_device_token_with_handle,
     },
 };
 
-const DEFAULT_MAX_PENDING_BYTES: usize = 512 * 1024 * 1024;
+mod fast_replay;
+use fast_replay::CapturedFastFrame;
+
+// Full prefill keeps the temporary tensors for a voice reference and text in flight.
+const DEFAULT_MAX_PENDING_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const DEFAULT_MAX_KV_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_MAX_PENDING_STEPS: usize = 128;
 
@@ -151,14 +159,26 @@ pub(super) struct CubeClSampledToken {
     request_id: u64,
 }
 
+pub(super) struct PendingFastSample {
+    handle: Handle,
+    request_id: u64,
+}
+
 pub struct CubeClRunResult {
     pub host: NamedTensors,
     pub device: BTreeMap<String, CubeClDeviceTensor>,
 }
 
-/// Preflight-only model plan collection. No GPU allocation or CubeCL runtime is needed.
+struct SlowDecodeProfiles {
+    config: FishModelConfig,
+    first: usize,
+    slots: Vec<OnceLock<CubeClGraph>>,
+}
+
+/// Model plan collection. Preparing or compiling a plan does not allocate GPU memory.
 pub struct CubeClPreparedModel {
     graphs: BTreeMap<String, CubeClGraph>,
+    slow_decode: Option<SlowDecodeProfiles>,
     weights: BTreeMap<String, TensorType>,
     caches: BTreeMap<String, TensorType>,
 }
@@ -167,6 +187,7 @@ impl CubeClPreparedModel {
     pub fn compile(graphs: impl IntoIterator<Item = (String, Graph)>) -> Result<Self> {
         let mut result = Self {
             graphs: BTreeMap::new(),
+            slow_decode: None,
             weights: BTreeMap::new(),
             caches: BTreeMap::new(),
         };
@@ -224,8 +245,8 @@ impl CubeClPreparedModel {
         Ok(result)
     }
 
-    /// Build the Slow and Fast profiles for one request geometry. Positions are
-    /// specialized for now; dynamic position buckets are a later CubeCL optimization.
+    /// Prepare prefill, Fast AR and the first Slow decode position. Later
+    /// position-specific graphs are materialized only when generation reaches them.
     pub fn from_transformer(
         config: &FishModelConfig,
         prompt_len: usize,
@@ -240,36 +261,71 @@ impl CubeClPreparedModel {
                 "invalid CubeCL Transformer profile bounds",
             ));
         }
-        // A large number of position-specialized graphs is not a production path.
-        if max_new_tokens > 64 {
-            return Err(FishError::Unsupported(
-                "CubeCL dynamic Slow decode profiles are not implemented; limit is 64 tokens",
-            ));
-        }
         let factory = TransformerIrFactory::new(config)?;
         let mut graphs = vec![("slow_prefill".into(), factory.slow_prefill(prompt_len)?)];
-        for active in (prompt_len + 1)..(prompt_len + max_new_tokens) {
-            graphs.push((
-                format!("slow_decode_{active}"),
-                factory.slow_decode(active)?,
-            ));
+        let first = prompt_len + 1;
+        if max_new_tokens > 1 {
+            graphs.push((format!("slow_decode_{first}"), factory.slow_decode(first)?));
         }
         if config.kind == ModelKind::DualAr {
             for step in 0..config.num_codebooks {
                 graphs.push((format!("fast_{step}"), factory.fast_decode(step)?));
             }
         }
-        Self::compile(graphs)
+        let mut prepared = Self::compile(graphs)?;
+        if max_new_tokens > 2 {
+            prepared.slow_decode = Some(SlowDecodeProfiles {
+                config: config.clone(),
+                first: first + 1,
+                slots: (0..max_new_tokens - 2).map(|_| OnceLock::new()).collect(),
+            });
+        }
+        Ok(prepared)
     }
 
     pub fn graph(&self, key: &str) -> Result<&CubeClGraph> {
-        self.graphs.get(key).ok_or(FishError::InvalidConfig(
-            "CubeCL model profile is not prepared",
-        ))
+        if let Some(graph) = self.graphs.get(key) {
+            return Ok(graph);
+        }
+        let prepared = self
+            .slow_decode
+            .as_ref()
+            .and_then(|profile| {
+                let active = key.strip_prefix("slow_decode_")?.parse::<usize>().ok()?;
+                let slot = profile.slots.get(active.checked_sub(profile.first)?)?;
+                Some((profile, active, slot))
+            })
+            .ok_or(FishError::InvalidConfig(
+                "CubeCL model profile is not prepared",
+            ))?;
+        let (profile, active, slot) = prepared;
+        if let Some(graph) = slot.get() {
+            return Ok(graph);
+        }
+        let graph = TransformerIrFactory::new(&profile.config)?.slow_decode(active)?;
+        let compiled = CubeClGraph::compile(&graph)?;
+        for value in &graph.values {
+            let known = match value.origin {
+                Origin::Weight { .. } => self.weights.get(&value.name),
+                Origin::Input if is_cache_name(&value.name) => self.caches.get(&value.name),
+                _ => continue,
+            };
+            if known != Some(&value.ty) {
+                return Err(FishError::InvalidShape(
+                    "CubeCL lazy profile changed weight or cache layout",
+                ));
+            }
+        }
+        let _ = slot.set(compiled);
+        Ok(slot.get().expect("Slow decode profile was initialized"))
     }
 
     pub fn plan_count(&self) -> usize {
         self.graphs.len()
+            + self
+                .slow_decode
+                .as_ref()
+                .map_or(0, |profile| profile.slots.len())
     }
 
     pub fn weight_specs(&self) -> &BTreeMap<String, TensorType> {
@@ -311,9 +367,6 @@ impl CubeClModel {
     ) -> Result<Self> {
         prepared.validate_weights(weights)?;
         let executor = CubeClGraphExecutor::new(client);
-        for compiled in prepared.graphs.values() {
-            executor.ensure_bf16_supported(compiled)?;
-        }
         let mut device_weights = BTreeMap::new();
         for (name, ty) in &prepared.weights {
             device_weights.insert(name.clone(), executor.upload(ty, &weights[name]));
@@ -326,8 +379,8 @@ impl CubeClModel {
     }
 
     /// Upload semantic safetensors directly, one tensor at a time, avoiding a
-    /// complete intermediate F32 host checkpoint. F16/BF16 source weights are
-    /// converted to F32 using the existing validated checkpoint bridge.
+    /// complete intermediate F32 host checkpoint. Eligible BF16 projection
+    /// weights retain their exact bits in packed U32 device buffers.
     pub fn from_checkpoint(
         client: Client,
         prepared: CubeClPreparedModel,
@@ -353,15 +406,50 @@ impl CubeClModel {
             }
         }
         let executor = CubeClGraphExecutor::new(client);
+        // Only store packed coefficients for weights consumed exclusively as linear RHS.
+        let mut unpacked = BTreeSet::new();
         for compiled in prepared.graphs.values() {
-            executor
-                .ensure_bf16_supported(compiled)
-                .map_err(|e| WeightError::Invalid(format!("CubeCL device unsupported: {e}")))?;
+            let graph = compiled.graph();
+            for node in &graph.nodes {
+                for (index, id) in node.inputs.iter().enumerate() {
+                    let value = &graph.values[id.0];
+                    if matches!(value.origin, Origin::Weight { .. })
+                        && (index != 1 || !matches!(node.op, Op::Linear | Op::LinearBias))
+                    {
+                        unpacked.insert(value.name.as_str());
+                    }
+                }
+            }
+            unpacked.extend(
+                graph
+                    .outputs
+                    .iter()
+                    .map(|id| graph.values[id.0].name.as_str()),
+            );
         }
         let mut weights = BTreeMap::new();
         for (key, ty) in prepared.weight_specs() {
-            let bytes = checkpoint.semantic_f32_upload_bytes(key, ty)?;
-            weights.insert(key.clone(), executor.client().create_from_slice(&bytes));
+            let view = checkpoint.tensor(key)?;
+            let handle = if view.dtype() == Dtype::BF16
+                && ty.shape.len() == 2
+                && ty.shape[1] % 2 == 0
+                && !unpacked.contains(key.as_str())
+            {
+                let data = view.data();
+                if data
+                    .chunks_exact(2)
+                    .any(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]) & 0x7f80 == 0x7f80)
+                {
+                    return Err(WeightError::Invalid(format!(
+                        "non-finite CubeCL weight: {key}"
+                    )));
+                }
+                executor.client().create_from_slice(data)
+            } else {
+                let bytes = checkpoint.semantic_f32_upload_bytes(key, ty)?;
+                executor.client().create_from_slice(&bytes)
+            };
+            weights.insert(key.clone(), handle);
         }
         Ok(Self {
             prepared,
@@ -391,6 +479,8 @@ impl CubeClModel {
             kv_bytes: 0,
             poisoned: false,
             last_sample: None,
+            replay_context: None,
+            fast_replay: None,
         })
     }
 
@@ -411,6 +501,8 @@ pub struct CubeClRequest<'a> {
     kv_bytes: usize,
     poisoned: bool,
     last_sample: Option<CubeClSampledToken>,
+    replay_context: Option<CubeClDeviceTensor>,
+    fast_replay: Option<CapturedFastFrame>,
 }
 
 impl CubeClRequest<'_> {
@@ -443,7 +535,7 @@ impl CubeClRequest<'_> {
         if is_cancelled() {
             return Err(FishError::InvalidTransition("synthesis cancelled"));
         }
-        let result = self.run_inner(key, runtime, &BTreeMap::new(), None)?;
+        let result = self.run_inner(key, runtime, &BTreeMap::new(), None, None)?;
         if is_cancelled() {
             self.poisoned = true;
             return Err(FishError::InvalidTransition("synthesis cancelled"));
@@ -614,6 +706,137 @@ impl CubeClRequest<'_> {
         }
     }
 
+    pub(super) fn run_with_pending_fast(
+        &mut self,
+        key: &str,
+        token: &PendingFastSample,
+    ) -> Result<CubeClRunResult> {
+        self.run_inner(
+            key,
+            &NamedTensors::new(),
+            &BTreeMap::new(),
+            Some(&[]),
+            Some(token),
+        )
+    }
+
+    pub(super) fn enqueue_fast_sample(
+        &mut self,
+        logits: &CubeClDeviceTensor,
+        vocabulary: usize,
+        history: &[usize],
+        params: SamplingParams,
+        rng: Option<&mut fish_speech_core::sampling::SessionRng>,
+    ) -> Result<PendingFastSample> {
+        if self.poisoned
+            || logits.request_id != self.request_id
+            || logits.ty.dtype != ScalarType::F32
+        {
+            return Err(FishError::InvalidTransition(
+                "invalid CubeCL Fast sampler input",
+            ));
+        }
+        let extra = vocabulary
+            .checked_mul(if rng.is_some() { 12 } else { 0 })
+            .and_then(|bytes| bytes.checked_add(history.len().max(1).checked_mul(4)?))
+            .and_then(|bytes| bytes.checked_add(8))
+            .and_then(|bytes| bytes.checked_add(self.pending_bytes))
+            .ok_or(FishError::InvalidShape(
+                "CubeCL Fast sampler scratch byte overflow",
+            ))?;
+        if extra > self.limits.max_pending_bytes
+            || self.pending_steps >= self.limits.max_pending_steps
+        {
+            return Err(FishError::InvalidTransition(
+                "CubeCL GPU sampler pending budget exceeded",
+            ));
+        }
+        let client = self.model.executor.client();
+        let total = logits.shape_elements();
+        let eos = i32::MAX as u32;
+        let result = match rng {
+            Some(rng) => enqueue_top_p(
+                client,
+                &logits.handle,
+                total,
+                0,
+                vocabulary,
+                history,
+                params,
+                eos,
+                rng,
+                &mut self.retained,
+            ),
+            None => enqueue_greedy(
+                client,
+                &logits.handle,
+                total,
+                0,
+                vocabulary,
+                history,
+                params,
+                eos,
+                &mut self.retained,
+            ),
+        };
+        self.pending_steps += 1;
+        self.pending_bytes = extra;
+        match result {
+            Ok(handle) => Ok(PendingFastSample {
+                handle,
+                request_id: self.request_id,
+            }),
+            Err(error) => {
+                self.poisoned = true;
+                Err(error)
+            }
+        }
+    }
+
+    pub(super) fn read_fast_samples(
+        &mut self,
+        pending: Vec<PendingFastSample>,
+        vocabulary: usize,
+    ) -> Result<Vec<CubeClSampledToken>> {
+        if pending
+            .iter()
+            .any(|sample| sample.request_id != self.request_id)
+        {
+            return Err(FishError::InvalidTransition(
+                "invalid pending Fast AR token ownership",
+            ));
+        }
+        if pending.is_empty() {
+            return Ok(Vec::new());
+        }
+        let result = (|| {
+            let handles = pending.iter().map(|sample| sample.handle.clone()).collect();
+            let values =
+                self.model.executor.client().read(handles).map_err(|_| {
+                    FishError::InvalidTransition("CubeCL Fast samples readback failed")
+                })?;
+            if values.len() != pending.len() {
+                return Err(FishError::InvalidShape("missing CubeCL Fast sample"));
+            }
+            pending
+                .into_iter()
+                .zip(values)
+                .map(|(sample, bytes)| {
+                    let (token, _) = decode_sample(&bytes, vocabulary, i32::MAX as u32)?;
+                    Ok(CubeClSampledToken {
+                        token,
+                        handle: sample.handle,
+                        request_id: self.request_id,
+                    })
+                })
+                .collect()
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
     pub(super) fn take_sampled(&mut self, expected: u32) -> Result<CubeClSampledToken> {
         let selected = self.last_sample.take().ok_or(FishError::InvalidTransition(
             "CubeCL selected token has no device handle",
@@ -729,7 +952,7 @@ impl CubeClRequest<'_> {
                 "CubeCL stream poisoned; reset required",
             ));
         }
-        self.run_inner(key, runtime, device_inputs, Some(host_readbacks))
+        self.run_inner(key, runtime, device_inputs, Some(host_readbacks), None)
     }
 
     fn run_inner(
@@ -738,6 +961,7 @@ impl CubeClRequest<'_> {
         runtime: &NamedTensors,
         device_inputs: &BTreeMap<String, CubeClDeviceTensor>,
         host_readbacks: Option<&[&str]>,
+        pending_fast: Option<&PendingFastSample>,
     ) -> Result<CubeClRunResult> {
         if self.poisoned {
             return Err(FishError::InvalidTransition(
@@ -753,7 +977,7 @@ impl CubeClRequest<'_> {
                 "CubeCL graph input belongs to another request",
             ));
         }
-        let device_types = device_inputs
+        let mut device_types: BTreeMap<_, _> = device_inputs
             .iter()
             .map(|(name, tensor)| (name.clone(), tensor.ty.clone()))
             .collect();
@@ -782,7 +1006,22 @@ impl CubeClRequest<'_> {
                 );
             }
         }
-        plan.validate_runtime_bindings(&validation_inputs, &device_types)?;
+        if let Some(sample) = pending_fast {
+            if sample.request_id != self.request_id
+                || plan.graph().stage != Stage::FastDecode
+                || runtime.contains_key("previous_acoustic_code")
+                || device_types.contains_key("previous_acoustic_code")
+            {
+                return Err(FishError::InvalidTransition(
+                    "invalid pending Fast AR token",
+                ));
+            }
+            device_types.insert(
+                "previous_acoustic_code".into(),
+                TensorType::new([1, 1], ScalarType::I32, Layout::Plain),
+            );
+        }
+        plan.validate_runtime_bindings(&validation_inputs, &device_types, pending_fast.is_some())?;
         self.cursor.validate_step(plan.graph())?;
         let graph = plan.graph();
         if let Some(selected) = host_readbacks {
@@ -818,24 +1057,14 @@ impl CubeClRequest<'_> {
         }
         let new_kv = missing_kv.iter().try_fold(0usize, |bytes, (_, ty)| {
             bytes
-                .checked_add(tensor_bytes(ty)?)
+                .checked_add(self.model.executor.tensor_bytes(ty)?)
                 .ok_or(FishError::InvalidShape("CubeCL KV byte count overflow"))
         })?;
         let projected_kv = self
             .kv_bytes
             .checked_add(new_kv)
             .ok_or(FishError::InvalidShape("CubeCL KV byte count overflow"))?;
-        let scratch = graph
-            .values
-            .iter()
-            .filter(|v| matches!(v.origin, Origin::Node(_)))
-            .try_fold(0usize, |bytes, v| {
-                bytes
-                    .checked_add(tensor_bytes(&v.ty)?)
-                    .ok_or(FishError::InvalidShape(
-                        "CubeCL scratch byte count overflow",
-                    ))
-            })?;
+        let scratch = self.model.executor.scratch_bytes(plan)?;
         let projected_pending =
             self.pending_bytes
                 .checked_add(scratch)
@@ -855,7 +1084,11 @@ impl CubeClRequest<'_> {
             if matches!(value.origin, Origin::Input) && !is_cache_name(&value.name) {
                 inputs.insert(
                     value.name.clone(),
-                    if let Some(device) = device_inputs.get(&value.name) {
+                    if let Some(sample) =
+                        pending_fast.filter(|_| value.name == "previous_acoustic_code")
+                    {
+                        sample.handle.clone()
+                    } else if let Some(device) = device_inputs.get(&value.name) {
                         device.handle.clone()
                     } else {
                         self.model.executor.upload(&value.ty, &runtime[&value.name])
@@ -875,7 +1108,7 @@ impl CubeClRequest<'_> {
         let result = self
             .model
             .executor
-            .execute_handles(plan, &inputs, &mut self.retained);
+            .execute_handles(plan, &inputs, &mut self.retained, true);
         let outputs = match result {
             Ok(outputs) => outputs,
             Err(err) => {
@@ -947,8 +1180,12 @@ impl CubeClRequest<'_> {
             .caches
             .keys()
             .filter_map(|key| self.model.prepared.caches.get(key))
-            .filter_map(|ty| tensor_bytes(ty).ok())
-            .sum();
+            .filter_map(|ty| self.model.executor.tensor_bytes(ty).ok())
+            .sum::<usize>()
+            + self
+                .fast_replay
+                .as_ref()
+                .map_or(0, |replay| replay.kv_bytes);
         self.cursor.reset_fast();
     }
 
@@ -962,7 +1199,10 @@ impl CubeClRequest<'_> {
         }
         self.retained.clear();
         self.pending_steps = 0;
-        self.pending_bytes = 0;
+        self.pending_bytes = self
+            .fast_replay
+            .as_ref()
+            .map_or(0, |replay| replay.scratch_bytes);
         Ok(())
     }
 
@@ -994,8 +1234,11 @@ impl CubeClRequest<'_> {
     }
 
     pub async fn reset_request(&mut self) -> Result<()> {
+        self.replay_context = None;
         self.retire_completed().await?;
         self.caches.clear();
+        self.fast_replay = None;
+        self.pending_bytes = 0;
         self.kv_bytes = 0;
         self.cursor = CubeClRequestCursor::default();
         self.last_sample = None;
@@ -1141,7 +1384,18 @@ mod tests {
             assert!(profiles.graph(&format!("fast_{i}")).is_ok());
         }
         assert!(CubeClPreparedModel::from_transformer(&dual, 0, 2).is_err());
-        assert!(CubeClPreparedModel::from_transformer(&dual, 3, 65).is_err());
+        let long = CubeClPreparedModel::from_transformer(&dual, 3, 65).unwrap();
+        assert_eq!(long.plan_count(), dual.num_codebooks + 65);
+        assert!(
+            long.slow_decode
+                .as_ref()
+                .unwrap()
+                .slots
+                .iter()
+                .all(|slot| slot.get().is_none())
+        );
+        assert!(long.graph("slow_decode_67").is_ok());
+        assert!(long.graph("slow_decode_68").is_err());
         assert!(CubeClPreparedModel::from_transformer(&dual, 3, 0).is_err());
 
         let mut naive = dual.clone();

@@ -413,3 +413,5 @@ impl CubeClFireflyDecoder {
 
 #[cfg(all(test, feature = "cubecl-cpu"))]
 mod tests;
+
+pub(crate) use codec::CubeClFireflyReferenceEncoder;

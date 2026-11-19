@@ -170,7 +170,14 @@ impl LoadedFishArtifacts {
 }
 
 #[cfg(feature = "cubecl-backend")]
-impl FishModel<crate::cubecl_backend::CubeClSemanticGenerator> {
+impl CubeClFishModel {
+    /// Enable CubeCL graph replay for sampled Dual AR. Replay is off by default.
+    pub fn set_fast_replay(&mut self, enabled: bool) -> Result<()> {
+        let parts = self.parts.as_mut().ok_or(ModelRuntimeError::Closed)?;
+        parts.generator.set_fast_replay(enabled)?;
+        Ok(())
+    }
+
     pub fn open_cubecl(
         paths: &ModelPaths,
         client: cubecl::prelude::Client,
@@ -190,9 +197,9 @@ impl LoadedFishArtifacts {
         seed: u64,
         mode: SelectionMode,
         limits: crate::cubecl_backend::CubeClRequestLimits,
-    ) -> Result<FishModel<crate::cubecl_backend::CubeClSemanticGenerator>> {
+    ) -> Result<CubeClFishModel> {
         let generator = crate::cubecl_backend::CubeClSemanticGenerator::new(
-            client,
+            client.clone(),
             self.config.clone(),
             self.semantic,
             self.tokenizer.special_tokens(),
@@ -200,12 +207,28 @@ impl LoadedFishArtifacts {
             mode,
             limits,
         )?;
-        FishModel::from_components(self.config, self.tokenizer, self.firefly, generator)
+        let decoder = crate::cubecl_backend::CubeClFireflyAcousticDecoder::from_checkpoint(
+            client.clone(),
+            &self.firefly,
+        )?;
+        let encoder = crate::cubecl_backend::CubeClFireflyReferenceEncoder::new(
+            client,
+            std::sync::Arc::new(self.firefly),
+        );
+        Ok(FishModel::from_backends(
+            self.config,
+            self.tokenizer,
+            generator,
+            decoder,
+            ModelReferenceEncoder::CubeCl(Box::new(encoder)),
+        ))
     }
 }
 
 pub(crate) enum ModelReferenceEncoder {
     Cpu(CpuFireflyReferenceEncoder),
+    #[cfg(feature = "cubecl-backend")]
+    CubeCl(Box<crate::cubecl_backend::CubeClFireflyReferenceEncoder>),
     #[cfg(all(feature = "cuda-driver", feature = "tensorrt-api"))]
     Cuda(Box<crate::cuda_firefly::CudaFireflyReferenceEncoder>),
 }
@@ -214,6 +237,8 @@ impl ModelReferenceEncoder {
     fn set_audio_loader(&mut self, loader: ReferenceAudioLoader) {
         match self {
             Self::Cpu(encoder) => encoder.set_audio_loader(loader),
+            #[cfg(feature = "cubecl-backend")]
+            Self::CubeCl(encoder) => encoder.set_audio_loader(loader),
             #[cfg(all(feature = "cuda-driver", feature = "tensorrt-api"))]
             Self::Cuda(encoder) => encoder.set_audio_loader(loader),
         }
@@ -222,6 +247,8 @@ impl ModelReferenceEncoder {
     fn encode(&mut self, bytes: &[u8]) -> std::result::Result<Vec<Vec<u32>>, ReferenceLoadError> {
         match self {
             Self::Cpu(encoder) => encoder.encode_reference_bytes(bytes),
+            #[cfg(feature = "cubecl-backend")]
+            Self::CubeCl(encoder) => encoder.encode_reference_bytes(bytes),
             #[cfg(all(feature = "cuda-driver", feature = "tensorrt-api"))]
             Self::Cuda(encoder) => encoder.encode_reference_bytes(bytes),
         }
@@ -245,7 +272,10 @@ pub struct FishModel<G, D = CpuFireflyDecoder> {
 pub type CpuFishModel = FishModel<CpuSemanticGenerator>;
 
 #[cfg(feature = "cubecl-backend")]
-pub type CubeClFishModel = FishModel<crate::cubecl_backend::CubeClSemanticGenerator>;
+pub type CubeClFishModel = FishModel<
+    crate::cubecl_backend::CubeClSemanticGenerator,
+    crate::cubecl_backend::CubeClFireflyAcousticDecoder,
+>;
 
 impl FishModel<CpuSemanticGenerator> {
     pub fn open(paths: &ModelPaths, seed: u64, mode: SelectionMode) -> Result<Self> {

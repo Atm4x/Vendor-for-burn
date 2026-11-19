@@ -25,3 +25,5 @@ pub use session::{
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) use convnext::CubeClFireflyReferenceEncoder;

@@ -1,5 +1,4 @@
 use cubecl::prelude::*;
-use half::bf16;
 
 #[cube(launch)]
 pub(super) fn add_kernel(a: &[f32], b: &[f32], out: &mut [f32]) {
@@ -128,16 +127,52 @@ pub(super) fn rope_kernel(
     }
 }
 
+#[cube]
+fn kv_value(value: f32, #[comptime] emulate_bf16: bool) -> f32 {
+    if emulate_bf16 {
+        let bits = u32::reinterpret(value);
+        let magnitude = bits & 0x7fff_ffff;
+        let rounded = if magnitude > 0x7f80_0000 {
+            bits | 0x0040_0000
+        } else {
+            bits + 0x7fff + ((bits >> 16) & 1)
+        };
+        f32::reinterpret(rounded & 0xffff_0000)
+    } else {
+        value
+    }
+}
+
 #[cube(launch)]
-pub(super) fn kv_update_kernel(
-    previous: &[bf16],
+pub(super) fn kv_write_kernel<F: Float>(
     fresh: &[f32],
-    out: &mut [bf16],
+    cache: &mut [F],
+    #[comptime] capacity: usize,
+    #[comptime] frames: usize,
+    #[comptime] dimension: usize,
+    #[comptime] position: usize,
+    #[comptime] emulate_bf16: bool,
+) {
+    if ABSOLUTE_POS < fresh.len() {
+        let row = ABSOLUTE_POS / dimension;
+        let feature = ABSOLUTE_POS % dimension;
+        let destination =
+            ((row / frames) * capacity + position + row % frames) * dimension + feature;
+        cache[destination] = F::cast_from(kv_value(fresh[ABSOLUTE_POS], emulate_bf16));
+    }
+}
+
+#[cube(launch)]
+pub(super) fn kv_update_kernel<F: Float>(
+    previous: &[F],
+    fresh: &[f32],
+    out: &mut [F],
     #[comptime] heads: usize,
     #[comptime] capacity: usize,
     #[comptime] frames: usize,
     #[comptime] dimension: usize,
     #[comptime] position: usize,
+    #[comptime] emulate_bf16: bool,
 ) {
     if ABSOLUTE_POS < out.len() {
         let feature = ABSOLUTE_POS % dimension;
@@ -146,7 +181,7 @@ pub(super) fn kv_update_kernel(
         let batch = ABSOLUTE_POS / (dimension * capacity * heads);
         if frame >= position && frame < position + frames {
             let src = ((batch * heads + head) * frames + frame - position) * dimension + feature;
-            out[ABSOLUTE_POS] = bf16::cast_from(fresh[src]);
+            out[ABSOLUTE_POS] = F::cast_from(kv_value(fresh[src], emulate_bf16));
         } else {
             out[ABSOLUTE_POS] = previous[ABSOLUTE_POS];
         }
@@ -154,9 +189,9 @@ pub(super) fn kv_update_kernel(
 }
 
 #[cube(launch)]
-pub(super) fn kv_prefix_kernel(
-    cache: &[bf16],
-    out: &mut [bf16],
+pub(super) fn kv_prefix_kernel<F: Float>(
+    cache: &[F],
+    out: &mut [F],
     #[comptime] capacity: usize,
     #[comptime] active: usize,
     #[comptime] dimension: usize,
@@ -170,10 +205,71 @@ pub(super) fn kv_prefix_kernel(
 }
 
 #[cube(launch)]
-pub(super) fn causal_gqa_kernel(
+pub(super) fn gqa_scores_kernel<F: Float>(
     query: &[f32],
-    key: &[bf16],
-    value: &[bf16],
+    key: &[F],
+    scores: &mut [f32],
+    #[comptime] q_heads: usize,
+    #[comptime] kv_heads: usize,
+    #[comptime] frames: usize,
+    #[comptime] active: usize,
+    #[comptime] dimension: usize,
+    #[comptime] first_position: usize,
+) {
+    if ABSOLUTE_POS < scores.len() {
+        let step = ABSOLUTE_POS % active;
+        let row = ABSOLUTE_POS / active;
+        let frame = row % frames;
+        let head = (row / frames) % q_heads;
+        let batch = row / (frames * q_heads);
+        let mut score = 0.0f32;
+        if step <= first_position + frame {
+            let kv_head = head / (q_heads / kv_heads);
+            let key_start = ((batch * kv_heads + kv_head) * active + step) * dimension;
+            let query_start = row * dimension;
+            for d in 0..dimension {
+                score += query[query_start + d] * f32::cast_from(key[key_start + d]);
+            }
+            score *= 1.0 / (dimension as f32).sqrt();
+        }
+        scores[ABSOLUTE_POS] = score;
+    }
+}
+
+#[cube(launch)]
+pub(super) fn gqa_softmax_kernel(
+    scores: &mut [f32],
+    #[comptime] frames: usize,
+    #[comptime] active: usize,
+    #[comptime] first_position: usize,
+) {
+    let row = ABSOLUTE_POS;
+    if row < scores.len() / active {
+        let visible = first_position + row % frames + 1;
+        let start = row * active;
+        let mut maximum = scores[start];
+        for step in 1..visible {
+            let score = scores[start + step];
+            if score > maximum {
+                maximum = score;
+            }
+        }
+        let mut total = 0.0f32;
+        for step in 0..visible {
+            let weight = (scores[start + step] - maximum).exp();
+            scores[start + step] = weight;
+            total += weight;
+        }
+        for step in 0..visible {
+            scores[start + step] /= total;
+        }
+    }
+}
+
+#[cube(launch)]
+pub(super) fn gqa_values_kernel<F: Float>(
+    scores: &[f32],
+    value: &[F],
     out: &mut [f32],
     #[comptime] q_heads: usize,
     #[comptime] kv_heads: usize,
@@ -184,38 +280,19 @@ pub(super) fn causal_gqa_kernel(
 ) {
     if ABSOLUTE_POS < out.len() {
         let feature = ABSOLUTE_POS % dimension;
-        let head = (ABSOLUTE_POS / dimension) % q_heads;
-        let frame = (ABSOLUTE_POS / (dimension * q_heads)) % frames;
-        let batch = ABSOLUTE_POS / (dimension * q_heads * frames);
+        let row = ABSOLUTE_POS / dimension;
+        let frame = row % frames;
+        let head = (row / frames) % q_heads;
+        let batch = row / (frames * q_heads);
         let kv_head = head / (q_heads / kv_heads);
         let visible = first_position + frame + 1;
-        let q_offset = ((batch * q_heads + head) * frames + frame) * dimension;
-        let mut max_score = query[q_offset] * 0.0 - 3.4e38f32;
-        let scale = 1.0 / (dimension as f32).sqrt();
-        for t in 0..visible {
-            let k_offset = ((batch * kv_heads + kv_head) * active + t) * dimension;
-            let mut score = 0.0f32;
-            for d in 0..dimension {
-                score += query[q_offset + d] * f32::cast_from(key[k_offset + d]);
-            }
-            score *= scale;
-            if score > max_score {
-                max_score = score;
-            }
+        let value_start = (batch * kv_heads + kv_head) * active * dimension;
+        let mut sum = 0.0f32;
+        for step in 0..visible {
+            sum += scores[row * active + step]
+                * f32::cast_from(value[value_start + step * dimension + feature]);
         }
-        let mut denominator = 0.0f32;
-        let mut numerator = 0.0f32;
-        for t in 0..visible {
-            let k_offset = ((batch * kv_heads + kv_head) * active + t) * dimension;
-            let mut score = 0.0f32;
-            for d in 0..dimension {
-                score += query[q_offset + d] * f32::cast_from(key[k_offset + d]);
-            }
-            let probability = (score * scale - max_score).exp();
-            denominator += probability;
-            numerator += probability * f32::cast_from(value[k_offset + feature]);
-        }
-        out[ABSOLUTE_POS] = numerator / denominator;
+        out[ABSOLUTE_POS] = sum;
     }
 }
 
@@ -235,6 +312,116 @@ pub(super) fn linear_kernel(
             sum += a[row * input_features + k] * w[col * input_features + k];
         }
         out[ABSOLUTE_POS] = sum;
+    }
+}
+
+#[cube(launch)]
+pub(super) fn linear_plane_kernel(
+    a: &[f32],
+    w: &[f32],
+    out: &mut [f32],
+    #[comptime] input_features: usize,
+    #[comptime] output_features: usize,
+    #[comptime] plane_width: usize,
+) {
+    let index = ABSOLUTE_POS / plane_width;
+    let lane = UNIT_POS_X as usize % plane_width;
+    let mut sum = 0.0f32;
+    if index < out.len() {
+        let row = index / output_features;
+        let column = index % output_features;
+        let mut k = lane;
+        while k < input_features {
+            sum += a[row * input_features + k] * w[column * input_features + k];
+            k += plane_width;
+        }
+    }
+    let reduced = plane_sum(sum);
+    if lane == 0 && index < out.len() {
+        out[index] = reduced;
+    }
+}
+
+#[cube]
+fn unpack_bf16(word: u32, odd: usize) -> f32 {
+    let bits = if odd == 0 {
+        word << 16
+    } else {
+        word & 0xffff_0000
+    };
+    f32::reinterpret(bits)
+}
+
+#[cube(launch)]
+pub(super) fn linear_packed_plane_kernel(
+    a: &[f32],
+    w: &[u32],
+    out: &mut [f32],
+    #[comptime] input_features: usize,
+    #[comptime] output_features: usize,
+    #[comptime] plane_width: usize,
+) {
+    let index = ABSOLUTE_POS / plane_width;
+    let lane = UNIT_POS_X as usize % plane_width;
+    let mut sum = 0.0f32;
+    if index < out.len() {
+        let row = index / output_features;
+        let column = index % output_features;
+        let mut pair = lane;
+        while pair < input_features / 2 {
+            let word = w[column * (input_features / 2) + pair];
+            let offset = row * input_features + pair * 2;
+            sum += a[offset] * unpack_bf16(word, 0);
+            sum += a[offset + 1] * unpack_bf16(word, 1);
+            pair += plane_width;
+        }
+    }
+    let reduced = plane_sum(sum);
+    if lane == 0 && index < out.len() {
+        out[index] = reduced;
+    }
+}
+
+#[cube(launch)]
+pub(super) fn linear_packed_tile_kernel(
+    a: &[f32],
+    w: &[u32],
+    out: &mut [f32],
+    #[comptime] rows: usize,
+    #[comptime] input_features: usize,
+    #[comptime] output_features: usize,
+) {
+    let x = UNIT_POS_X as usize;
+    let y = UNIT_POS_Y as usize;
+    let row = CUBE_POS_Y as usize * 16 + y;
+    let column = CUBE_POS_X as usize * 16 + x;
+    let weight_row = CUBE_POS_X as usize * 16 + y;
+    let mut left = Shared::<[f32]>::new_slice(256usize);
+    let mut right = Shared::<[f32]>::new_slice(272usize);
+    let mut sum = 0.0f32;
+    let mut offset = 0usize;
+    while offset < input_features {
+        let k = offset + x;
+        left[y * 16 + x] = if row < rows && k < input_features {
+            a[row * input_features + k]
+        } else {
+            0.0f32
+        };
+        right[x * 17 + y] = if weight_row < output_features && k < input_features {
+            unpack_bf16(w[weight_row * (input_features / 2) + k / 2], k % 2)
+        } else {
+            0.0f32
+        };
+        sync_cube();
+        #[unroll]
+        for i in 0..16 {
+            sum += left[y * 16 + i] * right[i * 17 + x];
+        }
+        sync_cube();
+        offset += 16;
+    }
+    if row < rows && column < output_features {
+        out[row * output_features + column] = sum;
     }
 }
 
@@ -264,6 +451,38 @@ pub(super) fn rms_norm_kernel(
         let scale = 1.0 / (squared / (width as f32) + f32::from_bits(epsilon_bits)).sqrt();
         for k in 0..width {
             out[start + k] = a[start + k] * scale * gamma[k];
+        }
+    }
+}
+
+#[cube(launch)]
+pub(super) fn rms_norm_plane_kernel(
+    a: &[f32],
+    gamma: &[f32],
+    out: &mut [f32],
+    #[comptime] width: usize,
+    #[comptime] epsilon_bits: u32,
+    #[comptime] plane_width: usize,
+) {
+    let row = ABSOLUTE_POS / plane_width;
+    let lane = UNIT_POS_X as usize % plane_width;
+    let mut squared = 0.0f32;
+    let start = row * width;
+    if start < out.len() {
+        let mut k = lane;
+        while k < width {
+            let x = a[start + k];
+            squared += x * x;
+            k += plane_width;
+        }
+    }
+    let sum = plane_sum(squared);
+    if start < out.len() {
+        let scale = 1.0 / (sum / width as f32 + f32::from_bits(epsilon_bits)).sqrt();
+        let mut k = lane;
+        while k < width {
+            out[start + k] = a[start + k] * scale * gamma[k];
+            k += plane_width;
         }
     }
 }

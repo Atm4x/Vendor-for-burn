@@ -64,17 +64,11 @@ fn request_limit(config: &FishModelConfig, prompt_len: usize, requested: usize) 
         ));
     }
     let available = config.max_seq_len - prompt_len;
-    let count = if requested == 0 {
+    Ok(if requested == 0 {
         available
     } else {
         requested.min(available)
-    };
-    if count == 0 || count > available || count > 64 {
-        return Err(FishError::Unsupported(
-            "CubeCL request requires 1..=64 prepared decode tokens within context",
-        ));
-    }
-    Ok(count)
+    })
 }
 
 struct CubeClDualArBackend<'a, 'b> {
@@ -83,6 +77,7 @@ struct CubeClDualArBackend<'a, 'b> {
     codebook_size: usize,
     vocab_size: usize,
     mode: SelectionMode,
+    use_fast_replay: bool,
     rng: &'a mut SessionRng,
     pending_semantic: Option<CubeClDeviceTensor>,
     pending_semantic_token: Option<CubeClSampledToken>,
@@ -224,6 +219,10 @@ impl DualArBackend for CubeClDualArBackend<'_, '_> {
     }
 
     fn prime_fast(&mut self, context: CubeClDeviceTensor) -> Result<()> {
+        if self.mode == SelectionMode::Sample && self.use_fast_replay {
+            self.request.defer_fast_context(context);
+            return Ok(());
+        }
         let mut devices = std::collections::BTreeMap::new();
         devices.insert("fast_context".into(), context);
         self.request
@@ -260,75 +259,73 @@ impl DualArBackend for CubeClDualArBackend<'_, '_> {
             ))?;
         let mut codes = vec![initial];
         let mut selections = vec![(semantic.clone(), false), (semantic.clone(), true)];
-        let fast_type = TensorType::new([1, 1], ScalarType::I32, Layout::Plain);
-        for (index, history) in histories.iter().enumerate() {
+        let sampled = if self.mode == SelectionMode::Sample && self.use_fast_replay {
             if is_cancelled() {
                 return Err(FishError::InvalidTransition("synthesis cancelled"));
             }
-            let codebook = index + 1;
-            let previous = *codes.last().expect("Fast AR initial code present");
-            let token = {
-                let inputs = NamedTensors::new();
-                let previous_source = selections.last().expect("Fast code 0 present");
-                let device_previous = self.request.pack_token_column(
-                    &[(&previous_source.0, previous_source.1)],
-                    &[previous],
-                    self.semantic_begin_id,
-                    codebook_size,
-                    fast_type.clone(),
-                )?;
-                let mut devices = std::collections::BTreeMap::new();
-                devices.insert("previous_acoustic_code".into(), device_previous);
-                let outputs = self.request.run_selected(
-                    &format!("fast_{codebook}"),
-                    &inputs,
-                    &devices,
-                    &[],
-                )?;
-                let device_logits =
-                    outputs
-                        .device
-                        .get("fast_logits")
-                        .ok_or(FishError::InvalidShape(
-                            "CubeCL Fast AR device logits missing",
-                        ))?;
-                match self.mode {
-                    SelectionMode::Greedy => {
-                        self.request
-                            .sample_greedy(
-                                device_logits,
-                                0,
-                                codebook_size,
-                                history,
-                                params,
-                                i32::MAX as u32,
-                            )?
-                            .0
-                    }
-                    SelectionMode::Sample => {
-                        self.request
-                            .sample_top_p(
-                                device_logits,
-                                0,
-                                codebook_size,
-                                history,
-                                params,
-                                i32::MAX as u32,
-                                self.rng,
-                            )?
-                            .0
-                    }
-                }
-            };
-            if token as usize >= codebook_size {
-                return Err(FishError::InvalidShape(
-                    "Fast AR sample exceeds codebook size",
-                ));
+            let output = self.request.run_captured_fast(
+                initial,
+                histories,
+                codebook_size,
+                params,
+                self.rng,
+            )?;
+            if is_cancelled() {
+                return Err(FishError::InvalidTransition("synthesis cancelled"));
             }
-            let sampled = self.request.take_sampled(token)?;
+            for i in 1..=histories.len() {
+                on_codebook(i)?;
+            }
+            output
+        } else {
+            let mut pending = Vec::with_capacity(histories.len());
+            for (index, history) in histories.iter().enumerate() {
+                if is_cancelled() {
+                    return Err(FishError::InvalidTransition("synthesis cancelled"));
+                }
+                let codebook = index + 1;
+                let key = format!("fast_{codebook}");
+                let output = if let Some(prev) = pending.last() {
+                    self.request.run_with_pending_fast(&key, prev)?
+                } else {
+                    let previous = self.request.pack_token_column(
+                        &[(&semantic, true)],
+                        &[initial],
+                        self.semantic_begin_id,
+                        codebook_size,
+                        TensorType::new([1, 1], ScalarType::I32, Layout::Plain),
+                    )?;
+                    self.request.run_selected(
+                        &key,
+                        &NamedTensors::new(),
+                        &[("previous_acoustic_code".into(), previous)].into(),
+                        &[],
+                    )?
+                };
+                let logits = output
+                    .device
+                    .get("fast_logits")
+                    .ok_or(FishError::InvalidShape(
+                        "CubeCL Fast AR device logits missing",
+                    ))?;
+                let rng = match self.mode {
+                    SelectionMode::Greedy => None,
+                    SelectionMode::Sample => Some(&mut *self.rng),
+                };
+                pending.push(self.request.enqueue_fast_sample(
+                    logits,
+                    codebook_size,
+                    history,
+                    params,
+                    rng,
+                )?);
+                on_codebook(codebook)?;
+            }
+            self.request.read_fast_samples(pending, codebook_size)?
+        };
+        for sampled in sampled {
+            codes.push(sampled.token);
             selections.push((sampled, false));
-            codes.push(token);
-            on_codebook(codebook)?;
         }
         let mut complete = vec![semantic.token];
         complete.extend(codes.iter().copied());
@@ -528,6 +525,7 @@ pub struct CubeClSemanticGenerator {
     seed: u64,
     rng: SessionRng,
     mode: SelectionMode,
+    use_fast_replay: bool,
     cache: Option<((usize, usize), CubeClModel)>,
 }
 
@@ -581,8 +579,23 @@ impl CubeClSemanticGenerator {
             seed,
             rng: SessionRng::new(seed),
             mode,
+            use_fast_replay: false,
             cache: None,
         })
+    }
+
+    pub(crate) fn set_fast_replay(&mut self, enabled: bool) -> Result<()> {
+        if enabled
+            && (self.config.kind != ModelKind::DualAr
+                || self.mode != SelectionMode::Sample
+                || self.config.num_codebooks <= 1)
+        {
+            return Err(FishError::Unsupported(
+                "CubeCL Fast replay requires sampled DualAR",
+            ));
+        }
+        self.use_fast_replay = enabled;
+        Ok(())
     }
 
     pub fn prepared_geometry(&self) -> Option<(usize, usize)> {
@@ -621,6 +634,7 @@ impl CubeClSemanticGenerator {
                     codebook_size: self.config.codebook_size,
                     vocab_size: self.config.vocab_size,
                     mode: self.mode,
+                    use_fast_replay: self.use_fast_replay,
                     rng: &mut self.rng,
                     pending_semantic: None,
                     pending_semantic_token: None,
@@ -720,9 +734,12 @@ mod tests {
         };
         assert_eq!(checked_prompt(&valid, config.num_codebooks).unwrap(), 3);
         assert_eq!(request_limit(&config, 3, 5).unwrap(), 5);
-        assert!(request_limit(&config, 3, 65).is_err());
+        assert_eq!(request_limit(&config, 3, 65).unwrap(), 65);
         assert_eq!(request_limit(&config, 252, config.max_seq_len).unwrap(), 4);
-        assert!(request_limit(&config, 3, 0).is_err());
+        assert_eq!(
+            request_limit(&config, 3, 0).unwrap(),
+            config.max_seq_len - 3
+        );
         let mut bad = valid.clone();
         bad.channels[1].pop();
         assert!(checked_prompt(&bad, config.num_codebooks).is_err());
@@ -812,6 +829,7 @@ mod device_chain_tests {
             codebook_size: 8,
             vocab_size: 16,
             mode: SelectionMode::Greedy,
+            use_fast_replay: false,
             rng: &mut rng,
             pending_semantic: None,
             pending_semantic_token: None,
@@ -851,6 +869,7 @@ mod device_chain_tests {
             vocab_size: 16,
             codebook_logits_len: 16,
             mode: SelectionMode::Greedy,
+            use_fast_replay: false,
             rng: &mut rng,
             pending_semantic: None,
             pending_acoustic: None,

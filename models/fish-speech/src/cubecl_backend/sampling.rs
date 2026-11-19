@@ -45,7 +45,7 @@ fn greedy_token_kernel(
     }
 }
 
-pub(super) fn greedy_device_token_with_handle(
+pub(super) fn enqueue_greedy(
     client: &Client,
     logits: &Handle,
     total: usize,
@@ -55,7 +55,7 @@ pub(super) fn greedy_device_token_with_handle(
     params: SamplingParams,
     eos_id: u32,
     retained: &mut Vec<Handle>,
-) -> Result<(u32, bool, Handle)> {
+) -> Result<Handle> {
     params.validate()?;
     let end = offset
         .checked_add(vocabulary)
@@ -95,26 +95,28 @@ pub(super) fn greedy_device_token_with_handle(
     );
     retained.push(history_handle);
     retained.push(result.clone());
+    Ok(result)
+}
+
+pub(super) fn greedy_device_token_with_handle(
+    client: &Client,
+    logits: &Handle,
+    total: usize,
+    offset: usize,
+    vocabulary: usize,
+    history: &[usize],
+    params: SamplingParams,
+    eos_id: u32,
+    retained: &mut Vec<Handle>,
+) -> Result<(u32, bool, Handle)> {
+    let handle = enqueue_greedy(
+        client, logits, total, offset, vocabulary, history, params, eos_id, retained,
+    )?;
     let bytes = client
-        .read_one(result)
+        .read_one(handle.clone())
         .map_err(|_| FishError::InvalidTransition("CubeCL GPU sampled token readback failed"))?;
-    if bytes.len() != 8 {
-        return Err(FishError::InvalidShape(
-            "CubeCL GPU sampler returned invalid token data",
-        ));
-    }
-    let token = i32::from_le_bytes(bytes[0..4].try_into().expect("four bytes"));
-    let flag = i32::from_le_bytes(bytes[4..8].try_into().expect("four bytes"));
-    if token < 0 || token as usize >= vocabulary || flag != i32::from(token == eos) {
-        return Err(FishError::InvalidSampling(
-            "CubeCL GPU sampler returned invalid token or EOS",
-        ));
-    }
-    Ok((
-        token as u32,
-        flag != 0,
-        retained.last().expect("sampler result retained").clone(),
-    ))
+    let (token, eos) = decode_sample(&bytes, vocabulary, eos_id)?;
+    Ok((token, eos, handle))
 }
 
 pub(super) fn greedy_device_token(
@@ -134,6 +136,51 @@ pub(super) fn greedy_device_token(
     .map(|(token, eos, _)| (token, eos))
 }
 
+pub(super) fn decode_sample(bytes: &[u8], vocabulary: usize, eos_id: u32) -> Result<(u32, bool)> {
+    if bytes.len() != 8 {
+        return Err(FishError::InvalidShape(
+            "CubeCL GPU sampler invalid token data",
+        ));
+    }
+    let token = i32::from_le_bytes(bytes[..4].try_into().expect("four bytes"));
+    let flag = i32::from_le_bytes(bytes[4..].try_into().expect("four bytes"));
+    if token < 0 || token as usize >= vocabulary || flag != i32::from(token as u32 == eos_id) {
+        return Err(FishError::InvalidSampling(
+            "CubeCL GPU sampler invalid token or EOS",
+        ));
+    }
+    Ok((token as u32, flag != 0))
+}
+
+const SAMPLER_THREADS: u32 = 128;
+
+#[cube]
+fn score_key(score: f32) -> u32 {
+    let bits = u32::reinterpret(score);
+    if (bits & 0x8000_0000u32) != 0 {
+        !bits
+    } else {
+        bits ^ 0x8000_0000u32
+    }
+}
+
+#[cube]
+fn reduce_mass(values: &mut Shared<[f32]>, lane: usize, partial: f32) -> f32 {
+    values[lane] = partial;
+    sync_cube();
+    let mut width = CUBE_DIM_X as usize / 2;
+    while width > 0 {
+        if lane < width {
+            values[lane] += values[lane + width];
+        }
+        sync_cube();
+        width /= 2;
+    }
+    let sum = values[0];
+    sync_cube();
+    sum
+}
+
 #[cube(launch)]
 fn top_p_token_kernel(
     logits: &[f32],
@@ -149,151 +196,219 @@ fn top_p_token_kernel(
     penalty: f32,
     eos_id: i32,
 ) {
-    if ABSOLUTE_POS == 0 {
-        let mut maximum = logits[offset] * 0.0f32 - 3.402823466e38f32;
-        for i in 0..vocabulary {
-            let mut score = logits[offset + i];
-            if score != score || score > 3.402823e38f32 || score < -3.402823e38f32 {
-                result[0] = -1;
-                result[1] = -1;
-                terminate!();
-            }
-            for j in 0..history.len() {
-                if history[j] == i as i32 {
-                    if score < 0.0 {
-                        score *= penalty;
-                    } else {
-                        score /= penalty;
-                    }
-                    break;
-                }
-            }
-            if score != score || score > 3.402823e38f32 || score < -3.402823e38f32 {
-                result[0] = -1;
-                result[1] = -1;
-                terminate!();
-            }
-            scores[i] = score;
-            if score > maximum {
-                maximum = score;
+    let lane = UNIT_POS_X as usize;
+    let mut values = Shared::<[f32]>::new_slice(128usize);
+    let mut ids = Shared::<[i32]>::new_slice(128usize);
+    let mut local_max = f32::cast_from(CUBE_POS_X) - 3.402823466e38f32;
+    let mut invalid = 0.0f32;
+    let mut i = lane;
+    while i < vocabulary {
+        let mut score = logits[offset + i];
+        for j in 0..history.len() {
+            if history[j] == i as i32 {
+                score = if score < 0.0 {
+                    score * penalty
+                } else {
+                    score / penalty
+                };
+                break;
             }
         }
-        let mut total = 0.0f32;
-        for i in 0..vocabulary {
-            let weight = (scores[i] - maximum).exp();
-            weights[i] = weight;
-            total += weight;
+        if score != score || score > 3.402823e38f32 || score < -3.402823e38f32 {
+            invalid = 1.0;
         }
-        if total <= 0.0 || total != total {
+        scores[i] = score;
+        if score > local_max {
+            local_max = score;
+        }
+        i += CUBE_DIM_X as usize;
+    }
+    let invalid = reduce_mass(&mut values, lane, invalid);
+    if invalid > 0.0 {
+        if lane == 0 {
             result[0] = -1;
             result[1] = -1;
-            terminate!();
         }
-        let mut threshold = u32::cast_from(ABSOLUTE_POS);
-        let mut cutoff_id = i32::cast_from(ABSOLUTE_POS);
-        if top_p < 1.0 {
-            let target = total * top_p;
-            let mut low = 0u64;
-            let mut high = 4294967295u64;
-            for _pass in 0..32 {
-                let midpoint = (low + high + 1u64) / 2u64;
-                let mut mass = 0.0f32;
-                for i in 0..vocabulary {
-                    let bits = u32::reinterpret(scores[i]);
-                    let key = if (bits & 2147483648u32) != 0u32 {
-                        !bits
-                    } else {
-                        bits ^ 2147483648u32
-                    };
-                    if u64::cast_from(key) >= midpoint {
-                        mass += weights[i];
+        terminate!();
+    }
+    values[lane] = local_max;
+    sync_cube();
+    let mut width = CUBE_DIM_X as usize / 2;
+    while width > 0 {
+        if lane < width {
+            let other = values[lane + width];
+            if other > values[lane] {
+                values[lane] = other;
+            }
+        }
+        sync_cube();
+        width /= 2;
+    }
+    let maximum = values[0];
+    sync_cube();
+    let mut keys = Shared::<[u32]>::new_slice(2048usize);
+    let mut masses = Shared::<[f32]>::new_slice(2048usize);
+    let floor = score_key(maximum - 8.0f32);
+    let mut local_total = 0.0f32;
+    let mut tail_total = 0.0f32;
+    let mut entries = lane - lane;
+    i = lane;
+    while i < vocabulary {
+        let weight = (scores[i] - maximum).exp();
+        weights[i] = weight;
+        local_total += weight;
+        let key = score_key(scores[i]);
+        if top_p < 1.0 && key >= floor {
+            if entries < 16 {
+                let slot = entries * CUBE_DIM_X as usize + lane;
+                keys[slot] = key;
+                masses[slot] = weight;
+            }
+            entries += 1;
+            tail_total += weight;
+        }
+        i += CUBE_DIM_X as usize;
+    }
+    let total = reduce_mass(&mut values, lane, local_total);
+    let retained_total = reduce_mass(&mut values, lane, tail_total);
+    let overflow = reduce_mass(
+        &mut values,
+        lane,
+        if entries > 16 { 1.0f32 } else { 0.0f32 },
+    );
+    let mut threshold = 0u32;
+    let mut cutoff = i32::cast_from(CUBE_POS_X) - 1;
+    if top_p < 1.0 {
+        let target = total * top_p;
+        let compact = overflow == 0.0 && retained_total > target;
+        // Build the cutoff in descending bit order without overflowing U32.
+        let mut bit = 0x8000_0000u32;
+        while bit != 0 {
+            let candidate = threshold | bit;
+            let mut local_mass = 0.0f32;
+            if compact {
+                if candidate <= floor {
+                    local_mass = tail_total;
+                } else {
+                    let mut slot = lane;
+                    let stop = entries * CUBE_DIM_X as usize + lane;
+                    while slot < stop {
+                        if keys[slot] >= candidate {
+                            local_mass += masses[slot];
+                        }
+                        slot += CUBE_DIM_X as usize;
                     }
                 }
-                if mass > target {
-                    low = midpoint;
-                } else {
-                    high = midpoint - 1u64;
+            } else {
+                i = lane;
+                while i < vocabulary {
+                    if score_key(scores[i]) >= candidate {
+                        local_mass += weights[i];
+                    }
+                    i += CUBE_DIM_X as usize;
                 }
             }
-            threshold = u32::cast_from(low);
-            let mut above_mass = 0.0f32;
-            let mut equal_count = 0i32;
-            let mut equal_weight = weights[0] * 0.0f32;
-            for i in 0..vocabulary {
-                let bits = u32::reinterpret(scores[i]);
-                let key = if (bits & 2147483648u32) != 0u32 {
-                    !bits
-                } else {
-                    bits ^ 2147483648u32
-                };
-                if key > threshold {
-                    above_mass += weights[i];
-                } else if key == threshold {
-                    equal_count += 1;
-                    equal_weight = weights[i];
-                }
+            if reduce_mass(&mut values, lane, local_mass) > target {
+                threshold = candidate;
             }
-            let remaining = if target > above_mass {
-                target - above_mass
+            bit >>= 1;
+        }
+        let mut above = 0.0f32;
+        i = lane;
+        while i < vocabulary {
+            if score_key(scores[i]) > threshold {
+                above += weights[i];
+            }
+            i += CUBE_DIM_X as usize;
+        }
+        let above = reduce_mass(&mut values, lane, above);
+        if lane == 0 {
+            let remaining = if target > above {
+                target - above
             } else {
                 0.0f32
             };
-            let mut allowed = if equal_weight > 0.0f32 {
-                i32::cast_from(remaining / equal_weight)
+            let bits = if (threshold & 0x8000_0000u32) != 0u32 {
+                threshold ^ 0x8000_0000u32
             } else {
-                0i32
+                !threshold
             };
-            if above_mass == 0.0f32 && allowed == 0i32 {
-                allowed = 1;
-            }
-            if allowed > equal_count {
-                allowed = equal_count;
-            }
-            if allowed > 0i32 {
+            let unit = (f32::reinterpret(bits) - maximum).exp();
+            if above == 0.0 || remaining >= unit {
                 let mut seen = 0i32;
-                for i in 0..vocabulary {
-                    let bits = u32::reinterpret(scores[i]);
-                    let key = if (bits & 2147483648u32) != 0u32 {
-                        !bits
-                    } else {
-                        bits ^ 2147483648u32
-                    };
-                    if key == threshold {
+                for token in 0..vocabulary {
+                    if score_key(scores[token]) == threshold {
                         seen += 1;
-                        if seen == allowed {
-                            cutoff_id = i as i32;
+                        if remaining >= weights[token] * seen as f32 || (above == 0.0 && seen == 1)
+                        {
+                            cutoff = token as i32;
+                        } else {
                             break;
                         }
                     }
                 }
-            } else {
-                cutoff_id = -1;
+            }
+            ids[0] = cutoff;
+        }
+        sync_cube();
+        cutoff = ids[0];
+        sync_cube();
+    }
+    let mut best = f32::cast_from(CUBE_POS_X) - 1.0f32;
+    let mut chosen = i32::cast_from(CUBE_POS_X) - 1;
+    i = lane;
+    while i < vocabulary {
+        let key = score_key(scores[i]);
+        if top_p == 1.0 || key > threshold || (key == threshold && i as i32 <= cutoff) {
+            let denominator = race_denominators[i];
+            let race = ((scores[i] - maximum) / temperature).exp() / denominator;
+            if denominator > 0.0 && race > best {
+                best = race;
+                chosen = i as i32;
             }
         }
-        let mut best = scores[0] * 0.0f32 - 1.0f32;
-        let mut chosen = i32::cast_from(ABSOLUTE_POS) - 1i32;
-        for i in 0..vocabulary {
-            let bits = u32::reinterpret(scores[i]);
-            let key = if (bits & 2147483648u32) != 0u32 {
-                !bits
-            } else {
-                bits ^ 2147483648u32
-            };
-            if top_p == 1.0f32 || key > threshold || (key == threshold && i as i32 <= cutoff_id) {
-                let denominator = race_denominators[i];
-                let race = ((scores[i] - maximum) / temperature).exp() / denominator;
-                if denominator > 0.0f32 && race > best {
-                    best = race;
-                    chosen = i as i32;
-                }
+        i += CUBE_DIM_X as usize;
+    }
+    values[lane] = best;
+    ids[lane] = chosen;
+    sync_cube();
+    width = CUBE_DIM_X as usize / 2;
+    while width > 0 {
+        if lane < width {
+            let other = lane + width;
+            if values[other] > values[lane]
+                || (values[other] == values[lane] && ids[other] < ids[lane])
+            {
+                values[lane] = values[other];
+                ids[lane] = ids[other];
             }
         }
-        result[0] = chosen;
-        result[1] = if chosen == eos_id { 1 } else { 0 };
+        sync_cube();
+        width /= 2;
+    }
+    if lane == 0 {
+        result[0] = ids[0];
+        result[1] = if ids[0] == eos_id { 1 } else { 0 };
     }
 }
 
-pub(super) fn top_p_device_token_with_handle(
+pub(super) fn launch_prepared_top_p(
+    client: &Client, logits: Handle, history: Handle, draws: Handle,
+    scores: Handle, weights: Handle, result: Handle, vocabulary: usize, params: SamplingParams,
+) {
+    top_p_token_kernel::launch(
+        client, CubeCount::Static(1, 1, 1), CubeDim::new_1d(SAMPLER_THREADS),
+        unsafe { BufferArg::from_raw_parts(logits, vocabulary) },
+        unsafe { BufferArg::from_raw_parts(history, 16) },
+        unsafe { BufferArg::from_raw_parts(draws, vocabulary) },
+        unsafe { BufferArg::from_raw_parts(scores, vocabulary) },
+        unsafe { BufferArg::from_raw_parts(weights, vocabulary) },
+        unsafe { BufferArg::from_raw_parts(result, 2) },
+        0, vocabulary, params.top_p, params.temperature, params.repetition_penalty, i32::MAX,
+    );
+}
+
+pub(super) fn enqueue_top_p(
     client: &Client,
     logits: &Handle,
     total: usize,
@@ -304,7 +419,7 @@ pub(super) fn top_p_device_token_with_handle(
     eos_id: u32,
     rng: &mut fish_speech_core::sampling::SessionRng,
     retained: &mut Vec<Handle>,
-) -> Result<(u32, bool, Handle)> {
+) -> Result<Handle> {
     params.validate()?;
     let end = offset
         .checked_add(vocabulary)
@@ -341,7 +456,7 @@ pub(super) fn top_p_device_token_with_handle(
     top_p_token_kernel::launch(
         client,
         CubeCount::Static(1, 1, 1),
-        CubeDim::new_1d(1),
+        CubeDim::new_1d(SAMPLER_THREADS),
         unsafe { BufferArg::from_raw_parts(logits.clone(), total) },
         unsafe { BufferArg::from_raw_parts(history_handle.clone(), history.len()) },
         unsafe { BufferArg::from_raw_parts(draws.clone(), vocabulary) },
@@ -356,26 +471,29 @@ pub(super) fn top_p_device_token_with_handle(
         eos,
     );
     retained.extend([history_handle, draws, scores, weights, result.clone()]);
-    let bytes = client.read_one(result).map_err(|_| {
-        FishError::InvalidTransition("CubeCL GPU top-p sampled token readback failed")
-    })?;
-    if bytes.len() != 8 {
-        return Err(FishError::InvalidShape(
-            "CubeCL GPU top-p sampler invalid token data",
-        ));
-    }
-    let token = i32::from_le_bytes(bytes[0..4].try_into().expect("four bytes"));
-    let flag = i32::from_le_bytes(bytes[4..8].try_into().expect("four bytes"));
-    if token < 0 || token as usize >= vocabulary || flag != i32::from(token == eos) {
-        return Err(FishError::InvalidSampling(
-            "CubeCL GPU top-p sampler invalid token or EOS",
-        ));
-    }
-    Ok((
-        token as u32,
-        flag != 0,
-        retained.last().expect("sampler result retained").clone(),
-    ))
+    Ok(result)
+}
+
+pub(super) fn top_p_device_token_with_handle(
+    client: &Client,
+    logits: &Handle,
+    total: usize,
+    offset: usize,
+    vocabulary: usize,
+    history: &[usize],
+    params: SamplingParams,
+    eos_id: u32,
+    rng: &mut fish_speech_core::sampling::SessionRng,
+    retained: &mut Vec<Handle>,
+) -> Result<(u32, bool, Handle)> {
+    let handle = enqueue_top_p(
+        client, logits, total, offset, vocabulary, history, params, eos_id, rng, retained,
+    )?;
+    let bytes = client
+        .read_one(handle.clone())
+        .map_err(|_| FishError::InvalidTransition("CubeCL GPU sampled token readback failed"))?;
+    let (token, eos) = decode_sample(&bytes, vocabulary, eos_id)?;
+    Ok((token, eos, handle))
 }
 
 pub(super) fn top_p_device_token(
