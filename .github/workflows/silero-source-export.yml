@@ -11,6 +11,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: silero-source-export-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   export:
     runs-on: ubuntu-latest
