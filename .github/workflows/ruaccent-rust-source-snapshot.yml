@@ -36,6 +36,14 @@ jobs:
           printf '%s\n' 4dd4b2f49d2250ee17448484d040180e042f9cee > export/ruaccent-head.sha
           tar -C upstream --exclude=.git -czf export/ruaccent-rs.tar.gz ruaccent-rs
           sha256sum export/ruaccent-rs.tar.gz > export/ruaccent-rs.tar.gz.sha256
+      - name: Export offline RUAccent Cargo dependency sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd upstream/ruaccent-rs
+          cargo vendor --locked --versioned-dirs vendor >/dev/null
+          tar -czf ../../export/ruaccent-crates.tar.gz vendor
+          (cd ../../export && sha256sum ruaccent-crates.tar.gz > ruaccent-crates.tar.gz.sha256)
       - uses: actions/upload-artifact@v4
         with:
           name: silero-ruaccent-rust-source
