@@ -29,9 +29,13 @@ fn vocoder_gelu(x: Tensor<3>) -> Tensor<3> {
     gelu(x)
 }
 
-struct ConvNeXtBlock {
-    preprocess: ConvNeXtPreprocess,
-    pointwise: PointwiseEngine,
+enum ConvNeXtBlock {
+    Standard {
+        preprocess: ConvNeXtPreprocess,
+        pointwise: PointwiseEngine,
+    },
+    #[cfg(feature = "reference-flex")]
+    Native(crate::flex_convnext::FlexConvNeXt),
 }
 
 enum DepthwiseEngine {
@@ -186,6 +190,28 @@ impl ConvNeXtBlock {
             .transpose();
         let pw2_bias = weights.float(&format!("{p}.pwconv2.bias"), device)?;
         let gamma = weights.float(&format!("{p}.gamma"), device)?;
+        let dwconv_weight = weights.float(&format!("{p}.dwconv.weight"), device)?;
+        let dwconv_bias = weights.float(&format!("{p}.dwconv.bias"), device)?;
+        let norm_weight = weights.float(&format!("{p}.norm.weight"), device)?;
+        let norm_bias = weights.float(&format!("{p}.norm.bias"), device)?;
+        #[cfg(feature = "reference-flex")]
+        if device == &Device::flex()
+            && std::env::var_os("SILERO_FLEX_WHOLE_CONVNEXT").is_some()
+            && std::env::var_os("SILERO_FLEX_TENSOR_DEPTHWISE").is_none()
+            && std::env::var_os("SILERO_FLEX_TENSOR_POINTWISE").is_none()
+        {
+            return Ok(Self::Native(crate::flex_convnext::FlexConvNeXt::new(
+                crate::flex_depthwise::FlexDepthwiseNorm::new(
+                    dwconv_weight,
+                    dwconv_bias,
+                    norm_weight,
+                    norm_bias,
+                )?,
+                crate::flex_pointwise::FlexPointwise::new(
+                    pw1_weight, pw1_bias, pw2_weight, pw2_bias, gamma,
+                )?,
+            )));
+        }
         #[cfg(feature = "reference-flex")]
         let use_native =
             device == &Device::flex() && std::env::var_os("SILERO_FLEX_TENSOR_POINTWISE").is_none();
@@ -216,10 +242,6 @@ impl ConvNeXtBlock {
                 gamma,
             }
         };
-        let dwconv_weight = weights.float(&format!("{p}.dwconv.weight"), device)?;
-        let dwconv_bias = weights.float(&format!("{p}.dwconv.bias"), device)?;
-        let norm_weight = weights.float(&format!("{p}.norm.weight"), device)?;
-        let norm_bias = weights.float(&format!("{p}.norm.bias"), device)?;
         #[cfg(feature = "reference-flex")]
         let fused = device == &Device::flex()
             && std::env::var_os("SILERO_FLEX_FUSED_DEPTHWISE_NORM").is_some()
@@ -261,15 +283,24 @@ impl ConvNeXtBlock {
             norm_weight,
             norm_bias,
         };
-        Ok(Self {
+        Ok(Self::Standard {
             preprocess,
             pointwise,
         })
     }
 
     fn forward(&self, input: Tensor<3>) -> Tensor<3> {
-        let x = self.preprocess.forward(input.clone());
-        self.pointwise.forward(x, input)
+        match self {
+            Self::Standard {
+                preprocess,
+                pointwise,
+            } => {
+                let x = preprocess.forward(input.clone());
+                pointwise.forward(x, input)
+            }
+            #[cfg(feature = "reference-flex")]
+            Self::Native(native) => native.forward(input),
+        }
     }
 }
 
@@ -322,6 +353,32 @@ impl Vocoder {
             1e-6,
         )
         .swap_dims(1, 2);
+        #[cfg(feature = "reference-flex")]
+        let x = if self
+            .blocks
+            .iter()
+            .all(|block| matches!(block, ConvNeXtBlock::Native(_)))
+        {
+            let [batch, channels, frames] = x.dims();
+            let device = x.device();
+            let mut samples = x
+                .into_data()
+                .try_to_vec::<f32>()
+                .expect("Flex ConvNeXt input must be f32");
+            for block in &self.blocks {
+                let ConvNeXtBlock::Native(native) = block else {
+                    unreachable!()
+                };
+                samples = native.forward_host(&samples, batch, channels, frames);
+            }
+            Tensor::from_data(TensorData::new(samples, [batch, channels, frames]), &device)
+        } else {
+            for block in &self.blocks {
+                x = block.forward(x);
+            }
+            x
+        };
+        #[cfg(not(feature = "reference-flex"))]
         for block in &self.blocks {
             x = block.forward(x);
         }

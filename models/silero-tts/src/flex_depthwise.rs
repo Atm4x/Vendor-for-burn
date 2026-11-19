@@ -96,12 +96,25 @@ impl FlexDepthwiseNorm {
 
     pub(crate) fn forward(&self, input: Tensor<3>) -> Tensor<3> {
         let [batch, channels, frames] = input.dims();
-        assert_eq!(channels, self.conv.channels);
         let device = input.device();
         let samples = input
             .into_data()
             .try_to_vec::<f32>()
             .expect("Flex fused depthwise requires f32");
+        let output = self.forward_host(&samples, batch, channels, frames);
+        Tensor::from_data(TensorData::new(output, [batch, frames, channels]), &device)
+    }
+
+    pub(crate) fn forward_host(
+        &self,
+        samples: &[f32],
+        batch: usize,
+        channels: usize,
+        frames: usize,
+    ) -> Vec<f32> {
+        assert_eq!(channels, self.conv.channels);
+        assert_eq!(samples.len(), batch * channels * frames);
+        assert!(frames > 0);
         let mut output = vec![0.0f32; batch * frames * channels];
         let kernel = self.conv.kernel;
         let pad = (kernel / 2) as isize;
@@ -138,7 +151,7 @@ impl FlexDepthwiseNorm {
                 work(r, values);
             }
         }
-        Tensor::from_data(TensorData::new(output, [batch, frames, channels]), &device)
+        output
     }
 }
 

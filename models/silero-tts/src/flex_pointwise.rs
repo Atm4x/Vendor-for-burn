@@ -225,6 +225,45 @@ impl FlexPointwise {
             .into_data()
             .try_to_vec::<f32>()
             .expect("Flex residual must use f32");
+        let output = self.forward_host_time_major(&input, &residual, batch, frames, fused);
+        Tensor::from_data(TensorData::new(output, [batch, frames, channels]), &device)
+            .swap_dims(1, 2)
+    }
+
+    pub(crate) fn forward_host(
+        &self,
+        input: &[f32],
+        residual: &[f32],
+        batch: usize,
+        channels: usize,
+        frames: usize,
+    ) -> Vec<f32> {
+        assert_eq!(channels, self.first.in_channels);
+        let temporal =
+            self.forward_host_time_major(input, residual, batch, frames, self.fused_epilogue);
+        let mut output = vec![0.0f32; batch * channels * frames];
+        for b in 0..batch {
+            for c in 0..channels {
+                for t in 0..frames {
+                    output[(b * channels + c) * frames + t] =
+                        temporal[(b * frames + t) * channels + c];
+                }
+            }
+        }
+        output
+    }
+
+    fn forward_host_time_major(
+        &self,
+        input: &[f32],
+        residual: &[f32],
+        batch: usize,
+        frames: usize,
+        fused: bool,
+    ) -> Vec<f32> {
+        let channels = self.first.in_channels;
+        assert_eq!(input.len(), batch * frames * channels);
+        assert_eq!(residual.len(), batch * channels * frames);
         let rows = batch * frames;
         let timed = std::env::var_os("SILERO_VOCODER_TIMING").is_some();
         let start = Instant::now();
@@ -285,8 +324,7 @@ impl FlexPointwise {
                 }
             }
         }
-        Tensor::from_data(TensorData::new(output, [batch, frames, channels]), &device)
-            .swap_dims(1, 2)
+        output
     }
 }
 
