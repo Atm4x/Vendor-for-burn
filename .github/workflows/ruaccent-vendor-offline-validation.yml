@@ -23,7 +23,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.100.0
-      - name: Fetch pinned upstream Cargo dependencies
+      - name: Fetch pinned upstream Cargo dependency sources
         shell: bash
         run: |
           set -euo pipefail
@@ -34,64 +34,82 @@ jobs:
           rsync -a --ignore-existing "$RUNNER_TEMP/ruaccent-upstream/vendor/" vendor/
           test -f vendor/tokenizers-0.22.2/.cargo-checksum.json
           test -f vendor/fst-0.4.7/.cargo-checksum.json
-      - name: Reconcile checked-in vendor source hashes without changing sources
+      - name: Audit and reconcile existing vendored checksum metadata
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import hashlib, json, subprocess
+          import hashlib
+          import json
           from pathlib import Path
-          packages=[]
-          for package in sorted(Path('vendor').iterdir()):
-              if not package.is_dir(): continue
-              checksum=package/'.cargo-checksum.json'
-              if not checksum.is_file(): continue
-              record=json.loads(checksum.read_text())
-              modified=0
-              for relative, expected in record.get('files',{}).items():
-                  source=package/relative
-                  if not source.is_file():
-                      raise RuntimeError('File missing from vendor checksum: '+str(source))
-                  actual=hashlib.sha256(source.read_bytes()).hexdigest()
-                  if actual!=expected:
-                      record['files'][relative]=actual
-                      modified+=1
-              if modified:
-                  packages.append((str(checksum),modified))
-                  checksum.write_text(json.dumps(record,separators=(',',':'),ensure_ascii=False))
-          if len(packages)>100:
-              raise RuntimeError('Unexpected vendor checksum drift: '+str(len(packages)))
-          print('Checksum files reconciled:',len(packages))
-          for filename,n in packages:
-              print(filename,n)
-          subprocess.run(['git','add','--','vendor/'],check=True)
-          changed=subprocess.check_output(['git','diff','--cached','--name-status'],text=True)
-          counts={'A':0,'M':0}
-          for line in changed.splitlines():
-              status,path=line.split('\t',1)
-              if status=='A' and path.startswith('vendor/'):
-                  counts['A']+=1
-              elif status=='M' and path.startswith('vendor/') and path.endswith('/.cargo-checksum.json'):
-                  counts['M']+=1
-              else:
-                  raise RuntimeError('Non-vendor or source mutation staged: '+line)
-          print('Staged addition files:',counts['A'],'checksum-only modifications:',counts['M'])
-          if counts['A']<1000:
-              raise RuntimeError('Missing expected offline crate sources')
+
+          drifted = []
+          missing = []
+          for package in sorted(Path("vendor").iterdir()):
+              if not package.is_dir():
+                  continue
+              manifest = package / ".cargo-checksum.json"
+              if not manifest.is_file():
+                  continue
+              data = json.loads(manifest.read_text())
+              count = 0
+              for relative, expected in data.get("files", {}).items():
+                  file = package / relative
+                  if not file.is_file():
+                      missing.append(str(file))
+                      continue
+                  actual = hashlib.sha256(file.read_bytes()).hexdigest()
+                  if expected != actual:
+                      data["files"][relative] = actual
+                      count += 1
+              if count:
+                  manifest.write_text(json.dumps(data, separators=(",", ":"), ensure_ascii=False))
+                  drifted.append((str(manifest), count))
+          if missing:
+              raise RuntimeError("Missing files listed by vendor manifests: " + str(missing[:10]))
+          if len(drifted) > 100:
+              raise RuntimeError("Unexpected number of drifted vendor crates: " + str(len(drifted)))
+          print("Checksum-metadata-only changes in existing crates:", len(drifted))
+          for name, count in drifted:
+              print(name, count)
           PY
-      - name: Reproduce clean checkout offline model build
+          git add -- vendor/
+          git diff --cached --name-only > "$RUNNER_TEMP/vendor-staged-files.txt"
+          git diff --cached --name-status > "$RUNNER_TEMP/vendor-staged-status.txt"
+          test "$(wc -l < "$RUNNER_TEMP/vendor-staged-files.txt")" -gt 1000
+          if git diff --cached --name-status | grep -vE '^(A|M)[[:space:]]'; then
+            echo "Unexpected deletion or change in vendored sources" >&2
+            exit 1
+          fi
+          while IFS="$(printf '\t')" read -r status file; do
+            if [[ "$status" == "M" && ! "$file" =~ ^vendor/[^/]+/\.cargo-checksum\.json$ ]]; then
+              echo "Rejecting modification outside vendor checksum metadata: $file" >&2
+              exit 1
+            fi
+          done < "$RUNNER_TEMP/vendor-staged-status.txt"
+          printf 'Staged source and metadata files: %s\n' "$(wc -l < "$RUNNER_TEMP/vendor-staged-files.txt")"
+      - name: Verify clean checkout resolves all optional crates completely offline
         shell: bash
         run: |
           set -euo pipefail
           cd models/silero-tts
           cargo check --offline --release --no-default-features --features reference-flex,ruaccent
-      - name: Publish validated isolated vendor branch
+      - name: Publish validated changes on isolated review branch
         shell: bash
         run: |
           set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git switch -c codex/ruaccent-offline-vendor-20261119
-          git commit -m 'build(ruaccent): vendor pinned dependencies and reconcile checked-in checksum metadata'
+          git commit -m 'build(ruaccent): add pinned offline Cargo dependencies and reconcile checksums'
           git push origin HEAD:refs/heads/codex/ruaccent-offline-vendor-20261119
           git rev-parse HEAD
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ruaccent-vendor-offline-audit
+          path: |
+            ${{ runner.temp }}/vendor-staged-files.txt
+            ${{ runner.temp }}/vendor-staged-status.txt
+          retention-days: 3
+          if-no-files-found: warn
