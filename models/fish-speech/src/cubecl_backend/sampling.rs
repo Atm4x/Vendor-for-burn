@@ -112,3 +112,47 @@ pub(super) fn greedy_device_token(
     }
     Ok((token as u32, flag != 0))
 }
+
+#[cfg(all(test, feature = "cubecl-cpu"))]
+mod tests {
+    use super::*;
+    use cubecl::Device;
+    use fish_speech_core::sampling::{greedy, logits_to_probs};
+
+    #[test]
+    fn cubecl_greedy_sampler_matches_host_with_eos_repetition_and_offsets() {
+        let client = Device::Cpu(Default::default()).client();
+        let samples = [
+            (vec![0.5f32, 2.0, 2.0, -1.0], vec![], 1u32),
+            (vec![0.5f32, 2.0, 2.0, -1.0], vec![1], 2u32),
+            (vec![-1.0f32, -0.5, -0.25, -2.0], vec![2], 1u32),
+            (vec![-1.0f32, -0.5, -0.25, -2.0], vec![0, 0, 2], 3u32),
+        ];
+        let params = SamplingParams {
+            temperature: 0.75,
+            top_p: 1.0,
+            repetition_penalty: 1.5,
+        };
+        for (logits, history, eos) in samples {
+            let mut padded = vec![10.0f32, 20.0];
+            padded.extend_from_slice(&logits);
+            padded.push(30.0);
+            let logits_handle = client.create_from_slice(bytemuck::cast_slice(&padded));
+            let mut retained = Vec::new();
+            let gpu = greedy_device_token(
+                &client,
+                &logits_handle,
+                padded.len(),
+                2,
+                logits.len(),
+                &history,
+                params,
+                eos,
+                &mut retained,
+            )
+            .unwrap();
+            let cpu = greedy(&logits_to_probs(&logits, &history, params).unwrap()).unwrap() as u32;
+            assert_eq!(gpu, (cpu, cpu == eos));
+        }
+    }
+}

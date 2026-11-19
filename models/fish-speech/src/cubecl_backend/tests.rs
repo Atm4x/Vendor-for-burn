@@ -256,7 +256,16 @@ mod tests {
         TensorType::new(shape.to_vec(), ScalarType::F32, Layout::SequenceBtd)
     }
 
-    fn run_parity(graph: Graph, inputs: NamedTensors) {
+    fn run_parity(graph: Graph, mut inputs: NamedTensors) {
+        for value in &graph.values {
+            if value.ty.dtype == ScalarType::BF16 {
+                if let Some(TensorData::F32(values)) = inputs.get_mut(&value.name) {
+                    for x in values {
+                        *x = half::bf16::from_f32(*x).to_f32();
+                    }
+                }
+            }
+        }
         let expected = CpuIrInterpreter::run(&graph, &inputs).unwrap();
         let executor = CubeClGraphExecutor::new(Device::Cpu(Default::default()).client());
         let actual = executor
@@ -504,6 +513,117 @@ mod tests {
         inputs.insert("fresh".into(), TensorData::F32(vec![0.2, 1.2, -0.1, 0.7]));
         inputs.insert("q".into(), TensorData::F32(vec![0.1, 0.2, 0.5, -0.25]));
         run_parity(g, inputs);
+    }
+
+    #[test]
+    fn cubecl_plain_linear_identity_and_last_token_across_batches() {
+        let mut g = Graph::new(Stage::SlowPrefill, None, None);
+        let x = g.input("x", ty(&[2, 3, 4])).unwrap();
+        let weights = g
+            .weight(
+                "weights",
+                TensorType::new([5, 4], ScalarType::F32, Layout::Plain),
+            )
+            .unwrap();
+        let projected = g.emit("projected", Op::Linear, &[x, weights]).unwrap();
+        let copied = g.emit("copied", Op::Identity, &[projected]).unwrap();
+        let last = g.emit("last", Op::LastToken, &[copied]).unwrap();
+        for id in [projected, copied, last] {
+            g.output(id).unwrap();
+        }
+        let mut inputs = NamedTensors::new();
+        inputs.insert(
+            "x".into(),
+            TensorData::F32((0..24).map(|i| ((i as f32 - 11.0) * 0.41).sin()).collect()),
+        );
+        inputs.insert(
+            "weights".into(),
+            TensorData::F32((0..20).map(|i| ((i as f32 + 3.0) * 0.29).cos()).collect()),
+        );
+        run_parity(g, inputs);
+    }
+
+    #[test]
+    fn cubecl_bf16_gqa_multi_batch_multi_head_and_causal_mask() {
+        let mut g = Graph::new(Stage::SlowDecode, Some(5), Some(5));
+        let query = g
+            .input(
+                "query",
+                TensorType::new([2, 4, 3, 4], ScalarType::F32, Layout::HeadsBhtd),
+            )
+            .unwrap();
+        let key = g
+            .input(
+                "key",
+                TensorType::new([2, 2, 5, 4], ScalarType::BF16, Layout::HeadsBhtd),
+            )
+            .unwrap();
+        let value = g
+            .input(
+                "value",
+                TensorType::new([2, 2, 5, 4], ScalarType::BF16, Layout::HeadsBhtd),
+            )
+            .unwrap();
+        let attention = g
+            .emit(
+                "attention",
+                Op::GqaAttention {
+                    position: 2,
+                    q_heads: 4,
+                    kv_heads: 2,
+                },
+                &[query, key, value],
+            )
+            .unwrap();
+        g.output(attention).unwrap();
+
+        let mut inputs = NamedTensors::new();
+        inputs.insert(
+            "query".into(),
+            TensorData::F32((0..96).map(|i| ((i as f32 + 1.0) * 0.19).cos()).collect()),
+        );
+        inputs.insert(
+            "key".into(),
+            TensorData::F32((0..80).map(|i| ((i as f32 + 2.0) * 0.11).sin()).collect()),
+        );
+        inputs.insert(
+            "value".into(),
+            TensorData::F32((0..80).map(|i| ((i as f32 - 3.0) * 0.17).cos()).collect()),
+        );
+        run_parity(g.clone(), inputs.clone());
+
+        let executor = CubeClGraphExecutor::new(Device::Cpu(Default::default()).client());
+        let compiled = CubeClGraph::compile(&g).unwrap();
+        let before = executor.run(&compiled, &inputs).unwrap();
+        if let TensorData::F32(values) = inputs.get_mut("value").unwrap() {
+            for batch in 0..2 {
+                for head in 0..2 {
+                    for frame in 3..5 {
+                        for feature in 0..4 {
+                            let index = ((batch * 2 + head) * 5 + frame) * 4 + feature;
+                            values[index] = 100.0 + index as f32;
+                        }
+                    }
+                }
+            }
+        }
+        run_parity(g.clone(), inputs.clone());
+        let after = executor.run(&compiled, &inputs).unwrap();
+        let TensorData::F32(before) = &before["attention"] else {
+            panic!("attention must be F32");
+        };
+        let TensorData::F32(after) = &after["attention"] else {
+            panic!("attention must be F32");
+        };
+        for batch in 0..2 {
+            let first_query = batch * 3 * 16;
+            for (left, right) in before[first_query..first_query + 16]
+                .iter()
+                .zip(&after[first_query..first_query + 16])
+            {
+                assert_eq!(left, right, "future acoustic frames leaked into causal GQA");
+            }
+        }
     }
 
     #[test]

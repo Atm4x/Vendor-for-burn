@@ -1,28 +1,28 @@
 # Fish Speech 1.5 — CubeCL implementation tracker
 
-Baseline: `codex/fish-speech`; updated during CONT39 (2026-11-19).
+Baseline: `codex/fish-speech`; updated during CONT41 (2026-11-19).
 
 **Meaning:** This is a checklist of implementation/verification gates, not a benchmark, a statement of GPU operability, or the percentage of the original Fish Speech functional port. The checklist denominator is fixed at **26 gates**, allocated C01=4, C02=6, C03=4, C04=4, C05=4, C06=4. A gate for numeric parity stays open until the actual CubeCL runtime executes and its results are compared with a reference. Pure graph compilation does not satisfy that gate.
 
-**Overall: 12/26 = 46.2% implementation gates**. CubeCL numerical execution: unverified. CubeCL CUDA/Windows inference: unverified.
+**Overall: 14/26 = 53.8% implementation gates**. Real CubeCL CPU numerical execution: verified against `CpuIrInterpreter` for synthetic operator fixtures. CubeCL CUDA/Windows inference: unverified.
 
-## C01 — bootstrap: 3/4
+## C01 — bootstrap: 4/4
 
 - [x] Optional `cubecl-backend` feature, no TensorRT dependency.
 - [x] `Graph IR` compilation and deterministic binding preflight; reject invalid or unsupported graphs before dispatch.
 - [x] Device kernels for base F32 operators: linear, linear+bias, RMSNorm, SiLU, Add, Mul, Identity, LastToken.
-- [ ] Actual CubeCL kernel numerical parity with `CpuIrInterpreter`. `cubecl-cpu` requires Tracel LLVM 23.1, unavailable in the offline environment.
+- [x] Runtime-executed base F32 kernel numerical parity with `CpuIrInterpreter` on CubeCL CPU (Tracel LLVM 23.1.0-4), including Linear, LinearBias, Identity, RMSNorm, SiLU, Add, Mul and LastToken, across multi-batch fixtures.
 
-## C02 — Transformer operations: 5/6
+## C02 — Transformer operations: 6/6
 
 - [x] `TokenEmbedding` and gated `FishEmbedding` with external-token and LUT checks.
 - [x] Query/key/value unpacking plus position-correct interleaved RoPE (BF16-rounded rotary coefficients).
 - [x] Typed native BF16 KV storage, write and prefix extraction; no silent F32 device-cache substitution.
 - [x] Right-aligned masked causal grouped-query attention over BF16 K/V and F32 Q.
 - [x] Complete synthetic DualAR (Slow/Fast) and Naive graph precompilation; no TensorRT lowering.
-- [ ] Runtime-executed operator parity, including BF16 KV and GQA, on CubeCL CPU/CUDA. BF16 support must be probed on the selected device; no real kernel execution has been verified here.
+- [x] Runtime-executed CubeCL CPU operator parity, including embeddings, QKV/RoPE, BF16 KV update/prefix and multi-batch/multi-head causal GQA. BF16 external inputs are normalized to BF16 representable values before reference comparison; native BF16 support was validated by actual kernel execution. CUDA parity remains a separate C06 acceptance requirement.
 
-**C02 caveats:** implementations currently use correctness-first scalar reference kernels and host-staged graph bindings. This is not a persistent KV device owner, an optimized attention engine or a streaming generation backend. `TokenEmbedding` and `FishEmbedding` currently require external token IDs; device-generated indices are rejected at compile time pending a device-side error channel. Reuse of RoPE coefficient uploads should be optimized after numerical verification.
+**C02 caveats:** these are synthetic operator-level tests, not real checkpoint or end-to-end parity. Implementations currently use correctness-first scalar kernels; device-generated embedding indices still require a device-side error channel. Reuse of RoPE coefficient uploads and GPU attention performance remain future optimizations.
 
 ## C03 — stream-ordered CubeCL autoregression: 4/4
 
@@ -52,7 +52,16 @@ Baseline: `codex/fish-speech`; updated during CONT39 (2026-11-19).
 - [ ] Load/first-token/generation/RTF throughput and memory benchmarks.
 - [ ] Profiler-driven kernel optimization and resource lifetime acceptance.
 
-## Verification ledger — CONT39
+## Verification ledger — CONT41
+
+| Check | Status |
+| --- | --- |
+| Rust 1.100.0, Tracel LLVM 23.1.0-4 `cargo test --offline --locked --features cubecl-cpu --lib` | PASS: 81 passed, 2 ignored (real CPU kernels) |
+| `cargo fmt --all -- --check`; `git diff --check` | PASS |
+| CubeCL greedy sampling on CPU, EOS/repetition/offset versus host | PASS: correctness-first kernel; C04 still open |
+| CubeCL CUDA/Windows, full checkpoint inference, CPU Firefly end-to-end | NOT RUN / NOT CONFIRMED |
+
+## Historical verification — CONT39
 
 | Check | Status |
 | --- | --- |
