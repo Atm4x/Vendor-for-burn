@@ -1,0 +1,57 @@
+name: RUAccent offline vendor additions validation
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/silero-tts-cubecl-port-20261118
+    paths:
+      - .github/workflows/ruaccent-vendor-offline-validation.yml
+
+permissions:
+  contents: write
+
+jobs:
+  prepare-vendor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.100.0
+      - name: Fetch pinned upstream Cargo dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --quiet https://github.com/alksef/ruaccent-rs.git "$RUNNER_TEMP/ruaccent-upstream"
+          git -C "$RUNNER_TEMP/ruaccent-upstream" checkout --quiet 4dd4b2f49d2250ee17448484d040180e042f9cee
+          test "$(git -C "$RUNNER_TEMP/ruaccent-upstream" rev-parse HEAD)" = 4dd4b2f49d2250ee17448484d040180e042f9cee
+          (cd "$RUNNER_TEMP/ruaccent-upstream" && cargo vendor --locked --versioned-dirs vendor >/dev/null)
+          rsync -a --ignore-existing "$RUNNER_TEMP/ruaccent-upstream/vendor/" vendor/
+          test -f vendor/tokenizers-0.22.2/.cargo-checksum.json
+          test -f vendor/fst-0.4.7/.cargo-checksum.json
+          git add -- vendor/
+          test -z "$(git diff --cached --name-status | grep -v $'^A\\t' || true)"
+          git diff --cached --name-only > "$RUNNER_TEMP/new-vendor-files.txt"
+          test "$(wc -l < "$RUNNER_TEMP/new-vendor-files.txt")" -gt 1000
+          printf 'Vendored added file count: %s\\n' "$(wc -l < "$RUNNER_TEMP/new-vendor-files.txt")"
+      - name: Reproduce clean checkout offline model build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd models/silero-tts
+          cargo check --offline --release --locked --no-default-features --features reference-flex,ruaccent
+      - name: Publish validated addition-only branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -c codex/ruaccent-offline-vendor-20261119
+          git commit -m 'build(ruaccent): add pinned offline Cargo dependency sources'
+          git push origin HEAD:refs/heads/codex/ruaccent-offline-vendor-20261119
+          git rev-parse HEAD
