@@ -1,10 +1,10 @@
 # Fish Speech 1.5 — CubeCL implementation tracker
 
-Baseline: `codex/fish-speech`; updated during CONT41 (2026-11-19).
+Baseline: `codex/fish-speech`; updated during CONT42 (2026-11-19).
 
 **Meaning:** This is a checklist of implementation/verification gates, not a benchmark, a statement of GPU operability, or the percentage of the original Fish Speech functional port. The checklist denominator is fixed at **26 gates**, allocated C01=4, C02=6, C03=4, C04=4, C05=4, C06=4. A gate for numeric parity stays open until the actual CubeCL runtime executes and its results are compared with a reference. Pure graph compilation does not satisfy that gate.
 
-**Overall: 14/26 = 53.8% implementation gates**. Real CubeCL CPU numerical execution: verified against `CpuIrInterpreter` for synthetic operator fixtures. CubeCL CUDA/Windows inference: unverified.
+**Overall: 16/26 = 61.5% implementation gates**. Real CubeCL CPU numerical execution: verified against `CpuIrInterpreter` for synthetic operator fixtures. CubeCL CUDA/Windows inference: unverified.
 
 ## C01 — bootstrap: 4/4
 
@@ -31,10 +31,10 @@ Baseline: `codex/fish-speech`; updated during CONT41 (2026-11-19).
 - [x] Request-scoped KV, synchronization, cancellation and rollback/reset semantics. `CubeClRequest` preserves BF16 device cache handles and retains scratch until async stream synchronization; cancellation and post-enqueue failures poison the request. Runtime execution still requires hardware testing.
 - [x] Native CubeCL `SemanticGenerator` for DualAR and Naive behind the existing TTS API. `CubeClSemanticGenerator` dispatches to `CubeClRequest` and the shared Core DualAR/Naive controllers; CPU host sampling/readback remains pending C04. Public `CubeClFishModel`/`open_cubecl` are available.
 
-## C04 — complete generation: 0/4
+## C04 — complete generation: 2/4
 
-- [ ] Native CubeCL semantic top-p/repetition sampling.
-- [ ] Native CubeCL Fast and Naive acoustic codebook sampling.
+- [x] Native CubeCL semantic top-p/repetition sampling: device-resident logits with EOS output; CPU runtime compared against `logits_to_probs` and seeded `SessionRng` (synthetic vocabularies, ties, offsets, history penalties). The top-p kernel is correctness-first and single-lane; independent exponential draws are currently generated on the host and uploaded, not computed on GPU.
+- [x] Native CubeCL Fast and Naive acoustic codebook sampling: both selection modes dispatch directly against device F32 logits. Naive uses an explicit `NaiveArForward::DevicePending` backend contract, not sentinel empty host logits. CPU controller test checks callback order, 16-token acoustic history, and EOS-column handling.
 - [ ] Device-resident tokens, EOS and streaming/cancel correctness.
 - [ ] End-to-end CubeCL semantic generation + CPU Firefly, compared with the CPU trace.
 
@@ -52,7 +52,20 @@ Baseline: `codex/fish-speech`; updated during CONT41 (2026-11-19).
 - [ ] Load/first-token/generation/RTF throughput and memory benchmarks.
 - [ ] Profiler-driven kernel optimization and resource lifetime acceptance.
 
-## Verification ledger — CONT41
+## Verification ledger — CONT42
+
+| Check | Status |
+| --- | --- |
+| Rust 1.100.0 + CubeCL CPU real runtime top-p numerical parity versus Core seeded sampler | PASS: 3 top-p CPU tests, including NaN rejection and 4/16/64/257 vocabularies |
+| Core Naive device-pending controller with backend sampling, fixed semantic params, callback ordering and EOS | PASS |
+| CubeCL CPU `cargo test --offline --locked --features cubecl-cpu --lib` | PASS: 84 passed, 2 ignored |
+| `cargo test --offline --locked --features cubecl-backend --lib` | PASS: 72 passed, 2 ignored |
+| `cargo test --offline --locked --lib` | PASS: 58 passed, 2 ignored |
+| Core `cargo test --offline --locked --manifest-path core/Cargo.toml --lib` | PASS: 208 passed, 2 ignored |
+| Formatting + `git diff --check` | PASS |
+| GPU-resident token graph chaining, end-to-end checkpoint+Firefly, Windows CUDA, benchmark | NOT VERIFIED; separate open criteria |
+
+## Historical verification — CONT41
 
 | Check | Status |
 | --- | --- |

@@ -137,7 +137,7 @@ impl CpuNaiveBackend<'_> {
             Some(TensorData::F32(v)) => v.clone(),
             _ => return Err(FishError::InvalidShape("Naive acoustic logits missing")),
         };
-        Ok(NaiveArForward {
+        Ok(NaiveArForward::Host {
             semantic_logits,
             acoustic_logits,
         })

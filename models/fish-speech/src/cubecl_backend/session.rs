@@ -22,7 +22,7 @@ use fish_speech_core::{
 use super::{
     CubeClGraph, CubeClGraphExecutor,
     runtime::{is_cache_name, tensor_bytes, validate_binding},
-    sampling::greedy_device_token,
+    sampling::{greedy_device_token, top_p_device_token},
 };
 
 const DEFAULT_MAX_PENDING_BYTES: usize = 512 * 1024 * 1024;
@@ -124,6 +124,12 @@ pub struct CubeClDeviceTensor {
     ty: TensorType,
     handle: Handle,
     request_id: u64,
+}
+
+impl CubeClDeviceTensor {
+    pub fn shape_elements(&self) -> usize {
+        self.ty.shape.iter().product()
+    }
 }
 
 pub struct CubeClRunResult {
@@ -491,6 +497,78 @@ impl CubeClRequest<'_> {
             self.poisoned = true;
         }
         result
+    }
+
+    pub fn sample_top_p(
+        &mut self,
+        logits: &CubeClDeviceTensor,
+        offset: usize,
+        vocabulary: usize,
+        history: &[usize],
+        params: SamplingParams,
+        eos_id: u32,
+        rng: &mut fish_speech_core::sampling::SessionRng,
+    ) -> Result<(u32, bool)> {
+        if self.poisoned {
+            return Err(FishError::InvalidTransition(
+                "CubeCL stream poisoned; reset required",
+            ));
+        }
+        if logits.request_id != self.request_id {
+            return Err(FishError::InvalidTransition(
+                "CubeCL sampled tensor belongs to another request",
+            ));
+        }
+        if logits.ty.dtype != ScalarType::F32 {
+            return Err(FishError::InvalidShape(
+                "CubeCL GPU sampler requires F32 logits",
+            ));
+        }
+        let total = logits.ty.shape.iter().product();
+        let extra = history
+            .len()
+            .max(1)
+            .checked_mul(4)
+            .and_then(|bytes| {
+                vocabulary
+                    .checked_mul(12)
+                    .and_then(|scratch| bytes.checked_add(scratch))
+            })
+            .and_then(|bytes| bytes.checked_add(8))
+            .ok_or(FishError::InvalidShape(
+                "CubeCL sampler scratch byte overflow",
+            ))?;
+        let projected = self
+            .pending_bytes
+            .checked_add(extra)
+            .ok_or(FishError::InvalidShape(
+                "CubeCL sampler scratch byte overflow",
+            ))?;
+        if projected > self.limits.max_pending_bytes
+            || self.pending_steps >= self.limits.max_pending_steps
+        {
+            return Err(FishError::InvalidTransition(
+                "CubeCL GPU sampler pending budget exceeded",
+            ));
+        }
+        let sampled = top_p_device_token(
+            self.model.executor.client(),
+            &logits.handle,
+            total,
+            offset,
+            vocabulary,
+            history,
+            params,
+            eos_id,
+            rng,
+            &mut self.retained,
+        );
+        self.pending_steps += 1;
+        self.pending_bytes = projected;
+        if sampled.is_err() {
+            self.poisoned = true;
+        }
+        sampled
     }
 
     pub fn run_selected(

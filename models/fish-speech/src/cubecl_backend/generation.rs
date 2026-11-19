@@ -1,5 +1,5 @@
 //! CubeCL-backed semantic generation. The neural graph is executed by CubeCL;
-//! token sampling remains on the host until the separate GPU-sampling phase.
+//! sampled and greedy DualAR tokens are selected by CubeCL kernels.
 
 use cubecl::prelude::Client;
 use fish_speech_core::{
@@ -10,7 +10,7 @@ use fish_speech_core::{
     cpu_weighted_ar::SelectionMode,
     error::{FishError, Result},
     naive_generation::{NaiveArBackend, NaiveArForward, generate_naive_ar},
-    sampling::{SamplingParams, SessionRng, greedy, logits_to_probs},
+    sampling::{SamplingParams, SessionRng},
     synthesis::SemanticGenerator,
     tokenizer::{SEMANTIC_TOKEN_COUNT, SpecialTokens},
 };
@@ -75,27 +75,13 @@ fn request_limit(config: &FishModelConfig, prompt_len: usize, requested: usize) 
     Ok(count)
 }
 
-fn sample_host(
-    rng: &mut SessionRng,
-    mode: SelectionMode,
-    logits: &[f32],
-    history: &[usize],
-    params: SamplingParams,
-) -> Result<u32> {
-    let probabilities = logits_to_probs(logits, history, params)?;
-    let index = match mode {
-        SelectionMode::Sample => rng.sample_exponential_race(&probabilities)?,
-        SelectionMode::Greedy => greedy(&probabilities)?,
-    };
-    u32::try_from(index).map_err(|_| FishError::InvalidShape("CubeCL sampled token exceeds u32"))
-}
-
 struct CubeClDualArBackend<'a, 'b> {
     request: &'a mut CubeClRequest<'b>,
     semantic_lut: &'a [i32],
     codebook_size: usize,
     vocab_size: usize,
     mode: SelectionMode,
+    rng: &'a mut SessionRng,
     pending_semantic: Option<CubeClDeviceTensor>,
 }
 
@@ -110,28 +96,20 @@ impl CubeClDualArBackend<'_, '_> {
             "semantic_membership_lut".into(),
             TensorData::I32(self.semantic_lut.to_vec()),
         );
-        let readbacks: &[&str] = if self.mode == SelectionMode::Greedy {
-            &[]
-        } else {
-            &["logits"]
-        };
+        let readbacks: &[&str] = &[];
         let outputs = self
             .request
             .run_selected(key, &inputs, &Default::default(), readbacks)?;
-        let logits = if self.mode == SelectionMode::Greedy {
-            self.pending_semantic = Some(
-                outputs
-                    .device
-                    .get("logits")
-                    .ok_or(FishError::InvalidShape(
-                        "CubeCL semantic device logits missing",
-                    ))?
-                    .clone(),
-            );
-            SlowArLogits::DevicePending
-        } else {
-            SlowArLogits::Host(float_output(&outputs.host, "logits", self.vocab_size)?)
-        };
+        self.pending_semantic = Some(
+            outputs
+                .device
+                .get("logits")
+                .ok_or(FishError::InvalidShape(
+                    "CubeCL semantic device logits missing",
+                ))?
+                .clone(),
+        );
+        let logits = SlowArLogits::DevicePending;
         let fast_context = outputs
             .device
             .get("fast_context")
@@ -190,8 +168,25 @@ impl DualArBackend for CubeClDualArBackend<'_, '_> {
                     .ok_or(FishError::InvalidTransition(
                         "CubeCL semantic sampler has no pending logits",
                     ))?;
-                self.request
-                    .sample_greedy(&pending, 0, self.vocab_size, history, params, eos_id)
+                match self.mode {
+                    SelectionMode::Greedy => self.request.sample_greedy(
+                        &pending,
+                        0,
+                        self.vocab_size,
+                        history,
+                        params,
+                        eos_id,
+                    ),
+                    SelectionMode::Sample => self.request.sample_top_p(
+                        &pending,
+                        0,
+                        self.vocab_size,
+                        history,
+                        params,
+                        eos_id,
+                        self.rng,
+                    ),
+                }
             }
         }
     }
@@ -227,7 +222,7 @@ impl DualArBackend for CubeClDualArBackend<'_, '_> {
         codebook_size: usize,
         histories: &[Vec<usize>],
         params: SamplingParams,
-        sample: &mut dyn FnMut(&[f32], &[usize], SamplingParams) -> Result<u32>,
+        _sample: &mut dyn FnMut(&[f32], &[usize], SamplingParams) -> Result<u32>,
         on_codebook: &mut dyn FnMut(usize) -> Result<()>,
         is_cancelled: &mut dyn FnMut() -> bool,
     ) -> Result<Vec<u32>> {
@@ -238,7 +233,7 @@ impl DualArBackend for CubeClDualArBackend<'_, '_> {
             }
             let codebook = index + 1;
             let previous = *codes.last().expect("Fast AR initial code present");
-            let token = if self.mode == SelectionMode::Greedy {
+            let token = {
                 let mut inputs = NamedTensors::new();
                 inputs.insert(
                     "previous_acoustic_code".into(),
@@ -257,19 +252,33 @@ impl DualArBackend for CubeClDualArBackend<'_, '_> {
                         .ok_or(FishError::InvalidShape(
                             "CubeCL Fast AR device logits missing",
                         ))?;
-                self.request
-                    .sample_greedy(
-                        device_logits,
-                        0,
-                        codebook_size,
-                        history,
-                        params,
-                        i32::MAX as u32,
-                    )?
-                    .0
-            } else {
-                let logits = self.decode_fast(codebook, previous)?;
-                sample(&logits, history, params)?
+                match self.mode {
+                    SelectionMode::Greedy => {
+                        self.request
+                            .sample_greedy(
+                                device_logits,
+                                0,
+                                codebook_size,
+                                history,
+                                params,
+                                i32::MAX as u32,
+                            )?
+                            .0
+                    }
+                    SelectionMode::Sample => {
+                        self.request
+                            .sample_top_p(
+                                device_logits,
+                                0,
+                                codebook_size,
+                                history,
+                                params,
+                                i32::MAX as u32,
+                                self.rng,
+                            )?
+                            .0
+                    }
+                }
             };
             if token as usize >= codebook_size {
                 return Err(FishError::InvalidShape(
@@ -288,6 +297,10 @@ struct CubeClNaiveBackend<'a, 'b> {
     semantic_lut: &'a [i32],
     vocab_size: usize,
     codebook_logits_len: usize,
+    mode: SelectionMode,
+    rng: &'a mut SessionRng,
+    pending_semantic: Option<CubeClDeviceTensor>,
+    pending_acoustic: Option<CubeClDeviceTensor>,
 }
 
 impl CubeClNaiveBackend<'_, '_> {
@@ -301,10 +314,50 @@ impl CubeClNaiveBackend<'_, '_> {
             "semantic_membership_lut".into(),
             TensorData::I32(self.semantic_lut.to_vec()),
         );
-        let output = self.request.run(key, &input)?;
-        Ok(NaiveArForward {
-            semantic_logits: float_output(&output, "logits", self.vocab_size)?,
-            acoustic_logits: float_output(&output, "codebook_logits", self.codebook_logits_len)?,
+        let output = self
+            .request
+            .run_selected(key, &input, &Default::default(), &[])?;
+        let semantic = output.device.get("logits").ok_or(FishError::InvalidShape(
+            "CubeCL Naive device semantic logits missing",
+        ))?;
+        let acoustic = output
+            .device
+            .get("codebook_logits")
+            .ok_or(FishError::InvalidShape(
+                "CubeCL Naive device acoustic logits missing",
+            ))?;
+        if semantic.shape_elements() != self.vocab_size
+            || acoustic.shape_elements() != self.codebook_logits_len
+        {
+            return Err(FishError::InvalidShape(
+                "CubeCL Naive device logits shape mismatch",
+            ));
+        }
+        self.pending_semantic = Some(semantic.clone());
+        self.pending_acoustic = Some(acoustic.clone());
+        Ok(NaiveArForward::DevicePending)
+    }
+
+    fn select(
+        &mut self,
+        logits: &CubeClDeviceTensor,
+        offset: usize,
+        vocabulary: usize,
+        history: &[usize],
+        params: SamplingParams,
+        eos: u32,
+    ) -> Result<u32> {
+        Ok(match self.mode {
+            SelectionMode::Greedy => {
+                self.request
+                    .sample_greedy(logits, offset, vocabulary, history, params, eos)?
+                    .0
+            }
+            SelectionMode::Sample => {
+                self.request
+                    .sample_top_p(logits, offset, vocabulary, history, params, eos, self.rng)?
+                    .0
+            }
         })
     }
 }
@@ -326,6 +379,45 @@ impl NaiveArBackend for CubeClNaiveBackend<'_, '_> {
             &format!("slow_decode_{active_len}"),
             checked_tokens(previous_column.iter().copied())?,
         )
+    }
+
+    fn sample_semantic(
+        &mut self,
+        _: &NaiveArForward,
+        params: SamplingParams,
+        _: &mut dyn FnMut(&[f32], &[usize], SamplingParams) -> Result<u32>,
+    ) -> Result<u32> {
+        let logits = self
+            .pending_semantic
+            .take()
+            .ok_or(FishError::InvalidTransition(
+                "CubeCL Naive semantic logits not pending",
+            ))?;
+        self.select(&logits, 0, self.vocab_size, &[], params, u32::MAX)
+    }
+
+    fn sample_acoustic(
+        &mut self,
+        _: &NaiveArForward,
+        codebook: usize,
+        codebook_size: usize,
+        history: &[usize],
+        params: SamplingParams,
+        _: &mut dyn FnMut(&[f32], &[usize], SamplingParams) -> Result<u32>,
+    ) -> Result<u32> {
+        let logits = self
+            .pending_acoustic
+            .as_ref()
+            .ok_or(FishError::InvalidTransition(
+                "CubeCL Naive acoustic logits not pending",
+            ))?
+            .clone();
+        let offset = codebook
+            .checked_mul(codebook_size)
+            .ok_or(FishError::InvalidShape(
+                "CubeCL Naive acoustic offset overflow",
+            ))?;
+        self.select(&logits, offset, codebook_size, history, params, u32::MAX)
     }
 }
 
@@ -435,6 +527,7 @@ impl CubeClSemanticGenerator {
                     codebook_size: self.config.codebook_size,
                     vocab_size: self.config.vocab_size,
                     mode: self.mode,
+                    rng: &mut self.rng,
                     pending_semantic: None,
                 };
                 generate_dual_ar(
@@ -445,8 +538,10 @@ impl CubeClSemanticGenerator {
                     self.semantic_begin_id,
                     self.eos_id,
                     sampling,
-                    &mut |logits, history, params| {
-                        sample_host(&mut self.rng, self.mode, logits, history, params)
+                    &mut |_, _, _| {
+                        Err(FishError::InvalidTransition(
+                            "CubeCL DualAR unexpectedly requested host logits sampling",
+                        ))
                     },
                     &mut DualArTrace::default(),
                     is_cancelled,
@@ -458,6 +553,10 @@ impl CubeClSemanticGenerator {
                     semantic_lut: &self.semantic_lut,
                     vocab_size: self.config.vocab_size,
                     codebook_logits_len: self.config.num_codebooks * self.config.codebook_size,
+                    mode: self.mode,
+                    rng: &mut self.rng,
+                    pending_semantic: None,
+                    pending_acoustic: None,
                 };
                 generate_naive_ar(
                     &self.config,
@@ -466,8 +565,10 @@ impl CubeClSemanticGenerator {
                     limit,
                     self.eos_id,
                     sampling,
-                    &mut |logits, history, params| {
-                        sample_host(&mut self.rng, self.mode, logits, history, params)
+                    &mut |_, _, _| {
+                        Err(FishError::InvalidTransition(
+                            "CubeCL Naive unexpectedly requested host logits sampling",
+                        ))
                     },
                     is_cancelled,
                 )
