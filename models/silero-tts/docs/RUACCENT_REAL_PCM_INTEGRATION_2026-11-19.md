@@ -49,7 +49,7 @@ The worker was built from the corrected source, loaded both weight sets into one
 | Successful worker process shutdown | Exit status 0 |
 | Silero Flex `cargo check --offline --release --no-default-features --features reference-flex` (without RUAccent) | PASS |
 
-The one worker run loaded both models in approximately 5.42 seconds; load time is **excluded** from the inference/RFT measurements. The 2.104-second result is a single observed long-form run, not a statistically robust latency benchmark.
+The first worker run loaded both models in approximately 5.42 seconds; load time is **excluded** from inference/RTF measurements. A second independent long-form run produced the same 62.975-second audio in **2.218 seconds** (RTF **0.03522**). These two observations are not a statistically robust latency benchmark. A same-session repeat of an RUAccent request was **bit-identical** to the first output. After rejecting an unavailable RUAccent provider, the worker continued to synthesize ordinary `text` with **bit-identical PCM**.
 
 The regression test is model-gated: set `SILERO_RUACCENT_INTEGRATION_DIR` to the exported Silero weights and `RUACCENT_TINY_WORKDIR` to the RUAccent tiny pack when running `cargo test`. When these variables are omitted, the test returns early; a green no-weight test run must not be called evidence of real neural/PCM parity.
 
