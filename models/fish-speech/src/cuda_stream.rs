@@ -411,7 +411,7 @@ impl<F> KvStreamDevice for CudaArDevice<F> {
     }
 }
 
-impl<F> ArStreamDevice for CudaArDevice<F>
+impl<F> ArStreamDevice<TrtBlueprint> for CudaArDevice<F>
 where
     F: FnMut(&TrtBlueprint, &BTreeMap<Binding, CudaBuffer>, &Arc<CudaStream>) -> Result<()>,
 {

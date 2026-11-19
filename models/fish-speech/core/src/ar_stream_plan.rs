@@ -3,7 +3,52 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::error::{FishError, Result};
 use crate::graph_ir::{Graph, Op, ScalarType, TensorType};
 use crate::kv_device::{Bf16KvLayout, KvWrite2d};
-use crate::trtx_blueprint::{Binding, TrtBlueprint, TrtPrimitive, TrtStep};
+use crate::stream_binding::Binding;
+use crate::trtx_blueprint::{TrtBlueprint, TrtPrimitive, TrtStep};
+
+/// A backend-independent view of one executable network segment. The engine
+/// implementation owns its graph representation and validates internal nodes.
+/// The stream executor only requires the named external inputs and typed outputs.
+pub trait ArNetworkSegment {
+    fn validate_segment(&self) -> Result<()>;
+    fn external_inputs(&self) -> Vec<(Binding, &str)>;
+    fn outputs(&self) -> Result<Vec<(Binding, &TensorType)>>;
+}
+
+impl ArNetworkSegment for TrtBlueprint {
+    fn validate_segment(&self) -> Result<()> {
+        self.validate()?;
+        self.require_no_deferred_ops()
+    }
+
+    fn external_inputs(&self) -> Vec<(Binding, &str)> {
+        self.steps
+            .iter()
+            .filter_map(|step| {
+                matches!(
+                    step.primitive,
+                    TrtPrimitive::Input | TrtPrimitive::ConstantWeight
+                )
+                .then_some((step.result, step.name.as_str()))
+            })
+            .collect()
+    }
+
+    fn outputs(&self) -> Result<Vec<(Binding, &TensorType)>> {
+        self.outputs
+            .iter()
+            .map(|binding| {
+                self.steps
+                    .iter()
+                    .find(|step| step.result == *binding)
+                    .map(|step| (*binding, &step.output_type))
+                    .ok_or(FishError::InvalidShape(
+                        "AR output missing tensor definition",
+                    ))
+            })
+            .collect()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct KvTransfer {
@@ -23,19 +68,19 @@ pub struct KvWriteBarrier {
 }
 
 #[derive(Debug, Clone)]
-pub enum ArStreamPhase {
-    Network(TrtBlueprint),
+pub enum ArStreamPhase<N = TrtBlueprint> {
+    Network(N),
     KvWrites(KvWriteBarrier),
 }
 
 #[derive(Debug, Clone)]
-pub struct ArStreamPlan {
-    pub phases: Vec<ArStreamPhase>,
+pub struct ArStreamPlan<N = TrtBlueprint> {
+    pub phases: Vec<ArStreamPhase<N>>,
     pub cache_aliases: BTreeMap<Binding, Binding>,
     pub final_outputs: Vec<Binding>,
 }
 
-impl ArStreamPlan {
+impl ArStreamPlan<TrtBlueprint> {
     pub fn from_graph(graph: &Graph) -> Result<Self> {
         let original = TrtBlueprint::from_graph(graph)?;
         let mut catalogue = BTreeMap::<Binding, TrtStep>::new();
@@ -216,7 +261,9 @@ impl ArStreamPlan {
         plan.validate()?;
         Ok(plan)
     }
+}
 
+impl<N: ArNetworkSegment> ArStreamPlan<N> {
     pub fn validate(&self) -> Result<()> {
         if self.phases.len() < 3 || self.phases.len() % 2 == 0 {
             return Err(FishError::InvalidShape("AR stream phase order invalid"));
@@ -225,8 +272,7 @@ impl ArStreamPlan {
         for (i, phase) in self.phases.iter().enumerate() {
             match phase {
                 ArStreamPhase::Network(plan) if i % 2 == 0 => {
-                    plan.validate()?;
-                    plan.require_no_deferred_ops()?;
+                    plan.validate_segment()?;
                 }
                 ArStreamPhase::KvWrites(batch) if i % 2 == 1 => {
                     if batch.key.geometry.position != batch.position
@@ -246,9 +292,10 @@ impl ArStreamPlan {
                         unreachable!()
                     };
                     for source in [batch.key.source, batch.value.source] {
-                        let actual = before.steps.iter().find(|s| s.result == source);
-                        if actual.is_none_or(|s| s.output_type.dtype != ScalarType::BF16)
-                            || !before.outputs.contains(&source)
+                        let outputs = before.outputs()?;
+                        if !outputs
+                            .iter()
+                            .any(|(binding, ty)| *binding == source && ty.dtype == ScalarType::BF16)
                         {
                             return Err(FishError::InvalidShape(
                                 "KV write needs BF16 network output",

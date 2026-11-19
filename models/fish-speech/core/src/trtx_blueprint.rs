@@ -14,12 +14,7 @@ use crate::cpu_ir::{NamedTensors, TensorData};
 use crate::error::{FishError, Result};
 use crate::graph_ir::{Graph, Op, Origin, QkvPart, TensorType, ValueId};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Binding {
-    Value(ValueId),
-    Temp(usize),
-}
-
+pub use crate::stream_binding::Binding;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrtPrimitive {
     Input,

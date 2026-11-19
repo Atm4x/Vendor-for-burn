@@ -1,22 +1,23 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::ar_stream_plan::{ArStreamPhase, ArStreamPlan};
+use crate::ar_stream_plan::{ArNetworkSegment, ArStreamPhase, ArStreamPlan};
 use crate::error::{FishError, Result};
 use crate::graph_ir::{ScalarType, TensorType};
 use crate::kv_device_owner::{KvDeviceOwner, KvStreamDevice};
-use crate::trtx_blueprint::{Binding, TrtBlueprint, TrtPrimitive};
+use crate::stream_binding::Binding;
+use std::marker::PhantomData;
 
-/// All implementations must use the same ordered stream for TensorRT segment execution and
-/// the `KvStreamDevice::copy_2d_async` calls. Network compilation is outside this interface;
-/// each segment must be compiled or looked up before the first enqueue.
-pub trait ArStreamDevice: KvStreamDevice
+/// All implementations enqueue their network segments and KV copies on the
+/// same ordered stream. Network compilation is outside this interface.
+/// The network type is chosen by the backend, not by TensorRT.
+pub trait ArStreamDevice<N: ArNetworkSegment>: KvStreamDevice
 where
     Self::Buffer: Clone,
 {
     fn allocate_tensor(&mut self, ty: &TensorType) -> Result<Self::Buffer>;
     fn enqueue_network(
         &mut self,
-        network: &TrtBlueprint,
+        network: &N,
         bindings: &BTreeMap<Binding, Self::Buffer>,
     ) -> Result<()>;
 }
@@ -38,21 +39,24 @@ impl Default for ScratchLimits {
     }
 }
 
-pub struct ArStreamExecutor<D>
+pub struct ArStreamExecutor<D, N = crate::trtx_blueprint::TrtBlueprint>
 where
-    D: ArStreamDevice,
+    D: ArStreamDevice<N>,
     D::Buffer: Clone,
+    N: ArNetworkSegment,
 {
     kv: KvDeviceOwner<D>,
     inflight: Vec<Vec<D::Buffer>>,
     inflight_bytes: usize,
     limits: ScratchLimits,
+    _network: PhantomData<N>,
 }
 
-impl<D> ArStreamExecutor<D>
+impl<D, N> ArStreamExecutor<D, N>
 where
-    D: ArStreamDevice,
+    D: ArStreamDevice<N>,
     D::Buffer: Clone,
+    N: ArNetworkSegment,
 {
     pub fn new(device: D) -> Self {
         Self::with_scratch_limits(device, ScratchLimits::default())
@@ -68,27 +72,21 @@ where
             inflight: Vec::new(),
             inflight_bytes: 0,
             limits,
+            _network: PhantomData,
         })
     }
 
-    fn scratch_bytes_for(plan: &ArStreamPlan) -> Result<usize> {
+    fn scratch_bytes_for(plan: &ArStreamPlan<N>) -> Result<usize> {
         let mut seen = BTreeSet::new();
         let mut bytes = 0usize;
         for phase in &plan.phases {
             if let ArStreamPhase::Network(network) = phase {
-                for output in &network.outputs {
-                    if !seen.insert(*output) {
+                for (output, ty) in network.outputs()? {
+                    if !seen.insert(output) {
                         continue;
                     }
-                    let step = network
-                        .steps
-                        .iter()
-                        .find(|step| step.result == *output)
-                        .ok_or(FishError::InvalidShape(
-                            "AR output missing tensor definition",
-                        ))?;
                     bytes = bytes
-                        .checked_add(tensor_bytes(&step.output_type)?)
+                        .checked_add(tensor_bytes(ty)?)
                         .ok_or(FishError::InvalidShape("scratch byte count overflow"))?;
                 }
             }
@@ -98,7 +96,7 @@ where
 
     fn preflight_external_inputs(
         &self,
-        plan: &ArStreamPlan,
+        plan: &ArStreamPlan<N>,
         external: &BTreeMap<String, D::Buffer>,
     ) -> Result<()> {
         let cache_names = plan
@@ -117,18 +115,15 @@ where
         for phase in &plan.phases {
             match phase {
                 ArStreamPhase::Network(network) => {
-                    for step in &network.steps {
-                        if matches!(
-                            step.primitive,
-                            TrtPrimitive::Input | TrtPrimitive::ConstantWeight
-                        ) && !produced.contains(&step.result)
-                            && !cache_names.contains(step.name.as_str())
-                            && !external.contains_key(&step.name)
+                    for (binding, name) in network.external_inputs() {
+                        if !produced.contains(&binding)
+                            && !cache_names.contains(name)
+                            && !external.contains_key(name)
                         {
                             return Err(FishError::InvalidShape("missing AR segment device input"));
                         }
                     }
-                    produced.extend(network.outputs.iter().copied());
+                    produced.extend(network.outputs()?.into_iter().map(|(binding, _)| binding));
                 }
                 ArStreamPhase::KvWrites(writes) => {
                     produced.insert(writes.key.updated_alias);
@@ -141,7 +136,7 @@ where
 
     pub fn enqueue(
         &mut self,
-        plan: &ArStreamPlan,
+        plan: &ArStreamPlan<N>,
         external: &BTreeMap<String, D::Buffer>,
     ) -> Result<BTreeMap<Binding, D::Buffer>> {
         if self.kv.is_poisoned() {
@@ -182,7 +177,7 @@ where
 
     fn enqueue_inner(
         &mut self,
-        plan: &ArStreamPlan,
+        plan: &ArStreamPlan<N>,
         external: &BTreeMap<String, D::Buffer>,
         bindings: &mut BTreeMap<Binding, D::Buffer>,
         retained: &mut Vec<D::Buffer>,
@@ -202,43 +197,31 @@ where
         for phase in &plan.phases {
             match phase {
                 ArStreamPhase::Network(segment) => {
-                    for step in &segment.steps {
-                        if matches!(
-                            step.primitive,
-                            TrtPrimitive::Input | TrtPrimitive::ConstantWeight
-                        ) && !bindings.contains_key(&step.result)
-                        {
-                            let handle = if let Some(buffer) = external.get(&step.name) {
+                    for (binding, name) in segment.external_inputs() {
+                        if !bindings.contains_key(&binding) {
+                            let handle = if let Some(buffer) = external.get(name) {
                                 buffer.clone()
-                            } else if let Some(buffer) = self.kv.cache(&step.name) {
+                            } else if let Some(buffer) = self.kv.cache(name) {
                                 buffer.clone()
                             } else {
-                                let result =
-                                    Err(FishError::InvalidShape("missing AR segment device input"));
                                 self.kv.poison();
-                                return result;
+                                return Err(FishError::InvalidShape(
+                                    "missing AR segment device input",
+                                ));
                             };
-                            bindings.insert(step.result, handle);
+                            bindings.insert(binding, handle);
                         }
                     }
-                    for output in &segment.outputs {
-                        if !bindings.contains_key(output) {
-                            let step = segment
-                                .steps
-                                .iter()
-                                .find(|step| step.result == *output)
-                                .ok_or(FishError::InvalidShape(
-                                    "AR segment missing output producer",
-                                ))?;
-                            let allocation =
-                                match self.kv.device_mut().allocate_tensor(&step.output_type) {
-                                    Ok(allocation) => allocation,
-                                    Err(err) => {
-                                        self.kv.poison();
-                                        return Err(err);
-                                    }
-                                };
-                            bindings.insert(*output, allocation.clone());
+                    for (binding, ty) in segment.outputs()? {
+                        if !bindings.contains_key(&binding) {
+                            let allocation = match self.kv.device_mut().allocate_tensor(ty) {
+                                Ok(allocation) => allocation,
+                                Err(err) => {
+                                    self.kv.poison();
+                                    return Err(err);
+                                }
+                            };
+                            bindings.insert(binding, allocation.clone());
                             retained.push(allocation);
                         }
                     }
@@ -334,6 +317,7 @@ pub fn tensor_bytes(ty: &TensorType) -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
+    use crate::trtx_blueprint::{TrtBlueprint, TrtPrimitive};
     use std::{cell::RefCell, rc::Rc};
 
     use super::*;
@@ -374,7 +358,7 @@ mod tests {
         }
     }
 
-    impl ArStreamDevice for FakeBackend {
+    impl ArStreamDevice<TrtBlueprint> for FakeBackend {
         fn allocate_tensor(&mut self, ty: &TensorType) -> Result<Self::Buffer> {
             Ok(Rc::new(RefCell::new(vec![0; tensor_bytes(ty)?])))
         }
@@ -389,6 +373,142 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[derive(Debug, Clone)]
+    struct OpaqueNetwork {
+        inputs: Vec<(Binding, String)>,
+        outputs: Vec<(Binding, TensorType)>,
+    }
+
+    impl ArNetworkSegment for OpaqueNetwork {
+        fn validate_segment(&self) -> Result<()> {
+            if self.outputs.is_empty() {
+                return Err(FishError::InvalidShape("opaque network has no output"));
+            }
+            Ok(())
+        }
+
+        fn external_inputs(&self) -> Vec<(Binding, &str)> {
+            self.inputs
+                .iter()
+                .map(|(binding, name)| (*binding, name.as_str()))
+                .collect()
+        }
+
+        fn outputs(&self) -> Result<Vec<(Binding, &TensorType)>> {
+            Ok(self
+                .outputs
+                .iter()
+                .map(|(binding, ty)| (*binding, ty))
+                .collect())
+        }
+    }
+
+    impl ArStreamDevice<OpaqueNetwork> for FakeBackend {
+        fn allocate_tensor(&mut self, ty: &TensorType) -> Result<Self::Buffer> {
+            Ok(Rc::new(RefCell::new(vec![0; tensor_bytes(ty)?])))
+        }
+
+        fn enqueue_network(
+            &mut self,
+            network: &OpaqueNetwork,
+            bindings: &BTreeMap<Binding, Self::Buffer>,
+        ) -> Result<()> {
+            self.operations.borrow_mut().push("opaque-network");
+            for (output, _) in &network.outputs {
+                bindings[output].borrow_mut().fill(0);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn stream_coordinator_accepts_non_tensorrt_network_segments() {
+        let config = FishModelConfig::synthetic_dual_ar_fixture();
+        let graph = TransformerIrFactory::new(&config)
+            .unwrap()
+            .slow_prefill(4)
+            .unwrap();
+        let trt = ArStreamPlan::from_graph(&graph).unwrap();
+        let plan = ArStreamPlan::<OpaqueNetwork> {
+            phases: trt
+                .phases
+                .into_iter()
+                .map(|phase| match phase {
+                    ArStreamPhase::Network(network) => {
+                        let inputs = network
+                            .external_inputs()
+                            .into_iter()
+                            .map(|(binding, name)| (binding, name.to_owned()))
+                            .collect();
+                        let outputs = network
+                            .outputs()
+                            .unwrap()
+                            .into_iter()
+                            .map(|(binding, ty)| (binding, ty.clone()))
+                            .collect();
+                        ArStreamPhase::Network(OpaqueNetwork { inputs, outputs })
+                    }
+                    ArStreamPhase::KvWrites(writes) => ArStreamPhase::KvWrites(writes),
+                })
+                .collect(),
+            cache_aliases: trt.cache_aliases,
+            final_outputs: trt.final_outputs,
+        };
+        plan.validate().unwrap();
+        let first_cache_name = plan
+            .phases
+            .iter()
+            .find_map(|phase| match phase {
+                ArStreamPhase::KvWrites(writes) => Some(writes.key.cache_name.clone()),
+                ArStreamPhase::Network(_) => None,
+            })
+            .unwrap();
+        let operations = Rc::new(RefCell::new(Vec::new()));
+        let mut executor = ArStreamExecutor::<FakeBackend, OpaqueNetwork>::new(FakeBackend {
+            operations: operations.clone(),
+        });
+        let mut external = BTreeMap::new();
+        for phase in &plan.phases {
+            if let ArStreamPhase::Network(network) = phase {
+                for (binding, name) in &network.inputs {
+                    if !name.ends_with("_cache") && !name.ends_with("_updated") {
+                        let tensor_type = graph
+                            .values
+                            .iter()
+                            .find(|v| v.name == *name)
+                            .map(|v| v.ty.clone());
+                        let len = tensor_type
+                            .as_ref()
+                            .map(|ty| tensor_bytes(ty).unwrap())
+                            .unwrap_or(4096);
+                        external.entry(name.clone()).or_insert_with(|| {
+                            let _ = binding;
+                            Rc::new(RefCell::new(vec![0; len]))
+                        });
+                    }
+                }
+            }
+        }
+        let missing = external.keys().next().unwrap().clone();
+        let removed = external.remove(&missing).unwrap();
+        assert!(executor.enqueue(&plan, &external).is_err());
+        assert!(operations.borrow().is_empty());
+        external.insert(missing, removed);
+        let outputs = executor.enqueue(&plan, &external).unwrap();
+        assert_eq!(outputs.len(), plan.final_outputs.len());
+        assert_eq!(executor.cache_active_len(&first_cache_name), Some(4));
+        assert_eq!(
+            operations
+                .borrow()
+                .iter()
+                .filter(|x| **x == "opaque-network")
+                .count(),
+            3
+        );
+        executor.reset_request().unwrap();
+        assert_eq!(executor.inflight_submissions(), 0);
     }
 
     #[test]
@@ -493,16 +613,18 @@ mod tests {
 
     #[test]
     fn invalid_scratch_limits_and_too_small_budget_fail_before_submission() {
-        assert!(ArStreamExecutor::with_scratch_limits(
-            FakeBackend {
-                operations: Rc::default()
-            },
-            ScratchLimits {
-                max_inflight_bytes: 0,
-                max_inflight_submissions: 1
-            },
-        )
-        .is_err());
+        assert!(
+            ArStreamExecutor::<FakeBackend, TrtBlueprint>::with_scratch_limits(
+                FakeBackend {
+                    operations: Rc::default()
+                },
+                ScratchLimits {
+                    max_inflight_bytes: 0,
+                    max_inflight_submissions: 1
+                },
+            )
+            .is_err()
+        );
         let config = FishModelConfig::synthetic_dual_ar_fixture();
         let graph = TransformerIrFactory::new(&config)
             .unwrap()
