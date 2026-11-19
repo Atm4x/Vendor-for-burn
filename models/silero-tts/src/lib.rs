@@ -24,3 +24,6 @@ pub mod ssml;
 pub mod audio;
 
 pub mod worker;
+
+#[cfg(feature = "reference-flex")]
+mod flex_pointwise;

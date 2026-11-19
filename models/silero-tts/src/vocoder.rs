@@ -5,34 +5,9 @@ use burn::tensor::{Tensor, activation::gelu, module::{conv1d, layer_norm, linear
 #[cfg(feature = "reference-flex")]
 use burn::tensor::TensorData;
 #[cfg(feature = "reference-flex")]
-use rayon::prelude::*;
+use crate::flex_pointwise::{apply_fast_gelu, fast_gelu_scalar};
 use crate::store::TensorStore;
 use burn::tensor::Device;
-
-#[cfg(feature = "reference-flex")]
-#[inline]
-fn fast_gelu_scalar(x: f32) -> f32 {
-    let z = x * std::f32::consts::FRAC_1_SQRT_2;
-    let t = 1.0 / (1.0 + 0.3275911 * z.abs());
-    let mut poly = 1.061405429 * t - 1.453152027;
-    poly = poly * t + 1.421413741;
-    poly = poly * t - 0.284496736;
-    poly = poly * t + 0.254829592;
-    poly *= t * (-z * z).exp();
-    let erf = (1.0 - poly).copysign(z);
-    0.5 * x * (1.0 + erf)
-}
-
-#[cfg(feature = "reference-flex")]
-fn apply_fast_gelu(data: &mut [f32], parallel: bool) {
-    if parallel && data.len() >= 32_768 {
-        data.par_iter_mut().for_each(|value| *value = fast_gelu_scalar(*value));
-    } else {
-        for value in data {
-            *value = fast_gelu_scalar(*value);
-        }
-    }
-}
 
 fn vocoder_gelu(x: Tensor<3>) -> Tensor<3> {
     #[cfg(feature = "reference-flex")]
@@ -52,26 +27,75 @@ struct ConvNeXtBlock {
     dwconv_bias: Tensor<1>,
     norm_weight: Tensor<1>,
     norm_bias: Tensor<1>,
-    pw1_weight: Tensor<2>,
-    pw1_bias: Tensor<1>,
-    pw2_weight: Tensor<2>,
-    pw2_bias: Tensor<1>,
-    gamma: Tensor<1>,
+    pointwise: PointwiseEngine,
+}
+
+enum PointwiseEngine {
+    Tensor {
+        pw1_weight: Tensor<2>,
+        pw1_bias: Tensor<1>,
+        pw2_weight: Tensor<2>,
+        pw2_bias: Tensor<1>,
+        gamma: Tensor<1>,
+    },
+    #[cfg(feature = "reference-flex")]
+    Flex(crate::flex_pointwise::FlexPointwise),
+}
+
+impl PointwiseEngine {
+    fn forward(&self, x: Tensor<3>, residual: Tensor<3>) -> Tensor<3> {
+        match self {
+            Self::Tensor { pw1_weight, pw1_bias, pw2_weight, pw2_bias, gamma } => {
+                let timed = std::env::var_os("SILERO_VOCODER_TIMING").is_some();
+                let start = std::time::Instant::now();
+                let channels = gamma.dims()[0];
+                let x = linear(x, pw1_weight.clone(), Some(pw1_bias.clone()));
+                if timed { eprintln!("[vocoder-block] pwconv1_ms={:.3}", start.elapsed().as_secs_f64()*1000.0); }
+                let start = std::time::Instant::now();
+                let x = vocoder_gelu(x);
+                if timed { eprintln!("[vocoder-block] gelu_ms={:.3}", start.elapsed().as_secs_f64()*1000.0); }
+                let start = std::time::Instant::now();
+                let x = linear(x, pw2_weight.clone(), Some(pw2_bias.clone()));
+                if timed { eprintln!("[vocoder-block] pwconv2_ms={:.3}", start.elapsed().as_secs_f64()*1000.0); }
+                (x * gamma.clone().reshape([1,1,channels])).swap_dims(1,2) + residual
+            }
+            #[cfg(feature = "reference-flex")]
+            Self::Flex(native) => native.forward(x, residual),
+        }
+    }
 }
 
 impl ConvNeXtBlock {
     fn load(weights: &TensorStore, id: usize, device: &Device) -> Result<Self> {
         let p = format!("vocoder.backbone.convnext.{id}");
+        let pw1_weight = weights.float::<2>(&format!("{p}.pwconv1.weight"), device)?.transpose();
+        let pw1_bias = weights.float(&format!("{p}.pwconv1.bias"), device)?;
+        let pw2_weight = weights.float::<2>(&format!("{p}.pwconv2.weight"), device)?.transpose();
+        let pw2_bias = weights.float(&format!("{p}.pwconv2.bias"), device)?;
+        let gamma = weights.float(&format!("{p}.gamma"), device)?;
+        #[cfg(feature = "reference-flex")]
+        let use_native = device == &Device::flex()
+            && std::env::var_os("SILERO_FLEX_TENSOR_POINTWISE").is_none();
+        #[cfg(not(feature = "reference-flex"))]
+        let use_native = false;
+        #[cfg(feature = "reference-flex")]
+        let pointwise = if use_native {
+            PointwiseEngine::Flex(crate::flex_pointwise::FlexPointwise::new(
+                pw1_weight, pw1_bias, pw2_weight, pw2_bias, gamma)?)
+        } else {
+            PointwiseEngine::Tensor { pw1_weight, pw1_bias, pw2_weight, pw2_bias, gamma }
+        };
+        #[cfg(not(feature = "reference-flex"))]
+        let pointwise = {
+            let _ = use_native;
+            PointwiseEngine::Tensor { pw1_weight, pw1_bias, pw2_weight, pw2_bias, gamma }
+        };
         Ok(Self {
             dwconv_weight: weights.float(&format!("{p}.dwconv.weight"), device)?,
             dwconv_bias: weights.float(&format!("{p}.dwconv.bias"), device)?,
             norm_weight: weights.float(&format!("{p}.norm.weight"), device)?,
             norm_bias: weights.float(&format!("{p}.norm.bias"), device)?,
-            pw1_weight: weights.float::<2>(&format!("{p}.pwconv1.weight"), device)?.transpose(),
-            pw1_bias: weights.float(&format!("{p}.pwconv1.bias"), device)?,
-            pw2_weight: weights.float::<2>(&format!("{p}.pwconv2.weight"), device)?.transpose(),
-            pw2_bias: weights.float(&format!("{p}.pwconv2.bias"), device)?,
-            gamma: weights.float(&format!("{p}.gamma"), device)?,
+            pointwise,
         })
     }
 
@@ -85,16 +109,7 @@ impl ConvNeXtBlock {
         let start = std::time::Instant::now();
         let x = layer_norm(x.swap_dims(1,2), self.norm_weight.clone(), Some(self.norm_bias.clone()), 1e-6);
         if timed { eprintln!("[vocoder-block] norm_ms={:.3}", start.elapsed().as_secs_f64()*1000.0); }
-        let start = std::time::Instant::now();
-        let x = linear(x, self.pw1_weight.clone(), Some(self.pw1_bias.clone()));
-        if timed { eprintln!("[vocoder-block] pwconv1_ms={:.3}", start.elapsed().as_secs_f64()*1000.0); }
-        let start = std::time::Instant::now();
-        let x = vocoder_gelu(x);
-        if timed { eprintln!("[vocoder-block] gelu_ms={:.3}", start.elapsed().as_secs_f64()*1000.0); }
-        let start = std::time::Instant::now();
-        let x = linear(x, self.pw2_weight.clone(), Some(self.pw2_bias.clone()));
-        if timed { eprintln!("[vocoder-block] pwconv2_ms={:.3}", start.elapsed().as_secs_f64()*1000.0); }
-        (x * self.gamma.clone().reshape([1,1,channels])).swap_dims(1,2) + input
+        self.pointwise.forward(x, input)
     }
 }
 
