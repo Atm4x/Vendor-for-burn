@@ -1,0 +1,150 @@
+name: Silero + RUAccent real Windows PCM parity
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/silero-tts-cubecl-port-20261118
+    paths:
+      - .github/workflows/ruaccent-silero-windows-real-pcm.yml
+
+permissions:
+  contents: read
+
+jobs:
+  prepare-models:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Download and export verified Silero and RUAccent models
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install --quiet 'safetensors>=0.4,<1' 'huggingface_hub[hf_xet]>=0.34,<1'
+          mkdir -p "$RUNNER_TEMP/model-assets/silero" "$RUNNER_TEMP/model-assets/ruaccent" "$RUNNER_TEMP/evidence"
+          curl -fL --retry 3 --retry-delay 2 \
+            https://models.silero.ai/models/tts/ru/v5_ru.pt -o "$RUNNER_TEMP/v5_ru.pt"
+          printf '7ba04d42340fe0398042eed2e0d12d62e23096d626b1b9feff4dcb1309197ab4  %s\n' \
+            "$RUNNER_TEMP/v5_ru.pt" | sha256sum --check
+          python models/silero-tts/tools/export_weights.py \
+            "$RUNNER_TEMP/v5_ru.pt" "$RUNNER_TEMP/model-assets/silero"
+          python - <<'PY'
+          import json, os, pathlib
+          from huggingface_hub import snapshot_download
+          model=pathlib.Path(os.environ['RUNNER_TEMP'])/'model-assets/ruaccent'
+          revision='b78ae5ea1e62beaf138bed1865cd8c3b0b5ca855'
+          snapshot_download('ruaccent/accentuator',revision=revision,local_dir=str(model),
+              allow_patterns=['dictionary/*.json.gz','nn/nn_accent/*',
+                  'nn/nn_stress_usage_predictor/*','nn/nn_yo_homograph_resolver/*',
+                  'nn/nn_omograph/tiny/*'])
+          required=['dictionary/accents.json.gz','dictionary/omographs.json.gz',
+              'dictionary/yo_words.json.gz','dictionary/yo_homographs.json.gz',
+              'nn/nn_accent/model.onnx','nn/nn_accent/config.json','nn/nn_accent/vocab.txt',
+              'nn/nn_stress_usage_predictor/model.onnx',
+              'nn/nn_stress_usage_predictor/tokenizer.json',
+              'nn/nn_yo_homograph_resolver/model.onnx',
+              'nn/nn_yo_homograph_resolver/tokenizer.json',
+              'nn/nn_omograph/tiny/model.onnx','nn/nn_omograph/tiny/tokenizer.json']
+          missing=[name for name in required if not (model/name).is_file()]
+          if missing: raise RuntimeError(f'Missing pinned model files: {missing}')
+          (pathlib.Path(os.environ['RUNNER_TEMP'])/'evidence/provenance.json').write_text(json.dumps({
+              'silero_sha256':'7ba04d42340fe0398042eed2e0d12d62e23096d626b1b9feff4dcb1309197ab4',
+              'ruaccent_revision':revision,'required_ruaccent_files':len(required)},indent=2))
+          PY
+          tar -czf "$GITHUB_WORKSPACE/real-model-assets.tar.gz" -C "$RUNNER_TEMP/model-assets" silero ruaccent
+      - uses: actions/upload-artifact@v4
+        with:
+          name: silero-ruaccent-real-windows-model-assets
+          path: real-model-assets.tar.gz
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: silero-ruaccent-windows-preparation-evidence
+          path: ${{ runner.temp }}/evidence/
+          retention-days: 7
+          if-no-files-found: warn
+
+  windows-real-pcm:
+    needs: prepare-models
+    runs-on: windows-2025
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.100.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@v4
+        with:
+          name: silero-ruaccent-real-windows-model-assets
+          path: ${{ runner.temp }}/model-download/
+      - name: Stage test crates and model assets without modifying vendor
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $src = Join-Path $env:RUNNER_TEMP 'test-sources'
+          $assets = Join-Path $env:RUNNER_TEMP 'model-assets'
+          $evidence = Join-Path $env:RUNNER_TEMP 'pcm-evidence'
+          New-Item -ItemType Directory -Force $src, $assets, $evidence | Out-Null
+          Copy-Item models/ruaccent (Join-Path $src 'ruaccent') -Recurse
+          Copy-Item models/silero-tts (Join-Path $src 'silero-tts') -Recurse
+          tar -xzf (Join-Path $env:RUNNER_TEMP 'model-download/real-model-assets.tar.gz') -C $assets
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "SILERO_RUACCENT_TEST_SOURCES=$src" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "SILERO_RUACCENT_ASSETS=$assets" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "SILERO_RUACCENT_EVIDENCE=$evidence" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Install official Microsoft Windows ONNX Runtime 1.22.0
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $nupkg = Join-Path $env:RUNNER_TEMP 'onnxruntime.zip'
+          $ort = Join-Path $env:RUNNER_TEMP 'onnxruntime-nuget'
+          Invoke-WebRequest -Uri 'https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.22.0/microsoft.ml.onnxruntime.1.22.0.nupkg' -OutFile $nupkg
+          Expand-Archive -LiteralPath $nupkg -DestinationPath $ort -Force
+          $dll = Get-ChildItem -Path $ort -Filter 'onnxruntime.dll' -Recurse |
+              Where-Object { $_.FullName -match 'win-x64' } | Select-Object -First 1
+          if ($null -eq $dll) { throw 'Official ONNX Runtime Windows DLL missing' }
+          "ORT_DYLIB_PATH=$($dll.FullName)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Compile and test native Windows Silero with RUAccent
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location (Join-Path $env:SILERO_RUACCENT_TEST_SOURCES 'silero-tts')
+          cargo test --release --no-default-features --features reference-flex,ruaccent --lib *>&1 |
+              Tee-Object (Join-Path $env:SILERO_RUACCENT_EVIDENCE 'release-rust-tests.log')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --release --no-default-features --features reference-flex,ruaccent --bin silero-tts *>&1 |
+              Tee-Object (Join-Path $env:SILERO_RUACCENT_EVIDENCE 'release-worker-build.log')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify Windows real-model PCM end-to-end
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sources = $env:SILERO_RUACCENT_TEST_SOURCES
+          $assets = $env:SILERO_RUACCENT_ASSETS
+          $evidence = $env:SILERO_RUACCENT_EVIDENCE
+          python (Join-Path $sources 'silero-tts/tools/verify_ruaccent_real_pcm.py') `
+              --worker (Join-Path $sources 'silero-tts/target/release/silero-tts.exe') `
+              --silero-dir (Join-Path $assets 'silero') `
+              --ruaccent-dir (Join-Path $assets 'ruaccent') `
+              --onnx-library $env:ORT_DYLIB_PATH `
+              --output (Join-Path $evidence 'windows-real-pcm.json') *>&1 |
+              Tee-Object (Join-Path $evidence 'windows-real-pcm.log')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: silero-ruaccent-windows-real-pcm-evidence
+          path: ${{ runner.temp }}/pcm-evidence/
+          retention-days: 7
+          if-no-files-found: warn
