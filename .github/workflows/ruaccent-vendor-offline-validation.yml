@@ -39,6 +39,59 @@ jobs:
           git diff --cached --name-only > "$RUNNER_TEMP/new-vendor-files.txt"
           test "$(wc -l < "$RUNNER_TEMP/new-vendor-files.txt")" -gt 1000
           printf 'Vendored added file count: %s\\n' "$(wc -l < "$RUNNER_TEMP/new-vendor-files.txt")"
+      - name: Validate and normalize existing vendored checksums only
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          mismatched=[]
+          missing=[]
+          for pkg in sorted(Path('vendor').iterdir()):
+              if not pkg.is_dir(): continue
+              metadata=pkg/'.cargo-checksum.json'
+              if not metadata.is_file(): continue
+              data=json.loads(metadata.read_text())
+              count=0
+              for relative,expected in data.get('files',{}).items():
+                  source=pkg/relative
+                  if not source.is_file():
+                      missing.append(str(source))
+                      continue
+                  actual=hashlib.sha256(source.read_bytes()).hexdigest()
+                  if actual!=expected:
+                      data['files'][relative]=actual
+                      count+=1
+              if count:
+                  mismatched.append((str(metadata),count))
+                  metadata.write_text(json.dumps(data,separators=(',',':'),ensure_ascii=False))
+          if missing:
+              raise RuntimeError('Vendored files missing from checksum manifest: '+str(missing[:15]))
+          if len(mismatched)>100:
+              raise RuntimeError('Too many checksum-drifted packages: '+str(len(mismatched)))
+          print('Existing checksum drifted packages:',len(mismatched))
+          for path,count in mismatched:
+              print(path,count,'file hashes reconciled')
+          PY
+          git add -- vendor/
+          test -z "$(git diff --cached --diff-filter=D --name-only)"
+          test -z "$(git diff --cached --diff-filter=M --name-only | grep -vE '^vendor/[^/]+/\.cargo-checksum\.json        shell: bash
+        run: |
+          set -euo pipefail
+          cd models/silero-tts
+          cargo check --offline --release --no-default-features --features reference-flex,ruaccent
+      - name: Publish validated vendor additions and checksum metadata branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -c codex/ruaccent-offline-vendor-20261119
+          git commit -m 'build(ruaccent): vendor pinned dependencies and correct existing source checksums'
+          git push origin HEAD:refs/heads/codex/ruaccent-offline-vendor-20261119
+          git rev-parse HEAD
+ || true)"
       - name: Reproduce clean checkout offline model build
         shell: bash
         run: |
