@@ -1,0 +1,131 @@
+name: RUAccent Windows native integration
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/silero-tts-cubecl-port-20261118
+    paths:
+      - .github/workflows/ruaccent-windows-native.yml
+
+permissions:
+  contents: read
+
+jobs:
+  windows-native:
+    runs-on: windows-2025
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.100.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Stage source crates outside Linux vendor configuration
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'ruaccent-native'
+          $evidence = Join-Path $env:RUNNER_TEMP 'evidence'
+          New-Item -ItemType Directory -Force $root, $evidence | Out-Null
+          Copy-Item models/ruaccent (Join-Path $root 'ruaccent') -Recurse
+          Copy-Item models/silero-tts (Join-Path $root 'silero-tts') -Recurse
+          "RUACCENT_TEST_ROOT=$root" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "RUACCENT_TINY_WORKDIR=$env:RUNNER_TEMP\ruaccent-tiny" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "ORT_TEST_EVIDENCE=$evidence" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Fetch model pack at pinned revision
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m pip install --quiet "huggingface_hub[hf_xet]>=0.34,<1"
+          @'
+          import json,os,pathlib
+          from huggingface_hub import snapshot_download
+          revision="b78ae5ea1e62beaf138bed1865cd8c3b0b5ca855"
+          target=os.environ["RUACCENT_TINY_WORKDIR"]
+          snapshot_download("ruaccent/accentuator",revision=revision,local_dir=target,
+              allow_patterns=["dictionary/*.json.gz","nn/nn_accent/*",
+                  "nn/nn_stress_usage_predictor/*","nn/nn_yo_homograph_resolver/*",
+                  "nn/nn_omograph/tiny/*"])
+          required=["dictionary/accents.json.gz","dictionary/omographs.json.gz",
+              "dictionary/yo_words.json.gz","dictionary/yo_homographs.json.gz",
+              "nn/nn_accent/model.onnx","nn/nn_accent/config.json",
+              "nn/nn_accent/vocab.txt","nn/nn_stress_usage_predictor/model.onnx",
+              "nn/nn_stress_usage_predictor/tokenizer.json",
+              "nn/nn_yo_homograph_resolver/model.onnx",
+              "nn/nn_yo_homograph_resolver/tokenizer.json",
+              "nn/nn_omograph/tiny/model.onnx",
+              "nn/nn_omograph/tiny/tokenizer.json"]
+          missing=[p for p in required if not (pathlib.Path(target)/p).is_file()]
+          report={"revision":revision,"checked":len(required),"missing":missing}
+          (pathlib.Path(os.environ["ORT_TEST_EVIDENCE"])/"model-manifest.json").write_text(json.dumps(report,indent=2))
+          assert not missing,missing
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Install ONNX Runtime Windows x64 from Microsoft NuGet
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = Join-Path $env:RUNNER_TEMP 'ort.zip'
+          $ort = Join-Path $env:RUNNER_TEMP 'ort-native'
+          Invoke-WebRequest -Uri 'https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.22.0/microsoft.ml.onnxruntime.1.22.0.nupkg' -OutFile $zip
+          Expand-Archive -LiteralPath $zip -DestinationPath $ort -Force
+          $dll = Get-ChildItem -Path $ort -Filter 'onnxruntime.dll' -Recurse |
+              Where-Object { $_.FullName -match 'win-x64' } | Select-Object -First 1
+          if ($null -eq $dll) { throw 'Official ONNX Runtime Windows DLL not found in NuGet package' }
+          "ORT_DYLIB_PATH=$($dll.FullName)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Test native RUAccent with actual ONNX models
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location (Join-Path $env:RUACCENT_TEST_ROOT 'ruaccent')
+          cargo test --locked --features onnx -- --skip models::accent::tests::logits_match_golden_within_1e4 --skip models::omograph::tests::logits_match_golden_within_1e4 *>&1 |
+              Tee-Object (Join-Path $env:ORT_TEST_EVIDENCE 'ruaccent-tests.log')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --locked --features onnx --bin ruaccent-worker *>&1 |
+              Tee-Object (Join-Path $env:ORT_TEST_EVIDENCE 'ruaccent-worker-build.log')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Exercise native Windows JSONL worker
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          import json,os,pathlib,subprocess
+          root=pathlib.Path(os.environ["RUACCENT_TEST_ROOT"])
+          binary=root/"ruaccent"/"target"/"debug"/"ruaccent-worker.exe"
+          inputs=[
+              {"command":"load","request_id":"load","model_dir":os.environ["RUACCENT_TINY_WORKDIR"]},
+              {"command":"process","request_id":"1","text":"На двери висит замок."},
+              {"command":"process","request_id":"2","text":"Он все понял и ушел."},
+              {"command":"status","request_id":"status"},
+              {"command":"shutdown","request_id":"shutdown"}]
+          p=subprocess.run([str(binary)],input="".join(json.dumps(x,ensure_ascii=False)+"\n" for x in inputs),
+              text=True,capture_output=True,encoding="utf-8",timeout=180)
+          replies=[json.loads(x) for x in p.stdout.splitlines()]
+          record={"exit_code":p.returncode,"stderr":p.stderr[-5000:],"responses":replies}
+          (pathlib.Path(os.environ["ORT_TEST_EVIDENCE"])/"windows-worker.json").write_text(
+              json.dumps(record,indent=2,ensure_ascii=False),encoding="utf-8")
+          assert p.returncode==0,record
+          assert len(replies)==len(inputs),record
+          assert all(r["ok"] for r in replies),record
+          assert replies[1]["data"]["text"]=="На дв+ери вис+ит зам+ок.",record
+          assert replies[2]["data"]["text"]=="+Он всё п+онял и уш+ёл.",record
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Compile Silero Rust frontend with optional RUAccent on Windows
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location (Join-Path $env:RUACCENT_TEST_ROOT 'silero-tts')
+          cargo check --no-default-features --features reference-flex,ruaccent --lib *>&1 |
+              Tee-Object (Join-Path $env:ORT_TEST_EVIDENCE 'silero-adapter-check.log')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ruaccent-windows-native-evidence
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn
+          retention-days: 7
