@@ -53,6 +53,12 @@ The first worker run loaded both models in approximately 5.42 seconds; load time
 
 The regression test is model-gated: set `SILERO_RUACCENT_INTEGRATION_DIR` to the exported Silero weights and `RUACCENT_TINY_WORKDIR` to the RUAccent tiny pack when running `cargo test`. When these variables are omitted, the test returns early; a green no-weight test run must not be called evidence of real neural/PCM parity.
 
+### Full RUAccent golden corpus through the Silero acoustic pipeline
+
+A separate persistent-worker smoke test processed **all 20 captured golden inputs** from the RUAccent text corpus with actual Silero v5 RU and RUAccent tiny weights. **18/18 pronounceable Russian phrases** (including contextual homographs) returned nonempty, finite PCM; the two non-pronounceable cases (empty string and punctuation only) were rejected as expected. The worker remained usable afterwards and exited with code 0.
+
+This is a corpus-level **TTS execution smoke test**, not PCM parity against PyTorch for all 18 phrases. The two earlier explicit-accent PCM comparisons above are the bitwise parity evidence. Reproduction script: `check_golden_corpus_pcm.py`; results: `golden-corpus-pcm-results.json` (both shipped in the evidence ZIP).
+
 ## Remaining release constraints
 
 1. **Strict ONNX logits parity**: inherited two raw-logit tests still fail at `1e-4` tolerance with the pinned model (accent absolute difference ~0.00142, omograph ~0.00207). These tests are not relaxed; separate Python ONNX audit showed the current omograph weights disagree with the older golden fixture even in Python. Final categorical/string results remain correct for the tested corpus.
