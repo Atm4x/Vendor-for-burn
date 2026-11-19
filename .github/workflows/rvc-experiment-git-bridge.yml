@@ -64,3 +64,4 @@ jobs:
 # Stage115: refresh PR2 full-history bundle for local Burn/CubeCL NCU audit 2026-11-16
 # Stage126: refresh requested current-HEAD bridge for local Conv1d/ImplicitGemm R&D 2026-11-17
 # Stage133: export exact PR2 HEAD for local CUDA acceleration audit 2026-11-18
+# Stage134: exact PR2 HEAD re-export for GPU persistent selector and worker R&D 2026-11-20
