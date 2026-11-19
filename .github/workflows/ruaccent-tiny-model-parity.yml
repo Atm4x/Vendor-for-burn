@@ -68,17 +68,19 @@ jobs:
               json.dumps(report,indent=2))
           if missing: raise RuntimeError('missing model files: '+repr(missing))
           PY
-      - name: Install ONNX Runtime shared library
+      - name: Install Microsoft's official ONNX Runtime NuGet native library
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/ort"
           curl -fL --retry 3 --retry-delay 2 \
-            https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-linux-x64-1.22.0.tgz \
-            -o "$RUNNER_TEMP/ort.tgz"
-          tar xf "$RUNNER_TEMP/ort.tgz" -C "$RUNNER_TEMP/ort" --strip-components=1
-          test -f "$RUNNER_TEMP/ort/lib/libonnxruntime.so.1.22.0"
-          echo "ORT_DYLIB_PATH=$RUNNER_TEMP/ort/lib/libonnxruntime.so.1.22.0" >> "$GITHUB_ENV"
+            https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.22.0/microsoft.ml.onnxruntime.1.22.0.nupkg \
+            -o "$RUNNER_TEMP/ort.nupkg"
+          unzip -q "$RUNNER_TEMP/ort.nupkg" -d "$RUNNER_TEMP/ort"
+          ORT_LIB="$(find "$RUNNER_TEMP/ort" -path '*/linux-x64/native/libonnxruntime.so' -type f -print -quit)"
+          test -n "$ORT_LIB" && test -f "$ORT_LIB"
+          ldd "$ORT_LIB"
+          echo "ORT_DYLIB_PATH=$ORT_LIB" >> "$GITHUB_ENV"
       - name: Build and verify all neural golden fixtures
         shell: bash
         run: |
