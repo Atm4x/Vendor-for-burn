@@ -44,7 +44,7 @@ jobs:
         run: |
           set -euo pipefail
           cd models/silero-tts
-          cargo check --offline --release --locked --no-default-features --features reference-flex,ruaccent
+          cargo check --offline --release --no-default-features --features reference-flex,ruaccent
       - name: Publish validated addition-only branch
         shell: bash
         run: |
