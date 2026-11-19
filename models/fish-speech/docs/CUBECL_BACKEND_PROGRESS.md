@@ -1,6 +1,6 @@
 # Fish Speech 1.5 — CubeCL implementation tracker
 
-Baseline: `codex/fish-speech`; updated during CONT44 (2026-11-19).
+Baseline: `codex/fish-speech`; updated during CONT45 (2026-11-19).
 
 **Meaning:** This is a checklist of implementation/verification gates, not a benchmark, a statement of GPU operability, or the percentage of the original Fish Speech functional port. The checklist denominator is fixed at **26 gates**, allocated C01=4, C02=6, C03=4, C04=4, C05=4, C06=4. A gate for numeric parity stays open until the actual CubeCL runtime executes and its results are compared with a reference. Pure graph compilation does not satisfy that gate.
 
@@ -41,7 +41,7 @@ Baseline: `codex/fish-speech`; updated during CONT44 (2026-11-19).
 ## C05 — CubeCL Firefly: 1/4
 
 - [x] Native grouped residual FSQ encode/decode, executed on CubeCL CPU and compared against Core CPU and existing Python-source-formula golden fixtures. Multi-batch, multi-group, multiple quantizer counts, ignored `-1` codes, malformed indices, non-finite inputs and 27 geometry combinations tested. Public `CubeClFsqExecutor` exposes encode and decode; CPU is a reference, never a compute fallback. These APIs currently transfer inputs/outputs to the host and do not yet integrate with the Firefly ConvNeXt/HiFiGAN graph.
-- [ ] ConvNeXt encoder and related transforms.
+- [ ] ConvNeXt encoder and related transforms. CONT45 implements a native CubeCL ConvNeXt block (depthwise/grouped Conv1d, LayerNorm, two channel-linear layers, GELU, LayerScale, residual), a multi-block device-resident chain and generic grouped/downsampling Conv1d. Block parameters can be bound directly from the canonical Firefly Graph IR checkpoint keys. Synthetic actual CubeCL CPU parity covers five ConvNeXt profiles, three chained blocks, five grouped/downsampling convolutions, and one real reference-encoder graph profile. **Still open:** execute the entire ConvNeXt backbone and reference encoder DAG, including LogMel/masks, FSQ graph handoff and device-resident checkpoint ownership. Do not count a standalone block as a complete encoder.
 - [ ] HiFiGAN / ConvTranspose audio decoder.
 - [ ] Full reference encoding, audio output and numerical parity.
 
@@ -51,6 +51,16 @@ Baseline: `codex/fish-speech`; updated during CONT44 (2026-11-19).
 - [ ] Checkpoint + audio trace parity versus Python / TensorRT with fixed seeds.
 - [ ] Load/first-token/generation/RTF throughput and memory benchmarks.
 - [ ] Profiler-driven kernel optimization and resource lifetime acceptance.
+
+## Verification ledger — CONT45
+
+| Check | Status |
+| --- | --- |
+| Native CubeCL CPU ConvNeXt block vs Core `ConvNextBlock::forward` | PASS: varied batch/channel/frame profiles, gamma on/off |
+| Three chained ConvNeXt blocks with no intermediate host readback | PASS |
+| Grouped/depthwise/downsampling Conv1d and dilation vs Core reference | PASS: five profiles |
+| Firefly `reference_encode` Graph IR checkpoint-key binding for a real 128-channel stage-0 block | PASS: synthetic weights, preflight of missing parameter |
+| Complete encoder reference audio to FSQ codes; CUDA/Windows GPU | NOT VERIFIED |
 
 ## Verification ledger — CONT44
 
