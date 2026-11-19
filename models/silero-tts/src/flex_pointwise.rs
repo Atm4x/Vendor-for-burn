@@ -30,23 +30,38 @@ pub(crate) fn apply_fast_gelu(data: &mut [f32], parallel: bool) {
 struct Projection {
     in_channels: usize,
     out_channels: usize,
-    weight_by_output: Vec<f32>,
+    weights: Vec<f32>,
+    output_contiguous: bool,
     bias: Vec<f32>,
 }
 
 impl Projection {
     fn new(weight: Tensor<2>, bias: Tensor<1>) -> Result<Self> {
+        let output_contiguous = std::env::var_os("SILERO_FLEX_GEMM_DIRECT_WEIGHTS").is_some();
+        Self::new_with_layout(weight, bias, output_contiguous)
+    }
+
+    fn new_with_layout(
+        weight: Tensor<2>,
+        bias: Tensor<1>,
+        output_contiguous: bool,
+    ) -> Result<Self> {
         let [in_channels, out_channels] = weight.dims();
         ensure!(
             bias.dims() == [out_channels],
             "Invalid pointwise bias shape"
         );
-        let weight_by_output = weight.transpose().into_data().try_to_vec::<f32>()?;
+        let weights = if output_contiguous {
+            weight.into_data().try_to_vec::<f32>()?
+        } else {
+            weight.transpose().into_data().try_to_vec::<f32>()?
+        };
         let bias = bias.into_data().try_to_vec::<f32>()?;
         Ok(Self {
             in_channels,
             out_channels,
-            weight_by_output,
+            weights,
+            output_contiguous,
             bias,
         })
     }
@@ -71,9 +86,17 @@ impl Projection {
                 input.as_ptr(),
                 1,
                 self.in_channels as isize,
-                self.weight_by_output.as_ptr(),
-                self.in_channels as isize,
-                1,
+                self.weights.as_ptr(),
+                if self.output_contiguous {
+                    1
+                } else {
+                    self.in_channels as isize
+                },
+                if self.output_contiguous {
+                    self.out_channels as isize
+                } else {
+                    1
+                },
                 0.0f32,
                 1.0f32,
                 false,
@@ -271,6 +294,49 @@ impl FlexPointwise {
 mod tests {
     use super::*;
     use burn::tensor::module::linear;
+
+    #[test]
+    fn direct_weights_match_transposed_weights() {
+        let device = Device::flex();
+        for (rows, in_channels, out_channels) in [
+            (1, 9, 17),
+            (7, 16, 32),
+            (97, 512, 1536),
+            (173, 1536, 512),
+            (257, 512, 1536),
+        ] {
+            let values = (0..in_channels * out_channels)
+                .map(|i| ((i * 29 % 211) as f32 - 105.0) * 0.0004)
+                .collect();
+            let weights = Tensor::<2>::from_data(
+                TensorData::new(values, [in_channels, out_channels]),
+                &device,
+            );
+            let bias = Tensor::<1>::from_data(
+                TensorData::new(
+                    (0..out_channels).map(|i| i as f32 * 0.001).collect(),
+                    [out_channels],
+                ),
+                &device,
+            );
+            let normal = Projection::new_with_layout(weights.clone(), bias.clone(), false).unwrap();
+            let direct = Projection::new_with_layout(weights, bias, true).unwrap();
+            let input: Vec<f32> = (0..rows * in_channels)
+                .map(|i| ((i * 17 % 97) as f32 - 48.0) * 0.002)
+                .collect();
+            let a = normal.forward_raw(&input, rows);
+            let b = direct.forward_raw(&input, rows);
+            let max_error = a
+                .iter()
+                .zip(b.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_error < 0.0001,
+                "{rows}x{in_channels}x{out_channels}: {max_error}"
+            );
+        }
+    }
 
     #[test]
     fn fused_epilogues_match_staged_operations_bitwise() {
