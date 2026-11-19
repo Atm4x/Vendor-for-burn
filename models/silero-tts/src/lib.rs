@@ -29,3 +29,6 @@ pub mod worker;
 mod flex_pointwise;
 #[cfg(feature = "reference-flex")]
 mod flex_spectral;
+
+#[cfg(feature = "reference-flex")]
+mod flex_depthwise;

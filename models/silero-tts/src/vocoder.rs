@@ -23,11 +23,33 @@ fn vocoder_gelu(x: Tensor<3>) -> Tensor<3> {
 }
 
 struct ConvNeXtBlock {
-    dwconv_weight: Tensor<3>,
-    dwconv_bias: Tensor<1>,
+    depthwise: DepthwiseEngine,
     norm_weight: Tensor<1>,
     norm_bias: Tensor<1>,
     pointwise: PointwiseEngine,
+}
+
+enum DepthwiseEngine {
+    Tensor {
+        weight: Tensor<3>,
+        bias: Tensor<1>,
+    },
+    #[cfg(feature = "reference-flex")]
+    Flex(crate::flex_depthwise::FlexDepthwise),
+}
+
+impl DepthwiseEngine {
+    fn forward(&self, input: Tensor<3>) -> Tensor<3> {
+        match self {
+            Self::Tensor { weight, bias } => {
+                let channels = weight.dims()[0];
+                conv1d(input, weight.clone(), Some(bias.clone()),
+                    ConvOptions::new([1], [3], [1], channels))
+            }
+            #[cfg(feature = "reference-flex")]
+            Self::Flex(native) => native.forward(input),
+        }
+    }
 }
 
 enum PointwiseEngine {
@@ -90,9 +112,20 @@ impl ConvNeXtBlock {
             let _ = use_native;
             PointwiseEngine::Tensor { pw1_weight, pw1_bias, pw2_weight, pw2_bias, gamma }
         };
+        let dwconv_weight = weights.float(&format!("{p}.dwconv.weight"), device)?;
+        let dwconv_bias = weights.float(&format!("{p}.dwconv.bias"), device)?;
+        #[cfg(feature = "reference-flex")]
+        let depthwise = if device == &Device::flex()
+            && std::env::var_os("SILERO_FLEX_TENSOR_DEPTHWISE").is_none() {
+            DepthwiseEngine::Flex(crate::flex_depthwise::FlexDepthwise::new(
+                dwconv_weight, dwconv_bias)?)
+        } else {
+            DepthwiseEngine::Tensor { weight: dwconv_weight, bias: dwconv_bias }
+        };
+        #[cfg(not(feature = "reference-flex"))]
+        let depthwise = DepthwiseEngine::Tensor { weight: dwconv_weight, bias: dwconv_bias };
         Ok(Self {
-            dwconv_weight: weights.float(&format!("{p}.dwconv.weight"), device)?,
-            dwconv_bias: weights.float(&format!("{p}.dwconv.bias"), device)?,
+            depthwise,
             norm_weight: weights.float(&format!("{p}.norm.weight"), device)?,
             norm_bias: weights.float(&format!("{p}.norm.bias"), device)?,
             pointwise,
@@ -102,9 +135,7 @@ impl ConvNeXtBlock {
     fn forward(&self, input: Tensor<3>) -> Tensor<3> {
         let timed = std::env::var_os("SILERO_VOCODER_TIMING").is_some();
         let start = std::time::Instant::now();
-        let channels = self.dwconv_weight.dims()[0];
-        let x = conv1d(input.clone(), self.dwconv_weight.clone(), Some(self.dwconv_bias.clone()),
-            ConvOptions::new([1], [3], [1], channels));
+        let x = self.depthwise.forward(input.clone());
         if timed { eprintln!("[vocoder-block] depthwise_ms={:.3}", start.elapsed().as_secs_f64()*1000.0); }
         let start = std::time::Instant::now();
         let x = layer_norm(x.swap_dims(1,2), self.norm_weight.clone(), Some(self.norm_bias.clone()), 1e-6);
