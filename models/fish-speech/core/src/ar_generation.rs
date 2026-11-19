@@ -26,6 +26,36 @@ pub trait DualArBackend {
     fn reset_fast(&mut self) -> Result<()>;
     fn prime_fast(&mut self, context: Self::FastContext) -> Result<()>;
     fn decode_fast(&mut self, codebook_index: usize, previous_code: u32) -> Result<Vec<f32>>;
+
+    fn sample_fast_codes(
+        &mut self,
+        initial: u32,
+        codebook_size: usize,
+        histories: &[Vec<usize>],
+        params: SamplingParams,
+        sample: &mut dyn FnMut(&[f32], &[usize], SamplingParams) -> Result<u32>,
+        on_codebook: &mut dyn FnMut(usize) -> Result<()>,
+        is_cancelled: &mut dyn FnMut() -> bool,
+    ) -> Result<Vec<u32>> {
+        let mut codes = vec![initial];
+        for (index, history) in histories.iter().enumerate() {
+            if is_cancelled() {
+                return Err(FishError::InvalidTransition("synthesis cancelled"));
+            }
+            let codebook = index + 1;
+            let logits =
+                self.decode_fast(codebook, *codes.last().expect("initial code present"))?;
+            let token = sample(&logits, history, params)?;
+            if token as usize >= codebook_size {
+                return Err(FishError::InvalidShape(
+                    "Fast AR sample exceeds codebook size",
+                ));
+            }
+            codes.push(token);
+            on_codebook(codebook)?;
+        }
+        Ok(codes)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -112,13 +142,8 @@ where
         }
         trace.fast_active_lengths.push(1);
         let initial = initial_acoustic_code(semantic, semantic_begin_id, config.codebook_size)?;
-        let mut next = vec![semantic, initial];
+        let mut histories = Vec::with_capacity(config.num_codebooks.saturating_sub(1));
         for index in 1..config.num_codebooks {
-            if is_cancelled() {
-                return Err(FishError::InvalidTransition("synthesis cancelled"));
-            }
-            let logits =
-                backend.decode_fast(index, *next.last().expect("initial acoustic code"))?;
             let history = if result[0].is_empty() {
                 Vec::new()
             } else {
@@ -128,18 +153,35 @@ where
                     .map(|&token| token as usize)
                     .collect()
             };
-            let acoustic = sample(&logits, &history, params)?;
-            if acoustic as usize >= config.codebook_size {
-                return Err(FishError::InvalidShape(
-                    "Fast AR sample exceeds codebook size",
-                ));
-            }
-            next.push(acoustic);
-            if session.next_fast_codebook()? != index {
-                return Err(FishError::InvalidTransition("Fast AR step mismatch"));
-            }
-            trace.fast_active_lengths.push(index + 1);
+            histories.push(history);
         }
+        let acoustics = backend.sample_fast_codes(
+            initial,
+            config.codebook_size,
+            &histories,
+            params,
+            sample,
+            &mut |index| {
+                if session.next_fast_codebook()? != index {
+                    return Err(FishError::InvalidTransition("Fast AR step mismatch"));
+                }
+                trace.fast_active_lengths.push(index + 1);
+                Ok(())
+            },
+            is_cancelled,
+        )?;
+        if acoustics.len() != config.num_codebooks
+            || acoustics
+                .iter()
+                .any(|&token| token as usize >= config.codebook_size)
+        {
+            return Err(FishError::InvalidShape(
+                "Fast AR sample exceeds codebook size",
+            ));
+        }
+        let mut next = Vec::with_capacity(count);
+        next.push(semantic);
+        next.extend(acoustics);
         session.finish_step(next.clone())?;
         for (channel, token) in result.iter_mut().zip(next) {
             channel.push(token);
@@ -257,6 +299,31 @@ mod tests {
         );
         assert_eq!(trace.slow_active_lengths, [2, 3]);
         assert_eq!(trace.fast_active_lengths, [1, 2, 3, 1, 2, 3]);
+    }
+
+    #[test]
+    fn invalid_fast_code_is_rejected_before_submitting_later_codebooks() {
+        let mut backend = ScriptedBackend { steps: Vec::new() };
+        let mut trace = DualArTrace::default();
+        let err = generate_dual_ar(
+            &config(),
+            &mut backend,
+            &prompt(),
+            2,
+            1,
+            0,
+            SamplingParams::default(),
+            &mut |logits, _, _| Ok(if logits.len() == 3 { 99 } else { 1 }),
+            &mut trace,
+            &mut || false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, FishError::InvalidShape(_)));
+        assert_eq!(
+            backend.steps,
+            ["prefill:2", "reset", "prime:11", "fast:1:0"]
+        );
+        assert_eq!(trace.fast_active_lengths, [1]);
     }
 
     #[test]

@@ -63,6 +63,7 @@ where
 {
     executor: ArStreamExecutor<CudaArDevice<F>>,
     weights: BTreeMap<String, CudaBuffer>,
+    kernel_inflight: Vec<CudaBuffer>,
 }
 
 impl<F> WeightedCudaArSession<F>
@@ -78,6 +79,7 @@ where
         Ok(Self {
             executor: ArStreamExecutor::new(device),
             weights,
+            kernel_inflight: Vec::new(),
         })
     }
 
@@ -100,8 +102,14 @@ where
         self.executor.enqueue(plan, &external)
     }
 
+    pub fn retain_cuda_buffer(&mut self, buffer: CudaBuffer) {
+        self.kernel_inflight.push(buffer);
+    }
+
     pub fn retire_completed(&mut self) -> Result<()> {
-        self.executor.retire_completed()
+        self.executor.retire_completed()?;
+        self.kernel_inflight.clear();
+        Ok(())
     }
 
     pub fn read_output_bytes(&mut self, output: &CudaBuffer) -> Result<Vec<u8>> {

@@ -17,6 +17,9 @@ use fish_speech_core::{
 use trtx::Logger;
 
 use crate::{
+    cuda_fast_sampling::{
+        CudaFastSampler, allocate_token, parse_column, upload_column, upload_history_mask,
+    },
     cuda_stream::CudaBuffer,
     cuda_trtx::{CachedArDispatchConfig, WeightedCudaArSession, with_resident_cuda_ar_session},
     device_memory::DeviceMemoryBudget,
@@ -119,6 +122,9 @@ where
     session: &'a mut WeightedCudaArSession<F>,
     plans: &'a PreparedDualArPlans,
     semantic_lut: CudaBuffer,
+    fast_sampler: CudaFastSampler,
+    seed: u64,
+    fast_columns: u64,
 }
 
 impl<'a, F> CudaDualArBackend<'a, F>
@@ -129,6 +135,7 @@ where
         session: &'a mut WeightedCudaArSession<F>,
         plans: &'a PreparedDualArPlans,
         semantic_lut: &[i32],
+        seed: u64,
     ) -> Result<Self> {
         let vocab = expected_runtime_input(&plans.slow_prefill.plan, "semantic_membership_lut")?;
         if vocab.shape != [semantic_lut.len()] || vocab.dtype != ScalarType::I32 {
@@ -141,10 +148,14 @@ where
             .flat_map(|value| value.to_le_bytes())
             .collect::<Vec<_>>();
         let lut = session.upload_runtime_input(&vocab, &bytes)?;
+        let fast_sampler = CudaFastSampler::new(session.device_mut().context())?;
         Ok(Self {
             session,
             plans,
             semantic_lut: lut,
+            fast_sampler,
+            seed,
+            fast_columns: 0,
         })
     }
 
@@ -300,6 +311,99 @@ where
         let outputs = self.session.enqueue(&plan.plan, &inputs)?;
         self.read_logits(plan, &outputs, "fast_logits")
     }
+
+    fn sample_fast_codes(
+        &mut self,
+        initial: u32,
+        codebook_size: usize,
+        histories: &[Vec<usize>],
+        params: SamplingParams,
+        _host_sample: &mut dyn FnMut(&[f32], &[usize], SamplingParams) -> Result<u32>,
+        on_codebook: &mut dyn FnMut(usize) -> Result<()>,
+        is_cancelled: &mut dyn FnMut() -> bool,
+    ) -> Result<Vec<u32>> {
+        let count = histories.len() + 1;
+        if count != self.plans.config.num_codebooks {
+            return Err(FishError::InvalidShape("CUDA Fast codebook count mismatch"));
+        }
+        let vocab = self.plans.config.codebook_size;
+        if codebook_size != vocab {
+            return Err(FishError::InvalidShape(
+                "CUDA Fast codebook vocabulary mismatch",
+            ));
+        }
+        let column = upload_column(self.session, initial, count)?;
+        self.session.retain_cuda_buffer(column.clone());
+        let initial_plan = self.plans.fast_decode.get(1);
+        let mut previous = if let Some(plan) = initial_plan {
+            self.tokens(&plan.plan, "previous_acoustic_code", &[initial])?
+        } else {
+            self.session.upload_runtime_input(
+                &TensorType::new(
+                    vec![1],
+                    ScalarType::I32,
+                    fish_speech_core::graph_ir::Layout::Plain,
+                ),
+                &i32::try_from(initial)
+                    .map_err(|_| FishError::InvalidShape("CUDA acoustic code exceeds i32"))?
+                    .to_le_bytes(),
+            )?
+        };
+        self.session.retain_cuda_buffer(previous.clone());
+        let stream = self.session.device_mut().stream().clone();
+        let seed = self.seed ^ self.fast_columns.wrapping_mul(0xd1b54a32d192ed03);
+        self.fast_columns = self.fast_columns.wrapping_add(1);
+        for (offset, history) in histories.iter().enumerate() {
+            if is_cancelled() {
+                return Err(FishError::InvalidTransition("synthesis cancelled"));
+            }
+            let index = offset + 1;
+            let plan = self
+                .plans
+                .fast_decode
+                .get(index)
+                .ok_or(FishError::InvalidShape(
+                    "CUDA Fast plan missing for acoustic codebook",
+                ))?;
+            let mut inputs = BTreeMap::new();
+            inputs.insert("previous_acoustic_code".to_owned(), previous);
+            let outputs = self.session.enqueue(&plan.plan, &inputs)?;
+            let logits = named_output(plan, &outputs, "fast_logits")?;
+            let ty = output_type(plan, "fast_logits")?;
+            if ty.dtype != ScalarType::F32 || ty.shape != [1, 1, vocab] {
+                return Err(FishError::InvalidShape("CUDA Fast logits shape mismatch"));
+            }
+            let history_mask = upload_history_mask(self.session, vocab, history)?;
+            let sampled = allocate_token(self.session)?;
+            self.session.retain_cuda_buffer(logits.clone());
+            self.session.retain_cuda_buffer(history_mask.clone());
+            self.session.retain_cuda_buffer(sampled.clone());
+            self.fast_sampler.enqueue(
+                &stream,
+                &logits,
+                &history_mask,
+                vocab,
+                params,
+                seed,
+                index,
+                &sampled,
+                &column,
+            )?;
+            previous = sampled;
+            on_codebook(index)?;
+        }
+        let result = parse_column(&self.session.read_output_bytes(&column)?, count, vocab)?;
+        Ok(result)
+    }
+}
+
+impl<F> Drop for CudaDualArBackend<'_, F>
+where
+    F: FnMut(&TrtBlueprint, &BTreeMap<Binding, CudaBuffer>, &Arc<CudaStream>) -> Result<()>,
+{
+    fn drop(&mut self) {
+        let _ = self.session.retire_completed();
+    }
 }
 
 fn expected_runtime_input(plan: &ArStreamPlan, name: &str) -> Result<TensorType> {
@@ -433,7 +537,7 @@ pub fn generate_prepared_cuda_dual_ar(
         device_ordinal,
         memory,
         |session| {
-            let mut backend = CudaDualArBackend::new(session, plans, semantic_lut)?;
+            let mut backend = CudaDualArBackend::new(session, plans, semantic_lut, seed)?;
             let mut rng = SessionRng::new(seed);
             let mut trace = DualArTrace::default();
             generate_dual_ar(
