@@ -148,15 +148,34 @@ impl CubeClGraph {
     /// Validate only request-owned inputs. KV buffers and immutable weights are owned by
     /// the request and model respectively, never accepted from a caller at every step.
     pub fn validate_runtime_inputs(&self, inputs: &NamedTensors) -> Result<()> {
+        self.validate_runtime_bindings(inputs, &BTreeMap::new())
+    }
+
+    pub(crate) fn validate_runtime_bindings(
+        &self,
+        inputs: &NamedTensors,
+        device_types: &BTreeMap<String, TensorType>,
+    ) -> Result<()> {
         for value in &self.graph.values {
             if matches!(value.origin, Origin::Input) && !is_cache_name(&value.name) {
-                let data = inputs
-                    .get(&value.name)
-                    .ok_or(FishError::InvalidShape("missing CubeCL request input"))?;
-                verify_binding(&value.ty, data)?;
+                if let Some(ty) = device_types.get(&value.name) {
+                    if value.name != "fast_context"
+                        || *ty != value.ty
+                        || inputs.contains_key(&value.name)
+                    {
+                        return Err(FishError::InvalidShape(
+                            "invalid CubeCL device input binding",
+                        ));
+                    }
+                } else {
+                    let data = inputs
+                        .get(&value.name)
+                        .ok_or(FishError::InvalidShape("missing CubeCL request input"))?;
+                    verify_binding(&value.ty, data)?;
+                }
             }
         }
-        for name in inputs.keys() {
+        for name in inputs.keys().chain(device_types.keys()) {
             if !self.graph.values.iter().any(|value| {
                 value.name == *name && matches!(value.origin, Origin::Input) && !is_cache_name(name)
             }) {

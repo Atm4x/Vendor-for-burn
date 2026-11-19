@@ -15,7 +15,9 @@ use fish_speech_core::{
     tokenizer::{SEMANTIC_TOKEN_COUNT, SpecialTokens},
 };
 
-use super::session::{CubeClModel, CubeClPreparedModel, CubeClRequest, CubeClRequestLimits};
+use super::session::{
+    CubeClDeviceTensor, CubeClModel, CubeClPreparedModel, CubeClRequest, CubeClRequestLimits,
+};
 use crate::weights::LoadedWeights;
 
 fn checked_tokens(tokens: impl IntoIterator<Item = u32>) -> Result<Vec<i32>> {
@@ -93,10 +95,12 @@ struct CubeClDualArBackend<'a, 'b> {
     semantic_lut: &'a [i32],
     codebook_size: usize,
     vocab_size: usize,
+    mode: SelectionMode,
+    pending_semantic: Option<CubeClDeviceTensor>,
 }
 
 impl CubeClDualArBackend<'_, '_> {
-    fn slow(&mut self, key: &str, tokens: Vec<i32>) -> Result<SlowArForward<TensorData>> {
+    fn slow(&mut self, key: &str, tokens: Vec<i32>) -> Result<SlowArForward<CubeClDeviceTensor>> {
         if self.request.cursor().fast_active_len > 0 {
             self.request.retire_blocking()?;
         }
@@ -106,26 +110,49 @@ impl CubeClDualArBackend<'_, '_> {
             "semantic_membership_lut".into(),
             TensorData::I32(self.semantic_lut.to_vec()),
         );
-        let outputs = self.request.run(key, &inputs)?;
-        let logits = float_output(&outputs, "logits", self.vocab_size)?;
+        let readbacks: &[&str] = if self.mode == SelectionMode::Greedy {
+            &[]
+        } else {
+            &["logits"]
+        };
+        let outputs = self
+            .request
+            .run_selected(key, &inputs, &Default::default(), readbacks)?;
+        let logits = if self.mode == SelectionMode::Greedy {
+            self.pending_semantic = Some(
+                outputs
+                    .device
+                    .get("logits")
+                    .ok_or(FishError::InvalidShape(
+                        "CubeCL semantic device logits missing",
+                    ))?
+                    .clone(),
+            );
+            SlowArLogits::DevicePending
+        } else {
+            SlowArLogits::Host(float_output(&outputs.host, "logits", self.vocab_size)?)
+        };
         let fast_context = outputs
+            .device
             .get("fast_context")
-            .filter(|v| matches!(v, TensorData::F32(_)))
             .ok_or(FishError::InvalidShape(
                 "CubeCL fast_context output missing",
             ))?
             .clone();
         Ok(SlowArForward {
-            logits: SlowArLogits::Host(logits),
+            logits,
             fast_context,
         })
     }
 }
 
 impl DualArBackend for CubeClDualArBackend<'_, '_> {
-    type FastContext = TensorData;
+    type FastContext = CubeClDeviceTensor;
 
-    fn slow_prefill(&mut self, prompt: &EncodedConversation) -> Result<SlowArForward<TensorData>> {
+    fn slow_prefill(
+        &mut self,
+        prompt: &EncodedConversation,
+    ) -> Result<SlowArForward<CubeClDeviceTensor>> {
         self.slow(
             "slow_prefill",
             checked_tokens(prompt.channels.iter().flatten().copied())?,
@@ -136,11 +163,37 @@ impl DualArBackend for CubeClDualArBackend<'_, '_> {
         &mut self,
         previous_column: &[u32],
         active_len: usize,
-    ) -> Result<SlowArForward<TensorData>> {
+    ) -> Result<SlowArForward<CubeClDeviceTensor>> {
         self.slow(
             &format!("slow_decode_{active_len}"),
             checked_tokens(previous_column.iter().copied())?,
         )
+    }
+
+    fn sample_semantic(
+        &mut self,
+        logits: &SlowArLogits,
+        history: &[usize],
+        params: SamplingParams,
+        eos_id: u32,
+        host_sample: &mut dyn FnMut(&[f32], &[usize], SamplingParams) -> Result<u32>,
+    ) -> Result<(u32, bool)> {
+        match logits {
+            SlowArLogits::Host(values) => {
+                let token = host_sample(values, history, params)?;
+                Ok((token, token == eos_id))
+            }
+            SlowArLogits::DevicePending => {
+                let pending = self
+                    .pending_semantic
+                    .take()
+                    .ok_or(FishError::InvalidTransition(
+                        "CubeCL semantic sampler has no pending logits",
+                    ))?;
+                self.request
+                    .sample_greedy(&pending, 0, self.vocab_size, history, params, eos_id)
+            }
+        }
     }
 
     fn reset_fast(&mut self) -> Result<()> {
@@ -149,10 +202,11 @@ impl DualArBackend for CubeClDualArBackend<'_, '_> {
         Ok(())
     }
 
-    fn prime_fast(&mut self, context: TensorData) -> Result<()> {
-        let mut runtime = NamedTensors::new();
-        runtime.insert("fast_context".into(), context);
-        self.request.run("fast_0", &runtime)?;
+    fn prime_fast(&mut self, context: CubeClDeviceTensor) -> Result<()> {
+        let mut devices = std::collections::BTreeMap::new();
+        devices.insert("fast_context".into(), context);
+        self.request
+            .run_selected("fast_0", &NamedTensors::new(), &devices, &[])?;
         Ok(())
     }
 
@@ -166,6 +220,66 @@ impl DualArBackend for CubeClDualArBackend<'_, '_> {
             .request
             .run(&format!("fast_{codebook_index}"), &runtime)?;
         float_output(&result, "fast_logits", self.codebook_size)
+    }
+    fn sample_fast_codes(
+        &mut self,
+        initial: u32,
+        codebook_size: usize,
+        histories: &[Vec<usize>],
+        params: SamplingParams,
+        sample: &mut dyn FnMut(&[f32], &[usize], SamplingParams) -> Result<u32>,
+        on_codebook: &mut dyn FnMut(usize) -> Result<()>,
+        is_cancelled: &mut dyn FnMut() -> bool,
+    ) -> Result<Vec<u32>> {
+        let mut codes = vec![initial];
+        for (index, history) in histories.iter().enumerate() {
+            if is_cancelled() {
+                return Err(FishError::InvalidTransition("synthesis cancelled"));
+            }
+            let codebook = index + 1;
+            let previous = *codes.last().expect("Fast AR initial code present");
+            let token = if self.mode == SelectionMode::Greedy {
+                let mut inputs = NamedTensors::new();
+                inputs.insert(
+                    "previous_acoustic_code".into(),
+                    TensorData::I32(checked_tokens([previous])?),
+                );
+                let outputs = self.request.run_selected(
+                    &format!("fast_{codebook}"),
+                    &inputs,
+                    &Default::default(),
+                    &[],
+                )?;
+                let device_logits =
+                    outputs
+                        .device
+                        .get("fast_logits")
+                        .ok_or(FishError::InvalidShape(
+                            "CubeCL Fast AR device logits missing",
+                        ))?;
+                self.request
+                    .sample_greedy(
+                        device_logits,
+                        0,
+                        codebook_size,
+                        history,
+                        params,
+                        i32::MAX as u32,
+                    )?
+                    .0
+            } else {
+                let logits = self.decode_fast(codebook, previous)?;
+                sample(&logits, history, params)?
+            };
+            if token as usize >= codebook_size {
+                return Err(FishError::InvalidShape(
+                    "Fast AR sample exceeds codebook size",
+                ));
+            }
+            codes.push(token);
+            on_codebook(codebook)?;
+        }
+        Ok(codes)
     }
 }
 
@@ -320,6 +434,8 @@ impl CubeClSemanticGenerator {
                     semantic_lut: &self.semantic_lut,
                     codebook_size: self.config.codebook_size,
                     vocab_size: self.config.vocab_size,
+                    mode: self.mode,
+                    pending_semantic: None,
                 };
                 generate_dual_ar(
                     &self.config,

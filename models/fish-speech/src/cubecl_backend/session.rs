@@ -1,7 +1,12 @@
 //! Model-scoped CubeCL weights and request-scoped stream-ordered KV ownership.
 //! This layer does not sample tokens or depend on TensorRT.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 use cubecl::{prelude::*, server::Handle};
 use fish_speech_core::{
@@ -10,12 +15,14 @@ use fish_speech_core::{
     error::{FishError, Result},
     graph::Stage,
     graph_ir::{Graph, Op, Origin, ScalarType, TensorType},
+    sampling::SamplingParams,
     transformer_ir::TransformerIrFactory,
 };
 
 use super::{
     CubeClGraph, CubeClGraphExecutor,
     runtime::{is_cache_name, tensor_bytes, validate_binding},
+    sampling::greedy_device_token,
 };
 
 const DEFAULT_MAX_PENDING_BYTES: usize = 512 * 1024 * 1024;
@@ -110,6 +117,18 @@ impl CubeClRequestCursor {
     pub fn reset_fast(&mut self) {
         self.fast_active_len = 0;
     }
+}
+
+#[derive(Clone)]
+pub struct CubeClDeviceTensor {
+    ty: TensorType,
+    handle: Handle,
+    request_id: u64,
+}
+
+pub struct CubeClRunResult {
+    pub host: NamedTensors,
+    pub device: BTreeMap<String, CubeClDeviceTensor>,
 }
 
 /// Preflight-only model plan collection. No GPU allocation or CubeCL runtime is needed.
@@ -337,6 +356,7 @@ impl CubeClModel {
         }
         Ok(CubeClRequest {
             model: self,
+            request_id: NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
             limits,
             cursor: CubeClRequestCursor::default(),
             caches: BTreeMap::new(),
@@ -355,6 +375,7 @@ impl CubeClModel {
 
 pub struct CubeClRequest<'a> {
     model: &'a CubeClModel,
+    request_id: u64,
     limits: CubeClRequestLimits,
     cursor: CubeClRequestCursor,
     caches: BTreeMap<String, Handle>,
@@ -395,24 +416,138 @@ impl CubeClRequest<'_> {
         if is_cancelled() {
             return Err(FishError::InvalidTransition("synthesis cancelled"));
         }
-        let result = self.run_inner(key, runtime)?;
+        let result = self.run_inner(key, runtime, &BTreeMap::new(), None)?;
         if is_cancelled() {
             self.poisoned = true;
             return Err(FishError::InvalidTransition("synthesis cancelled"));
         }
-        Ok(result)
+        Ok(result.host)
     }
 
-    fn run_inner(&mut self, key: &str, runtime: &NamedTensors) -> Result<NamedTensors> {
+    /// Execute a graph with explicitly selected host readbacks. Other exported
+    /// tensors remain device-owned and can be forwarded to a later graph.
+    /// Only validated F32 fast_context may enter a graph from a device output;
+    /// token IDs still require host-side bounds checks.
+    pub fn sample_greedy(
+        &mut self,
+        logits: &CubeClDeviceTensor,
+        offset: usize,
+        vocabulary: usize,
+        history: &[usize],
+        params: SamplingParams,
+        eos_id: u32,
+    ) -> Result<(u32, bool)> {
+        if self.poisoned {
+            return Err(FishError::InvalidTransition(
+                "CubeCL stream poisoned; reset required",
+            ));
+        }
+        if logits.request_id != self.request_id {
+            return Err(FishError::InvalidTransition(
+                "CubeCL sampled tensor belongs to another request",
+            ));
+        }
+        if logits.ty.dtype != ScalarType::F32 {
+            return Err(FishError::InvalidShape(
+                "CubeCL GPU sampler requires F32 logits",
+            ));
+        }
+        let total = logits.ty.shape.iter().product();
+        let extra = history
+            .len()
+            .max(1)
+            .checked_mul(4)
+            .and_then(|bytes| bytes.checked_add(8))
+            .ok_or(FishError::InvalidShape(
+                "CubeCL sampler scratch byte overflow",
+            ))?;
+        let projected = self
+            .pending_bytes
+            .checked_add(extra)
+            .ok_or(FishError::InvalidShape(
+                "CubeCL sampler scratch byte overflow",
+            ))?;
+        if projected > self.limits.max_pending_bytes
+            || self.pending_steps >= self.limits.max_pending_steps
+        {
+            return Err(FishError::InvalidTransition(
+                "CubeCL GPU sampler pending budget exceeded",
+            ));
+        }
+        let result = greedy_device_token(
+            self.model.executor.client(),
+            &logits.handle,
+            total,
+            offset,
+            vocabulary,
+            history,
+            params,
+            eos_id,
+            &mut self.retained,
+        );
+        self.pending_steps += 1;
+        self.pending_bytes = projected;
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    pub fn run_selected(
+        &mut self,
+        key: &str,
+        runtime: &NamedTensors,
+        device_inputs: &BTreeMap<String, CubeClDeviceTensor>,
+        host_readbacks: &[&str],
+    ) -> Result<CubeClRunResult> {
+        if self.poisoned {
+            return Err(FishError::InvalidTransition(
+                "CubeCL stream poisoned; reset required",
+            ));
+        }
+        self.run_inner(key, runtime, device_inputs, Some(host_readbacks))
+    }
+
+    fn run_inner(
+        &mut self,
+        key: &str,
+        runtime: &NamedTensors,
+        device_inputs: &BTreeMap<String, CubeClDeviceTensor>,
+        host_readbacks: Option<&[&str]>,
+    ) -> Result<CubeClRunResult> {
         if self.poisoned {
             return Err(FishError::InvalidTransition(
                 "CubeCL stream poisoned; reset required",
             ));
         }
         let plan = self.model.prepared.graph(key)?;
-        plan.validate_runtime_inputs(runtime)?;
+        if device_inputs
+            .values()
+            .any(|tensor| tensor.request_id != self.request_id)
+        {
+            return Err(FishError::InvalidTransition(
+                "CubeCL graph input belongs to another request",
+            ));
+        }
+        let device_types = device_inputs
+            .iter()
+            .map(|(name, tensor)| (name.clone(), tensor.ty.clone()))
+            .collect();
+        plan.validate_runtime_bindings(runtime, &device_types)?;
         self.cursor.validate_step(plan.graph())?;
         let graph = plan.graph();
+        if let Some(selected) = host_readbacks {
+            for &name in selected {
+                if !graph.outputs.iter().any(|id| {
+                    let value = &graph.values[id.0];
+                    value.name == name && !is_cache_name(&value.name)
+                }) {
+                    return Err(FishError::InvalidShape(
+                        "CubeCL requested readback is not a public graph output",
+                    ));
+                }
+            }
+        }
         let mut missing_kv = Vec::new();
         for value in &graph.values {
             if matches!(value.origin, Origin::Input) && is_cache_name(&value.name) {
@@ -471,7 +606,11 @@ impl CubeClRequest<'_> {
             if matches!(value.origin, Origin::Input) && !is_cache_name(&value.name) {
                 inputs.insert(
                     value.name.clone(),
-                    self.model.executor.upload(&value.ty, &runtime[&value.name]),
+                    if let Some(device) = device_inputs.get(&value.name) {
+                        device.handle.clone()
+                    } else {
+                        self.model.executor.upload(&value.ty, &runtime[&value.name])
+                    },
                 );
             }
         }
@@ -513,20 +652,32 @@ impl CubeClRequest<'_> {
             .filter_map(|node| matches!(node.op, Op::KvUpdate { .. }).then_some(node.result))
             .collect::<BTreeSet<_>>();
         let mut host = NamedTensors::new();
+        let mut device = BTreeMap::new();
         for output in &graph.outputs {
             if cache_output_ids.contains(output) {
                 continue;
             }
             let value = &graph.values[output.0];
-            match self.model.executor.read(&value.ty, &outputs[&value.name]) {
-                Ok(data) => {
-                    host.insert(value.name.clone(), data);
-                }
-                Err(err) => {
-                    self.poisoned = true;
-                    self.pending_steps += 1;
-                    self.pending_bytes = projected_pending;
-                    return Err(err);
+            let handle = &outputs[&value.name];
+            device.insert(
+                value.name.clone(),
+                CubeClDeviceTensor {
+                    ty: value.ty.clone(),
+                    handle: handle.clone(),
+                    request_id: self.request_id,
+                },
+            );
+            if host_readbacks.is_none_or(|selected| selected.contains(&value.name.as_str())) {
+                match self.model.executor.read(&value.ty, handle) {
+                    Ok(data) => {
+                        host.insert(value.name.clone(), data);
+                    }
+                    Err(err) => {
+                        self.poisoned = true;
+                        self.pending_steps += 1;
+                        self.pending_bytes = projected_pending;
+                        return Err(err);
+                    }
                 }
             }
         }
@@ -534,7 +685,7 @@ impl CubeClRequest<'_> {
         self.pending_steps += 1;
         self.pending_bytes = projected_pending;
         self.cursor.advance(graph);
-        Ok(host)
+        Ok(CubeClRunResult { host, device })
     }
 
     /// A new semantic token starts a fresh Fast AR history, without touching Slow KV.

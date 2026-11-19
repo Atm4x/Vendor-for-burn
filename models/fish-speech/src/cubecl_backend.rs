@@ -4,12 +4,14 @@
 mod generation;
 mod kernels;
 mod runtime;
+mod sampling;
 mod session;
 
 pub use generation::CubeClSemanticGenerator;
 pub use runtime::{CubeClGraph, CubeClGraphExecutor};
 pub use session::{
-    CubeClModel, CubeClPreparedModel, CubeClRequest, CubeClRequestCursor, CubeClRequestLimits,
+    CubeClDeviceTensor, CubeClModel, CubeClPreparedModel, CubeClRequest, CubeClRequestCursor,
+    CubeClRequestLimits, CubeClRunResult,
 };
 
 #[cfg(test)]
