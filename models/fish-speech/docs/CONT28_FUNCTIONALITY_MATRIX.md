@@ -1,4 +1,4 @@
-# Fish Speech 1.5 — CONT28 functional acceptance matrix
+# Fish Speech 1.5 — CONT29 functional acceptance matrix
 
 ## Scope and rules
 
@@ -6,9 +6,9 @@ Source of truth: the uploaded `Fish-speech-pipeline-main (1).zip`, particularly 
 
 A top-level F item is DONE when its behavior for that source is implemented in Rust and covered by local deterministic tests. Executing an authentic checkpoint on Windows/RTX is an independent *operability* gate, not a reason to keep a fully implemented CPU behavior PARTIAL. Conversely, a compiled TensorRT graph or a mock cannot establish a production TensorRT end-to-end path. Every incomplete feature retains an explicit acceptance checklist below.
 
-Top-level status: **16 DONE, 6 PARTIAL, 0 MISSING / 22**. Historical metric: `(16 + 6 * 0.5) / 22 = 86.36%` (was 84.09%). It is a coarse *status index*, not a measurement of time remaining.
+Top-level status: **17 DONE, 5 PARTIAL, 0 MISSING / 22**. Historical metric: `(17 + 5 * 0.5) / 22 = 88.64%` (was 86.36% in CONT28). It is a coarse *status index*, not a measurement of time remaining.
 
-A second meter tracks **the actual six incomplete components**: 22 completed acceptance gates / 36 defined gates = **61.11%**. As future gates complete, this meter changes even before an entire F item reaches DONE. These gates represent source/implementation milestones, not equal engineering effort, and their count/definition must not be silently changed.
+A second meter keeps the **same fixed CONT28 six-component baseline**: 24 completed acceptance gates / 36 defined gates = **66.67%** (previously 22/36 = 61.11%). F11 remains included in this denominator even though it is now DONE, preventing denominator changes from distorting progress. As future gates complete, this meter changes even before an entire F item reaches DONE. These gates represent source/implementation milestones, not equal engineering effort, and their count/definition must not be silently changed.
 
 ## Top-level inventory
 
@@ -24,7 +24,7 @@ A second meter tracks **the actual six incomplete components**: 22 completed acc
 | F08 | Audio reference formats | PARTIAL |
 | F09 | Resampling and LogMel | DONE |
 | F10 | Weighted Firefly encode | DONE |
-| F11 | Native weighted Slow prefill | PARTIAL |
+| F11 | Native weighted Slow prefill | **DONE CONT29 (source-level)** |
 | F12 | Native cached Slow decode | PARTIAL |
 | F13 | Native DualAR Fast codebooks | PARTIAL |
 | F14 | Native Naive AR in TensorRT | PARTIAL |
@@ -55,14 +55,14 @@ Out-of-scope: hypothetical Firefly variants not in the supplied Python source. I
 - [x] Cache invalidation when swapping audio loader; source resampling and sample-rate contract preserved.
 - [ ] Offline **self-contained** codec implementations or a licensed redistributable decoder backend for MP3, AAC/MP4 and WMA/ASF (the current vendored Symphonia set lacks MP3/AAC/MP4).
 
-## F11 — 4/6
+## F11 — 6/6 — DONE for compiled native API, RTX operability still separate
 
 - [x] Source-ordered weighted Slow prefill and CPU reference interpreter.
 - [x] TensorRT engine construction/load/cache contracts.
 - [x] Checked weight upload, shape/binding validation and preflight before enqueue.
 - [x] Lowered-output-to-original-ValueId mapping and logits handoff to common generation controller.
-- [ ] Automatic preparation from loaded model artifacts in public native GPU facade (currently CPU is the model-runtime default).
-- [ ] Production multi-request prefill route all the way to the TTS facade without manually assembled prepared plans.
+- [x] Public `CudaFishModel::open_cuda()` loads original semantic + Firefly model artifacts and automatically prepares per-prompt Slow prefill/Fast codebook plans; the shared `FishModel<G>` facade preserves CPU TTS/reference/streaming APIs.
+- [x] Multi-request facade calls the native `CudaSemanticGenerator` through the shared `synthesize_with_events` pipeline, retaining engine cache and memory budget across calls; manifests are preflighted before TensorRT launch, with a deliberately bounded 1–64 token static-profile limit.
 
 ## F12 — 5/7
 
@@ -103,4 +103,4 @@ Out-of-scope: hypothetical Firefly variants not in the supplied Python source. I
 
 ## Separate operability gates (not included in functional score)
 
-Historical baseline **7/11 verified**; Windows NVIDIA runtime, authentic checkpoint tensors, numeric parity and packaging remain independent. CONT28 executes Rust Core, outer crate and Python exporter tests on Linux; no claim of successful Windows/RTX execution. Linux CUDA/TensorRT feature test build timed out during dependency compilation, so its CONT28 result is NOT VERIFIED (prior CONT27 feature tests remain evidence for that earlier commit only).
+Historical baseline **7/11 verified**; Windows NVIDIA runtime, authentic checkpoint tensors, numeric parity and packaging remain independent. CONT29 verified Rust Core (225 PASS / 2 ignored), Rust outer crate (53 PASS / 2 ignored), TensorRT mocks (61 PASS / 2 ignored across suites) and CUDA+TensorRT feature tests (59 PASS / 2 ignored) on Linux. No real GPU inference, real checkpoint parity, Windows driver or deployment was verified. F11 DONE describes completed, compile-tested native source/API integration; not validated RTX operability. F08 remains 4/5 because portable MP3/AAC/MP4/WMA decoding is unavailable without installing or writing additional codec implementations.

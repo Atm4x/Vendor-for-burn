@@ -6,6 +6,7 @@ use fish_speech_core::config::FishModelConfig;
 use fish_speech_core::cpu_weighted_ar::SelectionMode;
 use fish_speech_core::error::FishError;
 use fish_speech_core::prompt::ReferenceExample;
+use fish_speech_core::synthesis::SemanticGenerator;
 use fish_speech_core::synthesis::{
     SynthesisEvent, SynthesisRequest, SynthesisSample, synthesize_with_events,
 };
@@ -164,39 +165,59 @@ impl LoadedFishArtifacts {
             seed,
             mode,
         )?;
-        let decoder = CpuFireflyDecoder::from_checkpoint(&self.firefly)?;
-        let reference_encoder = CpuFireflyReferenceEncoder::from_checkpoint(&self.firefly)?;
-        Ok(CpuFishModel {
-            parts: Some(CpuModelParts {
-                config: self.config,
+        FishModel::from_components(self.config, self.tokenizer, self.firefly, generator)
+    }
+}
+
+struct FishModelParts<G> {
+    config: FishModelConfig,
+    special: SpecialTokens,
+    tokenizer: FishBpeTokenizer,
+    generator: G,
+    decoder: CpuFireflyDecoder,
+    reference_encoder: CpuFireflyReferenceEncoder,
+    cache: ReferenceCache<Vec<Vec<u32>>>,
+}
+
+pub struct FishModel<G> {
+    parts: Option<FishModelParts<G>>,
+}
+
+pub type CpuFishModel = FishModel<CpuSemanticGenerator>;
+
+impl FishModel<CpuSemanticGenerator> {
+    pub fn open(paths: &ModelPaths, seed: u64, mode: SelectionMode) -> Result<Self> {
+        LoadedFishArtifacts::open(paths)?.into_cpu_model(seed, mode)
+    }
+
+    pub fn reload(&mut self, paths: &ModelPaths, seed: u64, mode: SelectionMode) -> Result<()> {
+        let replacement = Self::open(paths, seed, mode)?;
+        *self = replacement;
+        Ok(())
+    }
+}
+
+impl<G: SemanticGenerator> FishModel<G> {
+    pub(crate) fn from_components(
+        config: FishModelConfig,
+        tokenizer: FishBpeTokenizer,
+        firefly: LoadedWeights,
+        generator: G,
+    ) -> Result<Self> {
+        let special = tokenizer.special_tokens().clone();
+        let decoder = CpuFireflyDecoder::from_checkpoint(&firefly)?;
+        let reference_encoder = CpuFireflyReferenceEncoder::from_checkpoint(&firefly)?;
+        Ok(Self {
+            parts: Some(FishModelParts {
+                config,
                 special,
-                tokenizer: self.tokenizer,
+                tokenizer,
                 generator,
                 decoder,
                 reference_encoder,
                 cache: ReferenceCache::default(),
             }),
         })
-    }
-}
-
-struct CpuModelParts {
-    config: FishModelConfig,
-    special: SpecialTokens,
-    tokenizer: FishBpeTokenizer,
-    generator: CpuSemanticGenerator,
-    decoder: CpuFireflyDecoder,
-    reference_encoder: CpuFireflyReferenceEncoder,
-    cache: ReferenceCache<Vec<Vec<u32>>>,
-}
-
-pub struct CpuFishModel {
-    parts: Option<CpuModelParts>,
-}
-
-impl CpuFishModel {
-    pub fn open(paths: &ModelPaths, seed: u64, mode: SelectionMode) -> Result<Self> {
-        LoadedFishArtifacts::open(paths)?.into_cpu_model(seed, mode)
     }
 
     pub fn is_loaded(&self) -> bool {
@@ -212,12 +233,6 @@ impl CpuFishModel {
 
     pub fn close(&mut self) {
         self.parts = None;
-    }
-
-    pub fn reload(&mut self, paths: &ModelPaths, seed: u64, mode: SelectionMode) -> Result<()> {
-        let replacement = Self::open(paths, seed, mode)?;
-        *self = replacement;
-        Ok(())
     }
 
     pub fn config(&self) -> Result<&FishModelConfig> {

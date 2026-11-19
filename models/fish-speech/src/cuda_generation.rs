@@ -90,7 +90,7 @@ impl PreparedDualArPlans {
         })
     }
 
-    fn all(&self) -> Vec<&ArStreamPlan> {
+    pub(crate) fn ar_plans(&self) -> Vec<&ArStreamPlan> {
         let mut plans = vec![&self.slow_prefill.plan];
         plans.extend(self.slow_decode.values().map(|item| &item.plan));
         plans.extend(self.fast_decode.iter().map(|item| &item.plan));
@@ -381,7 +381,7 @@ pub fn generate_prepared_cuda_dual_ar(
     if is_cancelled() {
         return Err(FishError::InvalidTransition("synthesis cancelled"));
     }
-    let references = plans.all();
+    let references = plans.ar_plans();
     with_resident_cuda_ar_session(
         registry,
         logger,
@@ -428,7 +428,7 @@ mod tests {
         );
         assert_eq!(plans.fast_decode.len(), config.num_codebooks);
         assert_eq!(plans.config, config);
-        assert_eq!(plans.all().len(), 3 + config.num_codebooks);
+        assert_eq!(plans.ar_plans().len(), 3 + config.num_codebooks);
         assert_eq!(
             output_type(&plans.slow_prefill, "logits").unwrap().shape,
             [1, 1, config.vocab_size]
