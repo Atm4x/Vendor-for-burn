@@ -2,8 +2,39 @@
 
 use anyhow::Result;
 use burn::tensor::{Tensor, activation::gelu, module::{conv1d, layer_norm, linear}, ops::ConvOptions};
+#[cfg(feature = "reference-flex")]
+use burn::tensor::TensorData;
 use crate::store::TensorStore;
 use burn::tensor::Device;
+
+#[cfg(feature = "reference-flex")]
+#[inline]
+fn fast_gelu_scalar(x: f32) -> f32 {
+    let z = x * std::f32::consts::FRAC_1_SQRT_2;
+    let t = 1.0 / (1.0 + 0.3275911 * z.abs());
+    let mut poly = 1.061405429 * t - 1.453152027;
+    poly = poly * t + 1.421413741;
+    poly = poly * t - 0.284496736;
+    poly = poly * t + 0.254829592;
+    poly *= t * (-z * z).exp();
+    let erf = (1.0 - poly).copysign(z);
+    0.5 * x * (1.0 + erf)
+}
+
+fn vocoder_gelu(x: Tensor<3>) -> Tensor<3> {
+    #[cfg(feature = "reference-flex")]
+    if x.device() == Device::flex() && std::env::var_os("SILERO_EXACT_GELU").is_none() {
+        let dims = x.dims();
+        let device = x.device();
+        let mut data = x.into_data().try_into_vec::<f32>()
+            .expect("Flex vocoder GELU requires f32 data");
+        for value in &mut data {
+            *value = fast_gelu_scalar(*value);
+        }
+        return Tensor::from_data(TensorData::new(data, dims), &device);
+    }
+    gelu(x)
+}
 
 struct ConvNeXtBlock {
     dwconv_weight: Tensor<3>,
@@ -34,13 +65,24 @@ impl ConvNeXtBlock {
     }
 
     fn forward(&self, input: Tensor<3>) -> Tensor<3> {
+        let timed = std::env::var_os("SILERO_VOCODER_TIMING").is_some();
+        let start = std::time::Instant::now();
         let channels = self.dwconv_weight.dims()[0];
         let x = conv1d(input.clone(), self.dwconv_weight.clone(), Some(self.dwconv_bias.clone()),
             ConvOptions::new([1], [3], [1], channels));
+        if timed { eprintln!("[vocoder-block] depthwise_ms={:.3}", start.elapsed().as_secs_f64()*1000.0); }
+        let start = std::time::Instant::now();
         let x = layer_norm(x.swap_dims(1,2), self.norm_weight.clone(), Some(self.norm_bias.clone()), 1e-6);
+        if timed { eprintln!("[vocoder-block] norm_ms={:.3}", start.elapsed().as_secs_f64()*1000.0); }
+        let start = std::time::Instant::now();
         let x = linear(x, self.pw1_weight.clone(), Some(self.pw1_bias.clone()));
-        let x = gelu(x);
+        if timed { eprintln!("[vocoder-block] pwconv1_ms={:.3}", start.elapsed().as_secs_f64()*1000.0); }
+        let start = std::time::Instant::now();
+        let x = vocoder_gelu(x);
+        if timed { eprintln!("[vocoder-block] gelu_ms={:.3}", start.elapsed().as_secs_f64()*1000.0); }
+        let start = std::time::Instant::now();
         let x = linear(x, self.pw2_weight.clone(), Some(self.pw2_bias.clone()));
+        if timed { eprintln!("[vocoder-block] pwconv2_ms={:.3}", start.elapsed().as_secs_f64()*1000.0); }
         (x * self.gamma.clone().reshape([1,1,channels])).swap_dims(1,2) + input
     }
 }
@@ -118,6 +160,25 @@ mod tests {
                 .map(|(x,y)| (x-y).abs()).fold(0.0f32, f32::max);
             println!("{name}: max_abs={max_abs:.9}");
             assert!(max_abs < 1.0e-3, "{name} max_abs={max_abs:.9}");
+        }
+    }
+}
+
+#[cfg(all(test, feature = "reference-flex"))]
+mod cpu_optimization_tests {
+    use super::*;
+
+    #[test]
+    fn fast_gelu_matches_exact_erf() {
+        let device = Device::flex();
+        let inputs = (-2000..=2000).map(|i| i as f32 * 0.005).collect::<Vec<_>>();
+        let exact = gelu(Tensor::<3>::from_data(
+            TensorData::new(inputs.clone(), [1, inputs.len(), 1]), &device))
+            .into_data().try_to_vec::<f32>().unwrap();
+        for (x, expected) in inputs.into_iter().zip(exact) {
+            let actual = fast_gelu_scalar(x);
+            assert!((actual - expected).abs() < 2e-6,
+                "GELU({x}) mismatch: {actual} != {expected}");
         }
     }
 }

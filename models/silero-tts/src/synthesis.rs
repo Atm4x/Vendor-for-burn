@@ -26,18 +26,25 @@ impl Synthesizer {
         if !matches!(sample_rate, 8000 | 24000 | 48000) {
             bail!("Silero supports 8000, 24000, 48000 Hz only");
         }
+        let timed = std::env::var_os("SILERO_TIMING").is_some();
+        let start = std::time::Instant::now();
         let (magnitude, cosine, sine) = self.vocoder.forward(mel);
+        if timed { eprintln!("[silero-stage] vocoder_ms={:.3}", start.elapsed().as_secs_f64()*1000.0); }
+        let start = std::time::Instant::now();
         let waveform = self.istft.forward(magnitude.clone() * cosine, magnitude * sine)?;
+        if timed { eprintln!("[silero-stage] istft_ms={:.3}", start.elapsed().as_secs_f64()*1000.0); }
         if sample_rate == 48000 {
             return Ok(waveform);
         }
         let kernel = if sample_rate == 24000 { self.pqmf2.clone() } else { self.pqmf6.clone() };
         let bands = if sample_rate == 24000 { 2 } else { 6 };
+        let start = std::time::Instant::now();
         let audio = conv1d(waveform.unsqueeze::<3>(), kernel, None,
             ConvOptions::new([bands], [31], [1], 1));
         let limit: f32 = audio.clone().abs().max().into_scalar();
         let audio = if limit <= 1.0 { audio } else { audio.tanh() };
         let [batch, _, length] = audio.dims();
+        if timed { eprintln!("[silero-stage] pqmf_ms={:.3}", start.elapsed().as_secs_f64()*1000.0); }
         Ok(audio.slice([0..batch, 0..1, 0..length]).reshape([batch, length]))
     }
 }
