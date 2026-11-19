@@ -155,13 +155,26 @@ impl Vocoder {
         }
         let x = layer_norm(x.swap_dims(1,2), self.final_norm_weight.clone(),
             Some(self.final_norm_bias.clone()), 1e-6);
-        let spectrum = linear(x, self.head_weight.clone(), Some(self.head_bias.clone()))
-            .swap_dims(1,2);
+        let timed = std::env::var_os("SILERO_VOCODER_TIMING").is_some();
+        let start = std::time::Instant::now();
+        let spectrum = linear(x, self.head_weight.clone(), Some(self.head_bias.clone()));
+        if timed { eprintln!("[vocoder-head] linear_ms={:.3}", start.elapsed().as_secs_f64()*1000.0); }
+        let start = std::time::Instant::now();
+        #[cfg(feature = "reference-flex")]
+        if spectrum.device() == Device::flex()
+            && std::env::var_os("SILERO_FLEX_TENSOR_SPECTRAL").is_none() {
+            let result = crate::flex_spectral::split_spectrum(spectrum);
+            if timed { eprintln!("[vocoder-head] spectral_ms={:.3}", start.elapsed().as_secs_f64()*1000.0); }
+            return result;
+        }
+        let spectrum = spectrum.swap_dims(1,2);
         let [batch, channels, frames] = spectrum.dims();
         let bins = channels / 2;
         let mag = spectrum.clone().slice([0..batch, 0..bins, 0..frames]).exp().clamp_max(100.0);
         let phase = spectrum.slice([0..batch, bins..channels, 0..frames]);
-        (mag, phase.clone().cos(), phase.sin())
+        let result = (mag, phase.clone().cos(), phase.sin());
+        if timed { eprintln!("[vocoder-head] spectral_ms={:.3}", start.elapsed().as_secs_f64()*1000.0); }
+        result
     }
 }
 
