@@ -82,6 +82,14 @@ pub fn capabilities() -> Value {
         "outputs": ["inline_f32le", "wav_file"],
         "cancel_supported": false,
         "persistent_weights": true,
+        "long_form": {
+            "automatic_chunking": true,
+            "target_characters": crate::longform::TARGET_CHARS,
+            "maximum_input_characters": crate::longform::MAX_INPUT_CHARS,
+            "maximum_output_seconds": crate::longform::MAX_AUDIO_SECONDS,
+            "adaptive_acoustic_limit_retries": true,
+            "streaming": false,
+        },
     })
 }
 

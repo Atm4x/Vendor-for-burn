@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use burn::tensor::{Device, Tensor};
-use std::{collections::HashSet, fs, path::Path};
+use std::{collections::{HashSet, VecDeque}, fs, path::Path};
 
-use crate::{acoustic::TextToMel, accentor::{Accentor, AccentOptions}, homosolver::HomoSolver, frontend::ModelConfig, store::TensorStore, synthesis::Synthesizer, ssml::{self, SileroControlConstants}};
+use crate::{longform, acoustic::TextToMel, accentor::{Accentor, AccentOptions}, homosolver::HomoSolver, frontend::ModelConfig, store::TensorStore, synthesis::Synthesizer, ssml::{self, SileroControlConstants}};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -105,8 +105,12 @@ impl SileroTts {
 
     pub fn infer_text_with_options(&self, text: &str, speaker: &str, sample_rate: u32,
         flags: &TextOptions) -> Result<Vec<f32>> {
-        let accented = self.accentuate_with_options(text, flags)?;
-        self.infer_accented(&accented, speaker, sample_rate)
+        let speaker_id = self.config.validate_speaker(speaker)? as i64;
+        self.config.validate_sample_rate(sample_rate)?;
+        longform::infer_text_chunks(text, sample_rate, |fragment| {
+            let accented = self.accentuate_with_options(fragment, flags)?;
+            self.infer_accented_single(&accented, speaker_id, sample_rate)
+        })
     }
 
     /// Original `<speak>` SSML entrypoint with nested prosody, sentence breaks,
@@ -127,9 +131,53 @@ impl SileroTts {
         let constants = self.control_constants.as_ref()
             .ok_or_else(|| anyhow::anyhow!("Missing ssml-controls.json; export model weights again"))?;
         let segments = ssml::process_ssml(&self.config, ssml)?;
+        let total_chars = segments.iter().map(|s| s.text.chars().count()).sum::<usize>();
+        anyhow::ensure!(total_chars <= longform::MAX_INPUT_CHARS,
+            "Silero SSML text exceeds long-form input limit");
+        let mut pending: VecDeque<Vec<ssml::Segment>> = longform::group_ssml_segments(&self.config, segments)?.into();
+        let mut output = Vec::new();
+        let mut durations = Vec::new();
+        let mut completed = 0;
+        while let Some(group) = pending.pop_front() {
+            match self.infer_ssml_group(&group, speaker_id, sample_rate, flags, constants) {
+                Ok((pcm, timing)) => {
+                    longform::append_audio(&mut output, pcm, sample_rate)?;
+                    durations.extend(timing);
+                    completed += 1;
+                }
+                Err(error) if longform::is_acoustic_limit(&error) => {
+                    let halves = if group.len() > 1 {
+                        let midpoint = group.len() / 2;
+                        vec![group[..midpoint].to_vec(), group[midpoint..].to_vec()]
+                    } else {
+                        let item = &group[0];
+                        let max = (item.text.chars().count() / 2).max(2);
+                        longform::split_ssml_segment(&self.config, item, max)?.into_iter()
+                            .map(|single| vec![single]).collect::<Vec<_>>()
+                    };
+                    if halves.len() <= 1 {
+                        return Err(error.context("Cannot split SSML segment below acoustic limit"));
+                    }
+                    anyhow::ensure!(completed + pending.len() + halves.len() <= longform::MAX_CHUNKS,
+                        "Silero SSML segment count exceeds limit");
+                    for half in halves.into_iter().rev() {
+                        pending.push_front(half);
+                    }
+                }
+                Err(error) => return Err(error.context(format!(
+                    "Silero SSML long-form inference failed in segment {}", completed + 1,
+                ))),
+            }
+        }
+        Ok((output, durations))
+    }
+
+    fn infer_ssml_group(&self, segments: &[ssml::Segment], speaker_id: i64,
+        sample_rate: u32, flags: &TextOptions,
+        constants: &SileroControlConstants) -> Result<(Vec<f32>, Vec<f32>)> {
         let prepared = segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ");
         let accented = self.accentuate_prepared(&prepared, flags)?;
-        let merged = ssml::merge_segments(&segments, &accented)?;
+        let merged = ssml::merge_segments(segments, &accented)?;
         let (ids, _) = self.config.encode_accented(&merged.text)?;
         let (mel, durations) = self.acoustic.infer_with_controls(&ids, speaker_id, &merged, constants)?;
         let pcm = self.synthesizer.forward(mel, sample_rate)?.into_data().try_to_vec::<f32>()?;
@@ -171,9 +219,16 @@ impl SileroTts {
     /// Converts an explicitly stressed Silero-symbol string to PCM.
     /// A separate Accentor/HomoSolver pass is required for unstressed text.
     pub fn infer_accented(&self, text: &str, speaker: &str, sample_rate: u32) -> Result<Vec<f32>> {
-        let speaker = self.config.validate_speaker(speaker)?;
+        let speaker_id = self.config.validate_speaker(speaker)? as i64;
+        self.config.validate_sample_rate(sample_rate)?;
+        longform::infer_text_chunks(text, sample_rate, |fragment| {
+            self.infer_accented_single(fragment, speaker_id, sample_rate)
+        })
+    }
+
+    fn infer_accented_single(&self, text: &str, speaker_id: i64, sample_rate: u32) -> Result<Vec<f32>> {
         let (ids, _) = self.config.encode_accented(text)?;
-        let pcm = self.infer_token_ids(&ids, speaker as i64, sample_rate)?;
+        let pcm = self.infer_token_ids(&ids, speaker_id, sample_rate)?;
         Ok(pcm.into_data().try_to_vec::<f32>()?)
     }
 

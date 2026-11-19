@@ -35,3 +35,5 @@ mod flex_depthwise;
 
 #[cfg(feature = "reference-flex")]
 mod flex_convnext;
+
+mod longform;
