@@ -155,6 +155,16 @@ impl AcousticModel {
     }
 }
 
+#[inline]
+fn silence_near_zero_pitch(value: f32) -> f32 {
+    if value.abs() < 0.001 { 0.0 } else { value }
+}
+
+fn silence_near_zero_pitch_tensor(pitch: Tensor<3>) -> Tensor<3> {
+    let mask = pitch.clone().abs().lower_elem(0.001);
+    pitch.mask_fill(mask, 0.0)
+}
+
 pub struct TextToMel {
     pub duration: ScalarPredictor,
     pub pitch: ScalarPredictor,
@@ -230,7 +240,7 @@ impl TextToMel {
             .into_data().try_to_vec::<f32>()?;
         let mean = constants.pitch_mean_shift[speaker_id as usize];
         let pitch: Vec<f32> = pitch.into_iter().zip(&controls.pitches).map(|(value, &coef)| {
-            let value = if value.abs() < 0.001 { 0.0 } else { value };
+            let value = silence_near_zero_pitch(value);
             let scaled = value * coef;
             if scaled == 0.0 { 0.0 } else {
                 let shift_coef = if coef == 0.0 { 1.0 } else { coef };
@@ -276,6 +286,7 @@ impl TextToMel {
         }
         if len >= 3 { duration[len - 3] = duration[len - 3].min(13.0); }
         let pitch = self.pitch.forward(input.clone(), speaker.clone(), None, 1.0).reshape([1, 1, len]);
+        let pitch = silence_near_zero_pitch_tensor(pitch);
         let durations = Tensor::<2>::from_data(TensorData::new(duration.clone(), [1, len]), &self.device);
         Ok((self.acoustic.forward(input, speaker, None, durations, pitch, None)?, duration))
     }
@@ -368,5 +379,32 @@ mod full_inference_tests {
         let max_abs = got.iter().zip(expected_mel.iter()).map(|(a,b)| (a-b).abs()).fold(0.0f32, f32::max);
         println!("complete token-to-mel parity max_abs={max_abs:.9}");
         assert!(max_abs < 2e-3);
+    }
+}
+
+#[cfg(test)]
+mod pitch_silence_tests {
+    use super::{silence_near_zero_pitch, silence_near_zero_pitch_tensor};
+    use burn::tensor::{Device, Tensor, TensorData};
+
+    #[test]
+    fn matches_pytorch_submillipitch_threshold() {
+        for value in [0.0, -0.0, 0.000999, -0.000999] {
+            assert_eq!(silence_near_zero_pitch(value).to_bits(), 0.0f32.to_bits());
+        }
+        for value in [0.001, -0.001, 0.5, -0.5] {
+            assert_eq!(silence_near_zero_pitch(value), value);
+        }
+        #[cfg(feature = "reference-flex")]
+        {
+            let input = [0.0f32, -0.0, 0.000999, -0.000999, 0.001, -0.001, 0.5, -0.5];
+            let pitch = Tensor::<3>::from_data(
+                TensorData::new(input.to_vec(), [1, 1, input.len()]), &Device::flex());
+            let got = silence_near_zero_pitch_tensor(pitch)
+                .into_data().try_to_vec::<f32>().unwrap();
+            for (value, actual) in input.into_iter().zip(got) {
+                assert_eq!(actual.to_bits(), silence_near_zero_pitch(value).to_bits());
+            }
+        }
     }
 }

@@ -141,16 +141,25 @@ def main():
     parser.add_argument("--exact-gelu", action="store_true")
     parser.add_argument("--stages", action="store_true")
     parser.add_argument("--reference-pt", type=Path)
+    parser.add_argument("--max-pcm-error", type=float,
+                        help="Fail when PyTorch PCM max-absolute error exceeds this value")
     parser.add_argument("--output-json", type=Path)
     args = parser.parse_args()
     if args.repeats < 1:
         parser.error("--repeats must be at least 1")
     if args.threads is not None and args.threads < 1:
         parser.error("--threads must be at least 1")
+    if args.max_pcm_error is not None:
+        if not args.reference_pt:
+            parser.error("--max-pcm-error requires --reference-pt")
+        if args.max_pcm_error < 0:
+            parser.error("--max-pcm-error must be nonnegative")
     report = run(args)
     print("SUMMARY " + json.dumps(report, ensure_ascii=False), flush=True)
     if args.output_json:
         args.output_json.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    if args.max_pcm_error is not None and report["pytorch"]["max_absolute_error"] > args.max_pcm_error:
+        raise SystemExit(f"PCM parity failed: {report['pytorch']['max_absolute_error']:.9g} > {args.max_pcm_error:.9g}")
 
 
 if __name__ == "__main__":
