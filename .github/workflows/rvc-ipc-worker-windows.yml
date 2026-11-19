@@ -71,6 +71,8 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          cargo test --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --lib runtime_backend::native_runtime_tests
+          if ($LASTEXITCODE -ne 0) { throw 'Explicit native DLL loader tests failed' }
           cargo test --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --lib worker::tests
           if ($LASTEXITCODE -ne 0) { throw 'RVC lifecycle tests failed' }
           cargo test --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --lib audio_io::tests

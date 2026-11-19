@@ -1,24 +1,21 @@
 {
   "worker_protocol": 1,
-  "rvc_contract_version": 1,
-  "model_id_prefix": "rvc_v2_",
+  "worker_name_default": "rvc_v2",
   "service": "voice_conversion",
-  "physical_gpu_selector": ["pci", "windows_luid"],
+  "model_registry_required": false,
   "execution_variants": [
     "burn_cubecl_cuda_fp32",
     "burn_cubecl_wgpu_fp32",
     "burn_cubecl_cpu_fp32"
   ],
-  "assets": {
-    "voice": "voice.pth",
-    "hubert": "hubert.pt",
-    "rmvpe": "rmvpe.pt",
-    "index_optional": "index.index"
+  "gpu_selectors": ["pci", "windows_luid"],
+  "startup_arguments": {
+    "required": ["backend", "voice", "hubert", "rmvpe", "input-dir", "output-dir"],
+    "optional": ["name", "backend-path", "gpu-id", "index", "batch-size"]
   },
   "input_formats": ["wav"],
   "output_formats": ["wav"],
   "output_sample_rate_hz": 40000,
   "max_source_bytes": 67108864,
-  "max_request_frame_bytes": 1048576,
-  "requires_user_supplied_weights": true
+  "max_request_frame_bytes": 1048576
 }

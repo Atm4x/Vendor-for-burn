@@ -20,10 +20,15 @@ pub const MAX_SOURCE: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct LaunchConfig {
-    pub model_id: String,
+    pub name: String,
     pub backend: String,
+    pub backend_path: Option<PathBuf>,
+    pub runtime_dlls: Vec<PathBuf>,
     pub gpu_id: Option<String>,
-    pub model_dir: PathBuf,
+    pub voice: PathBuf,
+    pub hubert: PathBuf,
+    pub rmvpe: PathBuf,
+    pub index: Option<PathBuf>,
     pub input_dir: PathBuf,
     pub output_dir: PathBuf,
     pub batch_size: usize,
@@ -32,14 +37,17 @@ pub struct LaunchConfig {
 
 impl LaunchConfig {
     fn validate(&self) -> Result<(), String> {
-        if !self.model_id.starts_with("rvc_v2_")
-            || self.model_id.len() > 80
+        if self.name.is_empty()
+            || self.name.len() > 80
             || !self
-                .model_id
+                .name
                 .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
         {
-            return Err("model_id must be an rvc_v2_* package identifier".into());
+            return Err("worker name must contain 1..80 ASCII letters, digits, '_' or '-'".into());
+        }
+        if self.backend == "cpu" && (self.backend_path.is_some() || !self.runtime_dlls.is_empty()) {
+            return Err("external GPU runtime DLLs are only supported for GPU backends".into());
         }
         if !matches!(self.backend.as_str(), "cpu" | "cuda" | "wgpu") {
             return Err("unsupported backend".into());
@@ -48,30 +56,14 @@ impl LaunchConfig {
             if self.backend == "cpu" {
                 return Err("--gpu-id is only supported for cuda or wgpu".into());
             }
-            id.parse::<gpu_device_resolver::GpuId>().map_err(|e| e.to_string())?;
+            id.parse::<gpu_device_resolver::GpuId>()
+                .map_err(|e| e.to_string())?;
         }
         if !(1..=32).contains(&self.batch_size) {
             return Err("batch_size must be 1..=32".into());
         }
         self.chunk.validate()?;
         Ok(())
-    }
-
-    fn model_asset(&self, name: &str, required: bool) -> Result<Option<PathBuf>, String> {
-        let path = self.model_dir.join(name);
-        match fs::symlink_metadata(&path) {
-            Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {
-                if path.canonicalize().map_err(|e| e.to_string())?.parent()
-                    != Some(self.model_dir.as_path())
-                {
-                    return Err("model asset escaped model directory".into());
-                }
-                Ok(Some(path))
-            }
-            Ok(_) => Err(format!("model asset is not a regular file: {name}")),
-            Err(e) if e.kind() == io::ErrorKind::NotFound && !required => Ok(None),
-            Err(e) => Err(format!("missing or inaccessible model asset {name}: {e}")),
-        }
     }
 }
 
@@ -86,12 +78,6 @@ pub struct Request {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct LoadRequest {
-    model_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Snapshot {
     file_name: String,
     size_bytes: u64,
@@ -101,8 +87,6 @@ struct Snapshot {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InferRequest {
-    rvc_version: u32,
-    kind: String,
     input: Snapshot,
     #[serde(default)]
     index_rate: Option<f32>,
@@ -126,24 +110,14 @@ pub struct NativeRvcEngine(RvcV2Inferencer);
 
 impl WorkerEngine for NativeRvcEngine {
     fn load(config: &LaunchConfig) -> Result<Self, String> {
-        let voice = config
-            .model_asset("voice.pth", true)?
-            .ok_or("voice.pth missing")?;
-        let hubert = config
-            .model_asset("hubert.pt", true)?
-            .ok_or("hubert.pt missing")?;
-        let rmvpe = config
-            .model_asset("rmvpe.pt", true)?
-            .ok_or("rmvpe.pt missing")?;
-        let index = config.model_asset("index.index", false)?;
-        let device = runtime_backend::selected_physical_device(&config.backend, config.gpu_id.as_deref())?;
-        let model = RvcV2Inferencer::load(
-            &voice.to_string_lossy(),
-            &hubert.to_string_lossy(),
-            &rmvpe.to_string_lossy(),
-            index.as_ref().map(|p| p.to_string_lossy()).as_deref(),
-            device.clone(),
-        )?;
+        let device =
+            runtime_backend::selected_physical_device(&config.backend, config.gpu_id.as_deref())?;
+        let voice = config.voice.to_string_lossy();
+        let hubert = config.hubert.to_string_lossy();
+        let rmvpe = config.rmvpe.to_string_lossy();
+        let index = config.index.as_ref().map(|p| p.to_string_lossy());
+        let model =
+            RvcV2Inferencer::load(&voice, &hubert, &rmvpe, index.as_deref(), device.clone())?;
         device
             .sync()
             .map_err(|e| format!("model load sync failed: {e}"))?;
@@ -189,14 +163,13 @@ impl<E: WorkerEngine> Worker<E> {
     }
 
     fn command(&mut self, request: &Request) -> Result<Value, String> {
-        if !matches!(request.command.as_str(), "load" | "infer") && request.payload != json!({}) {
+        if request.command != "infer" && request.payload != json!({}) {
             return Err("unexpected command payload".into());
         }
         match request.command.as_str() {
             "capabilities" => Ok(json!({
-                "model_id": self.config.model_id,
+                "name": self.config.name,
                 "backends": [self.config.backend],
-                "rvc_contract_version": PROTOCOL_VERSION,
                 "rvc_capability": {
                     "kind": "voice_conversion", "formats": ["wav"],
                     "output_formats": ["wav"], "output_sample_rate_hz": 40_000,
@@ -207,7 +180,7 @@ impl<E: WorkerEngine> Worker<E> {
             })),
             "status" => Ok(json!({
                 "phase": if self.warm { "ready" } else if self.engine.is_some() { "loaded" } else { "started" },
-                "model_id": self.config.model_id,
+                "name": self.config.name,
                 "backend": self.config.backend,
                 "gpu_id": self.config.gpu_id,
                 "variant": match self.config.backend.as_str() {
@@ -217,10 +190,8 @@ impl<E: WorkerEngine> Worker<E> {
                 },
             })),
             "load" => {
-                let args: LoadRequest =
-                    serde_json::from_value(request.payload.clone()).map_err(|e| e.to_string())?;
-                if self.engine.is_some() || args.model_id != self.config.model_id {
-                    return Err("model does not match the package or is already loaded".into());
+                if self.engine.is_some() {
+                    return Err("model is already loaded; unload before loading again".into());
                 }
                 let model = E::load(&self.config)?;
                 self.engine = Some(model);
@@ -251,10 +222,7 @@ impl<E: WorkerEngine> Worker<E> {
             .ok_or("model is not ready")?;
         let args: InferRequest =
             serde_json::from_value(request.payload.clone()).map_err(|e| e.to_string())?;
-        if args.rvc_version != PROTOCOL_VERSION || args.kind != "voice_conversion" {
-            return Err("unsupported RVC request version or kind".into());
-        }
-        let has_index = self.config.model_asset("index.index", false)?.is_some();
+        let has_index = self.config.index.is_some();
         let index_rate = args
             .index_rate
             .unwrap_or(if has_index { 0.75 } else { 0.0 });
@@ -303,8 +271,6 @@ impl<E: WorkerEngine> Worker<E> {
             return Err(format!("cannot write output snapshot: {err}"));
         }
         Ok(json!({
-            "rvc_version": PROTOCOL_VERSION,
-            "kind": "voice_conversion",
             "input_sample_rate_hz": report.input_sample_rate,
             "input_samples": report.input_samples,
             "sample_rate_hz": report.output_sample_rate,
@@ -368,24 +334,60 @@ fn absolute_directory(value: String) -> Result<PathBuf, String> {
     path.canonicalize().map_err(|e| e.to_string())
 }
 
+fn absolute_regular_file(value: String) -> Result<PathBuf, String> {
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err("weight file path must be absolute".into());
+    }
+    let metadata = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err("weight file must be a regular non-symlink file".into());
+    }
+    path.canonicalize().map_err(|e| e.to_string())
+}
+
+fn absolute_backend_path(value: String) -> Result<PathBuf, String> {
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err("backend runtime path must be absolute".into());
+    }
+    let metadata = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+    if metadata.file_type().is_symlink() || !(metadata.is_file() || metadata.is_dir()) {
+        return Err("backend runtime path must be a regular file or directory".into());
+    }
+    path.canonicalize().map_err(|e| e.to_string())
+}
+
 pub fn parse_launch(mut args: impl Iterator<Item = String>) -> Result<LaunchConfig, String> {
     if args.next().as_deref() != Some("--ipc-stdio") {
         return Err("worker must be launched with --ipc-stdio".into());
     }
-    let mut model_id = None;
+    let mut name = None;
     let mut backend = None;
+    let mut backend_path = None;
+    let mut runtime_dlls = Vec::new();
     let mut gpu_id = None;
-    let mut model_dir = None;
+    let mut voice = None;
+    let mut hubert = None;
+    let mut rmvpe = None;
+    let mut index = None;
     let mut input_dir = None;
     let mut output_dir = None;
     let mut batch_size = None;
     while let Some(flag) = args.next() {
         let value = args.next().ok_or("missing worker launch argument value")?;
         match flag.as_str() {
-            "--model-id" if model_id.is_none() => model_id = Some(value),
+            "--name" if name.is_none() => name = Some(value),
             "--backend" if backend.is_none() => backend = Some(value),
+            "--backend-path" if backend_path.is_none() => {
+                backend_path = Some(absolute_backend_path(value)?)
+            }
             "--gpu-id" if gpu_id.is_none() => gpu_id = Some(value),
-            "--model-dir" if model_dir.is_none() => model_dir = Some(absolute_directory(value)?),
+            "--runtime-dll" => runtime_dlls.push(absolute_backend_path(value)?),
+            "--voice" if voice.is_none() => voice = Some(absolute_regular_file(value)?),
+            "--hubert" if hubert.is_none() => hubert = Some(absolute_regular_file(value)?),
+            "--rmvpe" if rmvpe.is_none() => rmvpe = Some(absolute_regular_file(value)?),
+            "--index" if index.is_none() => index = Some(absolute_regular_file(value)?),
             "--input-dir" if input_dir.is_none() => input_dir = Some(absolute_directory(value)?),
             "--output-dir" if output_dir.is_none() => output_dir = Some(absolute_directory(value)?),
             "--batch-size" if batch_size.is_none() => {
@@ -399,10 +401,15 @@ pub fn parse_launch(mut args: impl Iterator<Item = String>) -> Result<LaunchConf
         }
     }
     let config = LaunchConfig {
-        model_id: model_id.ok_or("missing --model-id")?,
+        name: name.unwrap_or_else(|| "rvc_v2".into()),
         backend: backend.ok_or("missing --backend")?,
+        backend_path,
+        runtime_dlls,
         gpu_id,
-        model_dir: model_dir.ok_or("missing --model-dir")?,
+        voice: voice.ok_or("missing --voice")?,
+        hubert: hubert.ok_or("missing --hubert")?,
+        rmvpe: rmvpe.ok_or("missing --rmvpe")?,
+        index,
         input_dir: input_dir.ok_or("missing --input-dir")?,
         output_dir: output_dir.ok_or("missing --output-dir")?,
         batch_size: batch_size.unwrap_or(2),
@@ -458,6 +465,11 @@ pub fn serve<E: WorkerEngine>(
 
 pub fn run_native(args: impl Iterator<Item = String>) -> Result<(), String> {
     let config = parse_launch(args)?;
+    runtime_backend::configure_native_libraries(
+        &config.backend,
+        config.backend_path.as_deref(),
+        &config.runtime_dlls,
+    )?;
     let _ = runtime_backend::selected_physical_device(&config.backend, config.gpu_id.as_deref())?;
     serve::<NativeRvcEngine>(config, io::stdin().lock(), io::stdout().lock())
 }
@@ -508,10 +520,15 @@ mod tests {
     const ID: &str = "d693ac39-dd75-48f8-b5fb-5db199110159";
     fn config(root: &Path) -> LaunchConfig {
         LaunchConfig {
-            model_id: "rvc_v2_test".into(),
+            name: "rvc_v2".into(),
             backend: "cpu".into(),
+            backend_path: None,
+            runtime_dlls: Vec::new(),
             gpu_id: None,
-            model_dir: root.into(),
+            voice: root.join("voice-any.pth"),
+            hubert: root.join("shared-hubert.pt"),
+            rmvpe: root.join("shared-rmvpe.pt"),
+            index: None,
             input_dir: root.into(),
             output_dir: root.into(),
             batch_size: 2,
@@ -540,8 +557,8 @@ mod tests {
         );
         assert!(invoke(&mut w, "warmup", json!({})).is_err());
         assert!(invoke(&mut w, "infer", json!({})).is_err());
-        invoke(&mut w, "load", json!({"model_id":"rvc_v2_test"})).unwrap();
-        assert!(invoke(&mut w, "load", json!({"model_id":"rvc_v2_test"})).is_err());
+        invoke(&mut w, "load", json!({})).unwrap();
+        assert!(invoke(&mut w, "load", json!({})).is_err());
         assert_eq!(
             invoke(&mut w, "status", json!({})).unwrap()["phase"],
             "loaded"
@@ -604,10 +621,9 @@ mod tests {
         let input = audio_io::encode_mono_wav(&[0.0; 3200], 16_000).unwrap();
         fs::write(root.join("sample.wav"), &input).unwrap();
         let mut worker = Worker::<MockEngine>::new(config(&root.canonicalize().unwrap())).unwrap();
-        invoke(&mut worker, "load", json!({"model_id":"rvc_v2_test"})).unwrap();
+        invoke(&mut worker, "load", json!({})).unwrap();
         invoke(&mut worker, "warmup", json!({})).unwrap();
         let payload = json!({
-            "rvc_version":1,"kind":"voice_conversion",
             "input":{
                 "file_name":"sample.wav", "size_bytes":input.len(),
                 "sha256":format!("{:x}",Sha256::digest(&input))
@@ -684,5 +700,105 @@ mod tests {
         let wrong =
             format!("{{\"version\":2,\"id\":\"{ID}\",\"command\":\"status\",\"payload\":{{}}}}\n");
         assert!(serve::<MockEngine>(config, Cursor::new(wrong), Vec::<u8>::new()).is_err());
+    }
+    #[test]
+    fn explicit_assets_and_optional_name_are_accepted() {
+        let root = std::env::temp_dir().join(format!("rvc-worker-assets-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        for name in [
+            "singer.pth",
+            "my-hubert.pt",
+            "pitch-model.pt",
+            "custom.index",
+        ] {
+            fs::write(root.join(name), b"fixture").unwrap();
+        }
+        let dir = root.canonicalize().unwrap();
+        let args = [
+            "--ipc-stdio".to_owned(),
+            "--backend".into(),
+            "cpu".into(),
+            "--voice".into(),
+            dir.join("singer.pth").display().to_string(),
+            "--hubert".into(),
+            dir.join("my-hubert.pt").display().to_string(),
+            "--rmvpe".into(),
+            dir.join("pitch-model.pt").display().to_string(),
+            "--index".into(),
+            dir.join("custom.index").display().to_string(),
+            "--input-dir".into(),
+            dir.display().to_string(),
+            "--output-dir".into(),
+            dir.display().to_string(),
+        ];
+        let config = parse_launch(args.into_iter()).unwrap();
+        assert_eq!(config.name, "rvc_v2");
+        assert_eq!(config.voice.file_name().unwrap(), "singer.pth");
+        assert_eq!(
+            config.index.as_deref().unwrap().file_name().unwrap(),
+            "custom.index"
+        );
+        assert!(
+            parse_launch(
+                [
+                    "--ipc-stdio".to_string(),
+                    "--backend".into(),
+                    "cpu".into(),
+                    "--model-id".into(),
+                    "rvc_v2_x".into(),
+                ]
+                .into_iter()
+            )
+            .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn multiple_external_runtime_dlls_are_accepted_at_launch() {
+        let root = std::env::temp_dir().join(format!("rvc-worker-dlls-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        for name in [
+            "voice.pth",
+            "hubert.pt",
+            "rmvpe.pt",
+            "nvrtc64_120_0.dll",
+            "cudart64_12.dll",
+        ] {
+            fs::write(root.join(name), b"fixture").unwrap();
+        }
+        let dir = root.canonicalize().unwrap();
+        let mut args = vec!["--ipc-stdio".into(), "--backend".into(), "cuda".into()];
+        for name in ["voice", "hubert", "rmvpe"] {
+            args.push(format!("--{name}"));
+            args.push(
+                dir.join(format!(
+                    "{name}.{}",
+                    if name == "voice" { "pth" } else { "pt" }
+                ))
+                .display()
+                .to_string(),
+            );
+        }
+        for dll in ["nvrtc64_120_0.dll", "cudart64_12.dll"] {
+            args.push("--runtime-dll".into());
+            args.push(dir.join(dll).display().to_string());
+        }
+        for flag in ["--input-dir", "--output-dir"] {
+            args.push(flag.into());
+            args.push(dir.display().to_string());
+        }
+        let config = parse_launch(args.into_iter()).unwrap();
+        assert_eq!(config.runtime_dlls.len(), 2);
+        assert_eq!(config.name, "rvc_v2");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn backend_path_rejected_for_cpu() {
+        let path = std::env::temp_dir();
+        let mut config = config(&path);
+        config.backend_path = Some(path);
+        assert!(config.validate().unwrap_err().contains("GPU"));
     }
 }
