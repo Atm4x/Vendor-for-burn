@@ -1,0 +1,82 @@
+name: RUAccent ONNX numerical reference diagnosis
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/silero-tts-cubecl-port-20261118
+    paths:
+      - .github/workflows/ruaccent-onnx-logits-diagnostics.yml
+
+permissions:
+  contents: read
+
+jobs:
+  reference:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install official Python ONNX Runtime and pinned model weights
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet 'onnxruntime==1.22.0' 'huggingface_hub[hf_xet]>=0.34,<1'
+          python - <<'PY'
+          import pathlib
+          from huggingface_hub import snapshot_download
+          snapshot_download('ruaccent/accentuator',
+              revision='b78ae5ea1e62beaf138bed1865cd8c3b0b5ca855',
+              local_dir='/tmp/ruaccent-model',
+              allow_patterns=['nn/nn_accent/model.onnx','nn/nn_omograph/tiny/model.onnx'])
+          assert pathlib.Path('/tmp/ruaccent-model/nn/nn_accent/model.onnx').is_file()
+          assert pathlib.Path('/tmp/ruaccent-model/nn/nn_omograph/tiny/model.onnx').is_file()
+          PY
+      - name: Diagnose golden logits from original inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ruaccent-evidence"
+          python - <<'PY'
+          import json, numpy as np, onnxruntime as ort, pathlib, os
+          corpus = [json.loads(x) for x in pathlib.Path('models/ruaccent/golden/tiny.jsonl').read_text().splitlines()]
+          accent_call = next(r['accent_nn_calls'][0] for r in corpus if r.get('accent_nn_calls'))
+          omograph_call = next(r['omograph_inputs'][0] for r in corpus if r.get('omograph_inputs'))
+          records = [
+              ('accent','/tmp/ruaccent-model/nn/nn_accent/model.onnx',accent_call),
+              ('omograph','/tmp/ruaccent-model/nn/nn_omograph/tiny/model.onnx',omograph_call)
+          ]
+          output = {'onnxruntime':ort.__version__,'numpy':np.__version__,'reference':'golden/tiny.jsonl',
+                    'model_revision':'b78ae5ea1e62beaf138bed1865cd8c3b0b5ca855','results':[]}
+          for name,path,call in records:
+              expected=np.asarray(call['logits'],dtype=np.float32)
+              for level in ('ORT_DISABLE_ALL','ORT_ENABLE_BASIC','ORT_ENABLE_EXTENDED','ORT_ENABLE_ALL'):
+                  for threads in (1,4):
+                      options=ort.SessionOptions()
+                      options.graph_optimization_level=getattr(ort.GraphOptimizationLevel,level)
+                      options.intra_op_num_threads=threads
+                      session=ort.InferenceSession(path,sess_options=options,providers=['CPUExecutionProvider'])
+                      feeds={k:np.asarray(call[k],dtype=np.int64) for k in ('input_ids','attention_mask','token_type_ids') if call.get(k) is not None}
+                      actual=session.run(['logits'],feeds)[0].astype(np.float32)
+                      assert actual.shape==expected.shape,(name,expected.shape,actual.shape)
+                      diff=np.abs(actual-expected)
+                      result={'model':name,'optimization':level,'threads':threads,
+                              'max_abs':float(diff.max()),'mean_abs':float(diff.mean()),
+                              'outside_1e-4':int((diff>1e-4).sum()),'total_values':int(diff.size),
+                              'argmax_same':bool(np.array_equal(actual.argmax(axis=-1),expected.argmax(axis=-1))),
+                              'shape':list(actual.shape)}
+                      output['results'].append(result)
+                      print(json.dumps(result))
+          pathlib.Path(os.environ['RUNNER_TEMP'],'ruaccent-evidence','python-onnx-logits.json').write_text(
+              json.dumps(output,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ruaccent-onnx-numerical-audit
+          path: ${{ runner.temp }}/ruaccent-evidence/
+          retention-days: 7
+          if-no-files-found: warn
