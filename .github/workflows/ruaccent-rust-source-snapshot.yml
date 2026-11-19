@@ -1,0 +1,45 @@
+name: RUAccent Rust source snapshot
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/silero-tts-cubecl-port-20261118
+    paths:
+      - .github/workflows/ruaccent-rust-source-snapshot.yml
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Export checked Git history and pinned upstream Rust source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p export upstream
+          git branch -f silero-ruaccent-base "$GITHUB_SHA"
+          git bundle create export/silero-source.bundle refs/heads/silero-ruaccent-base
+          git bundle verify export/silero-source.bundle
+          sha256sum export/silero-source.bundle > export/silero-source.bundle.sha256
+          printf '%s\n' "$GITHUB_SHA" > export/silero-head.sha
+          git clone --quiet https://github.com/alksef/ruaccent-rs.git upstream/ruaccent-rs
+          git -C upstream/ruaccent-rs checkout --quiet 4dd4b2f49d2250ee17448484d040180e042f9cee
+          test "$(git -C upstream/ruaccent-rs rev-parse HEAD)" = 4dd4b2f49d2250ee17448484d040180e042f9cee
+          printf '%s\n' 4dd4b2f49d2250ee17448484d040180e042f9cee > export/ruaccent-head.sha
+          tar -C upstream --exclude=.git -czf export/ruaccent-rs.tar.gz ruaccent-rs
+          sha256sum export/ruaccent-rs.tar.gz > export/ruaccent-rs.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: silero-ruaccent-rust-source
+          path: export/
+          compression-level: 0
+          retention-days: 2
+          if-no-files-found: error
