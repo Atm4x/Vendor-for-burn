@@ -219,6 +219,25 @@ impl CubeClFsqExecutor {
         batch: usize,
         frames: usize,
     ) -> Result<AudioTensor> {
+        let (result, _retained, channels) = self.decode_device(decoder, indices, batch, frames)?;
+        let count = checked_len(&[batch, channels, frames])?;
+        AudioTensor::new(
+            batch,
+            channels,
+            frames,
+            read_f32(&self.client, result, count)?,
+        )
+    }
+
+    /// Retains the FSQ output on the device for a subsequent decoder graph.
+    /// The returned handles own all dependencies until the first graph readback.
+    pub(crate) fn decode_device(
+        &self,
+        decoder: &GroupedResidualFsqDecoder,
+        indices: &[i32],
+        batch: usize,
+        frames: usize,
+    ) -> Result<(cubecl::server::Handle, Vec<cubecl::server::Handle>, usize)> {
         decoder.validate()?;
         let groups = decoder.projections.len();
         let dims = decoder.codebook.levels.len();
@@ -278,12 +297,12 @@ impl CubeClFsqExecutor {
             client,
             launch_geometry(output_len)?,
             CubeDim::new_1d(128),
-            unsafe { BufferArg::from_raw_parts(codes, input_len) },
-            unsafe { BufferArg::from_raw_parts(w, weights.len()) },
-            unsafe { BufferArg::from_raw_parts(b, bias.len()) },
-            unsafe { BufferArg::from_raw_parts(l, dims) },
-            unsafe { BufferArg::from_raw_parts(radix, dims) },
-            unsafe { BufferArg::from_raw_parts(scale, scales.len()) },
+            unsafe { BufferArg::from_raw_parts(codes.clone(), input_len) },
+            unsafe { BufferArg::from_raw_parts(w.clone(), weights.len()) },
+            unsafe { BufferArg::from_raw_parts(b.clone(), bias.len()) },
+            unsafe { BufferArg::from_raw_parts(l.clone(), dims) },
+            unsafe { BufferArg::from_raw_parts(radix.clone(), dims) },
+            unsafe { BufferArg::from_raw_parts(scale.clone(), scales.len()) },
             unsafe { BufferArg::from_raw_parts(output.clone(), output_len) },
             frames,
             groups,
@@ -291,12 +310,7 @@ impl CubeClFsqExecutor {
             width,
             dims,
         );
-        AudioTensor::new(
-            batch,
-            groups * width,
-            frames,
-            read_f32(client, output, output_len)?,
-        )
+        Ok((output, vec![codes, w, b, l, radix, scale], groups * width))
     }
 
     pub fn encode(
@@ -338,7 +352,10 @@ impl CubeClFsqExecutor {
         self.encode_device_prepared(&prepared, input, batch, channels, frames)
     }
 
-    pub(super) fn prepare_encode_device(&self, encoder: &GroupedResidualFsqEncoder) -> Result<CubeClPreparedFsqEncode> {
+    pub(super) fn prepare_encode_device(
+        &self,
+        encoder: &GroupedResidualFsqEncoder,
+    ) -> Result<CubeClPreparedFsqEncode> {
         let width = encoder.validate()?;
         let groups = encoder.projections.len();
         let dims = encoder.codebook.levels.len();
@@ -401,7 +418,10 @@ impl CubeClFsqExecutor {
             offset: client.create_from_slice(bytemuck::cast_slice(&offset)),
             shift: client.create_from_slice(bytemuck::cast_slice(&shift)),
             scales: client.create_from_slice(bytemuck::cast_slice(&scales)),
-            groups, dims, quantizers, width,
+            groups,
+            dims,
+            quantizers,
+            width,
         })
     }
 
@@ -415,8 +435,18 @@ impl CubeClFsqExecutor {
         frames: usize,
     ) -> Result<Vec<i32>> {
         let CubeClPreparedFsqEncode {
-            weights: w, bias: b, levels: l, bases: radix, half_width: half,
-            offset: off, shift: sh, scales: sc, groups, dims, quantizers, width
+            weights: w,
+            bias: b,
+            levels: l,
+            bases: radix,
+            half_width: half,
+            offset: off,
+            shift: sh,
+            scales: sc,
+            groups,
+            dims,
+            quantizers,
+            width,
         } = prepared;
         let (groups, dims, quantizers, width) = (*groups, *dims, *quantizers, *width);
         if channels != groups * width {

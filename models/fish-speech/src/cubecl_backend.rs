@@ -3,17 +3,20 @@
 
 mod convnext;
 mod fsq;
-mod logmel;
 mod generation;
 mod kernels;
+mod logmel;
 mod runtime;
 mod sampling;
 mod session;
 
-pub use convnext::{CubeClConvNextExecutor, CubeClPreparedFireflyEncoder};
+pub use convnext::{
+    CubeClConvNextExecutor, CubeClFireflyAcousticDecoder, CubeClFireflyCodec, CubeClFireflyDecoder,
+    CubeClPreparedFireflyEncoder,
+};
 pub use fsq::CubeClFsqExecutor;
-pub use logmel::CubeClLogMel;
 pub use generation::CubeClSemanticGenerator;
+pub use logmel::CubeClLogMel;
 pub use runtime::{CubeClGraph, CubeClGraphExecutor};
 pub use session::{
     CubeClDeviceTensor, CubeClModel, CubeClPreparedModel, CubeClRequest, CubeClRequestCursor,

@@ -1,10 +1,10 @@
 # Fish Speech 1.5 — CubeCL implementation tracker
 
-Baseline: `codex/fish-speech`; updated during CONT47 (2026-11-20).
+Baseline: `codex/fish-speech`; updated during CONT48 (2026-11-20).
 
 **Meaning:** This is a checklist of implementation/verification gates, not a benchmark, a statement of GPU operability, or the percentage of the original Fish Speech functional port. The checklist denominator is fixed at **26 gates**, allocated C01=4, C02=6, C03=4, C04=4, C05=4, C06=4. A gate for numeric parity stays open until the actual CubeCL runtime executes and its results are compared with a reference. Pure graph compilation does not satisfy that gate.
 
-**Overall: 19/26 = 73.1% implementation gates**. Real CubeCL CPU numerical execution: verified against `CpuIrInterpreter` for synthetic operator fixtures. CubeCL CUDA/Windows inference: unverified.
+**Overall: 21/26 = 80.8% implementation gates**. Real CubeCL CPU numerical execution: verified against `CpuIrInterpreter` for synthetic operator fixtures. CubeCL CUDA/Windows inference: unverified.
 
 ## C01 — bootstrap: 4/4
 
@@ -38,13 +38,13 @@ Baseline: `codex/fish-speech`; updated during CONT47 (2026-11-20).
 - [x] Device-resident token forwarding across Slow/Naive/Fast graphs, with request-owned sampled I32 handles, host-validated token shadows, sampled EOS readback, and controlled async scratch lifetime. Synthetic end-to-end generation passed for DualAR and Naive in greedy and stochastic top-p, including first-frame EOS and cancellation before the next frame on CubeCL CPU. Selected IDs still synchronize with CPU for session control and final trace; they are not uploaded back into the next graph. CUDA/Windows still unverified.
 - [ ] End-to-end CubeCL semantic generation + CPU Firefly, compared with the CPU trace.
 
-## C05 — CubeCL Firefly: 2/4
+## C05 — CubeCL Firefly: 4/4
 
-- [x] Native grouped residual FSQ encode/decode, executed on CubeCL CPU and compared against Core CPU and existing Python-source-formula golden fixtures. Multi-batch, multi-group, multiple quantizer counts, ignored `-1` codes, malformed indices, non-finite inputs and 27 geometry combinations tested. Public `CubeClFsqExecutor` exposes encode and decode; CPU is a reference, never a compute fallback. These APIs currently transfer inputs/outputs to the host and do not yet integrate with the Firefly ConvNeXt/HiFiGAN graph.
-- [x] Native ConvNeXt encoder and related transforms: CONT45/46 provided the complete 156-node reference encoder DAG from LogMel to resident FSQ. CONT47 replaces the CPU LogMel boundary with native CubeCL reflect padding, Hann window, 11-stage radix-2 FFT, magnitude, Slaney mel projection and logarithm. The PCM → CubeCL LogMel → full encoder → FSQ route now executes on CubeCL CPU with synthetic checkpoint and matches the Core-LogMel path's final codes. `CubeClPreparedFireflyEncoder` owns the Graph IR profile, immutable model-scoped GPU handles for all encoder checkpoint weights, reusable FFT/mel constants, and prepared FSQ parameter buffers; successive requests allocate only scratch/activations. CPU-reference parity has been measured for PCM lengths 1024/2048/3073, a graph encoder prefix, complete 156-node PCM→FSQ and repeated prepared calls. **Not yet verified:** real Fish Speech checkpoint parity, Windows CUDA or GPU throughput. Prepared profiles currently have fixed batch=1 and fixed LogMel frame count; FFT kernels are correctness-first rather than optimized. These limitations are covered by the final audio/parity gate and C06.
+- [x] Native grouped residual FSQ encode/decode, executed on CubeCL CPU and compared against Core CPU and existing Python-source-formula golden fixtures. Multi-batch, multi-group, multiple quantizer counts, ignored `-1` codes, malformed indices, non-finite inputs and 27 geometry combinations tested. Public `CubeClFsqExecutor` exposes encode and decode; CPU is a reference, never a compute fallback. The standalone APIs retain host readback; the integrated decoder now uses a device-resident FSQ output handle without a feature readback.
+- [x] Native ConvNeXt encoder and related transforms: CONT45/46 provided the complete 156-node reference encoder DAG from LogMel to resident FSQ. CONT47 replaces the CPU LogMel boundary with native CubeCL reflect padding, Hann window, 11-stage radix-2 FFT, magnitude, Slaney mel projection and logarithm. The PCM → CubeCL LogMel → full encoder → FSQ route now executes on CubeCL CPU with synthetic checkpoint and matches the Core-LogMel path's final codes. `CubeClPreparedFireflyEncoder` owns the Graph IR profile, immutable model-scoped GPU handles for all encoder checkpoint weights, reusable FFT/mel constants, and prepared FSQ parameter buffers; successive requests allocate only scratch/activations. CPU-reference parity has been measured for PCM lengths 1024/2048/3073, a graph encoder prefix, complete 156-node PCM→FSQ and repeated prepared calls. **Not yet verified:** real Fish Speech checkpoint parity, Windows CUDA or GPU throughput. Prepared profiles currently have fixed batch=1 and fixed LogMel frame count; FFT kernels are correctness-first rather than optimized. Real-checkpoint acceptance remains separate from synthetic CPU numerical parity and is tracked under C04/C06.
 
-- [ ] HiFiGAN / ConvTranspose audio decoder.
-- [ ] Full reference encoding, audio output and numerical parity.
+- [x] Native HiFiGAN / ConvTranspose audio decoder (CONT48). `CubeClFireflyDecoder` executes the canonical `FireflyGraph::waveform_decode` (240+ nodes), including grouped/depthwise Conv1d, gather-style ConvTranspose1d with PyTorch weight layout and exact temporal trimming, SiLU, residual additions, parallel-block averaging, LayerNorm/Linear/GELU/LayerScale, Tanh, both tail masks and FSQ decode directly into resident device features. All convolution weights and shapes are validated before dispatch. ConvTranspose numerical parity passed across 4 multi-batch/channel/stride shapes; a compact end-to-end FSQ→PCM graph and full HiFiGAN waveform graph separately passed actual CubeCL CPU vs independent `WeightedFireflyExecutor` numerical comparison on deterministic synthetic weights. Public `CubeClFireflyAcousticDecoder` implements Core `AcousticDecoder`, validates 8 acoustic codebooks, and exposes checkpoint loading.
+- [x] Full reference encoding → audio output numerical parity on CubeCL CPU (CONT48). `CubeClFireflyCodec` binds prepared native LogMel/156-node encoder/FSQ and full 240+ node decoder from one checkpoint contract. A heavy explicitly-run parity test covers PCM→CubeCL LogMel→encoder→FSQ→decoder→PCM, comparing both generated codes and waveform against independent Core `WeightedFireflyExecutor` with shared synthetic weights. The generated 4,096-sample waveform matched within `0.002 + 0.001 * |reference|` absolute tolerance; test PASS. **Not a claim of real Fish Speech checkpoint parity:** a real model checkpoint, fixed-seed Python/TensorRT trace and Windows CUDA device are not available in the Linux test environment, so those remain open C04/C06 acceptance gates. Encoder-to-decoder code indices are host-visible at the public API boundary by design; in-graph FSQ decode→HiFiGAN features remain device-resident.
 
 ## C06 — Windows NVIDIA acceptance: 0/4
 
@@ -52,6 +52,20 @@ Baseline: `codex/fish-speech`; updated during CONT47 (2026-11-20).
 - [ ] Checkpoint + audio trace parity versus Python / TensorRT with fixed seeds.
 - [ ] Load/first-token/generation/RTF throughput and memory benchmarks.
 - [ ] Profiler-driven kernel optimization and resource lifetime acceptance.
+
+## Verification ledger — CONT48
+
+| Check | Status |
+| --- | --- |
+| Native ConvTranspose1d vs `TransConv1dKernel::forward` | PASS: 4 batch/channel/stride geometries; CPU kernels |
+| Device FSQ decode → ConvTranspose → grouped/dilated Conv1d → residual + ParallelMean → Tanh/mask → PCM | PASS: Core `WeightedFireflyExecutor` comparison |
+| Complete 240+ node waveform decoder, full HiFiGAN from 8 FSQ indices | PASS: standalone ignored CPU runtime test executed; 1/1, synthetic weights |
+| Native full PCM → LogMel → encoder → FSQ → HiFiGAN → PCM versus Core CPU | PASS: standalone ignored runtime test executed; 1/1, 4096 waveform samples, synthetic weights |
+| Invalid codebook counts/indices/checkpoint weight shapes | PASS: rejected |
+| CubeCL CPU full library | PASS: 110 passed, 8 ignored; two new heavy tests executed separately and passed |
+| `cubecl-backend` without `cubecl-cpu` | PASS: 72 passed, 2 ignored |
+| Default library / Core library | PASS: 58 passed, 2 ignored / 208 passed, 2 ignored |
+| Original checkpoint/Python audio parity; Windows RTX CUDA | NOT VERIFIED (C04/C06) |
 
 ## Verification ledger — CONT47
 

@@ -34,7 +34,9 @@ fn grid(count: usize) -> Result<CubeCount> {
     ))
 }
 
+mod decoder;
 mod kernels;
+pub use decoder::{CubeClFireflyAcousticDecoder, CubeClFireflyCodec, CubeClFireflyDecoder};
 
 use kernels::*;
 
@@ -125,10 +127,15 @@ impl CubeClConvNextExecutor {
             fish_conv_padding(frames, conv.kernel_size, conv.stride, conv.dilation)?;
         let output_len = extent(&[batch, conv.out_channels, out_frames])?;
         let client = &self.client;
-        let bias = conv.bias.clone().unwrap_or_else(|| vec![0.0; conv.out_channels]);
+        let bias = conv
+            .bias
+            .clone()
+            .unwrap_or_else(|| vec![0.0; conv.out_channels]);
         let (weights, biases) = device_params.unwrap_or_else(|| {
-            (client.create_from_slice(bytemuck::cast_slice(&conv.weights)),
-             client.create_from_slice(bytemuck::cast_slice(&bias)))
+            (
+                client.create_from_slice(bytemuck::cast_slice(&conv.weights)),
+                client.create_from_slice(bytemuck::cast_slice(&bias)),
+            )
         });
         let output = client.empty(output_len * 4);
         retained.extend([weights.clone(), biases.clone(), output.clone()]);
