@@ -1,0 +1,71 @@
+name: RUAccent pinned tiny offline model pack
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/silero-tts-cubecl-port-20261118
+    paths:
+      - .github/workflows/ruaccent-tiny-offline-modelpack.yml
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      HF_REVISION: b78ae5ea1e62beaf138bed1865cd8c3b0b5ca855
+    steps:
+      - name: Download pinned licensed tiny model and ONNX native runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet 'huggingface_hub[hf_xet]>=0.34,<1'
+          mkdir -p "$RUNNER_TEMP/ruaccent-pack/model" "$RUNNER_TEMP/ruaccent-pack/ort"
+          python3 - <<'PY'
+          import json, pathlib, os
+          from huggingface_hub import snapshot_download
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'ruaccent-pack'
+          model=root/'model'
+          snapshot_download('ruaccent/accentuator',revision=os.environ['HF_REVISION'],
+            local_dir=str(model),allow_patterns=[
+              'dictionary/*.json.gz','nn/nn_accent/*',
+              'nn/nn_stress_usage_predictor/*','nn/nn_yo_homograph_resolver/*',
+              'nn/nn_omograph/tiny/*'])
+          required=['dictionary/accents.json.gz','dictionary/omographs.json.gz',
+            'dictionary/yo_words.json.gz','dictionary/yo_homographs.json.gz',
+            'nn/nn_accent/model.onnx','nn/nn_accent/config.json','nn/nn_accent/vocab.txt',
+            'nn/nn_stress_usage_predictor/model.onnx',
+            'nn/nn_stress_usage_predictor/tokenizer.json',
+            'nn/nn_yo_homograph_resolver/model.onnx',
+            'nn/nn_yo_homograph_resolver/tokenizer.json',
+            'nn/nn_omograph/tiny/model.onnx',
+            'nn/nn_omograph/tiny/tokenizer.json']
+          missing=[x for x in required if not (model/x).is_file()]
+          if missing: raise RuntimeError(f'Incomplete tiny model: {missing}')
+          (root/'MODEL_PROVENANCE.json').write_text(json.dumps({
+            'source':'ruaccent/accentuator','revision':os.environ['HF_REVISION'],
+            'license':'MIT','ort_version':'1.22.0','files':{
+              x:(model/x).stat().st_size for x in required}},indent=2))
+          PY
+          curl -fL --retry 3 \
+            https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.22.0/microsoft.ml.onnxruntime.1.22.0.nupkg \
+            -o "$RUNNER_TEMP/ort.nupkg"
+          unzip -q "$RUNNER_TEMP/ort.nupkg" -d "$RUNNER_TEMP/ort-nuget"
+          cp "$RUNNER_TEMP/ort-nuget/runtimes/linux-x64/native/"libonnxruntime.so* \
+            "$RUNNER_TEMP/ruaccent-pack/ort/"
+          ls -lh "$RUNNER_TEMP/ruaccent-pack/ort/"
+          cd "$RUNNER_TEMP"
+          tar -czf "$GITHUB_WORKSPACE/ruaccent-tiny-runtime.tar.gz" ruaccent-pack
+          sha256sum "$GITHUB_WORKSPACE/ruaccent-tiny-runtime.tar.gz" > "$GITHUB_WORKSPACE/ruaccent-tiny-runtime.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ruaccent-tiny-linux-runtime-pinned
+          path: |
+            ruaccent-tiny-runtime.tar.gz
+            ruaccent-tiny-runtime.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
