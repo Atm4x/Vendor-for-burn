@@ -7,8 +7,10 @@ use fish_speech_core::{
     config::{FishModelConfig, ModelKind},
     conversation::EncodedConversation,
     error::{FishError, Result},
+    graph::Stage,
     graph_ir::{Graph, ScalarType, TensorType},
     sampling::{SamplingParams, SessionRng, logits_to_probs},
+    shape_profiles::ArProfileGroup,
     transformer_ir::TransformerIrFactory,
     trtx_blueprint::{Binding, TrtBlueprint},
 };
@@ -18,6 +20,10 @@ use crate::{
     cuda_stream::CudaBuffer,
     cuda_trtx::{CachedArDispatchConfig, WeightedCudaArSession, with_resident_cuda_ar_session},
     device_memory::DeviceMemoryBudget,
+    dynamic_decode::{
+        KV_MASK, ROPE_COS, ROPE_SIN, decode_control_bytes, parameterize_slow_decode,
+        positioned_slow_decode,
+    },
     trtx_cache::EngineRegistry,
     weights::LoadedWeights,
 };
@@ -44,6 +50,7 @@ impl PreparedArGraph {
 pub struct PreparedDualArPlans {
     slow_prefill: PreparedArGraph,
     slow_decode: BTreeMap<usize, PreparedArGraph>,
+    slow_decode_profiles: ArProfileGroup,
     fast_decode: Vec<PreparedArGraph>,
     prompt_len: usize,
     max_new_tokens: usize,
@@ -69,13 +76,19 @@ impl PreparedDualArPlans {
             ));
         }
         let slow_prefill = PreparedArGraph::from_graph(factory.slow_prefill(prompt_len)?)?;
+        let slow_decode_profiles = ArProfileGroup::new(Stage::SlowDecode, config.max_seq_len, 32)?;
         let mut slow_decode = BTreeMap::new();
-        for generated in 1..max_new_tokens {
-            let active_len = prompt_len + generated;
-            slow_decode.insert(
-                active_len,
-                PreparedArGraph::from_graph(factory.slow_decode(active_len)?)?,
-            );
+        if max_new_tokens > 1 {
+            let first_active = prompt_len + 1;
+            let last_active = prompt_len + max_new_tokens - 1;
+            for bucket in &slow_decode_profiles.buckets {
+                if bucket.max < first_active || bucket.min > last_active {
+                    continue;
+                }
+                let mut profile = PreparedArGraph::from_graph(factory.slow_decode(bucket.max)?)?;
+                parameterize_slow_decode(&mut profile.plan, bucket.max)?;
+                slow_decode.insert(bucket.max, profile);
+            }
         }
         let fast_decode = (0..config.num_codebooks)
             .map(|step| PreparedArGraph::from_graph(factory.fast_decode(step)?))
@@ -84,6 +97,7 @@ impl PreparedDualArPlans {
             config: config.clone(),
             slow_prefill,
             slow_decode,
+            slow_decode_profiles,
             fast_decode,
             prompt_len,
             max_new_tokens,
@@ -138,6 +152,7 @@ where
         &mut self,
         graph: &PreparedArGraph,
         tokens: &[u32],
+        decode_position: Option<(usize, usize)>,
     ) -> Result<SlowArForward<CudaBuffer>> {
         let input = self.tokens(&graph.plan, "tokens", tokens)?;
         let mut runtime = BTreeMap::new();
@@ -146,6 +161,27 @@ where
             "semantic_membership_lut".to_owned(),
             self.semantic_lut.clone(),
         );
+        if let Some((active_len, bucket_end)) = decode_position {
+            let (index, _) = self.plans.slow_decode_profiles.locate(1, active_len)?;
+            if self.plans.slow_decode_profiles.buckets[index].max != bucket_end {
+                return Err(FishError::InvalidShape(
+                    "dynamic Slow decode bucket mismatch",
+                ));
+            }
+            let (cos, sin, mask) = decode_control_bytes(
+                active_len,
+                bucket_end,
+                self.plans.config.slow.head_dim(),
+                self.plans.config.rope_base,
+            )?;
+            for (name, data) in [(ROPE_COS, cos), (ROPE_SIN, sin), (KV_MASK, mask)] {
+                let ty = expected_runtime_input(&graph.plan, name)?;
+                runtime.insert(
+                    name.to_owned(),
+                    self.session.upload_runtime_input(&ty, &data)?,
+                );
+            }
+        }
         let result = self.session.enqueue(&graph.plan, &runtime)?;
         let context = named_output(graph, &result, "fast_context")?;
         let logits = self.read_logits(graph, &result, "logits")?;
@@ -214,7 +250,7 @@ where
             .flatten()
             .copied()
             .collect::<Vec<_>>();
-        self.slow(&self.plans.slow_prefill, &tokens)
+        self.slow(&self.plans.slow_prefill, &tokens, None)
     }
 
     fn slow_decode(
@@ -222,14 +258,20 @@ where
         previous_column: &[u32],
         active_len: usize,
     ) -> Result<SlowArForward<CudaBuffer>> {
-        let plan = self
+        let (index, _) = self.plans.slow_decode_profiles.locate(1, active_len)?;
+        let bucket_end = self.plans.slow_decode_profiles.buckets[index].max;
+        let template = self
             .plans
             .slow_decode
-            .get(&active_len)
+            .get(&bucket_end)
             .ok_or(FishError::InvalidShape(
-                "CUDA Slow decode position was not prepared",
+                "CUDA Slow decode bucket was not prepared",
             ))?;
-        self.slow(plan, previous_column)
+        let plan = PreparedArGraph {
+            plan: positioned_slow_decode(&template.plan, active_len, bucket_end)?,
+            outputs: template.outputs.clone(),
+        };
+        self.slow(&plan, previous_column, Some((active_len, bucket_end)))
     }
 
     fn reset_fast(&mut self) -> Result<()> {
@@ -419,16 +461,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn decode_bucket_edges_are_contiguous_and_use_constant_networks_within_each_bucket() {
+        let config = FishModelConfig::synthetic_dual_ar_fixture();
+        let plans = PreparedDualArPlans::new(&config, 4, 130).unwrap();
+        let mut unique_profiles = std::collections::BTreeSet::new();
+        for active_len in 5..134 {
+            let (index, _) = plans.slow_decode_profiles.locate(1, active_len).unwrap();
+            let bucket_end = plans.slow_decode_profiles.buckets[index].max;
+            let template = plans.slow_decode.get(&bucket_end).unwrap();
+            let positioned =
+                positioned_slow_decode(&template.plan, active_len, bucket_end).unwrap();
+            assert_eq!(positioned.network_count(), template.plan.network_count());
+            unique_profiles.insert(bucket_end);
+        }
+        assert_eq!(unique_profiles, [32, 64, 128, 256].into());
+        assert_eq!(unique_profiles.len(), plans.slow_decode.len());
+        assert_eq!(plans.slow_decode_profiles.locate(1, 32).unwrap().0, 0);
+        assert_eq!(plans.slow_decode_profiles.locate(1, 33).unwrap().0, 1);
+        assert_eq!(plans.slow_decode_profiles.locate(1, 65).unwrap().0, 2);
+    }
+
+    #[test]
     fn prepared_plans_cover_bounded_source_prefill_decode_and_fast_loop() {
         let config = FishModelConfig::synthetic_dual_ar_fixture();
         let plans = PreparedDualArPlans::new(&config, 4, 3).unwrap();
-        assert_eq!(
-            plans.slow_decode.keys().copied().collect::<Vec<_>>(),
-            [5, 6]
-        );
+        assert_eq!(plans.slow_decode.keys().copied().collect::<Vec<_>>(), [32]);
         assert_eq!(plans.fast_decode.len(), config.num_codebooks);
         assert_eq!(plans.config, config);
-        assert_eq!(plans.ar_plans().len(), 3 + config.num_codebooks);
+        assert_eq!(plans.ar_plans().len(), 2 + config.num_codebooks);
+        assert_eq!(plans.slow_decode_profiles.locate(1, 5).unwrap().0, 0);
         assert_eq!(
             output_type(&plans.slow_prefill, "logits").unwrap().shape,
             [1, 1, config.vocab_size]
@@ -453,6 +514,9 @@ mod tests {
         );
         assert!(PreparedDualArPlans::new(&config, 4, 0).is_err());
         assert!(PreparedDualArPlans::new(&config, 4, config.max_seq_len).is_err());
+        let longer = PreparedDualArPlans::new(&config, 4, config.max_seq_len - 4).unwrap();
+        assert!(longer.slow_decode.len() < 16);
+        assert!(longer.slow_decode.len() < config.max_seq_len - 4);
         let prompt = EncodedConversation {
             channels: vec![vec![1; 4]; config.num_codebooks + 1],
             vq_positions: vec![false; 4],

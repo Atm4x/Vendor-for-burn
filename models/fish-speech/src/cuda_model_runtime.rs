@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use fish_speech_core::{
     config::{FishModelConfig, ModelKind},
@@ -42,7 +46,7 @@ impl CudaRuntimeOptions {
         if self.engine_cache_dir.as_os_str().is_empty()
             || self.workspace_bytes == 0
             || self.device_memory_limit_bytes == 0
-            || !(1..=64).contains(&self.max_profiled_new_tokens)
+            || !(1..=32768).contains(&self.max_profiled_new_tokens)
             || self.engine_cache_per_engine_bytes == 0
             || self.engine_cache_resident_bytes < self.engine_cache_per_engine_bytes
             || [
@@ -63,6 +67,36 @@ impl CudaRuntimeOptions {
     }
 }
 
+const PREPARED_PLAN_CACHE_CAPACITY: usize = 8;
+
+#[derive(Default)]
+struct PreparedPlanCache {
+    entries: VecDeque<((usize, usize), Arc<PreparedDualArPlans>)>,
+}
+
+impl PreparedPlanCache {
+    fn get_or_prepare(
+        &mut self,
+        prompt_len: usize,
+        max_new_tokens: usize,
+        build: impl FnOnce() -> FishResult<PreparedDualArPlans>,
+    ) -> FishResult<Arc<PreparedDualArPlans>> {
+        let key = (prompt_len, max_new_tokens);
+        if let Some(index) = self.entries.iter().position(|(stored, _)| *stored == key) {
+            let (_, cached) = self.entries.remove(index).expect("existing cache entry");
+            let shared = Arc::clone(&cached);
+            self.entries.push_back((key, cached));
+            return Ok(shared);
+        }
+        let built = Arc::new(build()?);
+        if self.entries.len() >= PREPARED_PLAN_CACHE_CAPACITY {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((key, Arc::clone(&built)));
+        Ok(built)
+    }
+}
+
 pub struct CudaSemanticGenerator {
     config: FishModelConfig,
     checkpoint: LoadedWeights,
@@ -74,6 +108,7 @@ pub struct CudaSemanticGenerator {
     eos_id: u32,
     seed: u64,
     chunk_index: u64,
+    prepared: PreparedPlanCache,
 }
 
 impl CudaSemanticGenerator {
@@ -134,6 +169,7 @@ impl CudaSemanticGenerator {
             eos_id: special.im_end as u32,
             seed,
             chunk_index: 0,
+            prepared: PreparedPlanCache::default(),
         })
     }
 
@@ -144,7 +180,7 @@ impl CudaSemanticGenerator {
     ) -> FishResult<PreparedDualArPlans> {
         if max_new_tokens > self.options.max_profiled_new_tokens {
             return Err(FishError::InvalidConfig(
-                "CUDA request exceeds configured profiled decode limit",
+                "CUDA request exceeds configured decode token limit",
             ));
         }
         let plans = PreparedDualArPlans::new(&self.config, prompt.length(), max_new_tokens)?;
@@ -154,6 +190,26 @@ impl CudaSemanticGenerator {
 
     fn validate_plan_weights(&self, plans: &PreparedDualArPlans) -> FishResult<()> {
         validate_plan_weight_manifest(plans, &self.checkpoint.manifest().tensors)
+    }
+
+    fn cached_request(
+        &mut self,
+        prompt: &EncodedConversation,
+        max_new_tokens: usize,
+    ) -> FishResult<Arc<PreparedDualArPlans>> {
+        if max_new_tokens > self.options.max_profiled_new_tokens {
+            return Err(FishError::InvalidConfig(
+                "CUDA request exceeds configured decode token limit",
+            ));
+        }
+        let config = &self.config;
+        let weights = &self.checkpoint.manifest().tensors;
+        self.prepared
+            .get_or_prepare(prompt.length(), max_new_tokens, || {
+                let plans = PreparedDualArPlans::new(config, prompt.length(), max_new_tokens)?;
+                validate_plan_weight_manifest(&plans, weights)?;
+                Ok(plans)
+            })
     }
 }
 
@@ -204,7 +260,7 @@ impl SemanticGenerator for CudaSemanticGenerator {
             return Err(FishError::InvalidTransition("synthesis cancelled"));
         }
         sampling.validate()?;
-        let plans = self.prepare_request(prompt, max_new_tokens)?;
+        let plans = self.cached_request(prompt, max_new_tokens)?;
         let logger = Logger::stderr()
             .map_err(|_| FishError::InvalidTransition("TensorRT logger initialization failed"))?;
         let config = CachedArDispatchConfig {
@@ -213,7 +269,7 @@ impl SemanticGenerator for CudaSemanticGenerator {
             tensorrt_version: &self.options.tensorrt_version,
             driver_version: &self.options.driver_version,
             precision: &self.options.precision,
-            shape_profile: "source-1.5-auto-bounded",
+            shape_profile: "source-1.5-bucketed-slow-v1",
             build_flags: &self.options.build_flags,
             workspace_bytes: self.options.workspace_bytes,
         };
@@ -223,7 +279,7 @@ impl SemanticGenerator for CudaSemanticGenerator {
             config,
             &self.config,
             prompt,
-            &plans,
+            plans.as_ref(),
             &self.checkpoint,
             self.options.device_ordinal,
             self.memory.clone(),
@@ -296,6 +352,38 @@ mod tests {
     }
 
     #[test]
+    fn prepared_plan_cache_reuses_same_request_and_bounds_distinct_geometries() {
+        let config = FishModelConfig::synthetic_dual_ar_fixture();
+        let mut cache = PreparedPlanCache::default();
+        let first = cache
+            .get_or_prepare(4, 2, || PreparedDualArPlans::new(&config, 4, 2))
+            .unwrap();
+        let same = cache
+            .get_or_prepare(4, 2, || panic!("prepared geometry rebuilt"))
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &same));
+        for prompt_len in 5..5 + PREPARED_PLAN_CACHE_CAPACITY {
+            cache
+                .get_or_prepare(prompt_len, 2, || {
+                    PreparedDualArPlans::new(&config, prompt_len, 2)
+                })
+                .unwrap();
+        }
+        assert_eq!(cache.entries.len(), PREPARED_PLAN_CACHE_CAPACITY);
+        assert!(!cache.entries.iter().any(|(key, _)| *key == (4, 2)));
+        assert!(
+            cache
+                .get_or_prepare(config.max_seq_len, 2, || PreparedDualArPlans::new(
+                    &config,
+                    config.max_seq_len,
+                    2
+                ))
+                .is_err()
+        );
+        assert_eq!(cache.entries.len(), PREPARED_PLAN_CACHE_CAPACITY);
+    }
+
+    #[test]
     fn runtime_settings_validate_without_initializing_a_gpu() {
         assert!(settings().validate().is_ok());
         let mut bad = settings();
@@ -308,7 +396,7 @@ mod tests {
         bad.gpu_identity.clear();
         assert!(bad.validate().is_err());
         let mut bad = settings();
-        bad.max_profiled_new_tokens = 65;
+        bad.max_profiled_new_tokens = 32769;
         assert!(bad.validate().is_err());
     }
 

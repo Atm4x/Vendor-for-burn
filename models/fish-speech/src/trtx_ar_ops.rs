@@ -193,6 +193,59 @@ pub(crate) fn lower_rotary_interleaved<'network>(
     Ok(output)
 }
 
+pub(crate) fn lower_rotary_coefficients<'network>(
+    network: &mut NetworkDefinition<'network>,
+    input: &Tensor<'network>,
+    cosine: &Tensor<'network>,
+    signed_sine: &Tensor<'network>,
+) -> Result<Tensor<'network>, LoweringError> {
+    let dims = require_dimensions(network, input, 4, DataType::kFLOAT)?;
+    let cos = require_dimensions(network, cosine, 4, DataType::kFLOAT)?;
+    let sin = require_dimensions(network, signed_sine, 4, DataType::kFLOAT)?;
+    if dims[2] != 1 || dims[3] <= 0 || dims[3] % 2 != 0 || cos != [1, 1, 1, dims[3]] || sin != cos {
+        return Err(LoweringError::InvalidBlueprint(
+            "runtime RoPE requires FP32 [B,H,1,D] and matching [1,1,1,D] coefficients".into(),
+        ));
+    }
+    let partners = (0..dims[3])
+        .map(|i| if i % 2 == 0 { i + 1 } else { i - 1 })
+        .map(|i| {
+            i32::try_from(i)
+                .map_err(|_| LoweringError::UnsupportedType("RoPE head width exceeds i32".into()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let indices = network
+        .add_constant_owned(
+            &[dims[3]],
+            partners.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            DataType::kINT32,
+            None,
+        )
+        .map_err(trt)?
+        .output(network, 0)
+        .map_err(trt)?;
+    let swapped = network
+        .add_gather(input, &indices, 3)
+        .map_err(trt)?
+        .output(network, 0)
+        .map_err(trt)?;
+    let real = network
+        .add_elementwise(input, cosine, ElementWiseOperation::kPROD)
+        .map_err(trt)?
+        .output(network, 0)
+        .map_err(trt)?;
+    let imaginary = network
+        .add_elementwise(&swapped, signed_sine, ElementWiseOperation::kPROD)
+        .map_err(trt)?
+        .output(network, 0)
+        .map_err(trt)?;
+    network
+        .add_elementwise(&real, &imaginary, ElementWiseOperation::kSUM)
+        .map_err(trt)?
+        .output(network, 0)
+        .map_err(trt)
+}
+
 pub(crate) fn lower_fish_embedding<'network>(
     network: &mut NetworkDefinition<'network>,
     tokens: &Tensor<'network>,
@@ -322,6 +375,49 @@ pub(crate) fn lower_gqa_attention<'network>(
     query_heads: usize,
     kv_heads: usize,
 ) -> Result<Tensor<'network>, LoweringError> {
+    lower_gqa_attention_impl(
+        network,
+        query,
+        keys,
+        values,
+        Some(position),
+        None,
+        query_heads,
+        kv_heads,
+    )
+}
+
+pub(crate) fn lower_gqa_attention_masked<'network>(
+    network: &mut NetworkDefinition<'network>,
+    query: &Tensor<'network>,
+    keys: &Tensor<'network>,
+    values: &Tensor<'network>,
+    prefix_mask: &Tensor<'network>,
+    query_heads: usize,
+    kv_heads: usize,
+) -> Result<Tensor<'network>, LoweringError> {
+    lower_gqa_attention_impl(
+        network,
+        query,
+        keys,
+        values,
+        None,
+        Some(prefix_mask),
+        query_heads,
+        kv_heads,
+    )
+}
+
+fn lower_gqa_attention_impl<'network>(
+    network: &mut NetworkDefinition<'network>,
+    query: &Tensor<'network>,
+    keys: &Tensor<'network>,
+    values: &Tensor<'network>,
+    position: Option<usize>,
+    prefix_mask: Option<&Tensor<'network>>,
+    query_heads: usize,
+    kv_heads: usize,
+) -> Result<Tensor<'network>, LoweringError> {
     let q = require_dimensions(network, query, 4, DataType::kFLOAT)?;
     let k = require_dimensions(network, keys, 4, DataType::kBF16)?;
     let v = require_dimensions(network, values, 4, DataType::kBF16)?;
@@ -333,11 +429,20 @@ pub(crate) fn lower_gqa_attention<'network>(
         || query_heads % kv_heads != 0
         || q[1] != query_heads as i64
         || k[1] != kv_heads as i64
-        || position.checked_add(q[2] as usize) != Some(k[2] as usize)
+        || position.is_some_and(|start| start.checked_add(q[2] as usize) != Some(k[2] as usize))
+        || (prefix_mask.is_some() && q[2] != 1)
     {
         return Err(LoweringError::InvalidBlueprint(
             "GQA expects right-aligned FP32 Q and BF16 active-prefix K/V".into(),
         ));
+    }
+    if let Some(mask) = prefix_mask {
+        let dims = require_dimensions(network, mask, 5, DataType::kFLOAT)?;
+        if dims != [1, 1, 1, 1, k[2]] {
+            return Err(LoweringError::InvalidBlueprint(
+                "dynamic GQA prefix mask shape mismatch".into(),
+            ));
+        }
     }
     let shape = GqaShape {
         batch: q[0] as usize,
@@ -346,10 +451,16 @@ pub(crate) fn lower_gqa_attention<'network>(
         query_len: q[2] as usize,
         kv_len: k[2] as usize,
         head_dim: q[3] as usize,
-        first_position: position,
+        first_position: position.unwrap_or(k[2] as usize - 1),
     };
-    let mask = right_aligned_causal_bias(shape)
-        .map_err(|e| LoweringError::InvalidBlueprint(format!("invalid GQA mask: {e:?}")))?;
+    let mask = if prefix_mask.is_none() {
+        Some(
+            right_aligned_causal_bias(shape)
+                .map_err(|e| LoweringError::InvalidBlueprint(format!("invalid GQA mask: {e:?}")))?,
+        )
+    } else {
+        None
+    };
     let groups = (query_heads / kv_heads) as i64;
     let reshape = |network: &mut NetworkDefinition<'network>,
                    input: &Tensor<'network>,
@@ -398,13 +509,24 @@ pub(crate) fn lower_gqa_attention<'network>(
         .map_err(trt)?
         .output(network, 0)
         .map_err(trt)?;
-    let masked = if q[2] == 1 {
+    let masked = if let Some(bias) = prefix_mask {
+        network
+            .add_elementwise(&scaled, bias, ElementWiseOperation::kSUM)
+            .map_err(trt)?
+            .output(network, 0)
+            .map_err(trt)?
+    } else if q[2] == 1 {
         scaled
     } else {
         let bias = network
             .add_constant_owned(
                 &[1, 1, 1, q[2], k[2]],
-                mask.into_iter().flat_map(|val| val.to_le_bytes()).collect(),
+                mask.ok_or_else(|| {
+                    LoweringError::InvalidBlueprint("causal GQA bias absent".into())
+                })?
+                .into_iter()
+                .flat_map(|val| val.to_le_bytes())
+                .collect(),
                 DataType::kFLOAT,
                 None,
             )

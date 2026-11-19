@@ -232,6 +232,14 @@ pub fn lower_blueprint(
             } => crate::trtx_ar_ops::lower_gqa_attention(
                 network, args[0], args[1], args[2], position, q_heads, kv_heads,
             )?,
+            TrtPrimitive::RotaryCoefficients => {
+                crate::trtx_ar_ops::lower_rotary_coefficients(network, args[0], args[1], args[2])?
+            }
+            TrtPrimitive::GqaAttentionMasked { q_heads, kv_heads } => {
+                crate::trtx_ar_ops::lower_gqa_attention_masked(
+                    network, args[0], args[1], args[2], args[3], q_heads, kv_heads,
+                )?
+            }
             TrtPrimitive::KvActivePrefix { active_len } => {
                 let dims = args[0].dimensions(network).map_err(trt)?;
                 if dims.len() != 4

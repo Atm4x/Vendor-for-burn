@@ -51,6 +51,11 @@ pub enum TrtPrimitive {
         position: usize,
         base_bits: u32,
     },
+    RotaryCoefficients,
+    GqaAttentionMasked {
+        q_heads: usize,
+        kv_heads: usize,
+    },
     KvActivePrefix {
         active_len: usize,
     },
@@ -464,6 +469,87 @@ impl TrtBlueprint {
                                 },
                             )?
                         }
+                        TrtPrimitive::GqaAttentionMasked { q_heads, kv_heads } => {
+                            let q_shape = &args[0].0.shape;
+                            let cache_shape = &args[1].0.shape;
+                            let mask = read(3)?;
+                            if q_shape[2] != 1
+                                || cache_shape.len() != 4
+                                || q_shape[0] != cache_shape[0]
+                                || args[2].0.shape != *cache_shape
+                                || mask.len() != cache_shape[2]
+                                || args[3].0.shape != [1, 1, 1, 1, cache_shape[2]]
+                            {
+                                return Err(FishError::InvalidShape(
+                                    "dynamic GQA CPU reference shapes differ",
+                                ));
+                            }
+                            let active_len = mask.iter().take_while(|&&value| value == 0.0).count();
+                            if active_len == 0
+                                || mask[active_len..].iter().any(|&value| value != -1.0e9)
+                            {
+                                return Err(FishError::InvalidShape(
+                                    "dynamic GQA CPU prefix mask invalid",
+                                ));
+                            }
+                            let (batch, heads, capacity, dim) = (
+                                cache_shape[0],
+                                cache_shape[1],
+                                cache_shape[2],
+                                cache_shape[3],
+                            );
+                            let prefix = |data: &[f32]| {
+                                let mut selected =
+                                    Vec::with_capacity(batch * heads * active_len * dim);
+                                for row in data.chunks_exact(capacity * dim) {
+                                    selected.extend_from_slice(&row[..active_len * dim]);
+                                }
+                                selected
+                            };
+                            causal_gqa_cpu(
+                                read(0)?,
+                                &prefix(read(1)?),
+                                &prefix(read(2)?),
+                                GqaShape {
+                                    batch,
+                                    query_heads: q_heads,
+                                    kv_heads,
+                                    query_len: 1,
+                                    kv_len: active_len,
+                                    head_dim: dim,
+                                    first_position: active_len - 1,
+                                },
+                            )?
+                        }
+                        TrtPrimitive::RotaryCoefficients => {
+                            let input = read(0)?;
+                            let cos = read(1)?;
+                            let sin = read(2)?;
+                            let shape = &args[0].0.shape;
+                            let dim = *shape.get(3).ok_or(FishError::InvalidShape(
+                                "dynamic RoPE head dimension absent",
+                            ))?;
+                            if shape[2] != 1
+                                || dim == 0
+                                || dim % 2 != 0
+                                || cos.len() != dim
+                                || sin.len() != dim
+                            {
+                                return Err(FishError::InvalidShape(
+                                    "dynamic RoPE CPU coefficients mismatch",
+                                ));
+                            }
+                            let mut output = Vec::with_capacity(input.len());
+                            for row in input.chunks_exact(dim) {
+                                for offset in 0..dim {
+                                    let partner = offset ^ 1;
+                                    output.push(
+                                        row[offset] * cos[offset] + row[partner] * sin[offset],
+                                    );
+                                }
+                            }
+                            output
+                        }
                         TrtPrimitive::KvActivePrefix { active_len } => {
                             let input = read(0)?;
                             let shape = &args[0].0.shape;
@@ -833,5 +919,120 @@ mod tests {
             .any(|step| step.primitive == TrtPrimitive::EmbeddingGather));
         assert!(first.require_no_deferred_ops().is_err());
         assert!(later.require_no_deferred_ops().is_err());
+    }
+}
+
+#[cfg(test)]
+mod dynamic_decode_reference_tests {
+    use super::*;
+    use crate::{
+        ar_rotary::{fish_rope_coefficients, rotate_bhtd},
+        graph_ir::{Layout, ScalarType},
+    };
+
+    fn f32_input(name: &str, id: usize, shape: &[usize]) -> TrtStep {
+        TrtStep {
+            name: name.into(),
+            primitive: TrtPrimitive::Input,
+            arguments: vec![],
+            result: Binding::Temp(id),
+            output_type: TensorType::new(shape.to_vec(), ScalarType::F32, Layout::Plain),
+        }
+    }
+
+    #[test]
+    fn provided_rotary_coefficients_match_static_fish_rope() {
+        let coeff = fish_rope_coefficients(17, 1, 4, 10000.0).unwrap();
+        let mut blueprint = TrtBlueprint {
+            steps: vec![
+                f32_input("q", 0, &[1, 2, 1, 4]),
+                f32_input("cos", 1, &[1, 1, 1, 4]),
+                f32_input("sin", 2, &[1, 1, 1, 4]),
+            ],
+            outputs: vec![Binding::Temp(3)],
+            deferred: BTreeMap::new(),
+            weight_count: 0,
+        };
+        blueprint.steps.push(TrtStep {
+            name: "rotated".into(),
+            primitive: TrtPrimitive::RotaryCoefficients,
+            arguments: vec![Binding::Temp(0), Binding::Temp(1), Binding::Temp(2)],
+            result: Binding::Temp(3),
+            output_type: TensorType::new(vec![1, 2, 1, 4], ScalarType::F32, Layout::Plain),
+        });
+        let q = vec![0.1, 0.2, 0.3, 0.4, -0.5, -0.1, 0.6, 0.2];
+        let bindings = BTreeMap::from([
+            ("q".to_owned(), TensorData::F32(q.clone())),
+            ("cos".to_owned(), TensorData::F32(coeff.cosine)),
+            ("sin".to_owned(), TensorData::F32(coeff.signed_sine)),
+        ]);
+        let out = blueprint.execute_cpu_reference(&bindings).unwrap();
+        let expected = rotate_bhtd(&q, 1, 2, 17, 1, 4, 10000.0).unwrap();
+        let TensorData::F32(actual) = &out["rotated"] else {
+            panic!("expected FP32")
+        };
+        assert_eq!(*actual, expected);
+    }
+
+    #[test]
+    fn masked_bucket_attention_equals_exact_active_prefix() {
+        let mut blueprint = TrtBlueprint {
+            steps: vec![
+                f32_input("q", 0, &[1, 2, 1, 4]),
+                f32_input("k", 1, &[1, 1, 8, 4]),
+                f32_input("v", 2, &[1, 1, 8, 4]),
+                f32_input("prefix_mask", 3, &[1, 1, 1, 1, 8]),
+            ],
+            outputs: vec![Binding::Temp(4)],
+            deferred: BTreeMap::new(),
+            weight_count: 0,
+        };
+        blueprint.steps[1].output_type.dtype = ScalarType::BF16;
+        blueprint.steps[2].output_type.dtype = ScalarType::BF16;
+        blueprint.steps.push(TrtStep {
+            name: "attended".into(),
+            primitive: TrtPrimitive::GqaAttentionMasked {
+                q_heads: 2,
+                kv_heads: 1,
+            },
+            arguments: (0..4).map(Binding::Temp).collect(),
+            result: Binding::Temp(4),
+            output_type: TensorType::new(vec![1, 1, 8], ScalarType::F32, Layout::Plain),
+        });
+        let q = (0..8).map(|i| (i as f32 + 1.0) * 0.1).collect::<Vec<_>>();
+        let k = (0..32).map(|i| (i as f32) * 0.02).collect::<Vec<_>>();
+        let v = (0..32).map(|i| (i as f32) * 0.03).collect::<Vec<_>>();
+        for active in [1, 3, 8] {
+            let mut mask = vec![-1.0e9; 8];
+            mask[..active].fill(0.0);
+            let inputs = BTreeMap::from([
+                ("q".into(), TensorData::F32(q.clone())),
+                ("k".into(), TensorData::F32(k.clone())),
+                ("v".into(), TensorData::F32(v.clone())),
+                ("prefix_mask".into(), TensorData::F32(mask)),
+            ]);
+            let result = blueprint.execute_cpu_reference(&inputs).unwrap();
+            let expected = causal_gqa_cpu(
+                &q,
+                &k[..active * 4],
+                &v[..active * 4],
+                GqaShape {
+                    batch: 1,
+                    query_heads: 2,
+                    kv_heads: 1,
+                    query_len: 1,
+                    kv_len: active,
+                    head_dim: 4,
+                    first_position: active - 1,
+                },
+            )
+            .unwrap();
+            let TensorData::F32(actual) = &result["attended"] else {
+                panic!("expected FP32")
+            };
+            for (a, b) in actual.iter().zip(&expected) {
+                assert!((a - b).abs() < 1e-6);
+            }
+        }
     }
 }
