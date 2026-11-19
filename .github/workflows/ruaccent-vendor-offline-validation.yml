@@ -82,7 +82,7 @@ jobs:
                   continue
               data = json.loads(manifest.read_text())
               count = 0
-              for relative, expected in data.get("files", {}).items():
+              for relative, expected in list(data.get("files", {}).items()):
                   file = package / relative
                   if not file.is_file():
                       # Only missing test-key fixtures in the three explicit third-party crates
