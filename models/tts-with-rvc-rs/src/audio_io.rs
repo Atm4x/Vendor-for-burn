@@ -8,6 +8,10 @@ pub struct MonoAudio {
 /// Read uncompressed little-endian mono/stereo WAV, converting channels to mono.
 pub fn read_mono_wav(path: impl AsRef<Path>) -> Result<MonoAudio, String> {
     let bytes = fs::read(path).map_err(|e| format!("read WAV: {e}"))?;
+    read_mono_wav_bytes(&bytes)
+}
+
+pub fn read_mono_wav_bytes(bytes: &[u8]) -> Result<MonoAudio, String> {
     if bytes.len() < 44 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         return Err("input must be a RIFF/WAVE file".into());
     }
@@ -216,11 +220,7 @@ pub fn normalize_peak(samples: &mut [f32]) -> Result<(), String> {
     Ok(())
 }
 
-pub fn write_mono_wav(
-    path: impl AsRef<Path>,
-    samples: &[f32],
-    sample_rate: u32,
-) -> Result<(), String> {
+pub fn encode_mono_wav(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>, String> {
     let payload_size = samples.len().checked_mul(2).ok_or("WAV length overflow")?;
     let payload = u32::try_from(payload_size).map_err(|e| e.to_string())?;
     let chunk_size = 36_u32
@@ -244,6 +244,15 @@ pub fn write_mono_wav(
         let value = (sample * 32767.0).round() as i16;
         bytes.extend(value.to_le_bytes());
     }
+    Ok(bytes)
+}
+
+pub fn write_mono_wav(
+    path: impl AsRef<Path>,
+    samples: &[f32],
+    sample_rate: u32,
+) -> Result<(), String> {
+    let bytes = encode_mono_wav(samples, sample_rate)?;
     fs::write(path, bytes).map_err(|e| format!("write WAV: {e}"))
 }
 

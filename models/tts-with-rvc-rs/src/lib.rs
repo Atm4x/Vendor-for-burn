@@ -192,3 +192,7 @@ pub mod chunked;
 pub mod preprocess;
 
 pub mod rvc_inference;
+
+pub mod conversion;
+pub mod runtime_backend;
+pub mod worker;

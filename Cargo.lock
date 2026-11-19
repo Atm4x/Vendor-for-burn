@@ -6547,6 +6547,8 @@ dependencies = [
  "rustfft",
  "serde",
  "serde_json",
+ "sha2",
+ "uuid",
 ]
 
 [[package]]
@@ -6950,6 +6952,7 @@ checksum = "4a06f08a856b009bc7bbaf7d3e79808595d032dd19074c0c2ef26e49e03e6bdc"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
+ "serde_core",
  "sha1_smol",
  "wasm-bindgen",
 ]

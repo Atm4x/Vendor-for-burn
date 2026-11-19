@@ -17,41 +17,22 @@ pub(crate) fn process_wave_job(
     config: tts_with_rvc_rs::chunked::ChunkConfig,
     tensor_batch_size: usize,
 ) -> Result<(), String> {
-    use tts_with_rvc_rs::audio_io;
+    use tts_with_rvc_rs::conversion::{convert_file, ConversionSettings};
     if job.input.is_empty() || job.output.is_empty() || job.input == job.output {
         return Err("batch input and output paths must be nonempty and distinct".into());
     }
-    let audio = audio_io::read_mono_wav(&job.input)?;
-    let pcm = audio_io::resample(&audio.samples, audio.sample_rate, 16_000)?;
-    let mut settings = options.clone();
-    if let Some(rate) = job.index_rate {
-        settings.index_rate = rate;
-    }
-    if let Some(shift) = job.pitch_shift_semitones {
-        settings.pitch_shift_semitones = shift;
-    }
-    eprintln!(
-        "RVC processing {} input_samples={} input_sr={}",
-        job.input,
-        audio.samples.len(),
-        audio.sample_rate
-    );
-    let filtered = tts_with_rvc_rs::preprocess::highpass_48hz_zero_phase(&pcm)?;
-    let mut converted = inferencer.infer_long_filtered_16khz_batched(&filtered, &settings, config, tensor_batch_size, |p| {
-        eprintln!(
-            "RVC chunks={}/{} output_samples={}",
-            p.chunk_index, p.chunk_count, p.output_samples
-        );
+    let mut inference = options.clone();
+    if let Some(rate) = job.index_rate { inference.index_rate = rate; }
+    if let Some(shift) = job.pitch_shift_semitones { inference.pitch_shift_semitones = shift; }
+    let settings = ConversionSettings {
+        inference, chunk: config, batch_size: tensor_batch_size,
+        rms_mix_rate: job.rms_mix_rate.unwrap_or(0.5),
+    };
+    let report = convert_file(inferencer, &job.input, &job.output, &settings, |p| {
+        eprintln!("RVC chunks={}/{} output_samples={}", p.chunk_index, p.chunk_count, p.output_samples);
     })?;
-    let mix = job.rms_mix_rate.unwrap_or(0.5);
-    audio_io::mix_rms_envelope(&filtered, 16_000, &mut converted, 40_000, mix)?;
-    audio_io::normalize_peak(&mut converted)?;
-    audio_io::write_mono_wav(&job.output, &converted, 40_000)?;
-    println!(
-        "RVC WAV→WAV complete: samples={} sr=40000 path={}",
-        converted.len(),
-        job.output
-    );
+    println!("RVC WAV→WAV complete: samples={} sr={} path={}",
+        report.output_samples, report.output_sample_rate, job.output);
     Ok(())
 }
 
@@ -59,20 +40,7 @@ use std::{collections::{HashMap, HashSet}, fs, process::Command};
 use burn::tensor::Device;
 
 pub(crate) fn selected_device(name: &str) -> Result<Device, String> {
-    match name {
-        #[cfg(feature = "cpu")]
-        "cpu" => Ok(Device::cpu()),
-        #[cfg(all(not(feature = "cpu"), feature = "flex"))]
-        "cpu" => Ok(Device::flex()),
-        #[cfg(feature = "cuda")]
-        "cuda" => Ok(Device::cuda(0)),
-        #[cfg(feature = "wgpu")]
-        "wgpu" => Ok(Device::wgpu(Default::default())),
-        other if matches!(other, "cpu" | "cuda" | "wgpu") => Err(format!(
-            "backend {other} is not compiled into this executable; rebuild with the corresponding Cargo feature"
-        )),
-        other => Err(format!("unsupported device {other}; expected cpu, cuda or wgpu")),
-    }
+    tts_with_rvc_rs::runtime_backend::selected_device(name)
 }
 
 use tts_with_rvc_rs::{chunked::ChunkConfig, rvc_inference::{InferenceOptions, RvcV2Inferencer}};
