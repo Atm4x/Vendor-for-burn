@@ -4,6 +4,8 @@ use anyhow::Result;
 use burn::tensor::{Tensor, activation::gelu, module::{conv1d, layer_norm, linear}, ops::ConvOptions};
 #[cfg(feature = "reference-flex")]
 use burn::tensor::TensorData;
+#[cfg(feature = "reference-flex")]
+use rayon::prelude::*;
 use crate::store::TensorStore;
 use burn::tensor::Device;
 
@@ -21,6 +23,17 @@ fn fast_gelu_scalar(x: f32) -> f32 {
     0.5 * x * (1.0 + erf)
 }
 
+#[cfg(feature = "reference-flex")]
+fn apply_fast_gelu(data: &mut [f32], parallel: bool) {
+    if parallel && data.len() >= 32_768 {
+        data.par_iter_mut().for_each(|value| *value = fast_gelu_scalar(*value));
+    } else {
+        for value in data {
+            *value = fast_gelu_scalar(*value);
+        }
+    }
+}
+
 fn vocoder_gelu(x: Tensor<3>) -> Tensor<3> {
     #[cfg(feature = "reference-flex")]
     if x.device() == Device::flex() && std::env::var_os("SILERO_EXACT_GELU").is_none() {
@@ -28,9 +41,7 @@ fn vocoder_gelu(x: Tensor<3>) -> Tensor<3> {
         let device = x.device();
         let mut data = x.into_data().try_into_vec::<f32>()
             .expect("Flex vocoder GELU requires f32 data");
-        for value in &mut data {
-            *value = fast_gelu_scalar(*value);
-        }
+        apply_fast_gelu(&mut data, std::env::var_os("SILERO_SERIAL_GELU").is_none());
         return Tensor::from_data(TensorData::new(data, dims), &device);
     }
     gelu(x)
@@ -167,6 +178,19 @@ mod tests {
 #[cfg(all(test, feature = "reference-flex"))]
 mod cpu_optimization_tests {
     use super::*;
+
+    #[test]
+    fn parallel_gelu_matches_serial_bitwise() {
+        let input: Vec<f32> = (0..131_072).map(|i| ((i % 20_001) as f32 - 10_000.) * 0.001).collect();
+        let mut serial = input.clone();
+        let mut parallel = input;
+        apply_fast_gelu(&mut serial, false);
+        apply_fast_gelu(&mut parallel, true);
+        assert_eq!(serial.len(), parallel.len());
+        for (a, b) in serial.into_iter().zip(parallel) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+    }
 
     #[test]
     fn fast_gelu_matches_exact_erf() {
