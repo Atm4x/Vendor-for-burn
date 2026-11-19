@@ -5,6 +5,7 @@ use std::{
 };
 
 use fish_speech_core::{
+    ar_stream_plan::ArStreamPlan,
     config::{FishModelConfig, ModelKind},
     conversation::EncodedConversation,
     cpu_weighted_ar::SelectionMode,
@@ -18,6 +19,7 @@ use trtx::Logger;
 use crate::{
     ar_weight_bindings::required_ar_weights,
     cuda_generation::{PreparedDualArPlans, generate_prepared_cuda_dual_ar},
+    cuda_naive_generation::{PreparedNaiveArPlans, generate_prepared_cuda_naive},
     cuda_trtx::CachedArDispatchConfig,
     device_memory::DeviceMemoryBudget,
     model_runtime::{FishModel, LoadedFishArtifacts, ModelPaths, ModelRuntimeError, Result},
@@ -69,18 +71,25 @@ impl CudaRuntimeOptions {
 
 const PREPARED_PLAN_CACHE_CAPACITY: usize = 8;
 
-#[derive(Default)]
-struct PreparedPlanCache {
-    entries: VecDeque<((usize, usize), Arc<PreparedDualArPlans>)>,
+struct PreparedPlanCache<P> {
+    entries: VecDeque<((usize, usize), Arc<P>)>,
 }
 
-impl PreparedPlanCache {
+impl<P> Default for PreparedPlanCache<P> {
+    fn default() -> Self {
+        Self {
+            entries: VecDeque::new(),
+        }
+    }
+}
+
+impl<P> PreparedPlanCache<P> {
     fn get_or_prepare(
         &mut self,
         prompt_len: usize,
         max_new_tokens: usize,
-        build: impl FnOnce() -> FishResult<PreparedDualArPlans>,
-    ) -> FishResult<Arc<PreparedDualArPlans>> {
+        build: impl FnOnce() -> FishResult<P>,
+    ) -> FishResult<Arc<P>> {
         let key = (prompt_len, max_new_tokens);
         if let Some(index) = self.entries.iter().position(|(stored, _)| *stored == key) {
             let (_, cached) = self.entries.remove(index).expect("existing cache entry");
@@ -97,6 +106,51 @@ impl PreparedPlanCache {
     }
 }
 
+enum PreparedCudaArPlans {
+    Dual(PreparedDualArPlans),
+    Naive(PreparedNaiveArPlans),
+}
+
+impl PreparedCudaArPlans {
+    fn new(config: &FishModelConfig, prompt_len: usize, max_new_tokens: usize) -> FishResult<Self> {
+        match config.kind {
+            ModelKind::DualAr => Ok(Self::Dual(PreparedDualArPlans::new(
+                config,
+                prompt_len,
+                max_new_tokens,
+            )?)),
+            ModelKind::Naive => Ok(Self::Naive(PreparedNaiveArPlans::new(
+                config,
+                prompt_len,
+                max_new_tokens,
+            )?)),
+        }
+    }
+
+    fn ar_plans(&self) -> Vec<&ArStreamPlan> {
+        match self {
+            Self::Dual(plans) => plans.ar_plans(),
+            Self::Naive(plans) => plans.ar_plans(),
+        }
+    }
+}
+
+fn normalized_naive_tokens(
+    config: &FishModelConfig,
+    prompt_len: usize,
+    requested: usize,
+) -> FishResult<usize> {
+    if config.kind != ModelKind::Naive || prompt_len == 0 || prompt_len >= config.max_seq_len {
+        return Err(FishError::InvalidShape("invalid Naive prompt length"));
+    }
+    let remaining = config.max_seq_len - prompt_len;
+    Ok(if requested == 0 {
+        remaining
+    } else {
+        requested.min(remaining)
+    })
+}
+
 pub struct CudaSemanticGenerator {
     config: FishModelConfig,
     checkpoint: LoadedWeights,
@@ -108,7 +162,7 @@ pub struct CudaSemanticGenerator {
     eos_id: u32,
     seed: u64,
     chunk_index: u64,
-    prepared: PreparedPlanCache,
+    prepared: PreparedPlanCache<PreparedCudaArPlans>,
 }
 
 impl CudaSemanticGenerator {
@@ -122,11 +176,6 @@ impl CudaSemanticGenerator {
     ) -> Result<Self> {
         options.validate()?;
         config.validate()?;
-        if config.kind != ModelKind::DualAr {
-            return Err(ModelRuntimeError::Invalid(
-                "native GPU model supports DualAR; Naive TensorRT is F14".into(),
-            ));
-        }
         if mode != SelectionMode::Sample {
             return Err(ModelRuntimeError::Invalid(
                 "native GPU model currently supports sampled selection only".into(),
@@ -188,6 +237,23 @@ impl CudaSemanticGenerator {
         Ok(plans)
     }
 
+    pub fn prepare_naive_request(
+        &self,
+        prompt: &EncodedConversation,
+        max_new_tokens: usize,
+    ) -> FishResult<PreparedNaiveArPlans> {
+        let max_new_tokens =
+            normalized_naive_tokens(&self.config, prompt.length(), max_new_tokens)?;
+        if max_new_tokens > self.options.max_profiled_new_tokens {
+            return Err(FishError::InvalidConfig(
+                "CUDA request exceeds configured decode token limit",
+            ));
+        }
+        let plans = PreparedNaiveArPlans::new(&self.config, prompt.length(), max_new_tokens)?;
+        validate_ar_plan_weights(&plans.ar_plans(), &self.checkpoint.manifest().tensors)?;
+        Ok(plans)
+    }
+
     fn validate_plan_weights(&self, plans: &PreparedDualArPlans) -> FishResult<()> {
         validate_plan_weight_manifest(plans, &self.checkpoint.manifest().tensors)
     }
@@ -196,7 +262,7 @@ impl CudaSemanticGenerator {
         &mut self,
         prompt: &EncodedConversation,
         max_new_tokens: usize,
-    ) -> FishResult<Arc<PreparedDualArPlans>> {
+    ) -> FishResult<Arc<PreparedCudaArPlans>> {
         if max_new_tokens > self.options.max_profiled_new_tokens {
             return Err(FishError::InvalidConfig(
                 "CUDA request exceeds configured decode token limit",
@@ -206,8 +272,8 @@ impl CudaSemanticGenerator {
         let weights = &self.checkpoint.manifest().tensors;
         self.prepared
             .get_or_prepare(prompt.length(), max_new_tokens, || {
-                let plans = PreparedDualArPlans::new(config, prompt.length(), max_new_tokens)?;
-                validate_plan_weight_manifest(&plans, weights)?;
+                let plans = PreparedCudaArPlans::new(config, prompt.length(), max_new_tokens)?;
+                validate_ar_plan_weights(&plans.ar_plans(), weights)?;
                 Ok(plans)
             })
     }
@@ -217,7 +283,14 @@ fn validate_plan_weight_manifest(
     plans: &PreparedDualArPlans,
     entries: &BTreeMap<String, TensorEntry>,
 ) -> FishResult<()> {
-    for plan in plans.ar_plans() {
+    validate_ar_plan_weights(&plans.ar_plans(), entries)
+}
+
+fn validate_ar_plan_weights(
+    plans: &[&ArStreamPlan],
+    entries: &BTreeMap<String, TensorEntry>,
+) -> FishResult<()> {
+    for &plan in plans {
         let needed = required_ar_weights(plan)
             .map_err(|_| FishError::InvalidShape("invalid CUDA AR weight requirements"))?;
         for (key, ty) in needed {
@@ -260,6 +333,11 @@ impl SemanticGenerator for CudaSemanticGenerator {
             return Err(FishError::InvalidTransition("synthesis cancelled"));
         }
         sampling.validate()?;
+        let max_new_tokens = if self.config.kind == ModelKind::Naive {
+            normalized_naive_tokens(&self.config, prompt.length(), max_new_tokens)?
+        } else {
+            max_new_tokens
+        };
         let plans = self.cached_request(prompt, max_new_tokens)?;
         let logger = Logger::stderr()
             .map_err(|_| FishError::InvalidTransition("TensorRT logger initialization failed"))?;
@@ -269,27 +347,49 @@ impl SemanticGenerator for CudaSemanticGenerator {
             tensorrt_version: &self.options.tensorrt_version,
             driver_version: &self.options.driver_version,
             precision: &self.options.precision,
-            shape_profile: "source-1.5-bucketed-slow-v1",
+            shape_profile: match self.config.kind {
+                ModelKind::DualAr => "source-1.5-bucketed-slow-v1",
+                ModelKind::Naive => "source-1.5-naive-bucketed-v1",
+            },
             build_flags: &self.options.build_flags,
             workspace_bytes: self.options.workspace_bytes,
         };
-        let result = generate_prepared_cuda_dual_ar(
-            &self.registry,
-            &logger,
-            config,
-            &self.config,
-            prompt,
-            plans.as_ref(),
-            &self.checkpoint,
-            self.options.device_ordinal,
-            self.memory.clone(),
-            &self.semantic_lut,
-            self.semantic_begin_id,
-            self.eos_id,
-            sampling,
-            self.seed.wrapping_add(self.chunk_index),
-            is_cancelled,
-        );
+        let seed = self.seed.wrapping_add(self.chunk_index);
+        let result = match plans.as_ref() {
+            PreparedCudaArPlans::Dual(plans) => generate_prepared_cuda_dual_ar(
+                &self.registry,
+                &logger,
+                config,
+                &self.config,
+                prompt,
+                plans,
+                &self.checkpoint,
+                self.options.device_ordinal,
+                self.memory.clone(),
+                &self.semantic_lut,
+                self.semantic_begin_id,
+                self.eos_id,
+                sampling,
+                seed,
+                is_cancelled,
+            ),
+            PreparedCudaArPlans::Naive(plans) => generate_prepared_cuda_naive(
+                &self.registry,
+                &logger,
+                config,
+                &self.config,
+                prompt,
+                plans,
+                &self.checkpoint,
+                self.options.device_ordinal,
+                self.memory.clone(),
+                &self.semantic_lut,
+                self.eos_id,
+                sampling,
+                seed,
+                is_cancelled,
+            ),
+        };
         if result.is_ok() {
             self.chunk_index = self.chunk_index.wrapping_add(1);
         }
@@ -381,6 +481,43 @@ mod tests {
                 .is_err()
         );
         assert_eq!(cache.entries.len(), PREPARED_PLAN_CACHE_CAPACITY);
+    }
+
+    #[test]
+    fn naive_unbounded_and_overlong_requests_follow_python_max_sequence_rule() {
+        let mut naive = FishModelConfig::synthetic_dual_ar_fixture();
+        naive.kind = ModelKind::Naive;
+        naive.fast = None;
+        assert_eq!(
+            normalized_naive_tokens(&naive, 4, 0).unwrap(),
+            naive.max_seq_len - 4
+        );
+        assert_eq!(
+            normalized_naive_tokens(&naive, 4, usize::MAX).unwrap(),
+            naive.max_seq_len - 4
+        );
+        assert_eq!(normalized_naive_tokens(&naive, 4, 2).unwrap(), 2);
+        assert!(normalized_naive_tokens(&naive, 0, 2).is_err());
+        assert!(normalized_naive_tokens(&naive, naive.max_seq_len, 2).is_err());
+    }
+
+    #[test]
+    fn model_runtime_routes_dual_and_naive_to_separate_engine_contracts() {
+        let dual = FishModelConfig::synthetic_dual_ar_fixture();
+        let plans = PreparedCudaArPlans::new(&dual, 4, 3).unwrap();
+        assert!(matches!(plans, PreparedCudaArPlans::Dual(_)));
+        assert!(!plans.ar_plans().is_empty());
+        let mut naive = dual;
+        naive.kind = ModelKind::Naive;
+        naive.fast = None;
+        let plans = PreparedCudaArPlans::new(&naive, 4, 3).unwrap();
+        assert!(matches!(plans, PreparedCudaArPlans::Naive(_)));
+        assert_eq!(plans.ar_plans().len(), 2);
+        for plan in plans.ar_plans() {
+            let weights = required_ar_weights(plan).unwrap();
+            assert!(weights.contains_key("codebook_output.weight"));
+            assert!(!weights.contains_key("fast_output.weight"));
+        }
     }
 
     #[test]

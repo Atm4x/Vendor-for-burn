@@ -41,6 +41,20 @@ fn sampler_geometry(vocab: usize) -> Result<(usize, u32)> {
     Ok((padded, shared_bytes))
 }
 
+fn check_logits_slice(total_bytes: usize, vocabulary: usize, offset: usize) -> Result<()> {
+    sampler_geometry(vocabulary)?;
+    let end = offset
+        .checked_add(vocabulary)
+        .and_then(|elements| elements.checked_mul(4))
+        .ok_or(FishError::InvalidShape("CUDA Fast logits offset overflow"))?;
+    if end > total_bytes {
+        return Err(FishError::InvalidShape(
+            "CUDA Fast logits slice exceeds output",
+        ));
+    }
+    Ok(())
+}
+
 pub struct CudaFastSampler {
     kernel: CudaFunction,
 }
@@ -89,10 +103,38 @@ impl CudaFastSampler {
         result_token: &CudaBuffer,
         result_column: &CudaBuffer,
     ) -> Result<()> {
+        self.enqueue_slice(
+            stream,
+            logits,
+            history_mask,
+            vocabulary,
+            0,
+            params,
+            seed,
+            codebook_index,
+            result_token,
+            result_column,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_slice(
+        &self,
+        stream: &Arc<CudaStream>,
+        logits: &CudaBuffer,
+        history_mask: &CudaBuffer,
+        vocabulary: usize,
+        logits_offset: usize,
+        params: SamplingParams,
+        seed: u64,
+        codebook_index: usize,
+        result_token: &CudaBuffer,
+        result_column: &CudaBuffer,
+    ) -> Result<()> {
         params.validate()?;
         let (padded, shared_bytes) = sampler_geometry(vocabulary)?;
-        if logits.bytes() != vocabulary * 4
-            || history_mask.bytes() != vocabulary * 4
+        check_logits_slice(logits.bytes(), vocabulary, logits_offset)?;
+        if history_mask.bytes() != vocabulary * 4
             || result_token.bytes() != 4
             || result_column.bytes() < (codebook_index + 1) * 4
         {
@@ -108,6 +150,8 @@ impl CudaFastSampler {
             .map_err(|_| FishError::InvalidShape("CUDA Fast sampler vocabulary overflow"))?;
         let padded = i32::try_from(padded)
             .map_err(|_| FishError::InvalidShape("CUDA Fast sampler padded size overflow"))?;
+        let logits_offset = i32::try_from(logits_offset)
+            .map_err(|_| FishError::InvalidShape("CUDA Fast logits offset exceeds i32"))?;
         let codebook = i32::try_from(codebook_index)
             .map_err(|_| FishError::InvalidShape("CUDA Fast sampler codebook overflow"))?;
         let cfg = LaunchConfig {
@@ -120,6 +164,7 @@ impl CudaFastSampler {
             .arg(&logits_ptr)
             .arg(&history_ptr)
             .arg(&vocabulary)
+            .arg(&logits_offset)
             .arg(&padded)
             .arg(&params.top_p)
             .arg(&params.temperature)
@@ -228,6 +273,16 @@ mod tests {
         assert_eq!(sampler_geometry(1025).unwrap(), (2048, 16384));
         assert!(sampler_geometry(0).is_err());
         assert!(sampler_geometry(4097).is_err());
+    }
+
+    #[test]
+    fn naive_codebook_slices_cannot_cross_logit_boundaries() {
+        assert!(check_logits_slice(3 * 16 * 4, 16, 0).is_ok());
+        assert!(check_logits_slice(3 * 16 * 4, 16, 16).is_ok());
+        assert!(check_logits_slice(3 * 16 * 4, 16, 32).is_ok());
+        assert!(check_logits_slice(3 * 16 * 4, 16, 33).is_err());
+        assert!(check_logits_slice(3 * 16 * 4, 16, usize::MAX).is_err());
+        assert!(check_logits_slice(3 * 16 * 4, 4097, 0).is_err());
     }
 
     #[test]

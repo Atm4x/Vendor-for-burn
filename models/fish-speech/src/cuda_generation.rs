@@ -35,13 +35,13 @@ use crate::{
     weights::LoadedWeights,
 };
 
-struct PreparedArGraph {
-    plan: ArStreamPlan,
-    outputs: BTreeMap<String, Binding>,
+pub(crate) struct PreparedArGraph {
+    pub(crate) plan: ArStreamPlan,
+    pub(crate) outputs: BTreeMap<String, Binding>,
 }
 
 impl PreparedArGraph {
-    fn from_graph(graph: Graph) -> Result<Self> {
+    pub(crate) fn from_graph(graph: Graph) -> Result<Self> {
         let outputs = graph
             .outputs
             .iter()
@@ -463,7 +463,7 @@ where
     }
 }
 
-fn expected_runtime_input(plan: &ArStreamPlan, name: &str) -> Result<TensorType> {
+pub(crate) fn expected_runtime_input(plan: &ArStreamPlan, name: &str) -> Result<TensorType> {
     for phase in &plan.phases {
         if let ArStreamPhase::Network(network) = phase {
             for step in &network.steps {
@@ -478,7 +478,7 @@ fn expected_runtime_input(plan: &ArStreamPlan, name: &str) -> Result<TensorType>
     ))
 }
 
-fn output_type(graph: &PreparedArGraph, name: &str) -> Result<TensorType> {
+pub(crate) fn output_type(graph: &PreparedArGraph, name: &str) -> Result<TensorType> {
     let binding = graph.outputs.get(name).ok_or(FishError::InvalidShape(
         "CUDA output absent from original graph",
     ))?;
@@ -494,7 +494,7 @@ fn output_type(graph: &PreparedArGraph, name: &str) -> Result<TensorType> {
     Err(FishError::InvalidShape("CUDA output absent from graph"))
 }
 
-fn named_output(
+pub(crate) fn named_output(
     graph: &PreparedArGraph,
     outputs: &BTreeMap<Binding, CudaBuffer>,
     name: &str,

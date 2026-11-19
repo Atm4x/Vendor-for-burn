@@ -70,15 +70,16 @@ int main() {
     float top_p, temperature, penalty;
     unsigned long long seed;
     while (scanf("%d %f %f %f %llu %d", &size, &top_p, &temperature, &penalty, &seed, &codebook) == 6) {
-        float logits[4096]{};
+        float logits[32768]{};
         int history[4096]{};
-        for (int i=0; i<size; ++i) scanf("%f", &logits[i]);
+        const int offset = (codebook - 1) * size;
+        for (int i=0; i<size; ++i) scanf("%f", &logits[offset + i]);
         for (int i=0; i<size; ++i) scanf("%d", &history[i]);
         int padded=1;
         while (padded < size) padded *= 2;
         int result=-1;
         int column[16]{};
-        fish_fast_sample(logits, history, size, padded, top_p, temperature, penalty, seed, codebook, &result, column);
+        fish_fast_sample(logits, history, size, offset, padded, top_p, temperature, penalty, seed, codebook, &result, column);
         printf("%d\\n", column[codebook]);
         fflush(stdout);
     }

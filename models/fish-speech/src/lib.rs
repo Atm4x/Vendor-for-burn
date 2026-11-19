@@ -54,3 +54,6 @@ pub mod cuda_model_runtime;
 
 #[cfg(all(feature = "cuda-driver", feature = "tensorrt-api"))]
 mod dynamic_decode;
+
+#[cfg(all(feature = "cuda-driver", feature = "tensorrt-api"))]
+pub mod cuda_naive_generation;

@@ -12,6 +12,7 @@ extern "C" __global__ void fish_fast_sample(
     const float* logits,
     const int* history_mask,
     int vocabulary,
+    int logits_offset,
     int padded,
     float top_p,
     float temperature,
@@ -31,7 +32,7 @@ extern "C" __global__ void fish_fast_sample(
     for (int i = tid; i < padded; i += static_cast<int>(blockDim.x)) {
         float value = -INFINITY;
         if (i < vocabulary) {
-            value = logits[i];
+            value = logits[logits_offset + i];
             if (!isfinite(value)) {
                 atomicExch(&invalid, 1);
             } else if (history_mask[i]) {

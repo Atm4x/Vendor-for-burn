@@ -65,8 +65,41 @@ impl CudaSemanticSampler {
         eos_id: u32,
         result: &CudaBuffer,
     ) -> Result<()> {
+        self.enqueue_with_column(
+            stream,
+            logits,
+            history_mask,
+            vocabulary,
+            params,
+            seed,
+            semantic_step,
+            eos_id,
+            result,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_with_column(
+        &self,
+        stream: &Arc<CudaStream>,
+        logits: &CudaBuffer,
+        history_mask: &CudaBuffer,
+        vocabulary: usize,
+        params: SamplingParams,
+        seed: u64,
+        semantic_step: u64,
+        eos_id: u32,
+        result: &CudaBuffer,
+        output_column: Option<&CudaBuffer>,
+    ) -> Result<()> {
         params.validate()?;
         validate_vocabulary(vocabulary)?;
+        if output_column.is_some_and(|buffer| buffer.bytes() < 4) {
+            return Err(FishError::InvalidShape(
+                "CUDA semantic output column too short",
+            ));
+        }
         if logits.bytes() != vocabulary * 4
             || history_mask.bytes() != vocabulary * 4
             || result.bytes() != 8
@@ -82,6 +115,8 @@ impl CudaSemanticSampler {
         let logits_ptr = logits.address(stream);
         let history_ptr = history_mask.address(stream);
         let result_ptr = result.address(stream);
+        let column_ptr = output_column.unwrap_or(result).address(stream);
+        let write_column = i32::from(output_column.is_some());
         let mut launch = stream.launch_builder(&self.kernel);
         launch
             .arg(&logits_ptr)
@@ -93,7 +128,9 @@ impl CudaSemanticSampler {
             .arg(&seed)
             .arg(&semantic_step)
             .arg(&eos_id)
-            .arg(&result_ptr);
+            .arg(&result_ptr)
+            .arg(&column_ptr)
+            .arg(&write_column);
         unsafe {
             launch.launch(LaunchConfig {
                 grid_dim: (1, 1, 1),

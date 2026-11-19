@@ -29,7 +29,9 @@ extern "C" __global__ void fish_semantic_sample(
     uint64_t seed,
     uint64_t semantic_step,
     int eos_id,
-    int* result
+    int* result,
+    int* output_column,
+    int write_column
 ) {
     __shared__ double sums[256];
     __shared__ int counts[256];
@@ -205,5 +207,6 @@ extern "C" __global__ void fish_semantic_sample(
     if (tid == 0) {
         result[0] = counts[0];
         result[1] = (counts[0] >= 0 && counts[0] == eos_id) ? 1 : 0;
+        if (write_column) output_column[0] = counts[0];
     }
 }

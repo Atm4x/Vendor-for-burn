@@ -70,8 +70,9 @@ int main() {
         for (int i=0;i<n;++i) scanf("%f", &logits[i]);
         for (int i=0;i<n;++i) scanf("%d", &history[i]);
         int result[2]{-1,-1};
-        fish_semantic_sample(logits, history, n, top_p, temp, penalty, seed, step, eos, result);
-        printf("%d %d\\n", result[0], result[1]);
+        int column[2]{-1,-1};
+        fish_semantic_sample(logits, history, n, top_p, temp, penalty, seed, step, eos, result, column, 1);
+        printf("%d %d %d\\n", result[0], result[1], column[0]);
         fflush(stdout);
     }
 }
@@ -114,10 +115,11 @@ def main() -> None:
     assert len(lines) == len(cases), (len(lines), len(cases))
     for index, (line, case) in enumerate(zip(lines, cases)):
         xs, history, p, t, penalty, seed, step, eos = case
-        token, flagged = map(int, line.split())
+        token, flagged, column_token = map(int, line.split())
         expected = reference(xs, history, p, t, penalty, seed, step)
         assert token == expected, (index, len(xs), token, expected, p)
         assert flagged == int(token == eos), (index, token, flagged, eos)
+        assert column_token == token, (index, column_token, token)
     print(f"PASS {len(cases)} CUDA semantic host-emulation/reference parity cases")
 
 
