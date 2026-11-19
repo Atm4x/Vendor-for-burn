@@ -5,7 +5,7 @@ use burn::tensor::{Tensor, activation::gelu, module::{conv1d, layer_norm, linear
 #[cfg(feature = "reference-flex")]
 use burn::tensor::TensorData;
 #[cfg(feature = "reference-flex")]
-use crate::flex_pointwise::{apply_fast_gelu, fast_gelu_scalar};
+use crate::flex_pointwise::apply_fast_gelu;
 use crate::store::TensorStore;
 use burn::tensor::Device;
 
@@ -193,6 +193,7 @@ mod tests {
 #[cfg(all(test, feature = "reference-flex"))]
 mod cpu_optimization_tests {
     use super::*;
+    use crate::flex_pointwise::fast_gelu_scalar;
 
     #[test]
     fn parallel_gelu_matches_serial_bitwise() {

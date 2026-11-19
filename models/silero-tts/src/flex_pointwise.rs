@@ -51,7 +51,7 @@ impl Projection {
         })
     }
 
-    fn forward(&self, input: &[f32], rows: usize) -> Vec<f32> {
+    fn forward_raw(&self, input: &[f32], rows: usize) -> Vec<f32> {
         assert_eq!(input.len(), rows * self.in_channels);
         let mut output = vec![0.0; rows * self.out_channels];
         let parallel = if rows * self.in_channels * self.out_channels >= 192 * 192 * 192 {
@@ -82,6 +82,11 @@ impl Projection {
                 parallel,
             );
         }
+        output
+    }
+
+    fn forward(&self, input: &[f32], rows: usize) -> Vec<f32> {
+        let mut output = self.forward_raw(input, rows);
         if output.len() >= 32_768 {
             output.par_chunks_mut(self.out_channels).for_each(|row| {
                 for (value, bias) in row.iter_mut().zip(&self.bias) {
@@ -99,10 +104,60 @@ impl Projection {
     }
 }
 
+fn bias_gelu_epilogue(output: &mut [f32], bias: &[f32], parallel: bool) {
+    let width = bias.len();
+    if parallel && output.len() >= 32_768 {
+        output.par_chunks_mut(width).for_each(|row| {
+            for (value, bias) in row.iter_mut().zip(bias) {
+                *value = fast_gelu_scalar(*value + *bias);
+            }
+        });
+    } else {
+        for row in output.chunks_mut(width) {
+            for (value, bias) in row.iter_mut().zip(bias) {
+                *value = fast_gelu_scalar(*value + *bias);
+            }
+        }
+    }
+}
+
+fn bias_gamma_residual_epilogue(
+    output: &mut [f32],
+    bias: &[f32],
+    gamma: &[f32],
+    residual: &[f32],
+    batch: usize,
+    frames: usize,
+    parallel: bool,
+) {
+    let channels = bias.len();
+    assert_eq!(output.len(), batch * frames * channels);
+    assert_eq!(residual.len(), batch * frames * channels);
+    let apply_row = |row: usize, values: &mut [f32]| {
+        let b = row / frames;
+        let t = row % frames;
+        for c in 0..channels {
+            values[c] =
+                (values[c] + bias[c]) * gamma[c] + residual[(b * channels + c) * frames + t];
+        }
+    };
+    if parallel && output.len() >= 32_768 {
+        output
+            .par_chunks_mut(channels)
+            .enumerate()
+            .for_each(|(r, values)| apply_row(r, values));
+    } else {
+        for (r, values) in output.chunks_mut(channels).enumerate() {
+            apply_row(r, values);
+        }
+    }
+}
+
 pub(crate) struct FlexPointwise {
     first: Projection,
     second: Projection,
     gamma: Vec<f32>,
+    fused_epilogue: bool,
 }
 
 impl FlexPointwise {
@@ -126,10 +181,15 @@ impl FlexPointwise {
             first,
             second,
             gamma,
+            fused_epilogue: std::env::var_os("SILERO_FLEX_STAGED_EPILOGUE").is_none(),
         })
     }
 
     pub(crate) fn forward(&self, norm: Tensor<3>, residual: Tensor<3>) -> Tensor<3> {
+        self.forward_impl(norm, residual, self.fused_epilogue)
+    }
+
+    fn forward_impl(&self, norm: Tensor<3>, residual: Tensor<3>, fused: bool) -> Tensor<3> {
         let [batch, frames, channels] = norm.dims();
         assert_eq!(residual.dims(), [batch, channels, frames]);
         assert_eq!(channels, self.first.in_channels);
@@ -145,7 +205,11 @@ impl FlexPointwise {
         let rows = batch * frames;
         let timed = std::env::var_os("SILERO_VOCODER_TIMING").is_some();
         let start = Instant::now();
-        let mut hidden = self.first.forward(&input, rows);
+        let mut hidden = if fused {
+            self.first.forward_raw(&input, rows)
+        } else {
+            self.first.forward(&input, rows)
+        };
         if timed {
             eprintln!(
                 "[vocoder-block] pwconv1_ms={:.3}",
@@ -153,10 +217,12 @@ impl FlexPointwise {
             );
         }
         let start = Instant::now();
-        apply_fast_gelu(
-            &mut hidden,
-            std::env::var_os("SILERO_SERIAL_GELU").is_none(),
-        );
+        let parallel = std::env::var_os("SILERO_SERIAL_GELU").is_none();
+        if fused {
+            bias_gelu_epilogue(&mut hidden, &self.first.bias, parallel);
+        } else {
+            apply_fast_gelu(&mut hidden, parallel);
+        }
         if timed {
             eprintln!(
                 "[vocoder-block] gelu_ms={:.3}",
@@ -164,19 +230,35 @@ impl FlexPointwise {
             );
         }
         let start = Instant::now();
-        let mut output = self.second.forward(&hidden, rows);
+        let mut output = if fused {
+            self.second.forward_raw(&hidden, rows)
+        } else {
+            self.second.forward(&hidden, rows)
+        };
         if timed {
             eprintln!(
                 "[vocoder-block] pwconv2_ms={:.3}",
                 start.elapsed().as_secs_f64() * 1000.0
             );
         }
-        for b in 0..batch {
-            for t in 0..frames {
-                for c in 0..channels {
-                    let i = (b * frames + t) * channels + c;
-                    output[i] =
-                        output[i] * self.gamma[c] + residual[(b * channels + c) * frames + t];
+        if fused {
+            bias_gamma_residual_epilogue(
+                &mut output,
+                &self.second.bias,
+                &self.gamma,
+                &residual,
+                batch,
+                frames,
+                parallel,
+            );
+        } else {
+            for b in 0..batch {
+                for t in 0..frames {
+                    for c in 0..channels {
+                        let i = (b * frames + t) * channels + c;
+                        output[i] =
+                            output[i] * self.gamma[c] + residual[(b * channels + c) * frames + t];
+                    }
                 }
             }
         }
@@ -189,6 +271,65 @@ impl FlexPointwise {
 mod tests {
     use super::*;
     use burn::tensor::module::linear;
+
+    #[test]
+    fn fused_epilogues_match_staged_operations_bitwise() {
+        let rows = 67usize;
+        let channels = 512usize;
+        let hidden = 1536usize;
+        let mut original = (0..rows * hidden)
+            .map(|i| ((i * 13 % 511) as f32 - 255.0) * 0.004)
+            .collect::<Vec<_>>();
+        let mut combined = original.clone();
+        let bias = (0..hidden)
+            .map(|i| ((i * 17 % 97) as f32 - 48.0) * 0.002)
+            .collect::<Vec<_>>();
+        for row in original.chunks_mut(hidden) {
+            for (v, b) in row.iter_mut().zip(&bias) {
+                *v += *b;
+            }
+        }
+        apply_fast_gelu(&mut original, true);
+        bias_gelu_epilogue(&mut combined, &bias, true);
+        assert!(
+            original
+                .iter()
+                .zip(&combined)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        );
+
+        let mut original = (0..rows * channels)
+            .map(|i| ((i * 19 % 499) as f32 - 249.0) * 0.006)
+            .collect::<Vec<_>>();
+        let mut combined = original.clone();
+        let bias = (0..channels)
+            .map(|i| (i as f32 - 256.0) * 0.0003)
+            .collect::<Vec<_>>();
+        let gamma = (0..channels)
+            .map(|i| 0.001 * (i + 1) as f32)
+            .collect::<Vec<_>>();
+        let residual = (0..rows * channels)
+            .map(|i| ((i * 13 % 29) as f32 - 14.0) * 0.02)
+            .collect::<Vec<_>>();
+        for row in original.chunks_mut(channels) {
+            for (v, b) in row.iter_mut().zip(&bias) {
+                *v += *b;
+            }
+        }
+        for t in 0..rows {
+            for c in 0..channels {
+                let i = t * channels + c;
+                original[i] = original[i] * gamma[c] + residual[c * rows + t];
+            }
+        }
+        bias_gamma_residual_epilogue(&mut combined, &bias, &gamma, &residual, 1, rows, true);
+        assert!(
+            original
+                .iter()
+                .zip(&combined)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        );
+    }
 
     #[test]
     fn native_projection_matches_tensor_linear_for_uneven_rows() {
