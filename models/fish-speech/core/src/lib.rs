@@ -1,5 +1,6 @@
 pub mod ar_attention;
 pub mod ar_embedding;
+pub mod ar_generation;
 pub mod ar_rotary;
 pub mod ar_stream_executor;
 pub mod ar_stream_plan;

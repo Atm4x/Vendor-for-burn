@@ -1,10 +1,10 @@
+use crate::ar_generation::{generate_dual_ar, DualArBackend, DualArTrace, SlowArForward};
 use crate::config::{FishModelConfig, ModelKind};
 use crate::conversation::EncodedConversation;
 use crate::cpu_ir::{CpuIrInterpreter, NamedTensors, TensorData};
 use crate::error::{FishError, Result};
 use crate::graph_ir::{Graph, Layout, Origin};
 use crate::sampling::{greedy, logits_to_probs, SamplingParams, SessionRng};
-use crate::session::{initial_acoustic_code, GenerationSession, Phase};
 use crate::synthesis::SemanticGenerator;
 use crate::transformer_ir::TransformerIrFactory;
 
@@ -14,12 +14,7 @@ pub enum SelectionMode {
     Greedy,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CpuArTrace {
-    pub slow_active_lengths: Vec<usize>,
-    pub fast_active_lengths: Vec<usize>,
-    pub fast_resets: usize,
-}
+pub type CpuArTrace = DualArTrace;
 
 pub struct CpuWeightedDualAr {
     config: FishModelConfig,
@@ -92,23 +87,6 @@ impl CpuWeightedDualAr {
         &self.trace
     }
 
-    fn sample_id(
-        &mut self,
-        logits: &TensorData,
-        history: &[usize],
-        params: SamplingParams,
-    ) -> Result<u32> {
-        let TensorData::F32(values) = logits else {
-            return Err(FishError::InvalidShape("AR logits must be floating point"));
-        };
-        let probs = logits_to_probs(values, history, params)?;
-        let token = match self.mode {
-            SelectionMode::Greedy => greedy(&probs)?,
-            SelectionMode::Sample => self.rng.sample_exponential_race(&probs)?,
-        };
-        u32::try_from(token).map_err(|_| FishError::InvalidShape("generated token overflows u32"))
-    }
-
     pub fn generate_columns(
         &mut self,
         prompt: &EncodedConversation,
@@ -125,122 +103,129 @@ impl CpuWeightedDualAr {
         params: SamplingParams,
         is_cancelled: &mut dyn FnMut() -> bool,
     ) -> Result<Vec<Vec<u32>>> {
-        params.validate()?;
-        let count = self.config.num_codebooks + 1;
-        if prompt.channels.len() != count || prompt.channels[0].is_empty() {
-            return Err(FishError::InvalidShape("invalid Dual-AR prompt channels"));
-        }
-        let prompt_len = prompt.channels[0].len();
-        if prompt.channels.iter().any(|v| v.len() != prompt_len)
-            || prompt.vq_positions.len() != prompt_len
-        {
-            return Err(FishError::InvalidShape(
-                "inconsistent prompt channel lengths",
-            ));
-        }
-        let mut session =
-            GenerationSession::new(&self.config, prompt_len, max_new_tokens, self.eos_id)?;
-        let config = self.config.clone();
-        let factory = TransformerIrFactory::new(&config)?;
-        let mut slow_cache = NamedTensors::new();
-        let mut result = vec![Vec::new(); count];
-        self.trace = CpuArTrace::default();
-        session.prefill(prompt_len)?;
-
-        while session.phase != Phase::Finished {
-            if is_cancelled() {
-                return Err(FishError::InvalidTransition("synthesis cancelled"));
-            }
-            let active_len = prompt_len + result[0].len();
-            let graph = if result[0].is_empty() {
-                factory.slow_prefill(prompt_len)?
-            } else {
-                factory.slow_decode(active_len)?
-            };
-            let mut input = NamedTensors::new();
-            let tokens = if result[0].is_empty() {
-                checked_i32_tokens(prompt.channels.iter().flatten().copied())?
-            } else {
-                checked_i32_tokens(result.iter().map(|channel| *channel.last().unwrap()))?
-            };
-            input.insert("tokens".into(), TensorData::I32(tokens));
-            input.insert(
-                "semantic_membership_lut".into(),
-                TensorData::I32(self.semantic_lut.clone()),
-            );
-            let slow = run_weighted_graph(&self.weights, &graph, &input, &mut slow_cache)?;
-            self.trace.slow_active_lengths.push(active_len);
-            let history = if result[0].is_empty() {
-                Vec::new()
-            } else {
-                session
-                    .previous_window(0)?
-                    .iter()
-                    .map(|&x| x as usize)
-                    .collect()
-            };
-            let semantic = self.sample_id(
-                slow.get("logits")
-                    .ok_or(FishError::InvalidShape("slow logits missing"))?,
-                &history,
-                params,
-            )?;
-
-            session.begin_semantic_step()?;
-            let mut fast_cache = NamedTensors::new();
-            self.trace.fast_resets += 1;
-            let context = slow
-                .get("fast_context")
-                .ok_or(FishError::InvalidShape("slow Fast-AR context missing"))?;
-            let first = factory.fast_decode(0)?;
-            let mut fast_input = NamedTensors::new();
-            fast_input.insert("fast_context".into(), context.clone());
-            let _ = run_weighted_graph(&self.weights, &first, &fast_input, &mut fast_cache)?;
-            self.trace.fast_active_lengths.push(1);
-            if session.next_fast_codebook()? != 0 {
-                return Err(FishError::InvalidTransition("Fast AR step zero mismatch"));
-            }
-            let initial =
-                initial_acoustic_code(semantic, self.semantic_begin_id, self.config.codebook_size)?;
-            let mut next = vec![semantic, initial];
-            for step in 1..self.config.num_codebooks {
-                if is_cancelled() {
-                    return Err(FishError::InvalidTransition("synthesis cancelled"));
-                }
-                let graph = factory.fast_decode(step)?;
-                let mut fast_input = NamedTensors::new();
-                fast_input.insert(
-                    "previous_acoustic_code".into(),
-                    TensorData::I32(checked_i32_tokens([*next.last().unwrap()])?),
-                );
-                let fast = run_weighted_graph(&self.weights, &graph, &fast_input, &mut fast_cache)?;
-                let window: Vec<usize> = if result[0].is_empty() {
-                    Vec::new()
-                } else {
-                    session
-                        .previous_window(step + 1)?
-                        .iter()
-                        .map(|&x| x as usize)
-                        .collect()
+        let mut backend = CpuDualArBackend {
+            factory: TransformerIrFactory::new(&self.config)?,
+            weights: &self.weights,
+            semantic_lut: &self.semantic_lut,
+            slow_cache: NamedTensors::new(),
+            fast_cache: NamedTensors::new(),
+        };
+        let mode = self.mode;
+        let rng = &mut self.rng;
+        let output = generate_dual_ar(
+            &self.config,
+            &mut backend,
+            prompt,
+            max_new_tokens,
+            self.semantic_begin_id,
+            self.eos_id,
+            params,
+            &mut |logits, history, params| {
+                let probabilities = logits_to_probs(logits, history, params)?;
+                let token = match mode {
+                    SelectionMode::Greedy => greedy(&probabilities)?,
+                    SelectionMode::Sample => rng.sample_exponential_race(&probabilities)?,
                 };
-                let acoustic = self.sample_id(
-                    fast.get("fast_logits")
-                        .ok_or(FishError::InvalidShape("Fast AR logits missing"))?,
-                    &window,
-                    params,
-                )?;
-                next.push(acoustic);
-                self.trace.fast_active_lengths.push(step + 1);
-                if session.next_fast_codebook()? != step {
-                    return Err(FishError::InvalidTransition("Fast AR step mismatch"));
-                }
-            }
-            session.finish_step(next.clone())?;
-            for (channel, token) in result.iter_mut().zip(next) {
-                channel.push(token);
-            }
+                u32::try_from(token)
+                    .map_err(|_| FishError::InvalidShape("generated token overflows u32"))
+            },
+            &mut self.trace,
+            is_cancelled,
+        )?;
+        Ok(output)
+    }
+}
+
+struct CpuDualArBackend<'a> {
+    factory: TransformerIrFactory<'a>,
+    weights: &'a NamedTensors,
+    semantic_lut: &'a [i32],
+    slow_cache: NamedTensors,
+    fast_cache: NamedTensors,
+}
+
+impl CpuDualArBackend<'_> {
+    fn slow(
+        &mut self,
+        tokens: Vec<i32>,
+        active_len: usize,
+        prefill: bool,
+    ) -> Result<SlowArForward<TensorData>> {
+        let graph = if prefill {
+            self.factory.slow_prefill(active_len)?
+        } else {
+            self.factory.slow_decode(active_len)?
+        };
+        let mut input = NamedTensors::new();
+        input.insert("tokens".into(), TensorData::I32(tokens));
+        input.insert(
+            "semantic_membership_lut".into(),
+            TensorData::I32(self.semantic_lut.to_vec()),
+        );
+        let result = run_weighted_graph(self.weights, &graph, &input, &mut self.slow_cache)?;
+        let logits = match result.get("logits") {
+            Some(TensorData::F32(values)) => values.clone(),
+            _ => return Err(FishError::InvalidShape("slow logits missing")),
+        };
+        let fast_context = result
+            .get("fast_context")
+            .ok_or(FishError::InvalidShape("slow Fast-AR context missing"))?
+            .clone();
+        Ok(SlowArForward {
+            logits,
+            fast_context,
+        })
+    }
+}
+
+impl DualArBackend for CpuDualArBackend<'_> {
+    type FastContext = TensorData;
+
+    fn slow_prefill(&mut self, prompt: &EncodedConversation) -> Result<SlowArForward<TensorData>> {
+        self.slow(
+            checked_i32_tokens(prompt.channels.iter().flatten().copied())?,
+            prompt.length(),
+            true,
+        )
+    }
+
+    fn slow_decode(
+        &mut self,
+        previous_column: &[u32],
+        active_len: usize,
+    ) -> Result<SlowArForward<TensorData>> {
+        self.slow(
+            checked_i32_tokens(previous_column.iter().copied())?,
+            active_len,
+            false,
+        )
+    }
+
+    fn reset_fast(&mut self) -> Result<()> {
+        self.fast_cache.clear();
+        Ok(())
+    }
+
+    fn prime_fast(&mut self, context: TensorData) -> Result<()> {
+        let graph = self.factory.fast_decode(0)?;
+        let mut input = NamedTensors::new();
+        input.insert("fast_context".into(), context);
+        run_weighted_graph(self.weights, &graph, &input, &mut self.fast_cache)?;
+        Ok(())
+    }
+
+    fn decode_fast(&mut self, codebook_index: usize, previous_code: u32) -> Result<Vec<f32>> {
+        let graph = self.factory.fast_decode(codebook_index)?;
+        let mut input = NamedTensors::new();
+        input.insert(
+            "previous_acoustic_code".into(),
+            TensorData::I32(checked_i32_tokens([previous_code])?),
+        );
+        let result = run_weighted_graph(self.weights, &graph, &input, &mut self.fast_cache)?;
+        match result.get("fast_logits") {
+            Some(TensorData::F32(values)) => Ok(values.clone()),
+            _ => Err(FishError::InvalidShape("Fast AR logits missing")),
         }
-        Ok(result)
     }
 }
 

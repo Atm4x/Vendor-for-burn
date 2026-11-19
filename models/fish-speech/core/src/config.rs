@@ -40,7 +40,7 @@ impl TransformerDims {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FishModelConfig {
     pub kind: ModelKind,
     pub slow: TransformerDims,

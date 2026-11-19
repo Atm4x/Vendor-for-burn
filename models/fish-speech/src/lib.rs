@@ -39,3 +39,6 @@ pub mod cuda_stream;
 
 #[cfg(all(feature = "cuda-driver", feature = "tensorrt-api"))]
 pub mod cuda_trtx;
+
+#[cfg(all(feature = "cuda-driver", feature = "tensorrt-api"))]
+pub mod cuda_generation;
