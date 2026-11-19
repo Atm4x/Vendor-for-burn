@@ -35,7 +35,7 @@ jobs:
           test -f vendor/tokenizers-0.22.2/.cargo-checksum.json
           test -f vendor/fst-0.4.7/.cargo-checksum.json
           git add -- vendor/
-          test -z "$(git diff --cached --name-status | grep -v $'^A\\t' || true)"
+          test -z "$(git diff --cached --name-status | grep -v '^A[[:space:]]' || true)"
           git diff --cached --name-only > "$RUNNER_TEMP/new-vendor-files.txt"
           test "$(wc -l < "$RUNNER_TEMP/new-vendor-files.txt")" -gt 1000
           printf 'Vendored added file count: %s\\n' "$(wc -l < "$RUNNER_TEMP/new-vendor-files.txt")"
