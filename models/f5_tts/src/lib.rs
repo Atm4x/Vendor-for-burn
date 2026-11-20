@@ -25,6 +25,7 @@ pub mod mel;
 pub mod model;
 pub mod noise;
 pub mod pinyin;
+pub mod postprocess;
 #[cfg(any(
     feature = "cubecl-cpu",
     feature = "cubecl-cuda",
