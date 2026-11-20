@@ -30,8 +30,8 @@ pub fn resample(input: &[f32], source_rate: u32, target_rate: f64) -> Result<Vec
             let coefficient = cutoff * sinc * window;
             if j >= 0 && (j as usize) < input.len() {
                 numerator += input[j as usize] as f64 * coefficient;
-                denominator += coefficient;
             }
+            denominator += coefficient;
         }
         output.push((numerator / denominator.max(1e-16)) as f32);
     }
@@ -54,5 +54,13 @@ mod tests {
         let signal = vec![0.12; 5000];
         let output = resample(&signal, 44100, 16000.0).unwrap();
         for &x in &output[200..output.len()-200] { assert!((x - 0.12).abs() < 1e-4); }
+    }
+    #[test]
+    fn downsampling_edges_have_zero_padding_not_renormalized_boundary() {
+        let signal = vec![0.12; 5_000];
+        let output = resample(&signal, 44_100, 16_000.0).unwrap();
+        assert!(output[0] > 0.04 && output[0] < 0.10, "first sample: {}", output[0]);
+        assert!((output[300] - 0.12).abs() < 1e-4);
+        assert!(output[output.len() - 1] < 0.14);
     }
 }

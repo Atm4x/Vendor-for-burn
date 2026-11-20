@@ -235,7 +235,7 @@ fn absorb_small(
             if share >= fraction { break; }
             let bigger = (0..keys.len()).filter(|&k| sizes[k] > sizes[small]).collect::<Vec<_>>();
             if bigger.is_empty() { continue; }
-            let closest = bigger.iter().map(|&k| (1.0 - cosine(&sums[small], &sums[k])))
+            let closest = bigger.iter().map(|&k| 1.0 - cosine(&sums[small], &sums[k]))
                 .fold(f64::INFINITY, f64::min);
             if closest >= tau * (1.0 - share / fraction) { continue; }
             for (i, label) in labels.iter_mut().enumerate() {
@@ -285,10 +285,10 @@ pub fn decode_groups(
         for (j, &id) in ids.iter().enumerate() {
             let prob = normalize(&input.probabilities[id]);
             let best = (0..big.len()).max_by(|&a, &b| {
-                let sc = |slot| {
+                let sc = |slot: usize| {
                     let em = input.embeddings[id].iter().zip(&ce[slot])
                         .map(|(&x, &y)| f64::from(x) * y).sum::<f64>();
-                    em + config.lam * cosine(&prob, &cp[slot])
+                    em + config.lam * cosine(&prob, cp[slot].as_slice())
                 };
                 sc(a).total_cmp(&sc(b)).then_with(|| b.cmp(&a))
             }).unwrap();

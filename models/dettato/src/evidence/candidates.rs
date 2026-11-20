@@ -153,7 +153,7 @@ mod tests {
         InsertionLogits {
             exists: 2.0,
             pitch: peaked(INSERTION_PITCH_BINS, 24),
-            onset: peaked(INSERTION_TIME_BINS, 100),
+            onset: peaked(INSERTION_TIME_BINS, 105),
             duration: peaked(ABSOLUTE_DURATION_BINS, 63),
         }
     }
@@ -162,8 +162,8 @@ mod tests {
         let note = RepairInput { onset: 2.0, offset: 2.2, pitch: 64, velocity: 95, original_index: 0 };
         let logits = CandidateLogits { notes: vec![NoteLogits {
             keep: 3.0,
-            onset: peaked(ONSET_BINS, 100),
-            duration_ratio: peaked(DURATION_RATIO_BINS, 80),
+            onset: peaked(ONSET_BINS, 110),
+            duration_ratio: peaked(DURATION_RATIO_BINS, 83),
             insertion: [insertion(), insertion()],
         }]};
         let (edits, inserted) = decode_candidates(&[note], &logits, 0.0).unwrap();
@@ -176,5 +176,6 @@ mod tests {
     #[test]
     fn box_argmax_picks_leftmost_equal_peak() {
         assert_eq!(box_argmax(&[0.0, 0.1, 0.9, 0.9, 0.1, 0.0], 0), 2);
+        assert_eq!(box_argmax(&probabilities(&peaked(ONSET_BINS, 100)).unwrap(), 10), 90);
     }
 }

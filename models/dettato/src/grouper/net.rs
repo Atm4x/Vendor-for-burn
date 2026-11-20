@@ -212,7 +212,7 @@ impl NoteNet {
         let quantized = taps.iter().map(|note| {
             let mut result = [[0.0f32; TRANSCRIBER_TAP_DIM]; 3];
             for tap in 0..3 {
-                let scale = (note[tap].iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-6) / 127.0);
+                let scale = note[tap].iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-6) / 127.0;
                 let rounded_scale = half::f16::from_f32(scale).to_f32();
                 for c in 0..dim {
                     let q = (note[tap][c] / scale).round().clamp(-127.0, 127.0);

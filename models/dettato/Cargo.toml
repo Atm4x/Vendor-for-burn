@@ -7,7 +7,8 @@ license = "Apache-2.0"
 description = "Native Rust and Burn implementation of the Dettato multi-instrument transcription pipeline"
 
 [features]
-default = ["flex"]
+default = ["flex", "extended-audio"]
+extended-audio = ["symphonia/mp3", "symphonia/aac", "symphonia/isomp4", "symphonia/alac"]
 flex = ["burn/flex"]
 cuda = ["burn/cuda"]
 cpu = ["burn/cpu"]
@@ -16,7 +17,7 @@ wgpu = ["burn/wgpu"]
 [dependencies]
 burn = { version = "=0.22.1", default-features = false, features = ["std", "cubecl"] }
 rustfft = "=6.4.1"
-symphonia = { version = "=0.6.1", default-features = false, features = ["wav", "pcm", "flac", "mp3", "ogg", "vorbis", "aac", "isomp4", "aiff", "alac"] }
+symphonia = { version = "=0.6.1", default-features = false, features = ["wav", "pcm", "flac", "ogg", "vorbis", "aiff"] }
 safetensors = "=0.8.0"
 half = "=2.7.1"
 serde = { version = "1", features = ["derive"] }

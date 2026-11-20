@@ -244,7 +244,7 @@ mod tests {
         let front = extract(&audio).unwrap();
         assert_eq!(front.spectrogram.frames, 10);
         assert_eq!(front.spectrogram.bins, 288);
-        assert_eq!(front.extended_bins, 288 + 101 - (-36));
+        assert_eq!(front.extended_bins, 288 + 101 + 36);
         assert!(front.spectrogram.data.iter().all(|v| v.is_finite()));
         assert!(front.power.iter().all(|v| *v >= 0.0 && v.is_finite()));
     }

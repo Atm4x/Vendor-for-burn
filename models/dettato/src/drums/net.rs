@@ -2,7 +2,7 @@ use crate::{checkpoint::Checkpoint, transcriber::model::{BatchNorm, Conv2d}};
 use burn::tensor::{Device, Tensor, TensorData, activation, module, ops::{MaxPoolOptions, ConvOptions}};
 use serde_json::Value;
 
-use super::{DRUM_KEYS, TIMPANI_KEYS, features::{BANDS, CQ_BANDS, MEL_BANDS}};
+use super::{DRUM_KEYS, features::{BANDS, CQ_BANDS, MEL_BANDS}};
 
 #[derive(Clone)]
 struct Dense {
@@ -446,7 +446,7 @@ impl CqBranch {
                 floor.clone().expand([b,t,k])],2)
         };
         let input=Tensor::cat(vec![
-            centred.reshape([b,1,t,f]),
+            centred.clone().reshape([b,1,t,f]),
             shift(14).reshape([b,1,t,f]),
             shift(24).reshape([b,1,t,f]),
         ],1);

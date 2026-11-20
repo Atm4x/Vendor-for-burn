@@ -38,21 +38,25 @@ fn drum_ensemble_matches_upstream_logit_fixture() {
     let fixture:Value=serde_json::from_str(include_str!("fixtures/drum_logits_reference.json")).unwrap();
     assert_eq!(p.frames,fixture["frames"].as_u64().unwrap() as usize);
     let router=fixture["router"].as_f64().unwrap();
-    assert!((p.router as f64-router).abs()<0.1,
+    assert!((p.router as f64-router).abs()<0.005,
         "router differed: got {} expected {router}",p.router);
     let selected=&fixture["selected"];
+    println!("Drums router |Burn-PyTorch|={:.6}", (f64::from(p.router)-router).abs());
     for (name,channels,data) in [
         ("kit",61,&p.kit), ("kit_vel",61,&p.kit_velocity),
         ("drum",61,&p.orchestral), ("timpani",13,&p.timpani),
         ("vel",61,&p.orchestral_velocity),
     ] {
+        let mut max_abs_error = 0.0f64;
         for sample in selected[name].as_array().unwrap() {
             let t=sample[0].as_u64().unwrap() as usize;
             let c=sample[1].as_u64().unwrap() as usize;
             let expected=sample[2].as_f64().unwrap();
             let got=f64::from(data[t*channels+c]);
-            assert!((got-expected).abs()<0.1,
+            max_abs_error = max_abs_error.max((got-expected).abs());
+            assert!((got-expected).abs()<0.005,
                 "{name} frame={t} channel={c}: got {got} expected {expected}");
         }
+        println!("Drums {name} max selected |Burn-PyTorch|={max_abs_error:.6}");
     }
 }
