@@ -53,6 +53,25 @@ jobs:
         run: |
           git rev-parse HEAD
           git diff --stat -- models/f5_tts
+      - name: Package exact formatted F5-TTS sources
+        shell: bash
+        run: |
+          python - <<'PY'
+          import subprocess, zipfile
+          paths = subprocess.check_output(
+              ['git', 'ls-files', 'models/f5_tts'], text=True,
+          ).splitlines()
+          with zipfile.ZipFile('/tmp/f5-tts-cont19-source-only.zip', 'w', zipfile.ZIP_DEFLATED, compresslevel=8) as z:
+              for path in paths:
+                  z.write(path, path)
+          print('Packaged source files:', len(paths))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: f5-cont19-source-only
+          path: /tmp/f5-tts-cont19-source-only.zip
+          retention-days: 5
+          compression-level: 0
       - name: Check and run native Rust unit tests
         shell: bash
         run: |
