@@ -1,0 +1,86 @@
+name: F5 TTS CONT12 Linguistic Vendor
+on:
+  push:
+    branches:
+      - codex/f5-tts-cont12-linguistic-vendor-20261120
+    paths:
+      - .github/workflows/f5-cont12-linguistic-vendor.yml
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: a91d99b8a49902c28dddefa687c825bdf63c0945
+          persist-credentials: false
+      - name: Export pypinyin and rjieba oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --user rjieba pypinyin
+          mkdir -p /tmp/f5-cont12/linguistic
+          python - <<'PY'
+          import random,json
+          from pathlib import Path
+          import rjieba,pypinyin
+          from pypinyin import lazy_pinyin,Style
+          from pypinyin.phrases_dict import phrases_dict
+          root=Path('/tmp/f5-cont12/linguistic')
+          def han(c): return '\u3100' <= c <= '\u9fff'
+          def ok(s): return s.isascii() and s and s.rstrip('12345').islower() and len(s)-len(s.rstrip('12345')) <= 1
+          chars=[]
+          for n in range(0x3100,0xa000):
+              c=chr(n)
+              try: s=lazy_pinyin(c,style=Style.TONE3,tone_sandhi=True)[0]
+              except Exception: continue
+              if han(c) and ok(s): chars.append(c+'\t'+s)
+          (root/'pypinyin_chars.tsv').write_text('\n'.join(chars)+'\n',encoding='utf-8')
+          phrases=[]
+          for w in sorted(phrases_dict):
+              if 2<=len(w)<=32 and all(map(han,w)):
+                  try: ss=lazy_pinyin(w,style=Style.TONE3,tone_sandhi=True)
+                  except Exception: continue
+                  if len(ss)==len(w) and all(map(ok,ss)): phrases.append(w+'\t'+' '.join(ss))
+          (root/'pypinyin_phrases.tsv').write_text('\n'.join(phrases)+'\n',encoding='utf-8')
+          rng=random.Random(39281)
+          keys=[row.split('\t',1)[0] for row in phrases]
+          samples=['你好，世界！','我是中国人。','银行行长今天来到重庆。','你好吗？Yes, I am fine!','今天的天气怎么样？','第一，不要去。','绿茶和咖啡','Hello中国world!','中英文 Mixed text 123.']
+          for _ in range(1800):
+              samples.append(rng.choice(['','，','。',' ',' hello ']).join(rng.choice(keys) for i in range(rng.randint(1,5))))
+          with (root/'rjieba_reference.jsonl').open('w',encoding='utf-8') as f:
+              for txt in samples:
+                  segments=list(rjieba.cut(txt))
+                  syllables=[lazy_pinyin(s,style=Style.TONE3,tone_sandhi=True) for s in segments]
+                  f.write(json.dumps({'text':txt,'segments':segments,'syllables':syllables},ensure_ascii=False)+'\n')
+          (root/'versions.json').write_text(json.dumps({'rjieba':getattr(rjieba,'__version__','unknown'),'pypinyin':pypinyin.__version__}))
+          print('CHARS',len(chars),'PHRASES',len(phrases),'CASES',len(samples))
+          PY
+      - name: Export complete offline Cargo vendor
+        shell: bash
+        working-directory: models/f5_tts
+        run: |
+          set -euo pipefail
+          sed -i '/^serde_json = "1"/a jieba-rs = "=0.11.0"' Cargo.toml
+          cargo generate-lockfile
+          mkdir -p .cargo
+          cargo vendor --locked --versioned-dirs vendor > .cargo/config.toml
+          cargo metadata --offline --locked --no-deps --format-version=1 > /dev/null
+          tar -I 'zstd -T0 -1' -cf /tmp/f5-cont12/cargo-vendor.tar.zst vendor Cargo.lock .cargo/config.toml
+          sha256sum /tmp/f5-cont12/cargo-vendor.tar.zst > /tmp/f5-cont12/cargo-vendor.sha256
+          cp Cargo.lock /tmp/f5-cont12/linguistic/Cargo.lock
+      - uses: actions/upload-artifact@v4
+        with:
+          name: f5-cont12-linguistic
+          path: /tmp/f5-cont12/linguistic/
+          retention-days: 5
+      - uses: actions/upload-artifact@v4
+        with:
+          name: f5-cont12-vendor
+          path: |
+            /tmp/f5-cont12/cargo-vendor.tar.zst
+            /tmp/f5-cont12/cargo-vendor.sha256
+          compression-level: 0
+          retention-days: 5
