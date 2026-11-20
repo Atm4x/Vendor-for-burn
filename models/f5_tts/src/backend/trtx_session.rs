@@ -1005,6 +1005,10 @@ pub trait TrtSynthesis {
         restoration_gain: f32,
         sampling: SamplingConfig,
     ) -> Result<Vec<f32>>;
+    fn edit_speech_with_method(
+        &mut self, plan: &SpeechEditPlan, tokens: &[i32], noise: &[f32],
+        restoration_gain: f32, sampling: SamplingConfig, method: OdeMethod,
+    ) -> Result<Vec<f32>>;
     fn synthesize_seeded(
         &mut self,
         reference: &ReferenceAudio,
@@ -1035,6 +1039,15 @@ impl<I: CudaTransport, E: TrtExecutor> TrtSynthesis for TrtF5Session<I, E> {
         &mut self, request: SynthesisInputs<'_>, method: OdeMethod, mode: CfmSampleMode,
     ) -> Result<Vec<f32>> {
         TrtF5Session::synthesize_with_sample_mode(self, request, method, mode)
+    }
+
+    fn edit_speech_with_method(
+        &mut self, plan: &SpeechEditPlan, tokens: &[i32], noise: &[f32],
+        restoration_gain: f32, sampling: SamplingConfig, method: OdeMethod,
+    ) -> Result<Vec<f32>> {
+        TrtF5Session::edit_speech_with_method(
+            self, plan, tokens, noise, restoration_gain, sampling, method
+        )
     }
 
     fn synthesize_seeded(
