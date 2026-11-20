@@ -31,11 +31,23 @@ jobs:
           rm -f .cargo/config.toml models/f5_tts/.cargo/config.toml
           rustc --version
           cargo --version
-      - name: Check formatting
+      - name: Format and capture patched Rust source
         shell: bash
         run: |
           set -euo pipefail
+          cargo fmt --manifest-path models/f5_tts/Cargo.toml --all
+          git diff --name-only -- models/f5_tts | tee /tmp/f5-cont19-formatted-files.txt
+          tar -czf /tmp/f5-cont19-formatted-sources.tar.gz models/f5_tts
           cargo fmt --manifest-path models/f5_tts/Cargo.toml --all -- --check
+      - name: Upload formatted source for publication
+        uses: actions/upload-artifact@v4
+        with:
+          name: f5-cont19-rustfmt-sources
+          path: |
+            /tmp/f5-cont19-formatted-sources.tar.gz
+            /tmp/f5-cont19-formatted-files.txt
+          compression-level: 0
+          retention-days: 3
       - name: Check and run native Rust unit tests
         shell: bash
         run: |
