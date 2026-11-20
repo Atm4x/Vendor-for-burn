@@ -4,8 +4,8 @@ use burn::tensor::{Device, Int, Tensor, TensorData};
 
 use crate::{
     F5Error, Result,
-    backend::cubecl::{integrate_with_edit_mask_ode, integrate_with_ode_method},
-    cfm::{OdeMethod, SamplingConfig},
+    backend::cubecl::{integrate_with_edit_mask_ode, integrate_with_sample_mode},
+    cfm::{CfmSampleMode, OdeMethod, SamplingConfig},
     checkpoint::Checkpoint,
     dit_model::F5DiT,
     mel::VocosMel,
@@ -393,6 +393,29 @@ impl StandardF5Runtime {
         )
     }
 
+    /// Original CFM.sample() no_ref_audio / duplicate_test / t_inter options.
+    pub fn synthesize_with_sample_mode(
+        &mut self, reference: &ReferenceAudio, text_tokens: &[i32], options: GenerateOptions,
+        method: OdeMethod, mode: CfmSampleMode,
+    ) -> Result<Vec<f32>> {
+        let mut rng = StandardNormal::new(options.seed);
+        self.synthesize_from_noise_source_with_mode(
+            reference, text_tokens, options.total_frames, options.sampling, method, mode,
+            |count| Ok((0..count).map(|_| rng.sample()).collect()),
+        )
+    }
+
+    pub fn synthesize_with_noise_and_sample_mode(
+        &mut self, reference: &ReferenceAudio, text_tokens: &[i32], total_frames: usize,
+        sampling: SamplingConfig, method: OdeMethod, mode: CfmSampleMode,
+        initial_noise: &[f32],
+    ) -> Result<Vec<f32>> {
+        self.synthesize_from_noise_source_with_mode(
+            reference, text_tokens, total_frames, sampling, method, mode,
+            |count| validate_initial_noise(initial_noise.to_vec(), count),
+        )
+    }
+
     pub fn synthesize_with_noise(
         &mut self,
         reference: &ReferenceAudio,
@@ -438,12 +461,24 @@ impl StandardF5Runtime {
     }
 
     fn synthesize_from_noise_source_with_method(
+        &mut self, reference: &ReferenceAudio, text_tokens: &[i32], total_frames: usize,
+        sampling: SamplingConfig, method: OdeMethod,
+        create_noise: impl FnOnce(usize) -> Result<Vec<f32>>,
+    ) -> Result<Vec<f32>> {
+        self.synthesize_from_noise_source_with_mode(
+            reference, text_tokens, total_frames, sampling, method,
+            CfmSampleMode::default(), create_noise,
+        )
+    }
+
+    fn synthesize_from_noise_source_with_mode(
         &mut self,
         reference: &ReferenceAudio,
         text_tokens: &[i32],
         total_frames: usize,
         sampling: SamplingConfig,
         method: OdeMethod,
+        mode: CfmSampleMode,
         create_noise: impl FnOnce(usize) -> Result<Vec<f32>>,
     ) -> Result<Vec<f32>> {
         if text_tokens.is_empty() || text_tokens.len() > 8192 {
@@ -479,7 +514,7 @@ impl StandardF5Runtime {
             TensorData::new(text_tokens.to_vec(), [1, text_tokens.len()]),
             &self.device,
         );
-        let final_mel = integrate_with_ode_method(
+        let final_mel = integrate_with_sample_mode(
             &mut self.dit,
             noise,
             condition,
@@ -487,6 +522,7 @@ impl StandardF5Runtime {
             frames.reference,
             sampling,
             method,
+            mode,
         )?;
         let generated = final_mel.slice([0..1, frames.reference..frames.target, 0..100]);
         self.vocoder.decode(generated, restoration_gain)
