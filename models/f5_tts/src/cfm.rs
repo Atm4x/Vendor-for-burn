@@ -91,11 +91,17 @@ impl SamplingConfig {
 }
 
 /// Additional, optional behavior from the original Python CFM.sample().
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CfmSampleMode {
     pub no_ref_audio: bool,
     pub duplicate_test: bool,
     pub t_inter: f64,
+}
+
+impl Default for CfmSampleMode {
+    fn default() -> Self {
+        Self { no_ref_audio: false, duplicate_test: false, t_inter: 0.1 }
+    }
 }
 
 impl CfmSampleMode {
