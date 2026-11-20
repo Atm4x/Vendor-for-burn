@@ -1,7 +1,7 @@
 //! F5-specific text and voice orchestration for TensorRT-RTX. Graph selection
 //! is delegated to a prewarmed shape-specific kernel; there is no CubeCL fallback.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use crate::{
     F5Error, Result,
@@ -16,9 +16,24 @@ use crate::{
 
 use super::trtx_session::{CudaTransport, SynthesisInputs, TrtExecutor, TrtF5Session};
 
+pub trait TrtKernelFactory {
+    fn validate_model(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn build(
+        &mut self,
+        reference_frames: usize,
+        target_frames: usize,
+    ) -> Result<Box<dyn TrtChunkKernel>>;
+}
+
 pub struct TrtWarmBank {
     shapes: BTreeMap<(usize, usize), Box<dyn TrtChunkKernel>>,
     speed_shape: Option<(usize, usize)>,
+    factory: Option<Box<dyn TrtKernelFactory>>,
+    capacity: usize,
+    usage: VecDeque<(usize, usize)>,
 }
 
 impl TrtWarmBank {
@@ -26,7 +41,60 @@ impl TrtWarmBank {
         Self {
             shapes: BTreeMap::new(),
             speed_shape: None,
+            factory: None,
+            capacity: usize::MAX,
+            usage: VecDeque::new(),
         }
+    }
+
+    pub fn with_factory(factory: Box<dyn TrtKernelFactory>, capacity: usize) -> Result<Self> {
+        if capacity == 0 {
+            return Err(F5Error::InvalidConfiguration(
+                "F5 engine cache capacity must be nonzero",
+            ));
+        }
+        Ok(Self {
+            shapes: BTreeMap::new(),
+            speed_shape: None,
+            factory: Some(factory),
+            capacity,
+            usage: VecDeque::new(),
+        })
+    }
+
+    fn touch(&mut self, key: (usize, usize)) {
+        self.usage.retain(|item| *item != key);
+        self.usage.push_back(key);
+    }
+
+    fn ensure(&mut self, key: (usize, usize)) -> Result<()> {
+        if self.shapes.contains_key(&key) {
+            self.touch(key);
+            return Ok(());
+        }
+        let (reference_frames, target_frames) = key;
+        if reference_frames == 0 || target_frames <= reference_frames || target_frames > 65_536 {
+            return Err(F5Error::InvalidShape("Invalid F5 engine shape"));
+        }
+        let factory = self.factory.as_mut().ok_or(F5Error::InvalidShape(
+            "No warmed F5 engine matches requested shape and no factory is installed",
+        ))?;
+        let engine = factory.build(reference_frames, target_frames)?;
+        while self.shapes.len() >= self.capacity {
+            if let Some(oldest) = self.usage.pop_front() {
+                self.shapes.remove(&oldest);
+                if self.speed_shape == Some(oldest) {
+                    self.speed_shape = None;
+                }
+            } else {
+                return Err(F5Error::ModelExecution(
+                    "F5 engine cache lost LRU accounting".into(),
+                ));
+            }
+        }
+        self.shapes.insert(key, engine);
+        self.touch(key);
+        Ok(())
     }
 
     pub fn insert(
@@ -43,8 +111,12 @@ impl TrtWarmBank {
                 "Duplicate or invalid warmed TensorRT F5 shape",
             ));
         }
-        self.shapes
-            .insert((reference_frames, target_frames), engine);
+        if self.shapes.len() >= self.capacity {
+            return Err(F5Error::InvalidConfiguration("F5 engine cache is full"));
+        }
+        let key = (reference_frames, target_frames);
+        self.shapes.insert(key, engine);
+        self.touch(key);
         Ok(())
     }
 
@@ -68,12 +140,14 @@ impl TrtWarmBank {
         if self.speed_shape == Some(key) {
             self.speed_shape = None;
         }
+        self.usage.retain(|item| *item != key);
         self.shapes.remove(&key).is_some()
     }
 
     pub fn clear(&mut self) {
         self.speed_shape = None;
         self.shapes.clear();
+        self.usage.clear();
     }
 
     pub fn warmed_shapes(&self) -> usize {
@@ -99,6 +173,7 @@ impl TrtChunkKernel for TrtWarmBank {
         let reference_frames = crate::mel::VocosMel::new()
             .extract(&reference.samples)?
             .frames;
+        self.ensure((reference_frames, target_frames))?;
         let kernel = self
             .shapes
             .get_mut(&(reference_frames, target_frames))
@@ -109,9 +184,26 @@ impl TrtChunkKernel for TrtWarmBank {
     }
 
     fn predict_reference_speed(&mut self, reference: &ReferenceAudio) -> Result<f32> {
-        let key = self.speed_shape.ok_or(F5Error::InvalidConfiguration(
-            "No active Cross-Lingual speed engine",
-        ))?;
+        let reference_frames = crate::mel::VocosMel::new()
+            .extract(&reference.samples)?
+            .frames;
+        let key = if let Some(key) = self.speed_shape.filter(|key| key.0 == reference_frames) {
+            key
+        } else if let Some(key) = self
+            .shapes
+            .keys()
+            .find(|key| key.0 == reference_frames)
+            .copied()
+        {
+            key
+        } else {
+            let target_frames = reference_frames
+                .checked_add(1)
+                .ok_or(F5Error::InvalidShape("F5 reference length overflow"))?;
+            (reference_frames, target_frames)
+        };
+        self.ensure(key)?;
+        self.speed_shape = Some(key);
         self.shapes
             .get_mut(&key)
             .ok_or(F5Error::InvalidConfiguration(

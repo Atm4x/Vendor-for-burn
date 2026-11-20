@@ -28,3 +28,9 @@ pub mod trtx_cuda;
 
 #[cfg(any(feature = "tensorrt-api", feature = "tensorrt-mock"))]
 pub mod trtx_text;
+
+#[cfg(any(feature = "tensorrt-api", feature = "tensorrt-mock"))]
+pub mod trtx_worker;
+
+#[cfg(any(feature = "tensorrt-api", feature = "tensorrt-mock"))]
+pub mod trtx_factory;
