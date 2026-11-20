@@ -70,6 +70,9 @@ pub fn build_serialized_cfm_step(
     let state = net
         .add_input("state", DataType::kFLOAT, &[dims(b), dims(f), dims(c)])
         .map_err(fail)?;
+    let base_state = net
+        .add_input("base_state", DataType::kFLOAT, &[dims(b), dims(f), dims(c)])
+        .map_err(fail)?;
     let condition = net
         .add_input("condition", DataType::kFLOAT, &[dims(b), dims(f), dims(c)])
         .map_err(fail)?;
@@ -117,7 +120,7 @@ pub fn build_serialized_cfm_step(
     let scaled = binary(&mut net, delta, cfg, Ew::kPROD)?;
     let velocity = binary(&mut net, conditional, scaled, Ew::kSUM)?;
     let increment = binary(&mut net, velocity, dt, Ew::kPROD)?;
-    let next = binary(&mut net, state, increment, Ew::kSUM)?;
+    let next = binary(&mut net, base_state, increment, Ew::kSUM)?;
 
     let restore_mask = binary(&mut net, restore, reference_mask, Ew::kPROD)?;
     let reference_delta = binary(&mut net, condition, next, Ew::kSUB)?;
@@ -141,6 +144,7 @@ pub fn build_serialized_cfm_step(
 #[derive(Debug, Clone, Copy)]
 pub struct CfmStepBindings {
     pub state: DeviceBuffer,
+    pub base_state: DeviceBuffer,
     pub condition: DeviceBuffer,
     pub tokens: DeviceBuffer,
     pub text_mask: DeviceBuffer,
@@ -183,6 +187,7 @@ impl CfmStepBindings {
             .ok_or(F5Error::InvalidShape("CFM reference mask overflow"))?;
         for (buffer, bytes) in [
             (self.state, frame_bytes),
+            (self.base_state, frame_bytes),
             (self.condition, frame_bytes),
             (self.tokens, token_bytes),
             (self.text_mask, token_bytes),
@@ -202,6 +207,7 @@ impl CfmStepBindings {
             .ok_or(F5Error::InvalidShape("CFM output address overflow"))?;
         for x in [
             self.state,
+            self.base_state,
             self.condition,
             self.tokens,
             self.text_mask,
@@ -240,6 +246,7 @@ pub unsafe fn enqueue_cfm_step(
     unsafe {
         for (name, buffer) in [
             ("state", bindings.state),
+            ("base_state", bindings.base_state),
             ("condition", bindings.condition),
             ("tokens", bindings.tokens),
             ("text_mask", bindings.text_mask),
@@ -289,6 +296,10 @@ mod tests {
                 address: 0x1000,
                 bytes: 40,
             },
+            base_state: DeviceBuffer {
+                address: 0x1000,
+                bytes: 40,
+            },
             condition: DeviceBuffer {
                 address: 0x2000,
                 bytes: 40,
@@ -330,6 +341,9 @@ mod tests {
         buffers.next_state.address = buffers.state.address;
         assert!(buffers.validate(shape()).is_err());
         buffers.next_state.address = 0xA000;
+        buffers.base_state.address = buffers.next_state.address;
+        assert!(buffers.validate(shape()).is_err());
+        buffers.base_state.address = buffers.state.address;
         buffers.sincos.bytes -= 4;
         assert!(buffers.validate(shape()).is_err());
     }
