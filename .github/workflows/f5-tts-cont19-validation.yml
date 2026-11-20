@@ -48,6 +48,11 @@ jobs:
             /tmp/f5-cont19-formatted-files.txt
           compression-level: 0
           retention-days: 3
+      - name: Print and pin exact tested commit
+        shell: bash
+        run: |
+          git rev-parse HEAD
+          git diff --stat -- models/f5_tts
       - name: Check and run native Rust unit tests
         shell: bash
         run: |
