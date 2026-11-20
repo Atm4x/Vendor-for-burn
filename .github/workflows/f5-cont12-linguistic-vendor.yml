@@ -65,6 +65,7 @@ jobs:
           set -euo pipefail
           sed -i '/^serde_json = "1"/a jieba-rs = "=0.11.0"' Cargo.toml
           export CARGO_HOME=/tmp/f5-cont12/cargo-home
+          if test -f ../../.cargo/config.toml; then mv ../../.cargo/config.toml /tmp/f5-cont12/repo-cargo-config.toml; fi
           cargo generate-lockfile
           mkdir -p .cargo
           cargo vendor --locked --versioned-dirs vendor > /tmp/f5-cont12/vendor-config.toml
