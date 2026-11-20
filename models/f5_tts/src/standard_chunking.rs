@@ -129,9 +129,56 @@ pub fn plan_standard_chunks(
     Ok(planned)
 }
 
+pub fn emit_pcm_chunks(
+    waveform: &[f32],
+    chunk_size: usize,
+    emit: &mut impl FnMut(&[f32], usize) -> Result<()>,
+) -> Result<()> {
+    if chunk_size == 0 {
+        return Err(F5Error::InvalidConfiguration(
+            "Streaming chunk size must be nonzero",
+        ));
+    }
+    for chunk in waveform.chunks(chunk_size) {
+        emit(chunk, SAMPLE_RATE as usize)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streaming_pcm_keeps_sample_order_and_propagates_errors() {
+        let samples = (0..21).map(|i| i as f32).collect::<Vec<_>>();
+        let mut reconstructed = Vec::new();
+        let mut sizes = Vec::new();
+        emit_pcm_chunks(&samples, 8, &mut |chunk, sample_rate| {
+            assert_eq!(sample_rate, 24_000);
+            sizes.push(chunk.len());
+            reconstructed.extend_from_slice(chunk);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(sizes, [8, 8, 5]);
+        assert_eq!(reconstructed, samples);
+        assert!(emit_pcm_chunks(&samples, 0, &mut |_, _| Ok(())).is_err());
+        let mut calls = 0;
+        let failure = emit_pcm_chunks(&samples, 8, &mut |_, _| {
+            calls += 1;
+            Err(F5Error::ModelExecution("sink closed".into()))
+        });
+        assert!(failure.is_err());
+        assert_eq!(calls, 1);
+        let mut empty_calls = 0;
+        emit_pcm_chunks(&[], 8, &mut |_, _| {
+            empty_calls += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(empty_calls, 0);
+    }
 
     #[test]
     fn original_ascii_and_cjk_boundaries() {

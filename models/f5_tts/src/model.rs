@@ -1,5 +1,76 @@
 use crate::{F5Error, Result};
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct GeneratedSpectrogram {
+    pub channels: usize,
+    pub frames: usize,
+    pub values: Vec<f32>,
+}
+
+impl GeneratedSpectrogram {
+    pub fn from_frame_major(frame_major: &[f32], channels: usize) -> Result<Self> {
+        if channels == 0 || frame_major.is_empty() || frame_major.len() % channels != 0 {
+            return Err(F5Error::InvalidShape("Invalid generated mel dimensions"));
+        }
+        let frames = frame_major.len() / channels;
+        let mut values = vec![0.0; frame_major.len()];
+        for frame in 0..frames {
+            for channel in 0..channels {
+                values[channel * frames + frame] = frame_major[frame * channels + channel];
+            }
+        }
+        Ok(Self {
+            channels,
+            frames,
+            values,
+        })
+    }
+
+    pub fn concatenate(chunks: &[Self]) -> Result<Self> {
+        let first = chunks
+            .first()
+            .ok_or(F5Error::InvalidShape("No generated mel chunks"))?;
+        let channels = first.channels;
+        if channels == 0
+            || chunks.iter().any(|c| {
+                c.channels != channels
+                    || c.frames == 0
+                    || c.frames.checked_mul(channels) != Some(c.values.len())
+            })
+        {
+            return Err(F5Error::InvalidShape("Incompatible generated mel chunks"));
+        }
+        let frames = chunks.iter().try_fold(0usize, |acc, c| {
+            acc.checked_add(c.frames)
+                .ok_or(F5Error::InvalidShape("Generated mel length overflow"))
+        })?;
+        let length = frames
+            .checked_mul(channels)
+            .ok_or(F5Error::InvalidShape("Generated mel size overflow"))?;
+        let mut values = vec![0.0; length];
+        for channel in 0..channels {
+            let mut cursor = channel * frames;
+            for chunk in chunks {
+                let span = &chunk.values[channel * chunk.frames..(channel + 1) * chunk.frames];
+                values[cursor..cursor + span.len()].copy_from_slice(span);
+                cursor += span.len();
+            }
+        }
+        Ok(Self {
+            channels,
+            frames,
+            values,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct InferenceOutput {
+    pub waveform: Vec<f32>,
+    pub sample_rate: usize,
+    pub spectrogram: GeneratedSpectrogram,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum F5Variant {
     Standard,
@@ -103,6 +174,18 @@ impl MelFrames {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_spectrogram_transposition_and_python_style_batch_concat() {
+        let left = GeneratedSpectrogram::from_frame_major(&[1.0, 10.0, 2.0, 20.0], 2).unwrap();
+        let right = GeneratedSpectrogram::from_frame_major(&[3.0, 30.0], 2).unwrap();
+        assert_eq!(left.values, [1.0, 2.0, 10.0, 20.0]);
+        let joined = GeneratedSpectrogram::concatenate(&[left, right]).unwrap();
+        assert_eq!(joined.frames, 3);
+        assert_eq!(joined.values, [1.0, 2.0, 3.0, 10.0, 20.0, 30.0]);
+        assert!(GeneratedSpectrogram::from_frame_major(&[1.0], 2).is_err());
+        assert!(GeneratedSpectrogram::concatenate(&[]).is_err());
+    }
 
     #[test]
     fn version_one_model_shape() {

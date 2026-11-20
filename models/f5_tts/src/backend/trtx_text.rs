@@ -7,10 +7,11 @@ use crate::{
     F5Error, Result,
     cfm::{CfmSampleMode, OdeMethod, SamplingConfig},
     cross_lingual::{EnglishSyllableCounter, cross_fade_waves, plan_cross_lingual_chunks},
+    model::{GeneratedSpectrogram, InferenceOutput},
     noise::StandardNormal,
     reference::ReferenceAudio,
     speech_edit::SpeechEditPlan,
-    standard_chunking::plan_standard_chunks,
+    standard_chunking::{emit_pcm_chunks, plan_standard_chunks},
     text_frontend::{F5TextFrontend, PinyinProvider, parse_voice_segments},
     vocab::Vocabulary,
 };
@@ -181,13 +182,21 @@ impl TrtChunkKernel for TrtWarmBank {
     }
 
     fn edit_speech_with_method(
-        &mut self, plan: &SpeechEditPlan, tokens: &[i32], noise: &[f32],
-        restoration_gain: f32, sampling: SamplingConfig, method: OdeMethod,
+        &mut self,
+        plan: &SpeechEditPlan,
+        tokens: &[i32],
+        noise: &[f32],
+        restoration_gain: f32,
+        sampling: SamplingConfig,
+        method: OdeMethod,
     ) -> Result<Vec<f32>> {
         let key = (0, plan.total_frames);
         self.ensure(key)?;
-        self.shapes.get_mut(&key)
-            .ok_or(F5Error::InvalidConfiguration("Missing warmed speech-edit engine"))?
+        self.shapes
+            .get_mut(&key)
+            .ok_or(F5Error::InvalidConfiguration(
+                "Missing warmed speech-edit engine",
+            ))?
             .edit_speech_with_method(plan, tokens, noise, restoration_gain, sampling, method)
     }
 
@@ -213,14 +222,77 @@ impl TrtChunkKernel for TrtWarmBank {
     }
 
     fn synthesize_chunk_with_sample_mode(
-        &mut self, reference: &ReferenceAudio, tokens: &[i32], target_frames: usize,
-        noise: &[f32], sampling: SamplingConfig, method: OdeMethod, mode: CfmSampleMode,
+        &mut self,
+        reference: &ReferenceAudio,
+        tokens: &[i32],
+        target_frames: usize,
+        noise: &[f32],
+        sampling: SamplingConfig,
+        method: OdeMethod,
+        mode: CfmSampleMode,
     ) -> Result<Vec<f32>> {
-        let reference_frames = crate::mel::VocosMel::new().extract(&reference.samples)?.frames;
+        let reference_frames = crate::mel::VocosMel::new()
+            .extract(&reference.samples)?
+            .frames;
         self.ensure((reference_frames, target_frames))?;
-        self.shapes.get_mut(&(reference_frames, target_frames))
+        self.shapes
+            .get_mut(&(reference_frames, target_frames))
             .ok_or(F5Error::InvalidConfiguration("Warmed F5 shape not found"))?
-            .synthesize_chunk_with_sample_mode(reference, tokens, target_frames, noise, sampling, method, mode)
+            .synthesize_chunk_with_sample_mode(
+                reference,
+                tokens,
+                target_frames,
+                noise,
+                sampling,
+                method,
+                mode,
+            )
+    }
+
+    fn synthesize_chunk_with_spectrogram(
+        &mut self,
+        reference: &ReferenceAudio,
+        tokens: &[i32],
+        target_frames: usize,
+        noise: &[f32],
+        sampling: SamplingConfig,
+    ) -> Result<InferenceOutput> {
+        let reference_frames = crate::mel::VocosMel::new()
+            .extract(&reference.samples)?
+            .frames;
+        self.ensure((reference_frames, target_frames))?;
+        self.shapes
+            .get_mut(&(reference_frames, target_frames))
+            .ok_or(F5Error::InvalidShape("Warmed TRT shape missing"))?
+            .synthesize_chunk_with_spectrogram(reference, tokens, target_frames, noise, sampling)
+    }
+
+    fn synthesize_chunk_with_spectrogram_and_sample_mode(
+        &mut self,
+        reference: &ReferenceAudio,
+        tokens: &[i32],
+        target_frames: usize,
+        noise: &[f32],
+        sampling: SamplingConfig,
+        method: OdeMethod,
+        mode: CfmSampleMode,
+    ) -> Result<InferenceOutput> {
+        let reference_frames = crate::mel::VocosMel::new()
+            .extract(&reference.samples)?
+            .frames;
+        self.ensure((reference_frames, target_frames))?;
+        self.shapes
+            .get_mut(&(reference_frames, target_frames))
+            .ok_or(F5Error::InvalidShape("Warmed TRT shape missing"))?
+            .synthesize_chunk_with_spectrogram_and_sample_mode(
+                reference,
+                tokens,
+                target_frames,
+                noise,
+                sampling,
+                method,
+                mode,
+            )
     }
 
     fn predict_reference_speed(&mut self, reference: &ReferenceAudio) -> Result<f32> {
@@ -268,13 +340,20 @@ pub trait TrtChunkKernel {
     }
 
     fn edit_speech_with_method(
-        &mut self, plan: &SpeechEditPlan, tokens: &[i32], noise: &[f32],
-        restoration_gain: f32, sampling: SamplingConfig, method: OdeMethod,
+        &mut self,
+        plan: &SpeechEditPlan,
+        tokens: &[i32],
+        noise: &[f32],
+        restoration_gain: f32,
+        sampling: SamplingConfig,
+        method: OdeMethod,
     ) -> Result<Vec<f32>> {
         if method == OdeMethod::Euler {
             self.edit_speech(plan, tokens, noise, restoration_gain, sampling)
         } else {
-            Err(F5Error::InvalidConfiguration("TRT kernel does not support midpoint editing"))
+            Err(F5Error::InvalidConfiguration(
+                "TRT kernel does not support midpoint editing",
+            ))
         }
     }
 
@@ -289,14 +368,59 @@ pub trait TrtChunkKernel {
 
     fn synthesize_chunk_with_sample_mode(
         &mut self,
-        reference: &ReferenceAudio, tokens: &[i32], target_frames: usize,
-        noise: &[f32], sampling: SamplingConfig,
-        method: OdeMethod, mode: CfmSampleMode,
+        reference: &ReferenceAudio,
+        tokens: &[i32],
+        target_frames: usize,
+        noise: &[f32],
+        sampling: SamplingConfig,
+        method: OdeMethod,
+        mode: CfmSampleMode,
     ) -> Result<Vec<f32>> {
         if method == OdeMethod::Euler && mode == CfmSampleMode::default() {
             self.synthesize_chunk(reference, tokens, target_frames, noise, sampling)
         } else {
-            Err(F5Error::InvalidConfiguration("TRT kernel does not support CFM sample modes"))
+            Err(F5Error::InvalidConfiguration(
+                "TRT kernel does not support CFM sample modes",
+            ))
+        }
+    }
+
+    fn synthesize_chunk_with_spectrogram(
+        &mut self,
+        reference: &ReferenceAudio,
+        tokens: &[i32],
+        target_frames: usize,
+        noise: &[f32],
+        sampling: SamplingConfig,
+    ) -> Result<InferenceOutput> {
+        let _ = (reference, tokens, target_frames, noise, sampling);
+        Err(F5Error::InvalidConfiguration(
+            "TRT kernel does not expose generated mel spectrogram",
+        ))
+    }
+
+    fn synthesize_chunk_with_spectrogram_and_sample_mode(
+        &mut self,
+        reference: &ReferenceAudio,
+        tokens: &[i32],
+        target_frames: usize,
+        noise: &[f32],
+        sampling: SamplingConfig,
+        method: OdeMethod,
+        mode: CfmSampleMode,
+    ) -> Result<InferenceOutput> {
+        if method == OdeMethod::Euler && mode == CfmSampleMode::default() {
+            self.synthesize_chunk_with_spectrogram(
+                reference,
+                tokens,
+                target_frames,
+                noise,
+                sampling,
+            )
+        } else {
+            Err(F5Error::InvalidConfiguration(
+                "TRT kernel does not support mel capture with CFM sample modes",
+            ))
         }
     }
 
@@ -316,11 +440,22 @@ impl<I: CudaTransport, E: TrtExecutor> TrtChunkKernel for TrtF5Session<I, E> {
     }
 
     fn edit_speech_with_method(
-        &mut self, plan: &SpeechEditPlan, tokens: &[i32], noise: &[f32],
-        restoration_gain: f32, sampling: SamplingConfig, method: OdeMethod,
+        &mut self,
+        plan: &SpeechEditPlan,
+        tokens: &[i32],
+        noise: &[f32],
+        restoration_gain: f32,
+        sampling: SamplingConfig,
+        method: OdeMethod,
     ) -> Result<Vec<f32>> {
         TrtF5Session::edit_speech_with_method(
-            self, plan, tokens, noise, restoration_gain, sampling, method,
+            self,
+            plan,
+            tokens,
+            noise,
+            restoration_gain,
+            sampling,
+            method,
         )
     }
 
@@ -356,21 +491,94 @@ impl<I: CudaTransport, E: TrtExecutor> TrtChunkKernel for TrtF5Session<I, E> {
     }
 
     fn synthesize_chunk_with_sample_mode(
-        &mut self, reference: &ReferenceAudio, tokens: &[i32], target_frames: usize,
-        noise: &[f32], sampling: SamplingConfig, method: OdeMethod, mode: CfmSampleMode,
+        &mut self,
+        reference: &ReferenceAudio,
+        tokens: &[i32],
+        target_frames: usize,
+        noise: &[f32],
+        sampling: SamplingConfig,
+        method: OdeMethod,
+        mode: CfmSampleMode,
     ) -> Result<Vec<f32>> {
         if target_frames != self.shape().cfm.backbone.frames {
             return Err(F5Error::InvalidShape("Wrong warmed duration"));
         }
-        let condition = reference.prepare(&crate::mel::VocosMel::new(), target_frames, tokens.len())?;
+        let condition =
+            reference.prepare(&crate::mel::VocosMel::new(), target_frames, tokens.len())?;
         if condition.frames.reference != self.shape().reference_frames {
             return Err(F5Error::InvalidShape("Wrong warmed reference length"));
         }
-        self.synthesize_with_sample_mode(SynthesisInputs {
-            condition: &condition.conditioning_mel,
-            initial_noise: noise, tokens,
-            restoration_gain: condition.restoration_gain(), sampling,
-        }, method, mode)
+        self.synthesize_with_sample_mode(
+            SynthesisInputs {
+                condition: &condition.conditioning_mel,
+                initial_noise: noise,
+                tokens,
+                restoration_gain: condition.restoration_gain(),
+                sampling,
+            },
+            method,
+            mode,
+        )
+    }
+
+    fn synthesize_chunk_with_spectrogram(
+        &mut self,
+        reference: &ReferenceAudio,
+        tokens: &[i32],
+        target_frames: usize,
+        noise: &[f32],
+        sampling: SamplingConfig,
+    ) -> Result<InferenceOutput> {
+        if target_frames != self.shape().cfm.backbone.frames {
+            return Err(F5Error::InvalidShape("Wrong warmed F5 duration"));
+        }
+        let condition =
+            reference.prepare(&crate::mel::VocosMel::new(), target_frames, tokens.len())?;
+        if condition.frames.reference != self.shape().reference_frames {
+            return Err(F5Error::InvalidShape("Wrong warmed F5 reference length"));
+        }
+        self.synthesize_with_spectrogram(
+            SynthesisInputs {
+                condition: &condition.conditioning_mel,
+                initial_noise: noise,
+                tokens,
+                restoration_gain: condition.restoration_gain(),
+                sampling,
+            },
+            OdeMethod::Euler,
+            CfmSampleMode::default(),
+        )
+    }
+
+    fn synthesize_chunk_with_spectrogram_and_sample_mode(
+        &mut self,
+        reference: &ReferenceAudio,
+        tokens: &[i32],
+        target_frames: usize,
+        noise: &[f32],
+        sampling: SamplingConfig,
+        method: OdeMethod,
+        mode: CfmSampleMode,
+    ) -> Result<InferenceOutput> {
+        if target_frames != self.shape().cfm.backbone.frames {
+            return Err(F5Error::InvalidShape("Wrong warmed F5 duration"));
+        }
+        let condition =
+            reference.prepare(&crate::mel::VocosMel::new(), target_frames, tokens.len())?;
+        if condition.frames.reference != self.shape().reference_frames {
+            return Err(F5Error::InvalidShape("Wrong warmed F5 reference length"));
+        }
+        self.synthesize_with_spectrogram(
+            SynthesisInputs {
+                condition: &condition.conditioning_mel,
+                initial_noise: noise,
+                tokens,
+                restoration_gain: condition.restoration_gain(),
+                sampling,
+            },
+            method,
+            mode,
+        )
     }
 
     fn predict_reference_speed(&mut self, reference: &ReferenceAudio) -> Result<f32> {
@@ -426,15 +634,26 @@ pub fn synthesize_standard_text<K: TrtChunkKernel, P: PinyinProvider>(
     options: StandardTextOptions,
 ) -> Result<Vec<f32>> {
     synthesize_standard_text_with_sample_mode(
-        kernel, reference, generated_text, vocabulary, pinyin, options,
-        OdeMethod::Euler, CfmSampleMode::default(),
+        kernel,
+        reference,
+        generated_text,
+        vocabulary,
+        pinyin,
+        options,
+        OdeMethod::Euler,
+        CfmSampleMode::default(),
     )
 }
 
 pub fn synthesize_standard_text_with_sample_mode<K: TrtChunkKernel, P: PinyinProvider>(
-    kernel: &mut K, reference: TrtVoice<'_>, generated_text: &str,
-    vocabulary: &Vocabulary, pinyin: P, options: StandardTextOptions,
-    method: OdeMethod, mode: CfmSampleMode,
+    kernel: &mut K,
+    reference: TrtVoice<'_>,
+    generated_text: &str,
+    vocabulary: &Vocabulary,
+    pinyin: P,
+    options: StandardTextOptions,
+    method: OdeMethod,
+    mode: CfmSampleMode,
 ) -> Result<Vec<f32>> {
     let plans = plan_standard_chunks(
         generated_text,
@@ -449,15 +668,168 @@ pub fn synthesize_standard_text_with_sample_mode<K: TrtChunkKernel, P: PinyinPro
     let mut waves = Vec::with_capacity(plans.len());
     for chunk in plans {
         let tokens = frontend.standard_tokens(reference.transcript, &chunk.text)?;
-        let count = chunk.total_frames.checked_mul(100)
+        let count = chunk
+            .total_frames
+            .checked_mul(100)
             .ok_or(F5Error::InvalidShape("Noise size overflow"))?;
         let noise = rng.sample_vec(count)?;
         waves.push(kernel.synthesize_chunk_with_sample_mode(
-            reference.audio, &tokens, chunk.total_frames,
-            &noise, options.sampling, method, mode,
+            reference.audio,
+            &tokens,
+            chunk.total_frames,
+            &noise,
+            options.sampling,
+            method,
+            mode,
         )?);
     }
     cross_fade_waves(&waves, options.cross_fade_seconds as f64)
+}
+
+pub fn synthesize_standard_text_with_spectrogram<K: TrtChunkKernel, P: PinyinProvider>(
+    kernel: &mut K,
+    reference: TrtVoice<'_>,
+    generated_text: &str,
+    vocabulary: &Vocabulary,
+    pinyin: P,
+    options: StandardTextOptions,
+) -> Result<InferenceOutput> {
+    synthesize_standard_text_with_spectrogram_and_sample_mode(
+        kernel,
+        reference,
+        generated_text,
+        vocabulary,
+        pinyin,
+        options,
+        OdeMethod::Euler,
+        CfmSampleMode::default(),
+    )
+}
+
+pub fn synthesize_standard_text_with_spectrogram_and_sample_mode<
+    K: TrtChunkKernel,
+    P: PinyinProvider,
+>(
+    kernel: &mut K,
+    reference: TrtVoice<'_>,
+    generated_text: &str,
+    vocabulary: &Vocabulary,
+    pinyin: P,
+    options: StandardTextOptions,
+    method: OdeMethod,
+    mode: CfmSampleMode,
+) -> Result<InferenceOutput> {
+    mode.validate()?;
+    let plans = plan_standard_chunks(
+        generated_text,
+        reference.transcript,
+        reference.audio.samples.len(),
+        options.speed,
+        options.fixed_seconds,
+        options.cross_fade_seconds,
+    )?;
+    let frontend = F5TextFrontend::new(vocabulary, pinyin);
+    let mut rng = StandardNormal::new(options.seed);
+    let mut waves = Vec::with_capacity(plans.len());
+    let mut spectra = Vec::with_capacity(plans.len());
+    for chunk in plans {
+        let tokens = frontend.standard_tokens(reference.transcript, &chunk.text)?;
+        let noise = rng.sample_vec(
+            chunk
+                .total_frames
+                .checked_mul(100)
+                .ok_or(F5Error::InvalidShape("Noise size overflow"))?,
+        )?;
+        let output = kernel.synthesize_chunk_with_spectrogram_and_sample_mode(
+            reference.audio,
+            &tokens,
+            chunk.total_frames,
+            &noise,
+            options.sampling,
+            method,
+            mode,
+        )?;
+        waves.push(output.waveform);
+        spectra.push(output.spectrogram);
+    }
+    Ok(InferenceOutput {
+        waveform: cross_fade_waves(&waves, options.cross_fade_seconds as f64)?,
+        sample_rate: crate::mel::SAMPLE_RATE,
+        spectrogram: GeneratedSpectrogram::concatenate(&spectra)?,
+    })
+}
+
+pub fn stream_standard_text<K: TrtChunkKernel, P: PinyinProvider>(
+    kernel: &mut K,
+    reference: TrtVoice<'_>,
+    generated_text: &str,
+    vocabulary: &Vocabulary,
+    pinyin: P,
+    options: StandardTextOptions,
+    chunk_size: usize,
+    emit: impl FnMut(&[f32], usize) -> Result<()>,
+) -> Result<()> {
+    stream_standard_text_with_sample_mode(
+        kernel,
+        reference,
+        generated_text,
+        vocabulary,
+        pinyin,
+        options,
+        OdeMethod::Euler,
+        CfmSampleMode::default(),
+        chunk_size,
+        emit,
+    )
+}
+
+pub fn stream_standard_text_with_sample_mode<K: TrtChunkKernel, P: PinyinProvider>(
+    kernel: &mut K,
+    reference: TrtVoice<'_>,
+    generated_text: &str,
+    vocabulary: &Vocabulary,
+    pinyin: P,
+    options: StandardTextOptions,
+    method: OdeMethod,
+    mode: CfmSampleMode,
+    chunk_size: usize,
+    mut emit: impl FnMut(&[f32], usize) -> Result<()>,
+) -> Result<()> {
+    if chunk_size == 0 {
+        return Err(F5Error::InvalidConfiguration(
+            "Streaming chunk size must be nonzero",
+        ));
+    }
+    mode.validate()?;
+    let plans = plan_standard_chunks(
+        generated_text,
+        reference.transcript,
+        reference.audio.samples.len(),
+        options.speed,
+        options.fixed_seconds,
+        options.cross_fade_seconds,
+    )?;
+    let frontend = F5TextFrontend::new(vocabulary, pinyin);
+    let mut rng = StandardNormal::new(options.seed);
+    for chunk in plans {
+        let tokens = frontend.standard_tokens(reference.transcript, &chunk.text)?;
+        let count = chunk
+            .total_frames
+            .checked_mul(100)
+            .ok_or(F5Error::InvalidShape("Noise size overflow"))?;
+        let noise = rng.sample_vec(count)?;
+        let wave = kernel.synthesize_chunk_with_sample_mode(
+            reference.audio,
+            &tokens,
+            chunk.total_frames,
+            &noise,
+            options.sampling,
+            method,
+            mode,
+        )?;
+        emit_pcm_chunks(&wave, chunk_size, &mut emit)?;
+    }
+    Ok(())
 }
 
 pub fn synthesize_multi_voice<K: TrtChunkKernel, P: PinyinProvider>(
@@ -577,6 +949,28 @@ mod tests {
             Ok(vec![target_frames as f32 / 10_000.0; 2048])
         }
 
+        fn synthesize_chunk_with_spectrogram(
+            &mut self,
+            reference: &ReferenceAudio,
+            tokens: &[i32],
+            target_frames: usize,
+            noise: &[f32],
+            sampling: SamplingConfig,
+        ) -> Result<InferenceOutput> {
+            let waveform =
+                self.synthesize_chunk(reference, tokens, target_frames, noise, sampling)?;
+            let frames = target_frames
+                - crate::mel::VocosMel::new()
+                    .extract(&reference.samples)?
+                    .frames;
+            let mel = vec![target_frames as f32; frames * 100];
+            Ok(InferenceOutput {
+                waveform,
+                sample_rate: 24_000,
+                spectrogram: GeneratedSpectrogram::from_frame_major(&mel, 100)?,
+            })
+        }
+
         fn predict_reference_speed(&mut self, _: &ReferenceAudio) -> Result<f32> {
             self.speed_calls += 1;
             Ok(2.0)
@@ -681,6 +1075,141 @@ mod tests {
             assert_eq!(call.0, planned[index].total_frames);
             assert_eq!(call.2, rng.sample_vec(call.0 * 100).unwrap()[..4]);
         }
+    }
+
+    #[test]
+    fn standard_streaming_emits_original_pcm_chunks_without_crossfade() {
+        let reference = reference();
+        let text = "Hello world. Another sentence. More words here!";
+        let options = StandardTextOptions {
+            speed: 1.0,
+            fixed_seconds: Some(9.0),
+            cross_fade_seconds: 0.15,
+            seed: 42,
+            sampling: SamplingConfig::default(),
+        };
+        let mut backend = RecordingKernel::default();
+        let mut audio = Vec::new();
+        let mut sizes = Vec::new();
+        stream_standard_text(
+            &mut backend,
+            TrtVoice {
+                audio: &reference,
+                transcript: "Hi",
+            },
+            text,
+            &vocab(),
+            NoPinyin,
+            options,
+            700,
+            |chunk, rate| {
+                assert_eq!(rate, 24_000);
+                sizes.push(chunk.len());
+                audio.extend_from_slice(chunk);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let planned =
+            plan_standard_chunks(text, "Hi", reference.samples.len(), 1.0, Some(9.0), 0.15)
+                .unwrap();
+        assert_eq!(backend.calls.len(), planned.len());
+        assert_eq!(audio.len(), 2048 * planned.len());
+        assert_eq!(sizes, [700, 700, 648].repeat(planned.len()));
+        for (i, call) in backend.calls.iter().enumerate() {
+            assert_eq!(call.0, planned[i].total_frames);
+            assert!(
+                audio[i * 2048..(i + 1) * 2048]
+                    .iter()
+                    .all(|v| *v == call.0 as f32 / 10_000.0)
+            );
+        }
+        assert!(
+            stream_standard_text(
+                &mut RecordingKernel::default(),
+                TrtVoice {
+                    audio: &reference,
+                    transcript: "Hi"
+                },
+                text,
+                &vocab(),
+                NoPinyin,
+                options,
+                0,
+                |_, _| Ok(()),
+            )
+            .is_err()
+        );
+        assert_eq!(backend.calls.len(), planned.len());
+    }
+
+    #[test]
+    fn streaming_sink_failure_prevents_generation_of_later_batches() {
+        let reference = reference();
+        let mut backend = RecordingKernel::default();
+        let result = stream_standard_text(
+            &mut backend,
+            TrtVoice {
+                audio: &reference,
+                transcript: "Hi",
+            },
+            "Hello world. Another sentence. More words here!",
+            &vocab(),
+            NoPinyin,
+            StandardTextOptions {
+                speed: 1.0,
+                fixed_seconds: None,
+                cross_fade_seconds: 0.15,
+                seed: 13,
+                sampling: SamplingConfig::default(),
+            },
+            128,
+            |_, _| Err(F5Error::ModelExecution("consumer closed".into())),
+        );
+        assert!(result.is_err());
+        assert_eq!(backend.calls.len(), 1);
+    }
+
+    #[test]
+    fn spectrogram_batches_are_concatenated_on_frame_axis() {
+        let reference = reference();
+        let mut backend = RecordingKernel::default();
+        let text = "Hello world. Another sentence. More words here!";
+        let options = StandardTextOptions {
+            speed: 1.0,
+            fixed_seconds: Some(9.0),
+            cross_fade_seconds: 0.15,
+            seed: 21,
+            sampling: SamplingConfig::default(),
+        };
+        let output = synthesize_standard_text_with_spectrogram(
+            &mut backend,
+            TrtVoice {
+                audio: &reference,
+                transcript: "Hi",
+            },
+            text,
+            &vocab(),
+            NoPinyin,
+            options,
+        )
+        .unwrap();
+        let ref_frames = crate::mel::VocosMel::new()
+            .extract(&reference.samples)
+            .unwrap()
+            .frames;
+        let generated_frames = backend
+            .calls
+            .iter()
+            .map(|x| x.0 - ref_frames)
+            .sum::<usize>();
+        assert_eq!(output.spectrogram.channels, 100);
+        assert_eq!(output.spectrogram.frames, generated_frames);
+        assert_eq!(output.spectrogram.values.len(), generated_frames * 100);
+        assert_eq!(output.sample_rate, 24_000);
+        assert_eq!(output.waveform.len(), 2048);
+        let first = backend.calls[0].0 as f32;
+        assert_eq!(output.spectrogram.values[0], first);
     }
 
     #[test]

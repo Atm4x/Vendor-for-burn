@@ -4,8 +4,13 @@
 use std::ffi::c_void;
 
 use crate::{
-    F5Error, Result, cfm::{CfmSampleMode, OdeMethod, SamplingConfig, duplicate_test_initial_state}, mel::VocosMel, noise::StandardNormal,
-    reference::ReferenceAudio, speech_edit::SpeechEditPlan,
+    F5Error, Result,
+    cfm::{CfmSampleMode, OdeMethod, SamplingConfig, duplicate_test_initial_state},
+    mel::VocosMel,
+    model::{GeneratedSpectrogram, InferenceOutput},
+    noise::StandardNormal,
+    reference::ReferenceAudio,
+    speech_edit::SpeechEditPlan,
 };
 
 use super::{
@@ -198,12 +203,19 @@ impl<I: CudaTransport, E: TrtExecutor> TrtF5Session<I, E> {
         self.synthesize_with_method(request, OdeMethod::Euler)
     }
 
-    pub fn synthesize_with_method(&mut self, request: SynthesisInputs<'_>, method: OdeMethod) -> Result<Vec<f32>> {
+    pub fn synthesize_with_method(
+        &mut self,
+        request: SynthesisInputs<'_>,
+        method: OdeMethod,
+    ) -> Result<Vec<f32>> {
         self.synthesize_with_sample_mode(request, method, CfmSampleMode::default())
     }
 
     pub fn synthesize_with_sample_mode(
-        &mut self, request: SynthesisInputs<'_>, method: OdeMethod, mode: CfmSampleMode,
+        &mut self,
+        request: SynthesisInputs<'_>,
+        method: OdeMethod,
+        mode: CfmSampleMode,
     ) -> Result<Vec<f32>> {
         let result = self.synthesize_inner(request, method, mode);
         let synchronized = self.io.synchronize();
@@ -214,19 +226,57 @@ impl<I: CudaTransport, E: TrtExecutor> TrtF5Session<I, E> {
         }
     }
 
+    pub fn synthesize_with_spectrogram(
+        &mut self,
+        request: SynthesisInputs<'_>,
+        method: OdeMethod,
+        mode: CfmSampleMode,
+    ) -> Result<InferenceOutput> {
+        let mut spectrogram = None;
+        let result = self.synthesize_inner_capture(request, method, mode, Some(&mut spectrogram));
+        let synchronized = self.io.synchronize();
+        match (result, synchronized) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(waveform), Ok(())) => Ok(InferenceOutput {
+                waveform,
+                sample_rate: crate::mel::SAMPLE_RATE,
+                spectrogram: spectrogram.ok_or(F5Error::ModelExecution(
+                    "TensorRT mel capture was not produced".into(),
+                ))?,
+            }),
+        }
+    }
+
     /// Speech editing runs CFM with an arbitrary preserved-frame mask and
     /// decodes the complete waveform, instead of trimming off a reference prefix.
     /// Requires an edit-shaped engine (reference_frames=0, vocos.frames=total).
     pub fn edit_speech(
-        &mut self, plan: &SpeechEditPlan, tokens: &[i32], noise: &[f32],
-        restoration_gain: f32, sampling: SamplingConfig,
+        &mut self,
+        plan: &SpeechEditPlan,
+        tokens: &[i32],
+        noise: &[f32],
+        restoration_gain: f32,
+        sampling: SamplingConfig,
     ) -> Result<Vec<f32>> {
-        self.edit_speech_with_method(plan, tokens, noise, restoration_gain, sampling, OdeMethod::Euler)
+        self.edit_speech_with_method(
+            plan,
+            tokens,
+            noise,
+            restoration_gain,
+            sampling,
+            OdeMethod::Euler,
+        )
     }
 
     pub fn edit_speech_with_method(
-        &mut self, plan: &SpeechEditPlan, tokens: &[i32], noise: &[f32],
-        restoration_gain: f32, sampling: SamplingConfig, method: OdeMethod,
+        &mut self,
+        plan: &SpeechEditPlan,
+        tokens: &[i32],
+        noise: &[f32],
+        restoration_gain: f32,
+        sampling: SamplingConfig,
+        method: OdeMethod,
     ) -> Result<Vec<f32>> {
         let frames = self.shape.cfm.backbone.frames;
         if self.shape.reference_frames != 0
@@ -255,6 +305,7 @@ impl<I: CudaTransport, E: TrtExecutor> TrtF5Session<I, E> {
             0,
             method,
             CfmSampleMode::default(),
+            None,
         );
         let synchronized = self.io.synchronize();
         match (result, synchronized) {
@@ -295,7 +346,20 @@ impl<I: CudaTransport, E: TrtExecutor> TrtF5Session<I, E> {
     }
 
     fn synthesize_inner(
-        &mut self, request: SynthesisInputs<'_>, method: OdeMethod, mode: CfmSampleMode,
+        &mut self,
+        request: SynthesisInputs<'_>,
+        method: OdeMethod,
+        mode: CfmSampleMode,
+    ) -> Result<Vec<f32>> {
+        self.synthesize_inner_capture(request, method, mode, None)
+    }
+
+    fn synthesize_inner_capture(
+        &mut self,
+        request: SynthesisInputs<'_>,
+        method: OdeMethod,
+        mode: CfmSampleMode,
+        spectrogram: Option<&mut Option<GeneratedSpectrogram>>,
     ) -> Result<Vec<f32>> {
         let frames = self.shape.cfm.backbone.frames;
         let r = self.shape.reference_frames;
@@ -313,7 +377,7 @@ impl<I: CudaTransport, E: TrtExecutor> TrtF5Session<I, E> {
         }
         let mut mask = vec![0.0; frames];
         mask[..r].fill(1.0);
-        self.synthesize_inner_masked(request, &mask, r, method, mode)
+        self.synthesize_inner_masked(request, &mask, r, method, mode, spectrogram)
     }
 
     fn synthesize_inner_masked(
@@ -323,6 +387,7 @@ impl<I: CudaTransport, E: TrtExecutor> TrtF5Session<I, E> {
         decoded_from: usize,
         method: OdeMethod,
         mode: CfmSampleMode,
+        spectrogram: Option<&mut Option<GeneratedSpectrogram>>,
     ) -> Result<Vec<f32>> {
         let cfg = self.shape.cfm;
         mode.validate()?;
@@ -361,7 +426,11 @@ impl<I: CudaTransport, E: TrtExecutor> TrtF5Session<I, E> {
         let mut initial_state = request.initial_noise.to_vec();
         if mode.duplicate_test {
             duplicate_test_initial_state(
-                &mut initial_state, request.condition, decoded_from.max(1), 100, mode.t_inter,
+                &mut initial_state,
+                request.condition,
+                decoded_from.max(1),
+                100,
+                mode.t_inter,
             )?;
         }
         self.upload_f32(A, &initial_state)?;
@@ -404,7 +473,11 @@ impl<I: CudaTransport, E: TrtExecutor> TrtF5Session<I, E> {
                 mid.validate(cfg)?;
                 self.executor.cfm_step(mid, stream)?;
             }
-            let eval_time = if method == OdeMethod::Midpoint { times[0] + 0.5 * dt } else { times[0] };
+            let eval_time = if method == OdeMethod::Midpoint {
+                times[0] + 0.5 * dt
+            } else {
+                times[0]
+            };
             let freq = timestep_frequencies(&[eval_time, eval_time])?;
             self.upload_f32(SINCOS, &freq)?;
             self.upload_f32(DT, &[dt])?;
@@ -442,6 +515,16 @@ impl<I: CudaTransport, E: TrtExecutor> TrtF5Session<I, E> {
         bindings.validate(self.shape.vocos)?;
         self.executor.vocos(bindings, self.io.stream())?;
         self.io.synchronize()?;
+        if let Some(output) = spectrogram {
+            let mut frame_major = vec![0.0_f32; generated_bytes / 4];
+            self.io.download(mel, unsafe {
+                std::slice::from_raw_parts_mut(
+                    frame_major.as_mut_ptr().cast::<u8>(),
+                    generated_bytes,
+                )
+            })?;
+            *output = Some(GeneratedSpectrogram::from_frame_major(&frame_major, 100)?);
+        }
         let mut spectral = vec![0.0; self.shape.vocos.head_bytes()? / 4];
         self.download_f32(SPECTRAL, &mut spectral)?;
         decode_vocos_spectrum(&spectral, request.restoration_gain)
@@ -657,7 +740,11 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(i, value)| {
-                    let velocity = if affine { 0.5 * state[i] + 0.1 } else { guided_velocity };
+                    let velocity = if affine {
+                        0.5 * state[i] + 0.1
+                    } else {
+                        guided_velocity
+                    };
                     let sample = *value + velocity * dt;
                     if restore > 0.5 && reference[i / 100] > 0.5 {
                         condition[i]
@@ -795,6 +882,49 @@ mod tests {
     }
 
     #[test]
+    fn optional_spectrogram_matches_generated_cfm_mel_and_downloads_only_on_request() {
+        let gpu = Rc::new(RefCell::new(TestGpu::default()));
+        let mut session =
+            TrtF5Session::open(TestIo(gpu.clone()), TestExecutor(gpu.clone()), test_shape())
+                .unwrap();
+        let mut condition = vec![0.0; 600];
+        condition[..200].fill(0.75);
+        let noise = vec![0.25; 600];
+        let sampling = SamplingConfig {
+            steps: 3,
+            cfg_strength: 2.0,
+            sway_sampling_coef: None,
+            empirically_pruned_steps: false,
+        };
+        let inputs = || SynthesisInputs {
+            condition: &condition,
+            initial_noise: &noise,
+            tokens: &[1, 2, 3],
+            restoration_gain: 1.0,
+            sampling,
+        };
+        let without_mel = session.synthesize(inputs()).unwrap();
+        assert_eq!(gpu.borrow().downloads.len(), 1);
+        let output = session
+            .synthesize_with_spectrogram(inputs(), OdeMethod::Euler, CfmSampleMode::default())
+            .unwrap();
+        assert_eq!(output.waveform, without_mel);
+        assert_eq!(output.sample_rate, 24_000);
+        assert_eq!(output.spectrogram.channels, 100);
+        assert_eq!(output.spectrogram.frames, 4);
+        assert_eq!(gpu.borrow().downloads.len(), 3);
+        let observed = gpu.borrow().observed_mel.clone();
+        for channel in 0..100 {
+            for frame in 0..4 {
+                assert_eq!(
+                    output.spectrogram.values[channel * 4 + frame],
+                    observed[frame * 100 + channel],
+                );
+            }
+        }
+    }
+
+    #[test]
     fn full_session_keeps_cfm_states_on_gpu_and_reuses_memory() {
         let data = Rc::new(RefCell::new(TestGpu::default()));
         let shape = test_shape();
@@ -852,17 +982,31 @@ mod tests {
     fn midpoint_retains_original_state_and_keeps_mel_on_mock_gpu() {
         let data = Rc::new(RefCell::new(TestGpu::default()));
         let mut session = TrtF5Session::open(
-            TestIo(data.clone()), TestExecutor(data.clone()), test_shape()
-        ).unwrap();
+            TestIo(data.clone()),
+            TestExecutor(data.clone()),
+            test_shape(),
+        )
+        .unwrap();
         let mut condition = vec![0.0; 600];
         condition[..200].fill(0.5);
         let sampling = SamplingConfig {
-            steps: 5, cfg_strength: 1.0, sway_sampling_coef: None, empirically_pruned_steps: true,
+            steps: 5,
+            cfg_strength: 1.0,
+            sway_sampling_coef: None,
+            empirically_pruned_steps: true,
         };
-        let audio = session.synthesize_with_method(SynthesisInputs {
-            condition: &condition, initial_noise: &vec![0.0; 600], tokens: &[1, 2],
-            restoration_gain: 1.0, sampling,
-        }, OdeMethod::Midpoint).unwrap();
+        let audio = session
+            .synthesize_with_method(
+                SynthesisInputs {
+                    condition: &condition,
+                    initial_noise: &vec![0.0; 600],
+                    tokens: &[1, 2],
+                    restoration_gain: 1.0,
+                    sampling,
+                },
+                OdeMethod::Midpoint,
+            )
+            .unwrap();
         assert!(!audio.is_empty());
         let state = data.borrow();
         assert_eq!(state.stages, 10);
@@ -871,20 +1015,36 @@ mod tests {
 
     #[test]
     fn midpoint_state_dependent_velocity_agrees_with_torch_midpoint_not_euler() {
-        let data = Rc::new(RefCell::new(TestGpu { affine_velocity: true, ..Default::default() }));
+        let data = Rc::new(RefCell::new(TestGpu {
+            affine_velocity: true,
+            ..Default::default()
+        }));
         let mut session = TrtF5Session::open(
-            TestIo(data.clone()), TestExecutor(data.clone()), test_shape()
-        ).unwrap();
+            TestIo(data.clone()),
+            TestExecutor(data.clone()),
+            test_shape(),
+        )
+        .unwrap();
         let condition = vec![0.0; 600];
         let noise = vec![0.25; 600];
         let sampling = SamplingConfig {
-            steps: 2, cfg_strength: 0.0,
-            sway_sampling_coef: None, empirically_pruned_steps: false,
+            steps: 2,
+            cfg_strength: 0.0,
+            sway_sampling_coef: None,
+            empirically_pruned_steps: false,
         };
-        session.synthesize_with_method(SynthesisInputs {
-            condition: &condition, initial_noise: &noise, tokens: &[1, 2],
-            restoration_gain: 1.0, sampling,
-        }, OdeMethod::Midpoint).unwrap();
+        session
+            .synthesize_with_method(
+                SynthesisInputs {
+                    condition: &condition,
+                    initial_noise: &noise,
+                    tokens: &[1, 2],
+                    restoration_gain: 1.0,
+                    sampling,
+                },
+                OdeMethod::Midpoint,
+            )
+            .unwrap();
         let observed = data.borrow();
         assert_eq!(observed.stages, 4);
         for value in &observed.observed_mel {
@@ -898,22 +1058,38 @@ mod tests {
     fn duplicate_test_no_ref_and_t_inter_reuse_warmed_cfm_engine() {
         let data = Rc::new(RefCell::new(TestGpu::default()));
         let mut session = TrtF5Session::open(
-            TestIo(data.clone()), TestExecutor(data.clone()), test_shape()
-        ).unwrap();
+            TestIo(data.clone()),
+            TestExecutor(data.clone()),
+            test_shape(),
+        )
+        .unwrap();
         let mut condition = vec![0.0; 600];
         condition[..200].fill(0.8);
         let noise = vec![0.25; 600];
         let sampling = SamplingConfig {
-            steps: 4, cfg_strength: 1.0,
-            sway_sampling_coef: None, empirically_pruned_steps: true,
+            steps: 4,
+            cfg_strength: 1.0,
+            sway_sampling_coef: None,
+            empirically_pruned_steps: true,
         };
         let mode = CfmSampleMode {
-            no_ref_audio: true, duplicate_test: true, t_inter: 0.5,
+            no_ref_audio: true,
+            duplicate_test: true,
+            t_inter: 0.5,
         };
-        session.synthesize_with_sample_mode(SynthesisInputs {
-            condition: &condition, initial_noise: &noise, tokens: &[1, 2],
-            restoration_gain: 1.0, sampling,
-        }, OdeMethod::Euler, mode).unwrap();
+        session
+            .synthesize_with_sample_mode(
+                SynthesisInputs {
+                    condition: &condition,
+                    initial_noise: &noise,
+                    tokens: &[1, 2],
+                    restoration_gain: 1.0,
+                    sampling,
+                },
+                OdeMethod::Euler,
+                mode,
+            )
+            .unwrap();
         let state = data.borrow();
         assert_eq!(state.stages, 2);
         assert_eq!(state.observed_mel.len(), 400);
@@ -995,7 +1171,10 @@ pub struct TrtLibraryPaths<'a> {
 pub trait TrtSynthesis {
     fn synthesize(&mut self, request: SynthesisInputs<'_>) -> Result<Vec<f32>>;
     fn synthesize_with_sample_mode(
-        &mut self, request: SynthesisInputs<'_>, method: OdeMethod, mode: CfmSampleMode,
+        &mut self,
+        request: SynthesisInputs<'_>,
+        method: OdeMethod,
+        mode: CfmSampleMode,
     ) -> Result<Vec<f32>>;
     fn edit_speech(
         &mut self,
@@ -1006,8 +1185,13 @@ pub trait TrtSynthesis {
         sampling: SamplingConfig,
     ) -> Result<Vec<f32>>;
     fn edit_speech_with_method(
-        &mut self, plan: &SpeechEditPlan, tokens: &[i32], noise: &[f32],
-        restoration_gain: f32, sampling: SamplingConfig, method: OdeMethod,
+        &mut self,
+        plan: &SpeechEditPlan,
+        tokens: &[i32],
+        noise: &[f32],
+        restoration_gain: f32,
+        sampling: SamplingConfig,
+        method: OdeMethod,
     ) -> Result<Vec<f32>>;
     fn synthesize_seeded(
         &mut self,
@@ -1036,17 +1220,31 @@ impl<I: CudaTransport, E: TrtExecutor> TrtSynthesis for TrtF5Session<I, E> {
     }
 
     fn synthesize_with_sample_mode(
-        &mut self, request: SynthesisInputs<'_>, method: OdeMethod, mode: CfmSampleMode,
+        &mut self,
+        request: SynthesisInputs<'_>,
+        method: OdeMethod,
+        mode: CfmSampleMode,
     ) -> Result<Vec<f32>> {
         TrtF5Session::synthesize_with_sample_mode(self, request, method, mode)
     }
 
     fn edit_speech_with_method(
-        &mut self, plan: &SpeechEditPlan, tokens: &[i32], noise: &[f32],
-        restoration_gain: f32, sampling: SamplingConfig, method: OdeMethod,
+        &mut self,
+        plan: &SpeechEditPlan,
+        tokens: &[i32],
+        noise: &[f32],
+        restoration_gain: f32,
+        sampling: SamplingConfig,
+        method: OdeMethod,
     ) -> Result<Vec<f32>> {
         TrtF5Session::edit_speech_with_method(
-            self, plan, tokens, noise, restoration_gain, sampling, method
+            self,
+            plan,
+            tokens,
+            noise,
+            restoration_gain,
+            sampling,
+            method,
         )
     }
 

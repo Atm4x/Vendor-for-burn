@@ -7,6 +7,7 @@ use crate::{
     cfm::{CfmSampleMode, OdeMethod, SamplingConfig},
     cross_lingual::EnglishSyllableCounter,
     mel::VocosMel,
+    model::InferenceOutput,
     noise::StandardNormal,
     reference::ReferenceAudio,
     speech_edit::{EditSpan, SpeechEditPlan},
@@ -16,8 +17,10 @@ use crate::{
 
 use super::trtx_text::{
     CrossLingualTextOptions, StandardTextOptions, TrtChunkKernel, TrtKernelFactory, TrtVoice,
-    TrtWarmBank, synthesize_cross_lingual, synthesize_multi_voice, synthesize_standard_text,
-    synthesize_standard_text_with_sample_mode,
+    TrtWarmBank, stream_standard_text, stream_standard_text_with_sample_mode,
+    synthesize_cross_lingual, synthesize_multi_voice, synthesize_standard_text,
+    synthesize_standard_text_with_sample_mode, synthesize_standard_text_with_spectrogram,
+    synthesize_standard_text_with_spectrogram_and_sample_mode,
 };
 
 #[derive(Debug, Clone)]
@@ -191,14 +194,21 @@ impl<P: PinyinProvider + Clone> TrtModelWorker<P> {
     }
 
     pub fn edit_speech_with_method(
-        &mut self, recording: &ReferenceAudio, target_text: &str,
-        spans: &[EditSpan], seed: u64, sampling: SamplingConfig, method: OdeMethod,
+        &mut self,
+        recording: &ReferenceAudio,
+        target_text: &str,
+        spans: &[EditSpan],
+        seed: u64,
+        sampling: SamplingConfig,
+        method: OdeMethod,
     ) -> Result<Vec<f32>> {
-        let active = self.active.as_mut()
+        let active = self
+            .active
+            .as_mut()
             .ok_or(F5Error::InvalidConfiguration("No F5 model loaded"))?;
-        let tokens = crate::text_frontend::F5TextFrontend::new(
-            &active.vocabulary, active.pinyin.clone(),
-        ).cross_lingual_tokens(target_text)?;
+        let tokens =
+            crate::text_frontend::F5TextFrontend::new(&active.vocabulary, active.pinyin.clone())
+                .cross_lingual_tokens(target_text)?;
         let original = VocosMel::new().extract(&recording.samples)?;
         let plan = SpeechEditPlan::new(&original.values, original.frames, spans, tokens.len())?;
         let mut rng = StandardNormal::new(seed);
@@ -208,9 +218,9 @@ impl<P: PinyinProvider + Clone> TrtModelWorker<P> {
         } else {
             1.0
         };
-        active.engines.edit_speech_with_method(
-            &plan, &tokens, &noise, gain, sampling, method,
-        )
+        active
+            .engines
+            .edit_speech_with_method(&plan, &tokens, &noise, gain, sampling, method)
     }
 
     pub fn synthesize(&mut self, text: &str, options: StandardTextOptions) -> Result<Vec<f32>> {
@@ -234,17 +244,138 @@ impl<P: PinyinProvider + Clone> TrtModelWorker<P> {
 
     /// Full original CFM.sample() options on the warmed TensorRT worker.
     pub fn synthesize_with_sample_mode(
-        &mut self, text: &str, options: StandardTextOptions,
-        method: OdeMethod, mode: CfmSampleMode,
+        &mut self,
+        text: &str,
+        options: StandardTextOptions,
+        method: OdeMethod,
+        mode: CfmSampleMode,
     ) -> Result<Vec<f32>> {
         mode.validate()?;
-        let active = self.active.as_mut()
+        let active = self
+            .active
+            .as_mut()
             .ok_or(F5Error::InvalidConfiguration("No F5 model loaded"))?;
-        let voice = active.voices.get(&active.selected_voice)
+        let voice = active
+            .voices
+            .get(&active.selected_voice)
             .ok_or(F5Error::InvalidConfiguration("Active F5 voice missing"))?;
         synthesize_standard_text_with_sample_mode(
-            &mut active.engines, voice.borrowed(), text,
-            &active.vocabulary, active.pinyin.clone(), options, method, mode,
+            &mut active.engines,
+            voice.borrowed(),
+            text,
+            &active.vocabulary,
+            active.pinyin.clone(),
+            options,
+            method,
+            mode,
+        )
+    }
+
+    pub fn synthesize_with_spectrogram(
+        &mut self,
+        text: &str,
+        options: StandardTextOptions,
+    ) -> Result<InferenceOutput> {
+        let active = self
+            .active
+            .as_mut()
+            .ok_or(F5Error::InvalidConfiguration("No F5 model loaded"))?;
+        let voice = active
+            .voices
+            .get(&active.selected_voice)
+            .ok_or(F5Error::InvalidConfiguration("Active F5 voice missing"))?;
+        synthesize_standard_text_with_spectrogram(
+            &mut active.engines,
+            voice.borrowed(),
+            text,
+            &active.vocabulary,
+            active.pinyin.clone(),
+            options,
+        )
+    }
+
+    pub fn synthesize_with_spectrogram_and_sample_mode(
+        &mut self,
+        text: &str,
+        options: StandardTextOptions,
+        method: OdeMethod,
+        mode: CfmSampleMode,
+    ) -> Result<InferenceOutput> {
+        let active = self
+            .active
+            .as_mut()
+            .ok_or(F5Error::InvalidConfiguration("No F5 model loaded"))?;
+        let voice = active
+            .voices
+            .get(&active.selected_voice)
+            .ok_or(F5Error::InvalidConfiguration("Active F5 voice missing"))?;
+        synthesize_standard_text_with_spectrogram_and_sample_mode(
+            &mut active.engines,
+            voice.borrowed(),
+            text,
+            &active.vocabulary,
+            active.pinyin.clone(),
+            options,
+            method,
+            mode,
+        )
+    }
+
+    pub fn stream_synthesize(
+        &mut self,
+        text: &str,
+        options: StandardTextOptions,
+        chunk_size: usize,
+        emit: impl FnMut(&[f32], usize) -> Result<()>,
+    ) -> Result<()> {
+        let active = self
+            .active
+            .as_mut()
+            .ok_or(F5Error::InvalidConfiguration("No F5 model loaded"))?;
+        let voice = active
+            .voices
+            .get(&active.selected_voice)
+            .ok_or(F5Error::InvalidConfiguration("Active F5 voice missing"))?;
+        stream_standard_text(
+            &mut active.engines,
+            voice.borrowed(),
+            text,
+            &active.vocabulary,
+            active.pinyin.clone(),
+            options,
+            chunk_size,
+            emit,
+        )
+    }
+
+    pub fn stream_synthesize_with_sample_mode(
+        &mut self,
+        text: &str,
+        options: StandardTextOptions,
+        method: OdeMethod,
+        mode: CfmSampleMode,
+        chunk_size: usize,
+        emit: impl FnMut(&[f32], usize) -> Result<()>,
+    ) -> Result<()> {
+        let active = self
+            .active
+            .as_mut()
+            .ok_or(F5Error::InvalidConfiguration("No F5 model loaded"))?;
+        let voice = active
+            .voices
+            .get(&active.selected_voice)
+            .ok_or(F5Error::InvalidConfiguration("Active F5 voice missing"))?;
+        stream_standard_text_with_sample_mode(
+            &mut active.engines,
+            voice.borrowed(),
+            text,
+            &active.vocabulary,
+            active.pinyin.clone(),
+            options,
+            method,
+            mode,
+            chunk_size,
+            emit,
         )
     }
 

@@ -10,11 +10,12 @@ use crate::{
     checkpoint::Checkpoint,
     dit_model::F5DiT,
     mel::{BigVganMel, MelBackend, MelExtractor, VocosMel},
+    model::{GeneratedSpectrogram, InferenceOutput},
     noise::StandardNormal,
     pinyin::ChinesePinyin,
     reference::ReferenceAudio,
     speech_edit::{EditSpan, SpeechEditPlan},
-    standard_chunking::plan_standard_chunks,
+    standard_chunking::{emit_pcm_chunks, plan_standard_chunks},
     text_frontend::{F5TextFrontend, NoPinyin, PinyinProvider},
     vocab::Vocabulary,
     vocos::{VocosConfig, VocosDecoder},
@@ -205,6 +206,217 @@ impl StandardF5Runtime {
             waves.push(wave);
         }
         crate::cross_lingual::cross_fade_waves(&waves, cross_fade_seconds as f64)
+    }
+
+    pub fn synthesize_text_with_spectrogram(
+        &mut self,
+        reference: &ReferenceAudio,
+        reference_text: &str,
+        generated_text: &str,
+        speed: f32,
+        fixed_seconds: Option<f32>,
+        seed: u64,
+        sampling: SamplingConfig,
+    ) -> Result<InferenceOutput> {
+        let pinyin = Arc::clone(&self.native_pinyin);
+        self.synthesize_text_with_pinyin_and_spectrogram(
+            reference,
+            reference_text,
+            generated_text,
+            pinyin,
+            speed,
+            fixed_seconds,
+            0.15,
+            seed,
+            sampling,
+        )
+    }
+
+    pub fn synthesize_text_with_pinyin_and_spectrogram<P: PinyinProvider>(
+        &mut self,
+        reference: &ReferenceAudio,
+        reference_text: &str,
+        generated_text: &str,
+        pinyin: P,
+        speed: f32,
+        fixed_seconds: Option<f32>,
+        cross_fade_seconds: f32,
+        seed: u64,
+        sampling: SamplingConfig,
+    ) -> Result<InferenceOutput> {
+        self.synthesize_text_with_pinyin_and_spectrogram_and_sample_mode(
+            reference,
+            reference_text,
+            generated_text,
+            pinyin,
+            speed,
+            fixed_seconds,
+            cross_fade_seconds,
+            seed,
+            sampling,
+            OdeMethod::Euler,
+            CfmSampleMode::default(),
+        )
+    }
+
+    pub fn synthesize_text_with_pinyin_and_spectrogram_and_sample_mode<P: PinyinProvider>(
+        &mut self,
+        reference: &ReferenceAudio,
+        reference_text: &str,
+        generated_text: &str,
+        pinyin: P,
+        speed: f32,
+        fixed_seconds: Option<f32>,
+        cross_fade_seconds: f32,
+        seed: u64,
+        sampling: SamplingConfig,
+        method: OdeMethod,
+        mode: CfmSampleMode,
+    ) -> Result<InferenceOutput> {
+        mode.validate()?;
+        let planned = plan_standard_chunks(
+            generated_text,
+            reference_text,
+            reference.samples.len(),
+            speed,
+            fixed_seconds,
+            cross_fade_seconds,
+        )?;
+        let vocabulary = self.vocabulary.clone();
+        let frontend = F5TextFrontend::new(&vocabulary, pinyin);
+        let mut generator = StandardNormal::new(seed);
+        let mut waves = Vec::with_capacity(planned.len());
+        let mut spectra = Vec::with_capacity(planned.len());
+        for chunk in planned {
+            let tokens = frontend.standard_tokens(reference_text, &chunk.text)?;
+            let (wave, spec) = self.synthesize_from_noise_source_with_mode_output(
+                reference,
+                &tokens,
+                chunk.total_frames,
+                sampling,
+                method,
+                mode,
+                true,
+                |count| Ok((0..count).map(|_| generator.sample()).collect()),
+            )?;
+            waves.push(wave);
+            spectra.push(spec.ok_or(F5Error::ModelExecution(
+                "Mel capture was not produced".into(),
+            ))?);
+        }
+        Ok(InferenceOutput {
+            waveform: crate::cross_lingual::cross_fade_waves(&waves, cross_fade_seconds as f64)?,
+            sample_rate: crate::mel::SAMPLE_RATE,
+            spectrogram: GeneratedSpectrogram::concatenate(&spectra)?,
+        })
+    }
+
+    pub fn stream_text(
+        &mut self,
+        reference: &ReferenceAudio,
+        reference_text: &str,
+        generated_text: &str,
+        speed: f32,
+        fixed_seconds: Option<f32>,
+        seed: u64,
+        sampling: SamplingConfig,
+        chunk_size: usize,
+        emit: impl FnMut(&[f32], usize) -> Result<()>,
+    ) -> Result<()> {
+        let pinyin = Arc::clone(&self.native_pinyin);
+        self.stream_text_with_pinyin(
+            reference,
+            reference_text,
+            generated_text,
+            pinyin,
+            speed,
+            fixed_seconds,
+            0.15,
+            seed,
+            sampling,
+            chunk_size,
+            emit,
+        )
+    }
+
+    pub fn stream_text_with_pinyin<P: PinyinProvider>(
+        &mut self,
+        reference: &ReferenceAudio,
+        reference_text: &str,
+        generated_text: &str,
+        pinyin: P,
+        speed: f32,
+        fixed_seconds: Option<f32>,
+        cross_fade_seconds: f32,
+        seed: u64,
+        sampling: SamplingConfig,
+        chunk_size: usize,
+        emit: impl FnMut(&[f32], usize) -> Result<()>,
+    ) -> Result<()> {
+        self.stream_text_with_pinyin_and_sample_mode(
+            reference,
+            reference_text,
+            generated_text,
+            pinyin,
+            speed,
+            fixed_seconds,
+            cross_fade_seconds,
+            seed,
+            sampling,
+            OdeMethod::Euler,
+            CfmSampleMode::default(),
+            chunk_size,
+            emit,
+        )
+    }
+
+    pub fn stream_text_with_pinyin_and_sample_mode<P: PinyinProvider>(
+        &mut self,
+        reference: &ReferenceAudio,
+        reference_text: &str,
+        generated_text: &str,
+        pinyin: P,
+        speed: f32,
+        fixed_seconds: Option<f32>,
+        cross_fade_seconds: f32,
+        seed: u64,
+        sampling: SamplingConfig,
+        method: OdeMethod,
+        mode: CfmSampleMode,
+        chunk_size: usize,
+        mut emit: impl FnMut(&[f32], usize) -> Result<()>,
+    ) -> Result<()> {
+        if chunk_size == 0 {
+            return Err(F5Error::InvalidConfiguration(
+                "Streaming chunk size must be nonzero",
+            ));
+        }
+        mode.validate()?;
+        let planned = plan_standard_chunks(
+            generated_text,
+            reference_text,
+            reference.samples.len(),
+            speed,
+            fixed_seconds,
+            cross_fade_seconds,
+        )?;
+        let vocabulary = self.vocabulary.clone();
+        let frontend = F5TextFrontend::new(&vocabulary, pinyin);
+        let mut generator = StandardNormal::new(seed);
+        for chunk in planned {
+            let tokens = frontend.standard_tokens(reference_text, &chunk.text)?;
+            let wave = self.synthesize_from_noise_source_with_mode(
+                reference,
+                &tokens,
+                chunk.total_frames,
+                sampling,
+                method,
+                mode,
+                |count| Ok((0..count).map(|_| generator.sample()).collect()),
+            )?;
+            emit_pcm_chunks(&wave, chunk_size, &mut emit)?;
+        }
+        Ok(())
     }
 
     pub fn synthesize_script(
@@ -421,6 +633,50 @@ impl StandardF5Runtime {
         )
     }
 
+    pub fn synthesize_with_spectrogram(
+        &mut self,
+        reference: &ReferenceAudio,
+        text_tokens: &[i32],
+        options: GenerateOptions,
+    ) -> Result<InferenceOutput> {
+        self.synthesize_with_spectrogram_and_sample_mode(
+            reference,
+            text_tokens,
+            options,
+            OdeMethod::Euler,
+            CfmSampleMode::default(),
+        )
+    }
+
+    pub fn synthesize_with_spectrogram_and_sample_mode(
+        &mut self,
+        reference: &ReferenceAudio,
+        text_tokens: &[i32],
+        options: GenerateOptions,
+        method: OdeMethod,
+        mode: CfmSampleMode,
+    ) -> Result<InferenceOutput> {
+        mode.validate()?;
+        let mut rng = StandardNormal::new(options.seed);
+        let (waveform, mel) = self.synthesize_from_noise_source_with_mode_output(
+            reference,
+            text_tokens,
+            options.total_frames,
+            options.sampling,
+            method,
+            mode,
+            true,
+            |count| Ok((0..count).map(|_| rng.sample()).collect()),
+        )?;
+        Ok(InferenceOutput {
+            waveform,
+            sample_rate: crate::mel::SAMPLE_RATE,
+            spectrogram: mel.ok_or(F5Error::ModelExecution(
+                "Mel capture was not produced".into(),
+            ))?,
+        })
+    }
+
     /// Standard text conditioning using the original CFM's alternate ODE solver.
     /// Existing `synthesize` and chunked APIs retain Euler as their default.
     pub fn synthesize_with_ode_method(
@@ -576,6 +832,30 @@ impl StandardF5Runtime {
         mode: CfmSampleMode,
         create_noise: impl FnOnce(usize) -> Result<Vec<f32>>,
     ) -> Result<Vec<f32>> {
+        self.synthesize_from_noise_source_with_mode_output(
+            reference,
+            text_tokens,
+            total_frames,
+            sampling,
+            method,
+            mode,
+            false,
+            create_noise,
+        )
+        .map(|result| result.0)
+    }
+
+    fn synthesize_from_noise_source_with_mode_output(
+        &mut self,
+        reference: &ReferenceAudio,
+        text_tokens: &[i32],
+        total_frames: usize,
+        sampling: SamplingConfig,
+        method: OdeMethod,
+        mode: CfmSampleMode,
+        capture_spectrogram: bool,
+        create_noise: impl FnOnce(usize) -> Result<Vec<f32>>,
+    ) -> Result<(Vec<f32>, Option<GeneratedSpectrogram>)> {
         if text_tokens.is_empty() || text_tokens.len() > 8192 {
             return Err(F5Error::InvalidShape(
                 "F5 token count is outside valid limits",
@@ -620,7 +900,18 @@ impl StandardF5Runtime {
             mode,
         )?;
         let generated = final_mel.slice([0..1, frames.reference..frames.target, 0..100]);
-        self.vocoder.decode(generated, restoration_gain)
+        let spectrogram = if capture_spectrogram {
+            let data = generated
+                .clone()
+                .into_data()
+                .try_to_vec::<f32>()
+                .map_err(|e| F5Error::ModelExecution(format!("F5 mel download: {e}")))?;
+            Some(GeneratedSpectrogram::from_frame_major(&data, 100)?)
+        } else {
+            None
+        };
+        let waveform = self.vocoder.decode(generated, restoration_gain)?;
+        Ok((waveform, spectrogram))
     }
 }
 
