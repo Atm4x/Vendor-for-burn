@@ -1,0 +1,21 @@
+[package]
+name = "f5-tts-native"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+description = "Model-specific F5-TTS v1 inference runtime with independent CubeCL and TensorRT-RTX backends"
+
+[lib]
+name = "f5_tts_native"
+path = "src/lib.rs"
+
+[features]
+default = []
+cubecl-cpu = ["dep:burn", "burn/cpu"]
+cubecl-cuda = ["dep:burn", "burn/cuda"]
+cubecl-wgpu = ["dep:burn", "burn/wgpu"]
+
+[dependencies]
+serde_json = "1"
+burn = { version = "=0.22.1", default-features = false, features = ["std", "cubecl"], optional = true }
