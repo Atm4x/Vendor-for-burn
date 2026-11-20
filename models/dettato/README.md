@@ -66,7 +66,21 @@ cargo build --release --no-default-features --features 'cuda,wgpu,flex'
 ./target/release/dettato --weights /path/to/weights/dettato --input song.wav --device cuda:0
 ```
 
-`wgpu` without an index uses adapter auto-selection and can select a software adapter on some systems; use `wgpu:0` to require the first **discrete** adapter. CUDA needs a working NVIDIA driver. CubeCL CPU needs the Tracel LLVM runtime. The offline build in cycle 08 verified WGPU compilation, **not** GPU execution. CUDA compilation in that environment stopped in `tracel-llvm-bundler` because the LLVM archive could not be downloaded; this does not establish a CUDA compile PASS.
+`wgpu` without an index uses adapter auto-selection and can select a software adapter on some systems; use `wgpu:0` to require the first **discrete** adapter. CUDA needs a working NVIDIA driver. CubeCL CPU needs the Tracel LLVM runtime. The offline build in cycle 08 verified WGPU compilation, **not** GPU execution. Cycle 08 CUDA compilation stopped in `tracel-llvm-bundler` before this archive became available. Cycle 09 verified `cargo check --no-default-features --features cuda` with LLVM 23.1.0-4 installed locally. This is compilation only; no NVIDIA GPU is exposed in the test environment.
+
+## Offline Tracel LLVM for CubeCL (Linux)
+
+CUDA and CubeCL CPU builds with Burn 0.22.1 require the `tracel-llvm-bundler` release **23.1.0-4**. If the build machine has no network access, provide the matching `linux-x64.tar.xz` obtained from a trusted source and install it into the location expected by the bundler:
+
+```sh
+bash models/dettato/tools/install-tracel-llvm-linux.sh /path/to/linux-x64.tar.xz
+export LLVM_SYS_231_PREFIX="${XDG_DATA_HOME:-$HOME/.local/share}/tracel/tracel-llvm-23.1.0-4"
+cd models/dettato
+cargo check --no-default-features --features cuda
+cargo test --no-default-features --features cpu --lib
+```
+
+The script validates the archive directory and `llvm-config` version and checks that NVPTX support is present. It marks the existing locally supplied bundle as installed so `tracel-llvm-bundler` will not fetch it. It does not download LLVM or ship LLVM binaries. The marker is a **trusted, local offline bypass** of the bundler's online SHA-256 manifest verification; only use it with a trusted LLVM archive. A separate, complete Cargo vendor snapshot is still required for `--offline` builds (the earlier snapshot needed an external resolver overlay). To avoid huge DWARF-heavy integration-test links against static LLVM, this crate sets `profile.test.debug = 0`.
 
 ## Transcriber device-operation reductions (cycle 08)
 
