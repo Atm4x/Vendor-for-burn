@@ -1,0 +1,42 @@
+name: F5 TTS CONT20 Exact Git Bridge
+on:
+  push:
+    branches:
+      - codex/f5-tts-rust-cont20
+    paths:
+      - .github/workflows/f5-tts-cont20-bridge.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Export full git bundle including original CONT19 HEAD
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "667892cafd420c3eda4920204862d2b09853c24c"
+          git update-ref refs/heads/codex/f5-tts-rust-cont20 HEAD
+          git bundle create "$RUNNER_TEMP/f5-cont20.bundle" HEAD refs/heads/codex/f5-tts-rust-cont20
+          git bundle verify "$RUNNER_TEMP/f5-cont20.bundle"
+          git bundle list-heads "$RUNNER_TEMP/f5-cont20.bundle"
+          printf '%s\n' "$(git rev-parse HEAD)" > "$RUNNER_TEMP/source-head.txt"
+          printf '%s\n' "$(git rev-parse HEAD^)" > "$RUNNER_TEMP/cont19-head.txt"
+          (cd "$RUNNER_TEMP" && sha256sum f5-cont20.bundle > f5-cont20.bundle.sha256)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: f5-cont20-exact-git-bridge
+          path: |
+            ${{ runner.temp }}/f5-cont20.bundle
+            ${{ runner.temp }}/f5-cont20.bundle.sha256
+            ${{ runner.temp }}/source-head.txt
+            ${{ runner.temp }}/cont19-head.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
