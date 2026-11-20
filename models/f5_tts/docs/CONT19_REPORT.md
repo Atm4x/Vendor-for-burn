@@ -28,7 +28,7 @@ No ONNX. No CubeCL fallback inside the TensorRT runtime. The implementation chan
 - Earlier six local pydub differential tests: 432,576 PCM16 samples matched bit-exactly. The published `postprocess.rs` contains six exact PCM16 fixtures.
 - TensorRT mock includes a state-dependent affine velocity test of true midpoint versus an explicitly calculated PyTorch float32 reference. It also tests `duplicate_test + no_ref_audio + t_inter` on the warmed session, without GPU download of intermediate mel.
 - GitHub Actions run [44809314188](https://github.com/Atm4x/Vendor-for-burn/actions/runs/44809314188) completed SUCCESS: 59/59 default Rust unit tests, 88/88 TensorRT mock unit tests (2 hardware tests intentionally ignored), CubeCL CPU compile-check PASS. This was the previous revision, before the latest worker midpoint forwarding.
-- Final head verification: [44809707498](https://github.com/Atm4x/Vendor-for-burn/actions/runs/44809707498). This checks all worker routing modifications, formatting, default Rust, TensorRT mock and CubeCL CPU. Consult its actual conclusion before treating final-head gates as PASS.
+- Final source verification: [44809707498](https://github.com/Atm4x/Vendor-for-burn/actions/runs/44809707498) **SUCCESS** on source commit `3cb404ed3c84b9e9d3f9eebe2960aa2d139b2c67`: 59/59 default Rust tests PASS, 88/88 TensorRT mock tests PASS (2 hardware tests ignored), and CubeCL CPU `cargo check` PASS. The subsequent commit only adds this report.
 - True NVIDIA TensorRT engine build, numeric TRT-vs-PyTorch and Windows driver/DLL validation were deliberately deferred (priority 3).
 
 ## Still missing from original inference feature coverage
