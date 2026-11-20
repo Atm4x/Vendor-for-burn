@@ -1,0 +1,55 @@
+name: F5-TTS CONT19 source and numerical validation
+on:
+  push:
+    branches:
+      - codex/f5-tts-rust-cont19
+    paths:
+      - .github/workflows/f5-tts-cont19-validation.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  parity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_TARGET_DIR: /tmp/f5-cont19-target
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt
+      - name: Isolate registry from repository root's old vendor override
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f .cargo/config.toml models/f5_tts/.cargo/config.toml
+          rustc --version
+          cargo --version
+      - name: Check formatting
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --manifest-path models/f5_tts/Cargo.toml --all -- --check
+      - name: Check and run native Rust unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --manifest-path models/f5_tts/Cargo.toml --locked --lib
+          cargo test --manifest-path models/f5_tts/Cargo.toml --locked --lib -- --test-threads=1
+      - name: Check TensorRT RTX API and mock build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --manifest-path models/f5_tts/Cargo.toml --locked --features tensorrt-mock
+          cargo test --manifest-path models/f5_tts/Cargo.toml --locked --features tensorrt-mock --lib -- --test-threads=1
+      - name: Check native CubeCL CPU integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --manifest-path models/f5_tts/Cargo.toml --locked --features cubecl-cpu --lib
