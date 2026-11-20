@@ -50,10 +50,7 @@ impl Default for InferenceOptions {
     }
 }
 
-pub struct RvcV2Inferencer {
-    device: Device,
-    hubert: HubertFeatureModel,
-    rmvpe: RmvpeAudioModel,
+struct VoiceState {
     encoder: TextEncoder,
     flow: ResidualCouplingBlock,
     decoder: NsfWaveformDecoder,
@@ -66,16 +63,10 @@ pub struct RvcV2Inferencer {
     gpu_index: Option<GpuIvfIndex>,
 }
 
-impl RvcV2Inferencer {
-    pub fn load(
-        voice_path: &str,
-        hubert_path: &str,
-        rmvpe_path: &str,
-        index_path: Option<&str>,
-        device: Device,
-    ) -> Result<Self, String> {
-        let voice = RvcCheckpoint::open(voice_path)?;
-        let (shape, speaker_embeddings) = voice.tensor_f32("emb_g.weight")?;
+impl VoiceState {
+    fn load(voice_path: &str, index_path: Option<&str>, device: &Device) -> Result<Self, String> {
+        let checkpoint = RvcCheckpoint::open(voice_path)?;
+        let (shape, speaker_embeddings) = checkpoint.tensor_f32("emb_g.weight")?;
         let [speaker_count, speaker_channels] = shape.as_slice() else {
             return Err(format!(
                 "RVC speaker embedding must be rank-2, got {shape:?}"
@@ -84,20 +75,11 @@ impl RvcV2Inferencer {
         if *speaker_count == 0 || *speaker_channels == 0 {
             return Err("RVC has no speaker embeddings".into());
         }
-        let encoder = TextEncoder::load(&voice, &device)?;
-        let flow = ResidualCouplingBlock::load(&voice, &device)?;
-        let decoder = NsfWaveformDecoder::load(&voice, &[10, 10, 2, 2], 3, [1, 3, 5], &device)?;
-        let source = SourceModuleHnNSF::load(&voice, RVC_SAMPLE_RATE, 0, &device)?;
-        drop(voice);
-
-        let hubert_checkpoint = RvcCheckpoint::open_model(hubert_path)?;
-        let hubert = HubertFeatureModel::load(&hubert_checkpoint, 12, 12, &device)?;
-        drop(hubert_checkpoint);
-
-        let rmvpe_checkpoint = RvcCheckpoint::open_root(rmvpe_path)?;
-        let rmvpe = RmvpeAudioModel::load(&rmvpe_checkpoint, &device)?;
-        drop(rmvpe_checkpoint);
-
+        let encoder = TextEncoder::load(&checkpoint, device)?;
+        let flow = ResidualCouplingBlock::load(&checkpoint, device)?;
+        let decoder = NsfWaveformDecoder::load(&checkpoint, &[10, 10, 2, 2], 3, [1, 3, 5], device)?;
+        let source = SourceModuleHnNSF::load(&checkpoint, RVC_SAMPLE_RATE, 0, device)?;
+        drop(checkpoint);
         let index = index_path.map(IvfFlatIndex::open).transpose()?;
         if let Some(index) = &index {
             if index.dimension() != CONTENT_CHANNELS {
@@ -113,7 +95,7 @@ impl RvcV2Inferencer {
                 index
                     .as_ref()
                     .ok_or("GPU FAISS requested without an index")?,
-                &device,
+                device,
             )?)
         } else {
             None
@@ -123,11 +105,6 @@ impl RvcV2Inferencer {
             return Err("GPU FAISS requires a CubeCL backend compiled into this executable".into());
         }
         Ok(Self {
-            #[cfg(any(feature = "cpu", feature = "cuda", feature = "wgpu"))]
-            gpu_index,
-            device,
-            hubert,
-            rmvpe,
             encoder,
             flow,
             decoder,
@@ -136,7 +113,53 @@ impl RvcV2Inferencer {
             speaker_count: *speaker_count,
             speaker_channels: *speaker_channels,
             index,
+            #[cfg(any(feature = "cpu", feature = "cuda", feature = "wgpu"))]
+            gpu_index,
         })
+    }
+}
+
+pub struct RvcV2Inferencer {
+    device: Device,
+    hubert: HubertFeatureModel,
+    rmvpe: RmvpeAudioModel,
+    voice: VoiceState,
+}
+
+impl RvcV2Inferencer {
+    pub fn load(
+        voice_path: &str,
+        hubert_path: &str,
+        rmvpe_path: &str,
+        index_path: Option<&str>,
+        device: Device,
+    ) -> Result<Self, String> {
+        let voice = VoiceState::load(voice_path, index_path, &device)?;
+        let hubert_checkpoint = RvcCheckpoint::open_model(hubert_path)?;
+        let hubert = HubertFeatureModel::load(&hubert_checkpoint, 12, 12, &device)?;
+        drop(hubert_checkpoint);
+        let rmvpe_checkpoint = RvcCheckpoint::open_root(rmvpe_path)?;
+        let rmvpe = RmvpeAudioModel::load(&rmvpe_checkpoint, &device)?;
+        drop(rmvpe_checkpoint);
+        Ok(Self {
+            device,
+            hubert,
+            rmvpe,
+            voice,
+        })
+    }
+
+    pub fn switch_voice(
+        &mut self,
+        voice_path: &str,
+        index_path: Option<&str>,
+    ) -> Result<(), String> {
+        let next = VoiceState::load(voice_path, index_path, &self.device)?;
+        self.device
+            .sync()
+            .map_err(|e| format!("voice load sync failed: {e}"))?;
+        self.voice = next;
+        Ok(())
     }
 
     pub fn infer_long_16khz(
@@ -318,7 +341,7 @@ impl RvcV2Inferencer {
             );
         }
         for setting in options {
-            if setting.speaker_id >= self.speaker_count {
+            if setting.speaker_id >= self.voice.speaker_count {
                 return Err(format!("invalid RVC speaker id {}", setting.speaker_id));
             }
             if !(0.0..=1.0).contains(&setting.index_rate)
@@ -358,7 +381,7 @@ impl RvcV2Inferencer {
         }
         let retrieval_enabled = options.iter().any(|setting| setting.index_rate > 0.0);
         #[cfg(any(feature = "cpu", feature = "cuda", feature = "wgpu"))]
-        let gpu_retrieval = retrieval_enabled && self.gpu_index.is_some();
+        let gpu_retrieval = retrieval_enabled && self.voice.gpu_index.is_some();
         #[cfg(not(any(feature = "cpu", feature = "cuda", feature = "wgpu")))]
         let gpu_retrieval = false;
         let started = std::time::Instant::now();
@@ -492,6 +515,7 @@ impl RvcV2Inferencer {
                 let mut retrieved = original.to_vec();
                 if opts.index_rate > 0.0 {
                     let index = self
+                        .voice
                         .index
                         .as_ref()
                         .ok_or("FAISS retrieval requested but no index was loaded")?;
@@ -558,6 +582,7 @@ impl RvcV2Inferencer {
                 }
                 let gpu_start = std::time::Instant::now();
                 let blended = self
+                    .voice
                     .gpu_index
                     .as_ref()
                     .expect("GPU retrieval requested")
@@ -628,6 +653,7 @@ impl RvcV2Inferencer {
         let started = std::time::Instant::now();
         let _encoder_nvtx = crate::nvtx::Range::new("stage104_rust_encoder");
         let encoded = self
+            .voice
             .encoder
             .forward(phone, Some(pitch_tensor), &vec![frames; batch], None);
         drop(_encoder_nvtx);
@@ -660,22 +686,23 @@ impl RvcV2Inferencer {
             &self.device,
         );
         let latent = (encoded.mean + encoded.log_scale.exp() * latent_noise) * encoded.mask.clone();
-        let mut speaker_embeddings = Vec::with_capacity(batch * self.speaker_channels);
+        let mut speaker_embeddings = Vec::with_capacity(batch * self.voice.speaker_channels);
         for setting in options {
-            let start = setting.speaker_id * self.speaker_channels;
+            let start = setting.speaker_id * self.voice.speaker_channels;
             speaker_embeddings
-                .extend_from_slice(&self.speaker_embeddings[start..start + self.speaker_channels]);
+                .extend_from_slice(&self.voice.speaker_embeddings[start..start + self.voice.speaker_channels]);
         }
         let speaker = Tensor::from_data(
-            TensorData::new(speaker_embeddings, [batch, self.speaker_channels, 1]),
+            TensorData::new(speaker_embeddings, [batch, self.voice.speaker_channels, 1]),
             &self.device,
         );
         drop(_latent_nvtx);
         crate::diagnostic::measure(&self.device, "rvc.latent_noise_speaker_h2d", started,
-            serde_json::json!({"noise_h2d_bytes_estimate":batch*latent_channels*latent_frames*4,"speaker_h2d_bytes_estimate":batch*self.speaker_channels*4,"latent_frames":latent_frames}));
+            serde_json::json!({"noise_h2d_bytes_estimate":batch*latent_channels*latent_frames*4,"speaker_h2d_bytes_estimate":batch*self.voice.speaker_channels*4,"latent_frames":latent_frames}));
         let started = std::time::Instant::now();
         let _flow_nvtx = crate::nvtx::Range::new("stage104_rust_flow");
         let latent = self
+            .voice
             .flow
             .forward(latent, encoded.mask, Some(speaker.clone()), true);
         drop(_flow_nvtx);
@@ -720,11 +747,11 @@ impl RvcV2Inferencer {
             serde_json::json!({"sine_h2d_bytes_estimate":batch*frames*RVC_HOP*4,"f0_h2d_bytes_estimate":if gpu_f0 {0} else {batch*frames*4}}));
         let started = std::time::Instant::now();
         let _nsf_nvtx = crate::nvtx::Range::new("stage102_rust_nsf");
-        let output = self.decoder.forward_from_f0_with_execution_and_phase(
+        let output = self.voice.decoder.forward_from_f0_with_execution_and_phase(
             latent,
             f0_tensor,
             Some(speaker),
-            &self.source,
+            &self.voice.source,
             initial_phase,
             sine_noise,
             phase_offsets,

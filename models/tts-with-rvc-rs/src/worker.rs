@@ -96,8 +96,17 @@ struct InferRequest {
     rms_mix_rate: Option<f32>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SwitchVoiceRequest {
+    voice: String,
+    #[serde(default)]
+    index: Option<String>,
+}
+
 pub trait WorkerEngine: Sized {
     fn load(config: &LaunchConfig) -> Result<Self, String>;
+    fn switch_voice(&mut self, voice: &Path, index: Option<&Path>) -> Result<(), String>;
     fn warmup(&mut self) -> Result<(), String>;
     fn infer(
         &mut self,
@@ -122,6 +131,13 @@ impl WorkerEngine for NativeRvcEngine {
             .sync()
             .map_err(|e| format!("model load sync failed: {e}"))?;
         Ok(Self(model))
+    }
+
+    fn switch_voice(&mut self, voice: &Path, index: Option<&Path>) -> Result<(), String> {
+        self.0.switch_voice(
+            &voice.to_string_lossy(),
+            index.map(|p| p.to_string_lossy()).as_deref(),
+        )
     }
 
     fn warmup(&mut self) -> Result<(), String> {
@@ -163,7 +179,9 @@ impl<E: WorkerEngine> Worker<E> {
     }
 
     fn command(&mut self, request: &Request) -> Result<Value, String> {
-        if request.command != "infer" && request.payload != json!({}) {
+        if !matches!(request.command.as_str(), "infer" | "set_voice")
+            && request.payload != json!({})
+        {
             return Err("unexpected command payload".into());
         }
         match request.command.as_str() {
@@ -176,6 +194,7 @@ impl<E: WorkerEngine> Worker<E> {
                     "max_source_bytes": MAX_SOURCE,
                     "physical_gpu_selectors": ["pci", "windows_luid"],
                     "parameters": ["index_rate", "pitch_shift_semitones", "rms_mix_rate"],
+                    "hot_voice_switch": true,
                 },
             })),
             "status" => Ok(json!({
@@ -183,6 +202,8 @@ impl<E: WorkerEngine> Worker<E> {
                 "name": self.config.name,
                 "backend": self.config.backend,
                 "gpu_id": self.config.gpu_id,
+                "voice": self.config.voice,
+                "index": self.config.index,
                 "variant": match self.config.backend.as_str() {
                     "cuda" => "burn_cubecl_cuda_fp32",
                     "wgpu" => "burn_cubecl_wgpu_fp32",
@@ -200,11 +221,13 @@ impl<E: WorkerEngine> Worker<E> {
             }
             "warmup" => {
                 let model = self.engine.as_mut().ok_or("model is not loaded")?;
+                self.warm = false;
                 model.warmup()?;
                 self.warm = true;
                 Ok(json!({"warm": true}))
             }
             "infer" => self.infer(request),
+            "set_voice" => self.set_voice(request),
             "unload" | "shutdown" => {
                 self.engine = None;
                 self.warm = false;
@@ -212,6 +235,21 @@ impl<E: WorkerEngine> Worker<E> {
             }
             _ => Err("unknown worker command".into()),
         }
+    }
+
+    fn set_voice(&mut self, request: &Request) -> Result<Value, String> {
+        let engine = self.engine.as_mut().ok_or("model is not loaded")?;
+        let args: SwitchVoiceRequest =
+            serde_json::from_value(request.payload.clone()).map_err(|e| e.to_string())?;
+        let voice = absolute_regular_file(args.voice)?;
+        let index = args.index.map(absolute_regular_file).transpose()?;
+        engine.switch_voice(&voice, index.as_deref())?;
+        self.config.voice = voice;
+        self.config.index = index;
+        self.warm = false;
+        Ok(
+            json!({"loaded": true, "warm": false, "voice": self.config.voice, "index": self.config.index}),
+        )
     }
 
     fn infer(&mut self, request: &Request) -> Result<Value, String> {
@@ -480,10 +518,24 @@ mod tests {
     use crate::audio_io;
     use std::io::Cursor;
 
-    struct MockEngine;
+    struct MockEngine {
+        voice: PathBuf,
+        index: Option<PathBuf>,
+    }
     impl WorkerEngine for MockEngine {
-        fn load(_: &LaunchConfig) -> Result<Self, String> {
-            Ok(Self)
+        fn load(config: &LaunchConfig) -> Result<Self, String> {
+            Ok(Self {
+                voice: config.voice.clone(),
+                index: config.index.clone(),
+            })
+        }
+        fn switch_voice(&mut self, voice: &Path, index: Option<&Path>) -> Result<(), String> {
+            if voice.file_name().is_some_and(|name| name == "reject.pth") {
+                return Err("invalid voice weights".into());
+            }
+            self.voice = voice.to_path_buf();
+            self.index = index.map(Path::to_path_buf);
+            Ok(())
         }
         fn warmup(&mut self) -> Result<(), String> {
             Ok(())
@@ -800,5 +852,191 @@ mod tests {
         let mut config = config(&path);
         config.backend_path = Some(path);
         assert!(config.validate().unwrap_err().contains("GPU"));
+    }
+
+    #[test]
+    fn set_voice_preserves_shared_runtime_and_requires_new_warmup() {
+        let root = std::env::temp_dir().join(format!("rvc-worker-voices-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        for name in ["first.pth", "second.pth", "second.index"] {
+            fs::write(root.join(name), b"mock fixture").unwrap();
+        }
+        let root = root.canonicalize().unwrap();
+        let mut config = config(&root);
+        config.voice = root.join("first.pth");
+        let mut worker = Worker::<MockEngine>::new(config).unwrap();
+        assert!(
+            invoke(
+                &mut worker,
+                "set_voice",
+                json!({
+                    "voice": root.join("second.pth"), "index": root.join("second.index")
+                })
+            )
+            .is_err()
+        );
+        invoke(&mut worker, "load", json!({})).unwrap();
+        invoke(&mut worker, "warmup", json!({})).unwrap();
+        let changed = invoke(
+            &mut worker,
+            "set_voice",
+            json!({
+                "voice": root.join("second.pth"), "index": root.join("second.index")
+            }),
+        )
+        .unwrap();
+        assert_eq!(changed["warm"], false);
+        assert_eq!(
+            invoke(&mut worker, "status", json!({})).unwrap()["phase"],
+            "loaded"
+        );
+        assert_eq!(
+            worker.engine.as_ref().unwrap().voice,
+            root.join("second.pth")
+        );
+        assert_eq!(
+            worker.engine.as_ref().unwrap().index,
+            Some(root.join("second.index"))
+        );
+        assert_eq!(worker.config.hubert, root.join("shared-hubert.pt"));
+        assert_eq!(worker.config.rmvpe, root.join("shared-rmvpe.pt"));
+        assert!(invoke(&mut worker, "infer", json!({})).is_err());
+        invoke(&mut worker, "warmup", json!({})).unwrap();
+        assert_eq!(
+            invoke(&mut worker, "status", json!({})).unwrap()["phase"],
+            "ready"
+        );
+        let status = invoke(&mut worker, "status", json!({})).unwrap();
+        assert_eq!(
+            status["voice"],
+            root.join("second.pth").display().to_string()
+        );
+        assert_eq!(
+            status["index"],
+            root.join("second.index").display().to_string()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn set_voice_failure_keeps_previous_voice_ready_and_index_does_not_leak() {
+        let root =
+            std::env::temp_dir().join(format!("rvc-worker-voice-failure-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        for name in ["first.pth", "second.pth", "reject.pth", "old.index"] {
+            fs::write(root.join(name), b"mock fixture").unwrap();
+        }
+        let root = root.canonicalize().unwrap();
+        let mut config = config(&root);
+        config.voice = root.join("first.pth");
+        config.index = Some(root.join("old.index"));
+        let mut worker = Worker::<MockEngine>::new(config).unwrap();
+        invoke(&mut worker, "load", json!({})).unwrap();
+        invoke(&mut worker, "warmup", json!({})).unwrap();
+        assert!(
+            invoke(
+                &mut worker,
+                "set_voice",
+                json!({
+                    "voice": root.join("missing.pth")
+                })
+            )
+            .is_err()
+        );
+        assert!(
+            invoke(
+                &mut worker,
+                "set_voice",
+                json!({
+                    "voice": root.join("reject.pth")
+                })
+            )
+            .unwrap_err()
+            .contains("invalid voice weights")
+        );
+        assert!(
+            invoke(
+                &mut worker,
+                "set_voice",
+                json!({
+                    "voice": "relative.pth"
+                })
+            )
+            .is_err()
+        );
+        assert!(
+            invoke(
+                &mut worker,
+                "set_voice",
+                json!({
+                    "voice": root.join("second.pth"), "unknown": true
+                })
+            )
+            .is_err()
+        );
+        assert_eq!(worker.config.voice, root.join("first.pth"));
+        assert_eq!(worker.config.index, Some(root.join("old.index")));
+        assert_eq!(
+            invoke(&mut worker, "status", json!({})).unwrap()["phase"],
+            "ready"
+        );
+        let switched = invoke(
+            &mut worker,
+            "set_voice",
+            json!({
+                "voice": root.join("second.pth")
+            }),
+        )
+        .unwrap();
+        assert!(switched["index"].is_null());
+        assert!(worker.config.index.is_none());
+        assert!(worker.engine.as_ref().unwrap().index.is_none());
+        invoke(&mut worker, "unload", json!({})).unwrap();
+        invoke(&mut worker, "load", json!({})).unwrap();
+        assert_eq!(
+            worker.engine.as_ref().unwrap().voice,
+            root.join("second.pth")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn set_voice_ipc_keeps_stdout_protocol_only() {
+        let root =
+            std::env::temp_dir().join(format!("rvc-worker-voice-framing-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("second.pth"), b"mock fixture").unwrap();
+        let config = config(&root.canonicalize().unwrap());
+        let commands = [
+            ("load", json!({})),
+            ("warmup", json!({})),
+            ("set_voice", json!({"voice": root.join("second.pth")})),
+            ("status", json!({})),
+            ("warmup", json!({})),
+            ("status", json!({})),
+        ];
+        let requests: String = commands
+            .iter()
+            .map(|(command, payload)| {
+                json!({"version": 1, "id": ID, "command": command, "payload": payload}).to_string()
+                    + "\n"
+            })
+            .collect();
+        let mut output = Vec::new();
+        serve::<MockEngine>(config, Cursor::new(requests), &mut output).unwrap();
+        let lines: Vec<Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), commands.len());
+        assert!(
+            lines
+                .iter()
+                .all(|line| line["ok"] == true && line["id"] == ID)
+        );
+        assert_eq!(lines[3]["result"]["phase"], "loaded");
+        assert_eq!(lines[5]["result"]["phase"], "ready");
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -70,6 +70,7 @@ def main():
             assert call(proc, "status")["result"]["phase"] == "started"
             assert not call(proc, "infer", {})["ok"]
             assert not call(proc, "nonexistent", {})["ok"]
+            assert not call(proc, "set_voice", {"voice": str(args.voice or "missing.pth")})["ok"]
             if args.input_wav:
                 assert call(proc, "load")["ok"]
                 assert call(proc, "warmup")["ok"]

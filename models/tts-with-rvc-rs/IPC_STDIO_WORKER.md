@@ -3,8 +3,9 @@
 `rvc-worker` is a standalone subprocess which loads explicitly supplied model
 weights, warms them once, and accepts sequential voice-conversion requests.
 It is not a NeuroMita model registry, installer, ASR/TTS module, or file finder.
-It never downloads weights. One model is resident at a time; to change weights,
-restart the process with new arguments (or unload and load the same weights).
+It never downloads weights. One model is resident at a time; `set_voice` changes
+only the voice checkpoint and optional FAISS index in the running worker. HuBERT,
+RMVPE, selected device and external runtime libraries remain resident.
 
 ## Launch configuration
 
@@ -72,6 +73,8 @@ stderr. Frames use `version`, UUID `id`, `command`, and object `payload`.
 {"version":1,"id":"937a1d41-0e69-4c37-872f-d6c5e84a8cab","command":"warmup","payload":{}}
 {"version":1,"id":"58e21c92-d329-43cd-bcff-0f604c15683f","command":"status","payload":{}}
 {"version":1,"id":"e4164eae-165d-4935-bcfb-31e5d8dabd61","command":"infer","payload":{"input":{"file_name":"speech.wav","size_bytes":123456,"sha256":"<64 lowercase hex characters>"},"index_rate":0.75,"pitch_shift_semitones":0,"rms_mix_rate":0.5}}
+{"version":1,"id":"e8766084-0ba9-4697-8ce4-9638551eb2a2","command":"set_voice","payload":{"voice":"D:\\Voices\\AnotherMita.pth","index":"D:\\Voices\\AnotherMita.index"}}
+{"version":1,"id":"e4238333-74b2-49e4-bc0c-bd3be90ca1de","command":"warmup","payload":{}}
 {"version":1,"id":"225d20a8-758e-41ce-83de-ea2387b45fa2","command":"unload","payload":{}}
 {"version":1,"id":"bb644729-6cfd-43b8-a755-b7d899b4e67e","command":"shutdown","payload":{}}
 ```
@@ -80,7 +83,22 @@ Success: `{"version":1,"id":"<UUID>","ok":true,"result":{},"error":null}`.
 Errors: `{"version":1,"id":"<UUID>","ok":false,"result":null,"error":"..."}`.
 No model ID, model name, RVC-specific envelope version, or `kind` parameter is
 required. `load`, `warmup`, `unload`, and `shutdown` take empty payloads.
-`status` reports `started`, `loaded`, or `ready`; `infer` requires `ready`.
+`status` reports `started`, `loaded`, or `ready`, as well as active `voice`
+and `index` paths; `infer` requires `ready`.
+
+`set_voice` requires an already loaded model. Its payload has a required absolute
+`voice` checkpoint path and an optional absolute `index` path. Omitting `index`
+(or passing `null`) **disables** FAISS retrieval; the previous voice's index is
+never silently reused. Both inputs must be existing non-symlink regular files.
+The worker loads and validates the new voice-specific TextEncoder, Flow, NSF
+Decoder, speaker embeddings and FAISS index on the **same Burn Device**. HuBERT
+and RMVPE are never recreated for this operation, and the process/DLLs stay
+loaded. If loading fails, the old voice remains unchanged and `ready`.
+After successful `set_voice`, the phase is `loaded`; send `warmup` again before
+`infer`. Subsequent `load` after `unload` uses the most recently selected voice.
+This operation is sequential (no inference concurrency or in-process GPU
+cancellation), and briefly holding both old and new voice tensors during the
+swap can increase peak VRAM usage. `set_voice` does not change backend or GPU.
 
 `infer` accepts an input WAV snapshot described by a single-leaf ASCII filename,
 length (max 64 MiB), and SHA-256. The worker validates the bytes once, processes
@@ -91,7 +109,7 @@ index is provided, otherwise 0; `pitch_shift_semitones` defaults to 0 and
 `rms_mix_rate` defaults to 0.5.
 
 `unload` drops the model; `shutdown` sends its reply and exits; EOF also exits.
-There is no in-process GPU cancellation, multiple resident models, dynamic
+There is no in-process GPU cancellation, multiple active voices, dynamic
 backend switching, or automatic backend/GPU fallback. To cancel a hung GPU
 operation, terminate the subprocess. The host owns the input/output folders,
 request scheduling, process timeouts, and installed native runtime libraries.
