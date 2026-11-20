@@ -208,6 +208,7 @@ enum Request {
         tokens: Vec<i32>,
         restoration_gain: f32,
         sampling: SamplingConfig,
+        method: OdeMethod,
         reply: mpsc::SyncSender<Result<Vec<f32>>>,
     },
     Speed {
@@ -284,14 +285,16 @@ impl TrtCompiledKernel {
                                         tokens,
                                         restoration_gain,
                                         sampling,
+                                        method,
                                         reply,
                                     } => {
-                                        let _ = reply.send(session.edit_speech(
+                                        let _ = reply.send(session.edit_speech_with_method(
                                             &plan,
                                             &tokens,
                                             &noise,
                                             restoration_gain,
                                             sampling,
+                                            method,
                                         ));
                                     }
                                     Request::Speed { mel, reply } => {
@@ -360,12 +363,28 @@ impl TrtChunkKernel for TrtCompiledKernel {
                 tokens: tokens.to_vec(),
                 restoration_gain,
                 sampling,
+                method: OdeMethod::Euler,
                 reply,
             })
             .map_err(|_| F5Error::ModelExecution("TRT speech edit worker stopped".into()))?;
         receive
             .recv()
             .map_err(|_| F5Error::ModelExecution("TRT speech edit interrupted".into()))?
+    }
+
+    fn edit_speech_with_method(
+        &mut self, plan: &SpeechEditPlan, tokens: &[i32], noise: &[f32],
+        restoration_gain: f32, sampling: SamplingConfig, method: OdeMethod,
+    ) -> Result<Vec<f32>> {
+        if self.shape.reference_frames != 0 || plan.total_frames != self.shape.cfm.backbone.frames {
+            return Err(F5Error::InvalidShape("Wrong warmed speech-edit shape"));
+        }
+        let (reply, receive) = mpsc::sync_channel(1);
+        self.sender.send(Request::Edit {
+            plan: plan.clone(), noise: noise.to_vec(), tokens: tokens.to_vec(),
+            restoration_gain, sampling, method, reply,
+        }).map_err(|_| F5Error::ModelExecution("TRT edit worker stopped".into()))?;
+        receive.recv().map_err(|_| F5Error::ModelExecution("TRT edit interrupted".into()))?
     }
 
     fn synthesize_chunk(
