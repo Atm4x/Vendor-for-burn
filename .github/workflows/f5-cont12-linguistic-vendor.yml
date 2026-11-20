@@ -64,9 +64,11 @@ jobs:
         run: |
           set -euo pipefail
           sed -i '/^serde_json = "1"/a jieba-rs = "=0.11.0"' Cargo.toml
+          export CARGO_HOME=/tmp/f5-cont12/cargo-home
           cargo generate-lockfile
           mkdir -p .cargo
-          cargo vendor --locked --versioned-dirs vendor > .cargo/config.toml
+          cargo vendor --locked --versioned-dirs vendor > /tmp/f5-cont12/vendor-config.toml
+          mv /tmp/f5-cont12/vendor-config.toml .cargo/config.toml
           cargo metadata --offline --locked --no-deps --format-version=1 > /dev/null
           tar -I 'zstd -T0 -1' -cf /tmp/f5-cont12/cargo-vendor.tar.zst vendor Cargo.lock .cargo/config.toml
           sha256sum /tmp/f5-cont12/cargo-vendor.tar.zst > /tmp/f5-cont12/cargo-vendor.sha256
