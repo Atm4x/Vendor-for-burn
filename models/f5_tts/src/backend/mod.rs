@@ -13,3 +13,9 @@ pub mod trtx_input;
 
 #[cfg(any(feature = "tensorrt-api", feature = "tensorrt-mock"))]
 pub mod trtx_cfm;
+
+#[cfg(any(feature = "tensorrt-api", feature = "tensorrt-mock"))]
+pub mod trtx_vocos;
+
+#[cfg(any(feature = "tensorrt-api", feature = "tensorrt-mock"))]
+pub mod trtx_speed;

@@ -59,7 +59,7 @@ pub struct TrtConv1d {
 }
 
 impl TrtConv1d {
-    fn load(
+    pub(super) fn load(
         checkpoint: &Checkpoint,
         prefix: &str,
         input: usize,
@@ -174,7 +174,7 @@ impl TrtInputWeights {
     }
 }
 
-fn mish<'a>(net: &mut NetworkDefinition<'a>, x: Tensor<'a>) -> Result<Tensor<'a>> {
+pub(super) fn mish<'a>(net: &mut NetworkDefinition<'a>, x: Tensor<'a>) -> Result<Tensor<'a>> {
     let softplus = net
         .add_activation(&x, ActivationType::kSOFTPLUS)
         .map_err(fail)?
@@ -184,7 +184,7 @@ fn mish<'a>(net: &mut NetworkDefinition<'a>, x: Tensor<'a>) -> Result<Tensor<'a>
     binary(net, x, tanh, Ew::kPROD)
 }
 
-fn conv1d<'a>(
+pub(super) fn conv1d<'a>(
     net: &mut NetworkDefinition<'a>,
     input: Tensor<'a>,
     w: &TrtConv1d,
@@ -245,11 +245,21 @@ fn mask_pad<'a>(
     binary(net, x, valid, Ew::kPROD)
 }
 
-fn norm_affine<'a>(
+pub(super) fn norm_affine<'a>(
     net: &mut NetworkDefinition<'a>,
     x: Tensor<'a>,
     weight: &[f32],
     bias: &[f32],
+) -> Result<Tensor<'a>> {
+    norm_affine_eps(net, x, weight, bias, 1e-6)
+}
+
+pub(super) fn norm_affine_eps<'a>(
+    net: &mut NetworkDefinition<'a>,
+    x: Tensor<'a>,
+    weight: &[f32],
+    bias: &[f32],
+    epsilon: f32,
 ) -> Result<Tensor<'a>> {
     let mean = net
         .add_reduce(&x, ReduceOperation::kAVG, Axes::new([2]), true)
@@ -263,7 +273,7 @@ fn norm_affine<'a>(
         .map_err(fail)?
         .output(net, 0)
         .map_err(fail)?;
-    let eps = scalar(net, 1e-6)?;
+    let eps = scalar(net, epsilon)?;
     let var = binary(net, var, eps, Ew::kSUM)?;
     let root = unary(net, var, UnaryOperation::kSQRT)?;
     let x = binary(net, centered, root, Ew::kDIV)?;

@@ -178,7 +178,7 @@ fn layer_norm<'a>(net: &mut NetworkDefinition<'a>, x: Tensor<'a>) -> Result<Tens
     binary(net, centered, root, Ew::kDIV)
 }
 
-fn rope<'a>(
+pub(super) fn rope<'a>(
     net: &mut NetworkDefinition<'a>,
     x: Tensor<'a>,
     shape: BackboneShape,
