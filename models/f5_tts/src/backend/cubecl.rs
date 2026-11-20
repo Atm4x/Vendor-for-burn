@@ -20,6 +20,7 @@ pub fn integrate<N: DiTVelocity>(
     mut noise: Tensor<3>,
     reference_mel: Tensor<3>,
     text_tokens: Tensor<2, Int>,
+    reference_frames: usize,
     sampling: SamplingConfig,
 ) -> Result<Tensor<3>> {
     let result = (|| {
@@ -28,6 +29,11 @@ pub fn integrate<N: DiTVelocity>(
         if reference_mel.dims() != shape || shape[2] != 100 {
             return Err(F5Error::InvalidShape(
                 "CFM tensors must have matching [B, frames, 100] shapes",
+            ));
+        }
+        if reference_frames == 0 || reference_frames >= shape[1] {
+            return Err(F5Error::InvalidShape(
+                "CFM reference length must be between zero and total frames",
             ));
         }
         if text_tokens.dims()[0] != shape[0] {
@@ -46,7 +52,9 @@ pub fn integrate<N: DiTVelocity>(
             }
             noise = noise + velocity * (times[1] - times[0]);
         }
-        Ok(noise)
+        let reference_prefix = reference_mel.slice([0..shape[0], 0..reference_frames, 0..shape[2]]);
+        let generated_suffix = noise.slice([0..shape[0], reference_frames..shape[1], 0..shape[2]]);
+        Ok(Tensor::cat(vec![reference_prefix, generated_suffix], 1))
     })();
     network.release_request_cache();
     result
@@ -65,4 +73,59 @@ pub fn wgpu_device() -> Device {
 #[cfg(feature = "cubecl-cpu")]
 pub fn cpu_device() -> Device {
     Device::cpu()
+}
+
+#[cfg(all(test, feature = "cubecl-cpu"))]
+mod tests {
+    use super::*;
+    use burn::tensor::TensorData;
+
+    struct ConstantVelocity {
+        calls: usize,
+        released: bool,
+    }
+
+    impl DiTVelocity for ConstantVelocity {
+        fn predict(
+            &mut self,
+            noisy: Tensor<3>,
+            _: Tensor<3>,
+            _: Tensor<2, Int>,
+            _: f32,
+            _: f32,
+        ) -> Result<Tensor<3>> {
+            self.calls += 1;
+            Ok(Tensor::ones(noisy.dims(), &noisy.device()))
+        }
+
+        fn release_request_cache(&mut self) {
+            self.released = true;
+        }
+    }
+
+    #[test]
+    fn cpu_cfm_keeps_reference_and_integrates_generated_suffix() {
+        let device = Device::cpu();
+        let mut model = ConstantVelocity {
+            calls: 0,
+            released: false,
+        };
+        let noise = Tensor::zeros([1, 6, 100], &device);
+        let mut condition = vec![0.0; 600];
+        condition[..200].fill(3.5);
+        let condition = Tensor::from_data(TensorData::new(condition, [1, 6, 100]), &device);
+        let text = Tensor::<2, Int>::zeros([1, 4], &device);
+        let sampling = SamplingConfig {
+            steps: 5,
+            cfg_strength: 2.0,
+            sway_sampling_coef: None,
+            empirically_pruned_steps: false,
+        };
+        let output = integrate(&mut model, noise, condition, text, 2, sampling).unwrap();
+        let values = output.into_data().try_to_vec::<f32>().unwrap();
+        assert!(values[..200].iter().all(|&v| (v - 3.5).abs() < 1e-6));
+        assert!(values[200..].iter().all(|&v| (v - 1.0).abs() < 1e-5));
+        assert_eq!(model.calls, 5);
+        assert!(model.released);
+    }
 }

@@ -19,7 +19,9 @@ pub mod dit_input;
     feature = "cubecl-wgpu"
 ))]
 pub mod dit_model;
+pub mod mel;
 pub mod model;
+pub mod reference;
 pub mod vocab;
 
 #[cfg(any(
