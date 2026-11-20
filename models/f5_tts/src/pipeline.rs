@@ -5,10 +5,11 @@ use burn::tensor::{Device, Int, Tensor, TensorData};
 use crate::{
     F5Error, Result,
     backend::cubecl::{integrate_with_edit_mask_ode, integrate_with_sample_mode},
+    bigvgan::{BigVganConfig, BigVganDecoder},
     cfm::{CfmSampleMode, OdeMethod, SamplingConfig},
     checkpoint::Checkpoint,
     dit_model::F5DiT,
-    mel::VocosMel,
+    mel::{BigVganMel, MelBackend, MelExtractor, VocosMel},
     noise::StandardNormal,
     pinyin::ChinesePinyin,
     reference::ReferenceAudio,
@@ -19,11 +20,25 @@ use crate::{
     vocos::{VocosConfig, VocosDecoder},
 };
 
+enum NativeVocoder {
+    Vocos(VocosDecoder),
+    BigVgan(BigVganDecoder),
+}
+
+impl NativeVocoder {
+    fn decode(&self, mel: Tensor<3>, gain: f32) -> Result<Vec<f32>> {
+        match self {
+            Self::Vocos(v) => v.decode(mel, gain),
+            Self::BigVgan(v) => v.decode(mel, gain),
+        }
+    }
+}
+
 pub struct StandardF5Runtime {
     device: Device,
-    mel: VocosMel,
+    mel: MelBackend,
     dit: F5DiT,
-    vocoder: VocosDecoder,
+    vocoder: NativeVocoder,
     vocabulary: Vocabulary,
     native_pinyin: Arc<ChinesePinyin>,
 }
@@ -65,9 +80,37 @@ impl StandardF5Runtime {
         let vocoder = VocosDecoder::from_checkpoint(&vocos_checkpoint, vocos_config, &device)?;
         Ok(Self {
             device,
-            mel: VocosMel::new(),
+            mel: MelBackend::Vocos(VocosMel::new()),
             dit,
-            vocoder,
+            vocoder: NativeVocoder::Vocos(vocoder),
+            vocabulary,
+            native_pinyin,
+        })
+    }
+
+    /// F5TTS_Base_bigvgan checkpoint. The conditioning spectrogram and
+    /// synthesized waveform both use the BigVGAN-specific 24 kHz frontend.
+    pub fn load_bigvgan(
+        f5_checkpoint: impl AsRef<Path>,
+        bigvgan_checkpoint: impl AsRef<Path>,
+        vocabulary: impl AsRef<Path>,
+        device: Device,
+    ) -> Result<Self> {
+        let vocabulary = Vocabulary::from_path(vocabulary)?;
+        let f5_checkpoint = Checkpoint::open(f5_checkpoint)?;
+        let bigvgan_checkpoint = Checkpoint::open(bigvgan_checkpoint)?;
+        let native_pinyin = Arc::new(ChinesePinyin::bundled()?);
+        let dit = F5DiT::from_checkpoint(&f5_checkpoint, vocabulary.size(), &device)?;
+        let vocoder = BigVganDecoder::from_checkpoint(
+            &bigvgan_checkpoint,
+            BigVganConfig::V2_24KHZ_100BAND_256X,
+            &device,
+        )?;
+        Ok(Self {
+            device,
+            mel: MelBackend::BigVgan(BigVganMel::new()),
+            dit,
+            vocoder: NativeVocoder::BigVgan(vocoder),
             vocabulary,
             native_pinyin,
         })
@@ -225,17 +268,23 @@ impl StandardF5Runtime {
 
     /// Optional pydub-compatible 24kHz PCM16 silence trimming.
     pub fn synthesize_wav_with_silence_removal(
-        &mut self, reference: &ReferenceAudio, text_tokens: &[i32],
-        options: GenerateOptions, remove_silence: bool,
+        &mut self,
+        reference: &ReferenceAudio,
+        text_tokens: &[i32],
+        options: GenerateOptions,
+        remove_silence: bool,
     ) -> Result<Vec<u8>> {
         let wav = self.synthesize_wav(reference, text_tokens, options)?;
         if !remove_silence {
             return Ok(wav);
         }
-        let samples: Vec<i16> = wav[44..].chunks_exact(2)
-            .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]])).collect();
+        let samples: Vec<i16> = wav[44..]
+            .chunks_exact(2)
+            .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]]))
+            .collect();
         let trimmed = crate::postprocess::remove_generated_silence(
-            &samples, crate::mel::SAMPLE_RATE as u32,
+            &samples,
+            crate::mel::SAMPLE_RATE as u32,
             crate::postprocess::SilenceRemoval::default(),
         )?;
         crate::wav::mono_pcm16_from_i16(&trimmed)
@@ -413,23 +462,42 @@ impl StandardF5Runtime {
 
     /// Original CFM.sample() no_ref_audio / duplicate_test / t_inter options.
     pub fn synthesize_with_sample_mode(
-        &mut self, reference: &ReferenceAudio, text_tokens: &[i32], options: GenerateOptions,
-        method: OdeMethod, mode: CfmSampleMode,
+        &mut self,
+        reference: &ReferenceAudio,
+        text_tokens: &[i32],
+        options: GenerateOptions,
+        method: OdeMethod,
+        mode: CfmSampleMode,
     ) -> Result<Vec<f32>> {
         let mut rng = StandardNormal::new(options.seed);
         self.synthesize_from_noise_source_with_mode(
-            reference, text_tokens, options.total_frames, options.sampling, method, mode,
+            reference,
+            text_tokens,
+            options.total_frames,
+            options.sampling,
+            method,
+            mode,
             |count| Ok((0..count).map(|_| rng.sample()).collect()),
         )
     }
 
     pub fn synthesize_with_noise_and_sample_mode(
-        &mut self, reference: &ReferenceAudio, text_tokens: &[i32], total_frames: usize,
-        sampling: SamplingConfig, method: OdeMethod, mode: CfmSampleMode,
+        &mut self,
+        reference: &ReferenceAudio,
+        text_tokens: &[i32],
+        total_frames: usize,
+        sampling: SamplingConfig,
+        method: OdeMethod,
+        mode: CfmSampleMode,
         initial_noise: &[f32],
     ) -> Result<Vec<f32>> {
         self.synthesize_from_noise_source_with_mode(
-            reference, text_tokens, total_frames, sampling, method, mode,
+            reference,
+            text_tokens,
+            total_frames,
+            sampling,
+            method,
+            mode,
             |count| validate_initial_noise(initial_noise.to_vec(), count),
         )
     }
@@ -479,13 +547,22 @@ impl StandardF5Runtime {
     }
 
     fn synthesize_from_noise_source_with_method(
-        &mut self, reference: &ReferenceAudio, text_tokens: &[i32], total_frames: usize,
-        sampling: SamplingConfig, method: OdeMethod,
+        &mut self,
+        reference: &ReferenceAudio,
+        text_tokens: &[i32],
+        total_frames: usize,
+        sampling: SamplingConfig,
+        method: OdeMethod,
         create_noise: impl FnOnce(usize) -> Result<Vec<f32>>,
     ) -> Result<Vec<f32>> {
         self.synthesize_from_noise_source_with_mode(
-            reference, text_tokens, total_frames, sampling, method,
-            CfmSampleMode::default(), create_noise,
+            reference,
+            text_tokens,
+            total_frames,
+            sampling,
+            method,
+            CfmSampleMode::default(),
+            create_noise,
         )
     }
 

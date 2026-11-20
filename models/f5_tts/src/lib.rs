@@ -25,13 +25,13 @@ pub mod mel;
 pub mod model;
 pub mod noise;
 pub mod pinyin;
-pub mod postprocess;
 #[cfg(any(
     feature = "cubecl-cpu",
     feature = "cubecl-cuda",
     feature = "cubecl-wgpu"
 ))]
 pub mod pipeline;
+pub mod postprocess;
 pub mod reference;
 pub mod resample;
 pub mod speech_edit;
@@ -51,6 +51,13 @@ pub mod vocab;
 ))]
 pub mod vocos;
 pub mod wav;
+
+#[cfg(any(
+    feature = "cubecl-cpu",
+    feature = "cubecl-cuda",
+    feature = "cubecl-wgpu"
+))]
+pub mod bigvgan;
 
 pub mod backend;
 

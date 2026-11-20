@@ -111,6 +111,142 @@ impl VocosMel {
     }
 }
 
+/// Slaney-normalized, center-free mel frontend used by BigVGAN v2 and the
+/// corresponding F5-TTS checkpoint. The Vocos frontend is not interchangeable.
+#[derive(Debug, Clone)]
+pub struct BigVganMel {
+    filters: Vec<f32>,
+    window: [f32; FFT_SIZE],
+}
+
+#[derive(Debug, Clone)]
+pub enum MelBackend {
+    Vocos(VocosMel),
+    BigVgan(BigVganMel),
+}
+
+impl MelExtractor for MelBackend {
+    fn extract(&self, samples: &[f32]) -> Result<MelFrames> {
+        match self {
+            Self::Vocos(v) => v.extract(samples),
+            Self::BigVgan(v) => v.extract(samples),
+        }
+    }
+}
+
+pub trait MelExtractor {
+    fn extract(&self, samples: &[f32]) -> Result<MelFrames>;
+}
+
+impl MelExtractor for VocosMel {
+    fn extract(&self, samples: &[f32]) -> Result<MelFrames> {
+        VocosMel::extract(self, samples)
+    }
+}
+
+impl Default for BigVganMel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn slaney_mel(hz: f64) -> f64 {
+    const LINEAR_HZ_PER_MEL: f64 = 200.0 / 3.0;
+    if hz < 1000.0 {
+        hz / LINEAR_HZ_PER_MEL
+    } else {
+        15.0 + (hz / 1000.0).ln() / (6.4_f64.ln() / 27.0)
+    }
+}
+
+fn slaney_hz(mel: f64) -> f64 {
+    const LINEAR_HZ_PER_MEL: f64 = 200.0 / 3.0;
+    if mel < 15.0 {
+        mel * LINEAR_HZ_PER_MEL
+    } else {
+        1000.0 * ((mel - 15.0) * (6.4_f64.ln() / 27.0)).exp()
+    }
+}
+
+impl BigVganMel {
+    pub fn new() -> Self {
+        let mut window = [0.0; FFT_SIZE];
+        for (index, value) in window.iter_mut().enumerate() {
+            *value = 0.5
+                - 0.5 * (2.0 * std::f64::consts::PI * index as f64 / FFT_SIZE as f64).cos() as f32;
+        }
+        let max_mel = slaney_mel((SAMPLE_RATE / 2) as f64);
+        let mel_hz: Vec<f64> = (0..MEL_CHANNELS + 2)
+            .map(|i| slaney_hz(i as f64 * max_mel / (MEL_CHANNELS + 1) as f64))
+            .collect();
+        let mut filters = vec![0.0; MEL_CHANNELS * FFT_BINS];
+        for channel in 0..MEL_CHANNELS {
+            let low = mel_hz[channel];
+            let center = mel_hz[channel + 1];
+            let high = mel_hz[channel + 2];
+            let slaney_norm = 2.0 / (high - low);
+            for bin in 0..FFT_BINS {
+                let hz = bin as f64 * SAMPLE_RATE as f64 / FFT_SIZE as f64;
+                let up = (hz - low) / (center - low);
+                let down = (high - hz) / (high - center);
+                filters[channel * FFT_BINS + bin] = (up.min(down).max(0.0) * slaney_norm) as f32;
+            }
+        }
+        Self { filters, window }
+    }
+
+    pub fn extract(&self, samples: &[f32]) -> Result<MelFrames> {
+        const PAD: usize = (FFT_SIZE - HOP_SIZE) / 2;
+        if samples.len() <= PAD {
+            return Err(F5Error::InvalidShape(
+                "BigVGAN mel reflect padding requires >384 samples",
+            ));
+        }
+        if samples.iter().any(|v| !v.is_finite()) {
+            return Err(F5Error::InvalidConfiguration(
+                "Reference audio contains non-finite samples",
+            ));
+        }
+        let padded_len = samples
+            .len()
+            .checked_add(PAD * 2)
+            .ok_or(F5Error::InvalidShape("BigVGAN mel frame count overflow"))?;
+        let frames = 1 + (padded_len - FFT_SIZE) / HOP_SIZE;
+        let output_len = frames
+            .checked_mul(MEL_CHANNELS)
+            .ok_or(F5Error::InvalidShape("BigVGAN mel size overflow"))?;
+        let mut values = vec![0.0_f32; output_len];
+        let mut real = [0.0_f32; FFT_SIZE];
+        let mut imag = [0.0_f32; FFT_SIZE];
+        let mut magnitudes = [0.0_f32; FFT_BINS];
+        for frame in 0..frames {
+            for i in 0..FFT_SIZE {
+                let position = frame as isize * HOP_SIZE as isize + i as isize - PAD as isize;
+                real[i] = samples[reflected_index(position, samples.len())] * self.window[i];
+                imag[i] = 0.0;
+            }
+            transform(&mut real, &mut imag, false);
+            for k in 0..FFT_BINS {
+                magnitudes[k] = (real[k] * real[k] + imag[k] * imag[k] + 1e-9).sqrt();
+            }
+            for channel in 0..MEL_CHANNELS {
+                let mut energy = 0.0_f32;
+                for k in 0..FFT_BINS {
+                    energy += self.filters[channel * FFT_BINS + k] * magnitudes[k];
+                }
+                values[frame * MEL_CHANNELS + channel] = energy.max(LOG_FLOOR).ln();
+            }
+        }
+        Ok(MelFrames { frames, values })
+    }
+}
+
+impl MelExtractor for BigVganMel {
+    fn extract(&self, samples: &[f32]) -> Result<MelFrames> {
+        BigVganMel::extract(self, samples)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MelFrames {
     pub frames: usize,
@@ -140,6 +276,48 @@ impl MelFrames {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bigvgan_uses_center_free_frames() {
+        let extractor = BigVganMel::new();
+        let mel = extractor.extract(&vec![0.0_f32; 2048]).unwrap();
+        assert_eq!(mel.frames, 8);
+        assert_eq!(mel.values.len(), 800);
+        assert!(mel.values.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn bigvgan_matches_original_torch_librosa_reference() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/bigvgan_mel_expected.json"))
+                .unwrap();
+        let extractor = BigVganMel::new();
+        for fixture in fixture.as_array().unwrap() {
+            let length = fixture["length"].as_u64().unwrap() as usize;
+            let samples: Vec<f32> = (0..length)
+                .map(|i| ((i * 37 % 101) as i32 - 50) as f32 / 128.0)
+                .collect();
+            let expected: Vec<f32> = fixture["mel"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap() as f32)
+                .collect();
+            let found = extractor.extract(&samples).unwrap();
+            assert_eq!(found.frames, fixture["frames"].as_u64().unwrap() as usize);
+            assert_eq!(found.values.len(), expected.len());
+            let maximum = found
+                .values
+                .iter()
+                .zip(expected)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                maximum < 5e-3,
+                "BigVGAN mel PyTorch differential max_abs={maximum}"
+            );
+        }
+    }
 
     #[test]
     fn mel_frame_count_and_padded_audio_shape() {

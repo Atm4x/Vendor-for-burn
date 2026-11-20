@@ -1,4 +1,4 @@
-use crate::{F5Error, Result, mel::VocosMel, model::MelFrames, resample::resample_to_24khz};
+use crate::{F5Error, Result, mel::MelExtractor, model::MelFrames, resample::resample_to_24khz};
 
 const TARGET_RMS: f32 = 0.1;
 const MAX_REFERENCE_SECONDS: usize = 12;
@@ -98,7 +98,7 @@ impl ReferenceAudio {
 
     pub fn prepare(
         &self,
-        extractor: &VocosMel,
+        extractor: &impl MelExtractor,
         requested_frames: usize,
         token_count: usize,
     ) -> Result<PreparedCondition> {
@@ -140,7 +140,7 @@ impl PreparedCondition {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mel::SAMPLE_RATE;
+    use crate::mel::{SAMPLE_RATE, VocosMel};
 
     #[test]
     fn speech_edit_audio_is_not_truncated_at_reference_prompt_limit() {
