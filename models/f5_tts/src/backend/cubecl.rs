@@ -2,7 +2,7 @@ use burn::tensor::{Device, Int, Tensor, TensorData};
 
 use crate::{
     F5Error, Result,
-    cfm::{OdeMethod, SamplingConfig},
+    cfm::{CfmSampleMode, OdeMethod, SamplingConfig},
 };
 
 pub trait DiTVelocity {
@@ -54,6 +54,7 @@ pub fn integrate_with_edit_mask<N: DiTVelocity>(
         sampling,
         100,
         OdeMethod::Euler,
+        CfmSampleMode::default(),
     )
 }
 
@@ -75,6 +76,7 @@ pub fn integrate_with_ode_method<N: DiTVelocity>(
         sampling,
         100,
         method,
+        CfmSampleMode::default(),
     )
 }
 
@@ -96,6 +98,23 @@ pub fn integrate_with_edit_mask_ode<N: DiTVelocity>(
         sampling,
         100,
         method,
+        CfmSampleMode::default(),
+    )
+}
+
+pub fn integrate_with_sample_mode<N: DiTVelocity>(
+    network: &mut N,
+    noise: Tensor<3>,
+    reference_mel: Tensor<3>,
+    text_tokens: Tensor<2, Int>,
+    reference_frames: usize,
+    sampling: SamplingConfig,
+    method: OdeMethod,
+    mode: CfmSampleMode,
+) -> Result<Tensor<3>> {
+    integrate_with_strategy(
+        network, noise, reference_mel, text_tokens,
+        RestoreStrategy::Prefix(reference_frames), sampling, 100, method, mode,
     )
 }
 
@@ -117,6 +136,7 @@ pub(crate) fn integrate_with_channels<N: DiTVelocity>(
         sampling,
         mel_channels,
         OdeMethod::Euler,
+        CfmSampleMode::default(),
     )
 }
 
@@ -134,9 +154,10 @@ fn integrate_with_strategy<N: DiTVelocity>(
     sampling: SamplingConfig,
     mel_channels: usize,
     method: OdeMethod,
+    mode: CfmSampleMode,
 ) -> Result<Tensor<3>> {
     let result = (|| {
-        let timeline = sampling.timeline()?;
+        let timeline = mode.timeline(sampling)?;
         let shape = noise.dims();
         if reference_mel.dims() != shape || shape[2] != mel_channels {
             return Err(F5Error::InvalidShape(
@@ -145,6 +166,28 @@ fn integrate_with_strategy<N: DiTVelocity>(
         }
         if text_tokens.dims()[0] != shape[0] {
             return Err(F5Error::InvalidShape("Text and mel batch sizes must match"));
+        }
+        if mode.duplicate_test {
+            let prefix = match restoration {
+                RestoreStrategy::Prefix(prefix) => prefix,
+                RestoreStrategy::FrameMask(_) => shape[1],
+            };
+            if prefix == 0 || prefix > shape[1] {
+                return Err(F5Error::InvalidShape("Invalid duplicate-test reference length"));
+            }
+            let copied = prefix.min(shape[1] - prefix);
+            let mut parts = vec![
+                Tensor::<3>::zeros([shape[0], prefix, mel_channels], &noise.device())
+            ];
+            if copied != 0 {
+                parts.push(reference_mel.clone().slice([0..shape[0], 0..copied, 0..mel_channels]));
+            }
+            if prefix + copied < shape[1] {
+                parts.push(Tensor::<3>::zeros(
+                    [shape[0], shape[1] - prefix - copied, mel_channels], &noise.device()
+                ));
+            }
+            noise = noise * (1.0 - mode.t_inter as f32) + Tensor::cat(parts, 1) * mode.t_inter as f32;
         }
         let (condition, frame_mask) = match restoration {
             RestoreStrategy::Prefix(reference_frames) => {
@@ -173,6 +216,11 @@ fn integrate_with_strategy<N: DiTVelocity>(
                 );
                 (reference_mel.clone() * mask.clone(), Some(mask))
             }
+        };
+        let condition = if mode.no_ref_audio {
+            Tensor::<3>::zeros(shape, &noise.device())
+        } else {
+            condition
         };
         for times in timeline.windows(2) {
             let delta = times[1] - times[0];
@@ -212,7 +260,7 @@ fn integrate_with_strategy<N: DiTVelocity>(
             Ok(condition + noise * unmasked)
         } else if let RestoreStrategy::Prefix(reference_frames) = restoration {
             let reference_prefix =
-                reference_mel.slice([0..shape[0], 0..reference_frames, 0..shape[2]]);
+                condition.slice([0..shape[0], 0..reference_frames, 0..shape[2]]);
             let generated_suffix =
                 noise.slice([0..shape[0], reference_frames..shape[1], 0..shape[2]]);
             Ok(Tensor::cat(vec![reference_prefix, generated_suffix], 1))
