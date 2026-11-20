@@ -627,6 +627,120 @@ mod tests {
     }
 
     #[test]
+    fn cubecl_gqa_prefill_preserves_token_major_heads_through_last_token() {
+        let mut graph = Graph::new(Stage::SlowPrefill, None, None);
+        let query = graph
+            .input(
+                "query",
+                TensorType::new([2, 4, 3, 2], ScalarType::F32, Layout::HeadsBhtd),
+            )
+            .unwrap();
+        let key = graph
+            .input(
+                "key",
+                TensorType::new([2, 2, 3, 2], ScalarType::BF16, Layout::HeadsBhtd),
+            )
+            .unwrap();
+        let value = graph
+            .input(
+                "value",
+                TensorType::new([2, 2, 3, 2], ScalarType::BF16, Layout::HeadsBhtd),
+            )
+            .unwrap();
+        let identity = graph
+            .weight(
+                "identity",
+                TensorType::new([8, 8], ScalarType::F32, Layout::Plain),
+            )
+            .unwrap();
+        let attention = graph
+            .emit(
+                "attention",
+                Op::GqaAttention {
+                    position: 0,
+                    q_heads: 4,
+                    kv_heads: 2,
+                },
+                &[query, key, value],
+            )
+            .unwrap();
+        let projected = graph
+            .emit("projected", Op::Linear, &[attention, identity])
+            .unwrap();
+        let last = graph.emit("last", Op::LastToken, &[projected]).unwrap();
+        graph.output(attention).unwrap();
+        graph.output(last).unwrap();
+
+        let mut inputs = NamedTensors::new();
+        inputs.insert("query".into(), TensorData::F32(vec![0.0; 2 * 4 * 3 * 2]));
+        inputs.insert("key".into(), TensorData::F32(vec![0.0; 2 * 2 * 3 * 2]));
+        let values = (0..2)
+            .flat_map(|batch| {
+                (0..2).flat_map(move |kv_head| {
+                    (0..3).flat_map(move |frame| {
+                        (0..2).map(move |feature| {
+                            (batch * 100 + kv_head * 40 + frame * 10 + feature + 1) as f32
+                        })
+                    })
+                })
+            })
+            .collect();
+        inputs.insert("value".into(), TensorData::F32(values));
+        inputs.insert(
+            "identity".into(),
+            TensorData::F32(
+                (0..8)
+                    .flat_map(|row| (0..8).map(move |col| if row == col { 1.0 } else { 0.0 }))
+                    .collect(),
+            ),
+        );
+        run_parity(graph, inputs);
+    }
+
+    #[test]
+    fn cubecl_gqa_single_token_decode_preserves_head_order() {
+        let mut graph = Graph::new(Stage::SlowDecode, Some(5), Some(5));
+        let query = graph
+            .input(
+                "query",
+                TensorType::new([2, 4, 1, 2], ScalarType::F32, Layout::HeadsBhtd),
+            )
+            .unwrap();
+        let key = graph
+            .input(
+                "key",
+                TensorType::new([2, 2, 5, 2], ScalarType::BF16, Layout::HeadsBhtd),
+            )
+            .unwrap();
+        let value = graph
+            .input(
+                "value",
+                TensorType::new([2, 2, 5, 2], ScalarType::BF16, Layout::HeadsBhtd),
+            )
+            .unwrap();
+        let attention = graph
+            .emit(
+                "attention",
+                Op::GqaAttention {
+                    position: 4,
+                    q_heads: 4,
+                    kv_heads: 2,
+                },
+                &[query, key, value],
+            )
+            .unwrap();
+        graph.output(attention).unwrap();
+        let mut inputs = NamedTensors::new();
+        inputs.insert("query".into(), TensorData::F32(vec![0.0; 2 * 4 * 2]));
+        inputs.insert("key".into(), TensorData::F32(vec![0.0; 2 * 2 * 5 * 2]));
+        inputs.insert(
+            "value".into(),
+            TensorData::F32((0..2 * 2 * 5 * 2).map(|i| (i as f32 + 1.0) * 0.5).collect()),
+        );
+        run_parity(graph, inputs);
+    }
+
+    #[test]
     fn cubecl_compile_rejects_unsupported_before_device_use() {
         let mut g = Graph::new(Stage::SlowPrefill, None, None);
         let ids = g

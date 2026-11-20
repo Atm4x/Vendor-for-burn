@@ -280,16 +280,16 @@ pub(super) fn gqa_values_kernel<F: Float>(
 ) {
     if ABSOLUTE_POS < out.len() {
         let feature = ABSOLUTE_POS % dimension;
-        let row = ABSOLUTE_POS / dimension;
-        let frame = row % frames;
-        let head = (row / frames) % q_heads;
-        let batch = row / (frames * q_heads);
+        let head = (ABSOLUTE_POS / dimension) % q_heads;
+        let frame = (ABSOLUTE_POS / (dimension * q_heads)) % frames;
+        let batch = ABSOLUTE_POS / (dimension * q_heads * frames);
+        let score_row = (batch * q_heads + head) * frames + frame;
         let kv_head = head / (q_heads / kv_heads);
         let visible = first_position + frame + 1;
         let value_start = (batch * kv_heads + kv_head) * active * dimension;
         let mut sum = 0.0f32;
         for step in 0..visible {
-            sum += scores[row * active + step]
+            sum += scores[score_row * active + step]
                 * f32::cast_from(value[value_start + step * dimension + feature]);
         }
         out[ABSOLUTE_POS] = sum;
