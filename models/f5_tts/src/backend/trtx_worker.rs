@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     F5Error, Result,
-    cfm::SamplingConfig,
+    cfm::{CfmSampleMode, OdeMethod, SamplingConfig},
     cross_lingual::EnglishSyllableCounter,
     mel::VocosMel,
     noise::StandardNormal,
@@ -17,6 +17,7 @@ use crate::{
 use super::trtx_text::{
     CrossLingualTextOptions, StandardTextOptions, TrtChunkKernel, TrtKernelFactory, TrtVoice,
     TrtWarmBank, synthesize_cross_lingual, synthesize_multi_voice, synthesize_standard_text,
+    synthesize_standard_text_with_sample_mode,
 };
 
 #[derive(Debug, Clone)]
@@ -205,6 +206,22 @@ impl<P: PinyinProvider + Clone> TrtModelWorker<P> {
             &active.vocabulary,
             active.pinyin.clone(),
             options,
+        )
+    }
+
+    /// Full original CFM.sample() options on the warmed TensorRT worker.
+    pub fn synthesize_with_sample_mode(
+        &mut self, text: &str, options: StandardTextOptions,
+        method: OdeMethod, mode: CfmSampleMode,
+    ) -> Result<Vec<f32>> {
+        mode.validate()?;
+        let active = self.active.as_mut()
+            .ok_or(F5Error::InvalidConfiguration("No F5 model loaded"))?;
+        let voice = active.voices.get(&active.selected_voice)
+            .ok_or(F5Error::InvalidConfiguration("Active F5 voice missing"))?;
+        synthesize_standard_text_with_sample_mode(
+            &mut active.engines, voice.borrowed(), text,
+            &active.vocabulary, active.pinyin.clone(), options, method, mode,
         )
     }
 
