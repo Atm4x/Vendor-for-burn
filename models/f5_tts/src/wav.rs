@@ -6,6 +6,13 @@ pub fn mono_pcm16(samples: &[f32]) -> Result<Vec<u8>> {
             "WAV requires nonempty finite mono PCM",
         ));
     }
+    let converted: Vec<i16> = samples.iter().map(|&sample| {
+        (sample.clamp(-1.0, 1.0) * 32768.0).round().clamp(-32768.0, 32767.0) as i16
+    }).collect();
+    mono_pcm16_from_i16(&converted)
+}
+
+pub fn mono_pcm16_from_i16(samples: &[i16]) -> Result<Vec<u8>> {
     let data_bytes = samples
         .len()
         .checked_mul(2)
@@ -28,10 +35,7 @@ pub fn mono_pcm16(samples: &[f32]) -> Result<Vec<u8>> {
     result.extend_from_slice(b"data");
     result.extend_from_slice(&data_bytes.to_le_bytes());
     for &sample in samples {
-        let quantized = (sample.clamp(-1.0, 1.0) * 32768.0)
-            .round()
-            .clamp(-32768.0, 32767.0) as i16;
-        result.extend_from_slice(&quantized.to_le_bytes());
+        result.extend_from_slice(&sample.to_le_bytes());
     }
     Ok(result)
 }
