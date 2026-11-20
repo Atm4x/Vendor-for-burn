@@ -10,7 +10,8 @@ use crate::{
     dit_model::F5DiT,
     mel::VocosMel,
     reference::ReferenceAudio,
-    text_frontend::{F5TextFrontend, NoPinyin, PinyinProvider, standard_total_frames},
+    standard_chunking::plan_standard_chunks,
+    text_frontend::{F5TextFrontend, NoPinyin, PinyinProvider},
     vocab::Vocabulary,
     vocos::{VocosConfig, VocosDecoder},
 };
@@ -128,25 +129,55 @@ impl StandardF5Runtime {
         seed: u64,
         sampling: SamplingConfig,
     ) -> Result<Vec<f32>> {
-        let tokens = F5TextFrontend::new(&self.vocabulary, pinyin)
-            .standard_tokens(reference_text, generated_text)?;
-        let reference_frames = reference.samples.len() / 256;
-        let target = standard_total_frames(
-            reference_frames,
+        self.synthesize_chunked_with_pinyin(
+            reference,
             reference_text,
             generated_text,
+            pinyin,
             speed,
             fixed_seconds,
-        )?;
-        self.synthesize(
-            reference,
-            &tokens,
-            GenerateOptions {
-                total_frames: target,
-                seed,
-                sampling,
-            },
+            0.15,
+            seed,
+            sampling,
         )
+    }
+
+    pub fn synthesize_chunked_with_pinyin<P: PinyinProvider>(
+        &mut self,
+        reference: &ReferenceAudio,
+        reference_text: &str,
+        generated_text: &str,
+        pinyin: P,
+        speed: f32,
+        fixed_seconds: Option<f32>,
+        cross_fade_seconds: f32,
+        seed: u64,
+        sampling: SamplingConfig,
+    ) -> Result<Vec<f32>> {
+        let planned = plan_standard_chunks(
+            generated_text,
+            reference_text,
+            reference.samples.len(),
+            speed,
+            fixed_seconds,
+            cross_fade_seconds,
+        )?;
+        let vocabulary = self.vocabulary.clone();
+        let frontend = F5TextFrontend::new(&vocabulary, pinyin);
+        let mut generator = StandardNormal::new(seed);
+        let mut waves = Vec::with_capacity(planned.len());
+        for chunk in planned {
+            let tokens = frontend.standard_tokens(reference_text, &chunk.text)?;
+            let wave = self.synthesize_with_rng(
+                reference,
+                &tokens,
+                chunk.total_frames,
+                sampling,
+                &mut generator,
+            )?;
+            waves.push(wave);
+        }
+        crate::cross_lingual::cross_fade_waves(&waves, cross_fade_seconds)
     }
 
     pub fn synthesize_script(
@@ -170,18 +201,29 @@ impl StandardF5Runtime {
         let mut result = Vec::new();
         for segment in segments {
             let voice = voices.get(&segment.voice).unwrap_or(main);
-            let tokens = F5TextFrontend::new(&self.vocabulary, NoPinyin)
-                .standard_tokens(voice.transcript, &segment.text)?;
-            let total_frames = standard_total_frames(
-                voice.audio.samples.len() / 256,
-                voice.transcript,
+            let chunks = plan_standard_chunks(
                 &segment.text,
+                voice.transcript,
+                voice.audio.samples.len(),
                 speed,
                 None,
+                0.15,
             )?;
-            let wave =
-                self.synthesize_with_rng(voice.audio, &tokens, total_frames, sampling, &mut rng)?;
-            result.extend(wave);
+            let vocabulary = self.vocabulary.clone();
+            let frontend = F5TextFrontend::new(&vocabulary, NoPinyin);
+            let mut chunk_waves = Vec::with_capacity(chunks.len());
+            for chunk in chunks {
+                let tokens = frontend.standard_tokens(voice.transcript, &chunk.text)?;
+                let wave = self.synthesize_with_rng(
+                    voice.audio,
+                    &tokens,
+                    chunk.total_frames,
+                    sampling,
+                    &mut rng,
+                )?;
+                chunk_waves.push(wave);
+            }
+            result.extend(crate::cross_lingual::cross_fade_waves(&chunk_waves, 0.15)?);
         }
         Ok(result)
     }

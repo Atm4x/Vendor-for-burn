@@ -27,7 +27,7 @@ impl<'a, P: PinyinProvider> F5TextFrontend<'a, P> {
     }
 
     pub fn standard_tokens(&self, reference_text: &str, generated_text: &str) -> Result<Vec<i32>> {
-        let reference = normalized_reference_transcript(reference_text)?;
+        let reference = effective_reference_transcript(reference_text)?;
         if generated_text.trim().is_empty() {
             return Err(F5Error::InvalidConfiguration(
                 "Generation text must not be empty",
@@ -46,47 +46,133 @@ impl<'a, P: PinyinProvider> F5TextFrontend<'a, P> {
     }
 
     pub fn encode(&self, text: &str) -> Result<Vec<i32>> {
-        let mut tokens = Vec::with_capacity(text.len());
-        let mut chars = text.chars().peekable();
-        while let Some(ch) = chars.next() {
-            if is_han(ch) {
-                let mut segment = String::from(ch);
-                while chars.peek().is_some_and(|next| is_han(*next)) {
-                    segment.push(chars.next().unwrap());
-                }
-                let pronunciation = self.pinyin.syllables(&segment)?;
-                if pronunciation.len() != segment.chars().count()
-                    || pronunciation
-                        .iter()
-                        .any(|word| word.is_empty() || !word.is_ascii())
+        let normalized = normalize_punctuation(text);
+        let segments = script_segments(&normalized);
+        self.encode_segments(&segments)
+    }
+
+    pub fn encode_segments(&self, segments: &[&str]) -> Result<Vec<i32>> {
+        let mut normalized = Vec::<String>::new();
+        for raw in segments {
+            let segment = normalize_punctuation(raw);
+            let chars = segment.chars().count();
+            if chars == 0 {
+                continue;
+            }
+            if segment.is_ascii() {
+                if segment.len() > 1
+                    && !normalized.is_empty()
+                    && !matches!(
+                        normalized.last().map(String::as_str),
+                        Some(" " | ":" | "'" | "\"")
+                    )
                 {
-                    return Err(F5Error::InvalidConfiguration(
-                        "Pinyin provider must return one ASCII syllable per Han character",
-                    ));
+                    normalized.push(" ".to_owned());
                 }
-                for syllable in pronunciation {
-                    tokens.push(self.vocabulary.token_id(" "));
-                    for letter in syllable.chars() {
-                        tokens.push(self.vocabulary.char_id(letter));
+                normalized.extend(segment.chars().map(|ch| ch.to_string()));
+            } else if segment.len() == chars * 3 {
+                self.append_han_and_punctuation(&segment, &mut normalized)?;
+            } else {
+                for ch in segment.chars() {
+                    if is_han(ch) {
+                        let char_str = ch.to_string();
+                        let result = self.pinyin.syllables(&char_str)?;
+                        self.append_pinyin(&char_str, result, &mut normalized)?;
+                    } else {
+                        normalized.push(ch.to_string());
                     }
                 }
-            } else {
-                let normalized = match ch {
-                    ';' => ',',
-                    '“' | '”' => '"',
-                    '‘' | '’' => '\'',
-                    other => other,
-                };
-                tokens.push(self.vocabulary.char_id(normalized));
             }
         }
-        if tokens.is_empty() || tokens.len() > 8192 {
+        if normalized.is_empty() || normalized.len() > 8192 {
             return Err(F5Error::InvalidShape(
                 "F5 normalized text must contain 1..8192 tokens",
             ));
         }
-        Ok(tokens)
+        Ok(normalized
+            .iter()
+            .map(|token| self.vocabulary.token_id(token))
+            .collect())
     }
+
+    fn append_han_and_punctuation(&self, segment: &str, target: &mut Vec<String>) -> Result<()> {
+        let mut chars = segment.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if !is_han(ch) {
+                target.push(ch.to_string());
+                continue;
+            }
+            let mut word = String::from(ch);
+            while chars.peek().is_some_and(|next| is_han(*next)) {
+                word.push(chars.next().unwrap());
+            }
+            let syllables = self.pinyin.syllables(&word)?;
+            self.append_pinyin(&word, syllables, target)?;
+        }
+        Ok(())
+    }
+
+    fn append_pinyin(
+        &self,
+        han: &str,
+        syllables: Vec<String>,
+        target: &mut Vec<String>,
+    ) -> Result<()> {
+        if syllables.len() != han.chars().count()
+            || syllables
+                .iter()
+                .any(|word| word.is_empty() || !word.is_ascii())
+        {
+            return Err(F5Error::InvalidConfiguration(
+                "Pinyin provider must return one ASCII syllable per Han character",
+            ));
+        }
+        for syllable in syllables {
+            target.push(" ".to_owned());
+            target.push(syllable);
+        }
+        Ok(())
+    }
+}
+
+fn normalize_punctuation(text: &str) -> String {
+    text.chars()
+        .map(|ch| match ch {
+            ';' => ',',
+            '“' | '”' => '"',
+            '‘' | '’' => '\'',
+            other => other,
+        })
+        .collect()
+}
+
+fn script_segments(text: &str) -> Vec<&str> {
+    fn category(ch: char) -> u8 {
+        if is_han(ch) {
+            0
+        } else if ch.is_ascii_alphanumeric() || ch == '\'' {
+            1
+        } else {
+            2
+        }
+    }
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    let mut old = None;
+    for (index, ch) in text.char_indices() {
+        let now = category(ch);
+        if let Some(previous) = old {
+            if previous != now || now == 2 {
+                ranges.push(&text[start..index]);
+                start = index;
+            }
+        }
+        old = Some(now);
+    }
+    if start < text.len() {
+        ranges.push(&text[start..]);
+    }
+    ranges
 }
 
 fn is_han(ch: char) -> bool {
@@ -110,6 +196,14 @@ pub fn normalized_reference_transcript(text: &str) -> Result<String> {
     Ok(reference)
 }
 
+pub fn effective_reference_transcript(text: &str) -> Result<String> {
+    let mut transcript = normalized_reference_transcript(text)?;
+    if transcript.chars().last().is_some_and(|ch| ch.is_ascii()) {
+        transcript.push(' ');
+    }
+    Ok(transcript)
+}
+
 pub fn standard_total_frames(
     reference_frames: usize,
     reference_text: &str,
@@ -122,7 +216,7 @@ pub fn standard_total_frames(
             "Invalid standard F5 reference or speed",
         ));
     }
-    let reference = normalized_reference_transcript(reference_text)?;
+    let reference = effective_reference_transcript(reference_text)?;
     let ref_len = reference.len();
     let gen_len = generated_text.len();
     if gen_len == 0 || generated_text.trim().is_empty() {
@@ -131,24 +225,27 @@ pub fn standard_total_frames(
         ));
     }
     let frames = if let Some(seconds) = fixed_seconds {
-        if !seconds.is_finite() || seconds <= 0.0 {
+        if !seconds.is_finite() {
             return Err(F5Error::InvalidConfiguration(
-                "Fixed duration must be positive",
+                "Fixed duration must be finite",
             ));
         }
         (seconds as f64 * 24_000.0 / 256.0).floor()
     } else {
-        let local_speed = if gen_len < 10 { speed * 0.3 } else { speed };
+        let local_speed = if gen_len < 10 {
+            speed as f64 * 0.3
+        } else {
+            speed as f64
+        };
         reference_frames as f64
-            + ((reference_frames as f64 / ref_len as f64) * gen_len as f64 / local_speed as f64)
-                .floor()
+            + ((reference_frames as f64 / ref_len as f64) * gen_len as f64 / local_speed).floor()
     };
-    if !frames.is_finite() || frames <= reference_frames as f64 || frames > 65_536.0 {
+    if !frames.is_finite() || frames > 65_536.0 {
         return Err(F5Error::InvalidShape(
-            "Generated frames must exceed reference frames and remain within model limits",
+            "Generated frames exceed model limits",
         ));
     }
-    Ok(frames as usize)
+    Ok(frames.max(0.0) as usize)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -224,29 +321,38 @@ mod tests {
         assert_eq!(normalized_reference_transcript("你好。").unwrap(), "你好。");
         assert_eq!(
             standard_total_frames(120, "Hello", "some speech", 1.0, None).unwrap(),
-            120 + (120 * 11 / 7)
+            120 + (120 * 11 / 8)
         );
         assert_eq!(
             standard_total_frames(120, "Hello", "Hi", 1.0, None).unwrap(),
-            234
+            220
         );
         assert_eq!(
             standard_total_frames(120, "Hello", "Hi", 1.0, Some(2.0)).unwrap(),
             187
         );
-        assert!(standard_total_frames(120, "Hello", "Hi", 1.0, Some(0.5)).is_err());
+        assert_eq!(
+            standard_total_frames(120, "Hello", "Hi", 1.0, Some(0.5)).unwrap(),
+            46
+        );
     }
 
     #[test]
     fn normalized_english_and_chinese_path() {
         let alphabet = " abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.,'\"!?";
-        let vocab = Vocabulary::from_lines(alphabet.chars().map(|c| c.to_string())).unwrap();
+        let vocab = Vocabulary::from_lines(
+            alphabet
+                .chars()
+                .map(|c| c.to_string())
+                .chain(["ni3".to_owned(), "hao3".to_owned()]),
+        )
+        .unwrap();
         let english = F5TextFrontend::new(&vocab, NoPinyin);
         let full = english.standard_tokens("Hello", "world").unwrap();
         assert_eq!(
             full,
             vocab.encode_tokens(
-                "Hello. world"
+                "Hello.  world"
                     .chars()
                     .map(|c| c.to_string())
                     .collect::<Vec<_>>()
@@ -257,15 +363,18 @@ mod tests {
         assert!(english.cross_lingual_tokens("你好").is_err());
         let multilingual = F5TextFrontend::new(&vocab, FakePinyin);
         let romanized = multilingual.cross_lingual_tokens("你好!").unwrap();
-        let expected = vocab.encode_tokens(
-            " ni3 hao3!"
-                .chars()
-                .map(|c| c.to_string())
-                .collect::<Vec<_>>()
-                .iter()
-                .map(String::as_str),
-        );
+        let expected = vocab.encode_tokens([" ", "ni3", " ", "hao3", "!"].into_iter());
         assert_eq!(romanized, expected);
+        let mixed = multilingual.cross_lingual_tokens("你好world!").unwrap();
+        let target = vocab.encode_tokens(
+            [" ", "ni3", " ", "hao3", " ", "w", "o", "r", "l", "d", "!"].into_iter(),
+        );
+        assert_eq!(mixed, target);
+        let rjieba_segments = multilingual
+            .encode_segments(&["你好", "world", "!"])
+            .unwrap();
+        assert_eq!(mixed, rjieba_segments);
+
         assert_eq!(
             english.encode("he;“yo”").unwrap(),
             english.encode("he,\"yo\"").unwrap()

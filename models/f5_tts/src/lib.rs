@@ -37,6 +37,7 @@ pub mod resample;
     feature = "cubecl-wgpu"
 ))]
 pub mod speed_predictor;
+pub mod standard_chunking;
 pub mod text_frontend;
 pub mod vocab;
 #[cfg(any(
