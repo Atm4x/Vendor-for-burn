@@ -1,68 +1,60 @@
-# Dettato — native Rust / Burn port
+# Dettato — Rust + Burn port
 
-**Status: source-level implementations of all four neural stages and an end-to-end Rust API are present. The Rust code has NOT been compiled, its checkpoint import has NOT been run, and end-to-end Burn numerical correctness is not yet confirmed. See `CYCLE04_REPORT.md` for exact validation status.**
+Independent native Rust implementation of the [Dettato](https://github.com/kobimusic/dettato) multi-instrument Audio-to-MIDI pipeline. Original project by Nathan Mills / kobimusic, licensed under Apache-2.0. The original license and notice are retained in this directory.
 
-Original Dettato: Nathan Mills / kobimusic, Apache-2.0, <https://github.com/kobimusic/dettato>. See `LICENSE` and `NOTICE`.
+**Status (cycle 06):** all four learned stages and the end-to-end API are present in Rust. Rust 1.100.0 / Burn 0.22.1 builds and the standard tests pass on Flex CPU; all four released checkpoints load. Selected neural outputs of **each of the four stages** have been compared with the original PyTorch models. **A complete recording-to-MIDI run is not yet verified**; neither eight-second Transcriber performance nor GPU parity is established. See `CYCLE05_REPORT.md` and `CYCLE06_REPORT.md`.
 
-This is an independent crate in `models/dettato`. `models/beat_this` is unchanged. It uses Burn 0.22.1 and can be configured for Flex, CPU, CUDA and WGPU backends where the upstream Burn kernels support the operations. There is no ONNX or Python dependency at runtime.
+This is a separate crate at `models/dettato`. No source changes to `models/beat_this` are required. Model inference uses Burn (Flex/CPU/CUDA/WGPU features); there is no Python or ONNX runtime dependency.
 
-## Covered source features
+## Implemented stages
 
-| Component | Rust code currently present | Still missing |
-|---|---|---|
-| Checkpoints | `config.json`, named `safetensors` tensors for all four stages, F32/F16/BF16/F64 import | Automated full-key/shape parity on released checkpoints |
-| Transcriber | HCQT frontend, Stem, PitchMix, CNN backbone, pitch/time attention, RoPE, bidirectional GRU, six heads, 8 s Hann overlap, two-slot note decoder | Numerically verified layer outputs and performance optimizations |
-| Evidence | 31 map features, two 368-d hidden summaries, standardization/1/32 quantization, FP16 map feature rounding; CPU note context and beat-grid features; Burn embeddings/9-layer note transformer/RoPE/SwiGLU/heads; candidate decoding; keep/drop/insert repair | Compilation/parity of Burn Evidence network, batched/precision-optimized inference |
-| Grouper | HCQT extended harmonic power, PCEN, standardisation, HDemix, spectral Prof, LaneFront (depthwise conv/pitch mixing/pitch attention), full 7-layer NoteNet, 73 instrument logits, normalized 32-dimensional embeddings, keep head, weighted 24 s song windows, track-head, Hungarian overlap, optional `merge=false`, MIDI track output, streaming collection of three Transcriber taps | Compile, weight-key/shape and numeric parity; tuning/retuning |
-| Drums | 44.1 kHz frontend, 280 log-power bands, DrumNet, CQ branch, three OrchestralExpert models, router/ensemble, 61 drum keys, 13 timpani notes, velocity and 40 ms dedup | Rust build, weight load and numeric parity |
-| MIDI | Type-1 multitrack export, programs, dedicated drum channel, complete 4-stage orchestrator, array / file API | Rust build and end-to-end inference validation |
+| Stage | Implemented components | Verification status |
+| --- | --- | --- |
+| Transcriber | HCQT, Stem, 15-block LaneNet, sparse pitch mixing, axial attention, RoPE, bidirectional GRU, six probability maps, 8-second overlapping windows, two-voice decoding | Real checkpoint loaded; 0.2-second PyTorch/Burn forward parity PASS for all six heads; 8-second Flex CPU forward unconfirmed |
+| Evidence | 769-component features, FP16/quantized hidden representations, 9-layer Transformer with RoPE/SwiGLU, note keep/adjust/insert decoding | Real checkpoint forward PASS, selected logits match PyTorch to 4.77e-6 |
+| Grouper | Extended HCQT, PCEN, HDemix, Prof, LaneFront, 7-layer NoteNet, 73 instruments, 32-D embeddings, TrackHead, clustering, Hungarian matching and separate MIDI tracks | Real checkpoint forward PASS; probabilities/embeddings/keep/hidden PyTorch comparison PASS (max 1.765e-3) |
+| Drums | 44.1 kHz frontend, drum-kit network, router, three independent orchestral experts, ensemble, 61 GM drum notes, 13 timpani pitches and velocity | Real checkpoint forward PASS; selected PyTorch outputs match within 3.10e-4 |
 
-The Transcriber can now collect Evidence hidden vectors in a bounded-memory **second inference pass**, without storing the entire song's `[frames,88,368]` hidden tensor. It accumulates only notes' onset and mean vectors, with the same per-frame Hann-normalized weights used for the output maps. The first pass still provides the shared note maps.
+The Rust code also covers retuning, multi-format audio decoding, time conversion, MIDI Type-1 export and `merge_same_instrument=false` for keeping distinct instances of the same instrument in separate tracks. The complete flow is **implemented, not certified** by a real full-song test.
 
-The Rust EvidenceNetwork accepts 769-component evidence vectors and uses the original checkpoint key layout (`emb.*`, `bb.blocks.*`, `keep`, `don`, `dur`, `ins.*`). Its CPU-side continuous feature preparation must be numerically compared with PyTorch before the port is considered complete.
+## Weights
 
-Grouper now has a source-level Burn NoteNet and `Grouper::group_with_transcriber`. Its input contract includes 12 note scalars and three 368-channel Transcriber taps, gathered using the original coarse (4 s) sub-window stride without materializing whole-song tap maps. HCQT preprocessing, demixing and spectral profile extraction execute in native Rust on CPU; learnable convolutions, attention and projections use Burn. The saved 200-tap PCEN filter is implemented as an equivalent finite geometric recurrence rather than a temporal FFT. `merge_same_instrument=false` preserves independent same-instrument tracklets.
-
-## User-provided checkpoint layout
-
-The supplied `dettato.zip` can be extracted as-is. Set the weights root to the extraction directory containing the `dettato` folder; `ModelPaths` recognizes `dettato/detatto-evidence-config.json` and `dettato/detatto-evidence.safetensors` as the Evidence stage without renaming. The large weight files are not tracked by Git.
-
-The original Hugging Face directory format also remains valid:
-
-## Weights layout
+Unpack the released safetensors separately; they are not part of Git. Both the official per-model directories and the user's flat ZIP layout are supported. For the flat layout:
 
 ```text
 weights/
-  dettato/config.json
-  dettato/model.safetensors
-  dettato-evidence/config.json
-  dettato-evidence/model.safetensors
-  dettato-grouper/config.json
-  dettato-grouper/model.safetensors
-  dettato-drums/config.json
-  dettato-drums/model.safetensors
+  dettato/
+    dettato-config.json
+    dettato.safetensors
+    detatto-evidence-config.json
+    detatto-evidence.safetensors
+    dettato-grouper-config.json
+    dettato-grouper.safetensors
+    dettato-drums-config.json
+    dettato-drums.safetensors
 ```
 
-## One-call API
+The `detatto-evidence` spelling is intentional: the loader accepts the original misspelling.
 
-`Dettato::from_directory(root, &device)` loads all four checkpoints. Call `transcribe(&mono_pcm, source_rate)` or `transcribe_file(path)`; the returned `PipelineResult` includes a `Transcription` with `.save_midi(path)` and a separate `PipelineInfo`. This API is implemented in source and awaits compilation and end-to-end validation. `set_merge_same_instrument(false)` preserves independent tracks of the same named instrument.
+## API
 
-## Validation and limitations
+`Dettato::from_directory(root, &device)` initializes the four networks. `Dettato::transcribe(&mono_pcm, sample_rate)` or `transcribe_file(path)` returns a `PipelineResult` containing a `Transcription`. `Transcription::save_midi(path)` exports separate MIDI tracks. Call `set_merge_same_instrument(false)` to retain distinct same-instrument groups. Pitched stages work on retuned mono 16 kHz; the 44.1 kHz drums stage runs only when the input recording has a source sample rate of at least 40 kHz.
 
-Original-Python-generated reference fixtures cover 3 rows × 769 evidence features, PCEN/standardisation and HDemix. Python-side PCEN recurrence matched the reference with maximum absolute difference ~5.1e-6 and independent HDemix arithmetic matched within ~1.5e-8; these do **not** certify Rust parity. Rust tests cover independent algorithms (note features, insertion deduplication, candidate decoding, hierarchical clusters, Hungarian matching, instrument naming, drum peaks, MIDI output). Their Rust execution is **not confirmed**.
-
-Recommended validation commands in a Rust 1.100+ environment with accessible Burn dependencies:
+## Build and tests
 
 ```sh
-cargo fmt --manifest-path models/dettato/Cargo.toml --check
-cargo test --manifest-path models/dettato/Cargo.toml --features flex
+cd models/dettato
+cargo test --no-default-features --features flex
+export DETTATO_WEIGHTS=/path/to/weights/dettato
+cargo test --no-default-features --features flex --test transcriber_forward_parity -- --ignored --nocapture
+cargo test --no-default-features --features flex --test grouper_forward_parity -- --ignored --nocapture
+cargo test --no-default-features --features flex --test evidence_forward_parity -- --ignored --nocapture
 ```
 
-The authoring container does not have `cargo` or `rustc` and has no outbound DNS. Thus the new source has **not** been compiled or executed as Rust, and all compiler/API issues remain possible. Original Python modules were used to generate the reference evidence fixture. No CUDA benchmark or weight-based inference was attempted.
+The full default feature set also enables MP3/AAC/ISO-MP4/ALAC decoders through Symphonia. Those optional dependencies were unavailable in the local offline vendor snapshot, so all current local measurements use `--no-default-features --features flex` and an external Cargo source overlay. They do not establish that every optional codec builds offline.
 
-## Next verification priorities
+The new `transcriber_forward_reference.json` and `grouper_forward_reference.json` contain output values generated by the **original PyTorch networks and released weights**, not inferred fixture values. All real-weight tests are marked ignored by default, so the ordinary test suite can run without downloading checkpoints.
 
-1. Build with Rust 1.100+, fix all compile issues, and run unit tests.
-2. Unpack the user-provided weights and run the ignored four-checkpoint initialization and model fixture tests with `DETTATO_WEIGHTS` set.
-3. Compare full-network outputs PyTorch vs Burn and tighten numerical tolerances.
-4. Optimize the currently un-fused GRU/attention path only after parity has been established.
+## Remaining work
+
+Real eight-second Transcriber inference and full-song MIDI verification, broader numerical comparisons, optimized release/GPU benchmarks, DSP resampling parity with upstream `soxr HQ`, and optional audio decoder/packaging validation. The unoptimized Flex CPU test profile takes approximately 41 seconds to execute a 0.2-second Transcriber input; it must **not** be interpreted as the expected release or CUDA throughput.
