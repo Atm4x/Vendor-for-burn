@@ -1,4 +1,10 @@
+use std::sync::LazyLock;
+
+use jieba_rs::Jieba;
+
 use crate::{F5Error, Result, vocab::Vocabulary};
+
+static CHINESE_SEGMENTER: LazyLock<Jieba> = LazyLock::new(Jieba::new);
 
 pub trait PinyinProvider {
     /// Returns one tone-marked pinyin syllable per input Han character.
@@ -47,8 +53,9 @@ impl<'a, P: PinyinProvider> F5TextFrontend<'a, P> {
 
     pub fn encode(&self, text: &str) -> Result<Vec<i32>> {
         let normalized = normalize_punctuation(text);
-        let segments = script_segments(&normalized);
-        self.encode_segments(&segments)
+        let segments = CHINESE_SEGMENTER.cut(&normalized, true);
+        let words = segments.iter().map(|item| item.word).collect::<Vec<_>>();
+        self.encode_segments(&words)
     }
 
     pub fn encode_segments(&self, segments: &[&str]) -> Result<Vec<i32>> {
@@ -144,35 +151,6 @@ fn normalize_punctuation(text: &str) -> String {
             other => other,
         })
         .collect()
-}
-
-fn script_segments(text: &str) -> Vec<&str> {
-    fn category(ch: char) -> u8 {
-        if is_han(ch) {
-            0
-        } else if ch.is_ascii_alphanumeric() || ch == '\'' {
-            1
-        } else {
-            2
-        }
-    }
-    let mut ranges = Vec::new();
-    let mut start = 0;
-    let mut old = None;
-    for (index, ch) in text.char_indices() {
-        let now = category(ch);
-        if let Some(previous) = old {
-            if previous != now || now == 2 {
-                ranges.push(&text[start..index]);
-                start = index;
-            }
-        }
-        old = Some(now);
-    }
-    if start < text.len() {
-        ranges.push(&text[start..]);
-    }
-    ranges
 }
 
 fn is_han(ch: char) -> bool {

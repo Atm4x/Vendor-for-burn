@@ -4,6 +4,8 @@ use crate::{F5Error, Result, text_frontend::PinyinProvider};
 
 const CHAR_PRONUNCIATIONS: &str = include_str!("../assets/han_pinyin_unihan.tsv");
 const WORD_PRONUNCIATIONS: &str = include_str!("../assets/han_pinyin_words.tsv");
+const PYPINYIN_CHAR_PRONUNCIATIONS: &str = include_str!("../assets/pypinyin_chars.tsv");
+const PYPINYIN_WORD_PRONUNCIATIONS: &str = include_str!("../assets/pypinyin_phrases.tsv");
 
 /// Model-specific Chinese text-to-pinyin lexicon. No Python modules or network requests at runtime.
 /// The bundled character table is based on Unihan, not the polyphonic pypinyin dictionary.
@@ -11,12 +13,16 @@ const WORD_PRONUNCIATIONS: &str = include_str!("../assets/han_pinyin_words.tsv")
 pub struct ChinesePinyin {
     characters: HashMap<char, String>,
     words: HashMap<String, Vec<String>>,
+    exact_words: HashMap<String, Vec<String>>,
     longest_word: usize,
 }
 
 impl ChinesePinyin {
     pub fn bundled() -> Result<Self> {
-        Self::from_tsv(CHAR_PRONUNCIATIONS, WORD_PRONUNCIATIONS)
+        let mut dictionary = Self::from_tsv(CHAR_PRONUNCIATIONS, WORD_PRONUNCIATIONS)?;
+        dictionary
+            .load_exact_dictionary(PYPINYIN_CHAR_PRONUNCIATIONS, PYPINYIN_WORD_PRONUNCIATIONS)?;
+        Ok(dictionary)
     }
 
     /// Word pronunciations override individual character readings before tone sandhi.
@@ -57,6 +63,7 @@ impl ChinesePinyin {
         let mut result = Self {
             characters: dictionary,
             words: HashMap::new(),
+            exact_words: HashMap::new(),
             longest_word: 1,
         };
         result.extend_words(words)?;
@@ -86,15 +93,78 @@ impl ChinesePinyin {
                 )));
             }
             self.longest_word = self.longest_word.max(symbols.len());
-            self.words.insert(
-                han.to_string(),
-                pronunciation
-                    .iter()
-                    .map(|value| (*value).to_string())
-                    .collect(),
+            let readings = pronunciation
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect();
+            if self.exact_words.is_empty() {
+                self.words.insert(han.to_string(), readings);
+            } else {
+                self.exact_words.insert(han.to_string(), readings);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn load_exact_dictionary(&mut self, characters: &str, words: &str) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        for (index, row) in characters.lines().enumerate() {
+            if row.is_empty() || row.starts_with('#') {
+                continue;
+            }
+            let (symbol, reading) = row.split_once('\t').ok_or_else(|| {
+                F5Error::InvalidCheckpoint(format!(
+                    "Invalid exact pinyin character at line {}",
+                    index + 1
+                ))
+            })?;
+            let mut chars = symbol.chars();
+            let ch = chars.next().ok_or_else(|| {
+                F5Error::InvalidCheckpoint("Empty exact pinyin character".to_string())
+            })?;
+            if chars.next().is_some() || !is_han(ch) || !valid_pinyin(reading) || !seen.insert(ch) {
+                return Err(F5Error::InvalidCheckpoint(format!(
+                    "Invalid or duplicate exact character at line {}",
+                    index + 1
+                )));
+            }
+            self.characters.insert(ch, reading.to_owned());
+        }
+        let mut seen = std::collections::HashSet::new();
+        for (index, row) in words.lines().enumerate() {
+            if row.is_empty() || row.starts_with('#') {
+                continue;
+            }
+            let (word, readings) = row.split_once('\t').ok_or_else(|| {
+                F5Error::InvalidCheckpoint(format!(
+                    "Invalid exact pinyin phrase at line {}",
+                    index + 1
+                ))
+            })?;
+            let width = word.chars().count();
+            let syllables: Vec<_> = readings.split_whitespace().collect();
+            if !(2..=64).contains(&width)
+                || !word.chars().all(is_han)
+                || syllables.len() != width
+                || !syllables.iter().all(|item| valid_pinyin(item))
+                || !seen.insert(word.to_string())
+            {
+                return Err(F5Error::InvalidCheckpoint(format!(
+                    "Invalid or duplicate exact phrase at line {}",
+                    index + 1
+                )));
+            }
+            self.longest_word = self.longest_word.max(width);
+            self.exact_words.insert(
+                word.to_owned(),
+                syllables.iter().map(|item| (*item).to_owned()).collect(),
             );
         }
         Ok(())
+    }
+
+    pub fn exact_word_count(&self) -> usize {
+        self.exact_words.len()
     }
 
     pub fn character_count(&self) -> usize {
@@ -102,7 +172,7 @@ impl ChinesePinyin {
     }
 
     pub fn word_count(&self) -> usize {
-        self.words.len()
+        self.words.len() + self.exact_words.len()
     }
 
     pub fn syllables_for_han(&self, han: &str) -> Result<Vec<String>> {
@@ -119,14 +189,20 @@ impl ChinesePinyin {
             let maximum = (chars.len() - offset).min(self.longest_word);
             for width in (2..=maximum).rev() {
                 let candidate = chars[offset..offset + width].iter().collect::<String>();
+                if let Some(readings) = self.exact_words.get(&candidate) {
+                    matched = Some((width, readings, true));
+                    break;
+                }
                 if let Some(readings) = self.words.get(&candidate) {
-                    matched = Some((width, readings));
+                    matched = Some((width, readings, false));
                     break;
                 }
             }
-            if let Some((width, readings)) = matched {
+            if let Some((width, readings, exact)) = matched {
                 let mut word_readings = readings.clone();
-                sandhi_word(&chars[offset..offset + width], &mut word_readings);
+                if !exact {
+                    sandhi_word(&chars[offset..offset + width], &mut word_readings);
+                }
                 syllables.extend(word_readings);
                 offset += width;
             } else {
@@ -220,7 +296,8 @@ mod tests {
     #[test]
     fn bundled_table_has_unihan_coverage() {
         let pinyin = ChinesePinyin::bundled().unwrap();
-        assert_eq!(pinyin.character_count(), 26_676);
+        assert!(pinyin.character_count() >= 26_676);
+        assert!(pinyin.exact_word_count() >= 40_000);
         assert!(pinyin.word_count() >= 20);
         assert_eq!(
             pinyin.syllables_for_han("中国").unwrap(),
@@ -237,7 +314,7 @@ mod tests {
             pinyin.syllables_for_han("重庆").unwrap(),
             ["chong2", "qing4"]
         );
-        assert_eq!(pinyin.syllables_for_han("一共").unwrap(), ["yi2", "gong4"]);
+        assert_eq!(pinyin.syllables_for_han("一共").unwrap(), ["yi1", "gong4"]);
         assert_eq!(pinyin.syllables_for_han("不要").unwrap(), ["bu2", "yao4"]);
         assert_eq!(pinyin.syllables_for_han("第一").unwrap(), ["di4", "yi1"]);
     }
@@ -278,13 +355,13 @@ mod tests {
     fn entire_bundled_table_is_decodable() {
         let pinyin = ChinesePinyin::bundled().unwrap();
         let mut count = 0;
-        for row in CHAR_PRONUNCIATIONS.lines() {
+        for row in PYPINYIN_CHAR_PRONUNCIATIONS.lines() {
             let (han, expected) = row.split_once('\t').unwrap();
             let actual = pinyin.syllables_for_han(han).unwrap();
             assert_eq!(actual, [expected], "{han}");
             count += 1;
         }
-        assert_eq!(count, 26_676);
+        assert_eq!(count, 26_703);
     }
 
     #[test]
