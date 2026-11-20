@@ -39,6 +39,28 @@ fn bytes_per_element(dtype: &str) -> Option<u64> {
     }
 }
 
+fn decode_f16(bits: u16) -> f32 {
+    let sign = u32::from(bits & 0x8000) << 16;
+    let exponent = u32::from((bits >> 10) & 0x1f);
+    let mantissa = u32::from(bits & 0x03ff);
+    if exponent == 0 {
+        if mantissa == 0 {
+            return f32::from_bits(sign);
+        }
+        let mut fraction = mantissa;
+        let mut exp = 113_u32;
+        while fraction & 0x0400 == 0 {
+            fraction <<= 1;
+            exp -= 1;
+        }
+        return f32::from_bits(sign | (exp << 23) | ((fraction & 0x03ff) << 13));
+    }
+    if exponent == 31 {
+        return f32::from_bits(sign | 0x7f80_0000 | (mantissa << 13));
+    }
+    f32::from_bits(sign | ((exponent + 112) << 23) | (mantissa << 13))
+}
+
 impl Checkpoint {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
@@ -158,6 +180,50 @@ impl Checkpoint {
         ])
     }
 
+    pub fn read_f32(&self, normalized_name: &str, expected_shape: &[usize]) -> Result<Vec<f32>> {
+        let info = self
+            .tensors
+            .get(normalized_name)
+            .ok_or_else(|| invalid(format!("Weight not found: {normalized_name}")))?;
+        if info.shape != expected_shape {
+            return Err(invalid(format!(
+                "Weight {normalized_name} has shape {:?}, expected {expected_shape:?}",
+                info.shape
+            )));
+        }
+        let raw = self.read_tensor(normalized_name)?;
+        let mut data = Vec::with_capacity(expected_shape.iter().product());
+        match info.dtype.as_str() {
+            "F32" => {
+                for chunk in raw.chunks_exact(4) {
+                    data.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+                }
+            }
+            "F16" => {
+                for chunk in raw.chunks_exact(2) {
+                    data.push(decode_f16(u16::from_le_bytes(chunk.try_into().unwrap())));
+                }
+            }
+            "BF16" => {
+                for chunk in raw.chunks_exact(2) {
+                    let bits = u16::from_le_bytes(chunk.try_into().unwrap());
+                    data.push(f32::from_bits(u32::from(bits) << 16));
+                }
+            }
+            dtype => {
+                return Err(invalid(format!(
+                    "Weight {normalized_name}: unsupported model parameter dtype {dtype}"
+                )));
+            }
+        }
+        if data.iter().any(|value| !value.is_finite()) {
+            return Err(invalid(format!(
+                "Weight {normalized_name} contains non-finite values"
+            )));
+        }
+        Ok(data)
+    }
+
     pub fn read_tensor(&self, normalized_name: &str) -> Result<Vec<u8>> {
         let info = self
             .tensors
@@ -179,6 +245,15 @@ impl Checkpoint {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn f16_and_bf16_decode_match_ieee_values() {
+        assert_eq!(decode_f16(0x3c00), 1.0);
+        assert_eq!(decode_f16(0xbc00), -1.0);
+        assert_eq!(decode_f16(0x0001), 2.0_f32.powi(-24));
+        assert_eq!(decode_f16(0x7bff), 65504.0);
+        assert!(decode_f16(0x7c00).is_infinite());
+    }
 
     #[test]
     fn inspect_and_load_ema_without_loading_entire_checkpoint() {

@@ -41,3 +41,11 @@ Reference implementation: user-provided `F5-TTS-main (1).zip`, DiT/CFM v1. Cross
 *Functional completeness* and *hardware operability* are distinct. A correct timetable implementation is **not** a working DiT. A compiling CUDA backend is **not** proof that audio inference works. A real CubeCL DiT forward + numeric comparison must precede any claim of functional parity.
 
 No original Fish Speech files or legacy code should be changed while implementing F5-TTS.
+
+## CONT02 — model-specific DiT execution
+
+- `dit.rs`: timestep embedding, RoPE, modulation/attention/FFN blocks, backbone, parameterized checkpoint loader.
+- `dit_input.rs`: F5-specific text embedding, 4-layer ConvNeXt V2, input projection and grouped positional convolutions.
+- `dit_model.rs`: F5 DiT forward with CFG packing, text/RoPE request caching, `DiTVelocity` bridge.
+- Model weights are imported by exact PyTorch names; tensors remain on the selected Burn/CubeCL device during DiT and CFM loops.
+- Only reduced-size PyTorch reference slices have numerical parity tests so far. Complete model inference and Vocos are pending.

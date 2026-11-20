@@ -1,6 +1,24 @@
 pub mod cfm;
 pub mod checkpoint;
 pub mod cross_lingual;
+#[cfg(any(
+    feature = "cubecl-cpu",
+    feature = "cubecl-cuda",
+    feature = "cubecl-wgpu"
+))]
+pub mod dit;
+#[cfg(any(
+    feature = "cubecl-cpu",
+    feature = "cubecl-cuda",
+    feature = "cubecl-wgpu"
+))]
+pub mod dit_input;
+#[cfg(any(
+    feature = "cubecl-cpu",
+    feature = "cubecl-cuda",
+    feature = "cubecl-wgpu"
+))]
+pub mod dit_model;
 pub mod model;
 pub mod vocab;
 
