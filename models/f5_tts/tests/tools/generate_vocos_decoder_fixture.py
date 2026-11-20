@@ -48,28 +48,29 @@ class Toy(nn.Module):
     def forward(self, mel):
         return self.head.out(self.backbone(mel))
 
-torch.manual_seed(442)
-network = Toy().eval()
-for name, p in network.named_parameters():
-    if name.endswith('norm.weight') or name.endswith('layer_norm.weight'):
-        p.data.fill_(1.0)
-    elif name.endswith('grn.gamma'):
-        p.data.uniform_(-0.1, 0.1)
-    else:
-        p.data.uniform_(-0.06, 0.06)
-mel = torch.randn(1, 9, 100) * 0.3
-with torch.inference_mode():
-    output = network(mel)
-    spectral = output[0].T
-    magnitude, phase = spectral.chunk(2, dim=0)
-    spec = torch.polar(magnitude.exp(), phase)
-    spec = torch.cat([spec, spec[:,-1:]], dim=1)
-    wave = torch.istft(spec,n_fft=1024,hop_length=256,center=True,window=torch.hann_window(1024))
-root = Path(__file__).resolve().parent.parent/'fixtures'
-save_file({k: v.detach().contiguous() for k,v in network.state_dict().items()}, root/'vocos_decoder_small.safetensors')
-(root/'vocos_decoder_expected.json').write_text(json.dumps({
-    'mel':mel.flatten().tolist(),
-    'head':output.flatten().tolist(),
-    'wave':wave.tolist()
-},separators=(',',':')),encoding='utf-8')
-print('Wrote independent PyTorch Vocos backbone/head/ISTFT fixtures')
+if __name__ == "__main__":
+    torch.manual_seed(442)
+    network = Toy().eval()
+    for name, p in network.named_parameters():
+        if name.endswith('norm.weight') or name.endswith('layer_norm.weight'):
+            p.data.fill_(1.0)
+        elif name.endswith('grn.gamma'):
+            p.data.uniform_(-0.1, 0.1)
+        else:
+            p.data.uniform_(-0.06, 0.06)
+    mel = torch.randn(1, 9, 100) * 0.3
+    with torch.inference_mode():
+        output = network(mel)
+        spectral = output[0].T
+        magnitude, phase = spectral.chunk(2, dim=0)
+        spec = torch.polar(magnitude.exp(), phase)
+        spec = torch.cat([spec, spec[:,-1:]], dim=1)
+        wave = torch.istft(spec,n_fft=1024,hop_length=256,center=True,window=torch.hann_window(1024))
+    root = Path(__file__).resolve().parent.parent/'fixtures'
+    save_file({k: v.detach().contiguous() for k,v in network.state_dict().items()}, root/'vocos_decoder_small.safetensors')
+    (root/'vocos_decoder_expected.json').write_text(json.dumps({
+        'mel':mel.flatten().tolist(),
+        'head':output.flatten().tolist(),
+        'wave':wave.tolist()
+    },separators=(',',':')),encoding='utf-8')
+    print('Wrote independent PyTorch Vocos backbone/head/ISTFT fixtures')

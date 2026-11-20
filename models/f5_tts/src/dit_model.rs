@@ -475,4 +475,151 @@ mod numerical_tests {
             data("cfg_output"),
         );
     }
+
+    fn check_e2e_fixture(json: &str) {
+        use crate::{
+            backend::cubecl::integrate,
+            cfm::SamplingConfig,
+            vocos::{VocosConfig, VocosDecoder},
+            wav::mono_pcm16,
+        };
+
+        let oracle: serde_json::Value = serde_json::from_str(json).unwrap();
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let device = Device::cpu();
+        let dit_checkpoint = Checkpoint::open(directory.join("e2e_dit_small.safetensors")).unwrap();
+        let vocos_checkpoint =
+            Checkpoint::open(directory.join("vocos_decoder_small.safetensors")).unwrap();
+        let config = DiTConfig {
+            dim: 16,
+            depth: 2,
+            heads: 4,
+            head_dim: 4,
+            text_dim: 8,
+            ff_mult: 2,
+            conv_layers: 1,
+            mel_channels: 100,
+            sample_rate: 24_000,
+            hop_length: 256,
+        };
+        let floats = |field: &str| -> Vec<f32> {
+            oracle[field]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item.as_f64().unwrap() as f32)
+                .collect()
+        };
+        let compare = |stage: &str, actual: &[f32], expected: &[f32], tolerance: f32| {
+            assert_eq!(actual.len(), expected.len(), "{stage} length");
+            let max_abs = actual
+                .iter()
+                .zip(expected)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            eprintln!("{stage} PyTorch max_abs={max_abs:.9}");
+            assert!(max_abs <= tolerance, "{stage} max_abs={max_abs}");
+        };
+
+        let mut dit = F5DiT::from_validated_config(&dit_checkpoint, config, 8, &device).unwrap();
+        let tokens = oracle["token_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_i64().unwrap())
+            .collect::<Vec<_>>();
+        let frames = oracle["frames"].as_u64().unwrap() as usize;
+        let reference_frames = oracle["reference_frames"].as_u64().unwrap() as usize;
+        let token_count = tokens.len();
+        let tokens =
+            Tensor::<2, Int>::from_data(TensorData::new(tokens, [1, token_count]), &device);
+        let noise = Tensor::from_data(TensorData::new(floats("noise"), [1, frames, 100]), &device);
+        let condition = Tensor::from_data(
+            TensorData::new(floats("conditioned_reference"), [1, frames, 100]),
+            &device,
+        );
+        let result = integrate(
+            &mut dit,
+            noise,
+            condition,
+            tokens,
+            reference_frames,
+            SamplingConfig {
+                steps: oracle["steps"].as_u64().unwrap() as usize,
+                cfg_strength: oracle["cfg_strength"].as_f64().unwrap() as f32,
+                sway_sampling_coef: oracle["sway_sampling_coef"].as_f64().map(|x| x as f32),
+                empirically_pruned_steps: oracle["empirically_pruned_steps"].as_bool().unwrap(),
+            },
+        )
+        .unwrap();
+        compare(
+            "DiT/CFM/inpainting full mel",
+            &result.clone().into_data().try_to_vec::<f32>().unwrap(),
+            &floats("full_mel"),
+            2e-4,
+        );
+        let generated = result.slice([0..1, reference_frames..frames, 0..100]);
+        compare(
+            "generated mel",
+            &generated.clone().into_data().try_to_vec::<f32>().unwrap(),
+            &floats("generated_mel"),
+            2e-4,
+        );
+        let vocos = VocosDecoder::from_checkpoint(
+            &vocos_checkpoint,
+            VocosConfig {
+                mel_channels: 100,
+                dim: 8,
+                intermediate_dim: 16,
+                layers: 2,
+            },
+            &device,
+        )
+        .unwrap();
+        compare(
+            "Vocos spectrum head",
+            &vocos
+                .spectrogram_parameters(generated.clone())
+                .unwrap()
+                .into_data()
+                .try_to_vec::<f32>()
+                .unwrap(),
+            &floats("vocos_head"),
+            2e-4,
+        );
+        let gain = oracle["restoration_gain"].as_f64().unwrap() as f32;
+        let waveform = vocos.decode(generated, gain).unwrap();
+        compare("Vocos/ISTFT PCM float", &waveform, &floats("wave"), 2e-4);
+        let wav = mono_pcm16(&waveform).unwrap();
+        assert_eq!(&wav[..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(wav.len(), 44 + waveform.len() * 2);
+        let expected_pcm = oracle["pcm16"].as_array().unwrap();
+        let max_pcm_error = wav[44..]
+            .chunks_exact(2)
+            .zip(expected_pcm)
+            .map(|(bytes, expected)| {
+                (i32::from(i16::from_le_bytes([bytes[0], bytes[1]]))
+                    - expected.as_i64().unwrap() as i32)
+                    .abs()
+            })
+            .max()
+            .unwrap();
+        eprintln!("WAV PCM16 max quantization error={max_pcm_error}");
+        assert!(max_pcm_error <= 7);
+    }
+
+    #[test]
+    fn full_dit_cfm_vocos_pcm_matches_independent_pytorch() {
+        check_e2e_fixture(include_str!(
+            "../tests/fixtures/e2e_audio_pytorch_expected.json"
+        ));
+    }
+
+    #[test]
+    fn full_dit_cfm_vocos_epss_sway_pcm_matches_pytorch() {
+        check_e2e_fixture(include_str!(
+            "../tests/fixtures/e2e_audio_sway_pytorch_expected.json"
+        ));
+    }
 }

@@ -140,7 +140,7 @@ def backbone(x, time, trace=None):
     x = norm(x) * (1 + final_mod[0].unsqueeze(1)) + final_mod[1].unsqueeze(1)
     return lin(x, 'transformer.proj_out')
 
-def case(batch, frames, tokens, timestep, cfg_strength, *, reference_frames=None, steps=None, trace_layers=False):
+def case(batch, frames, tokens, timestep, cfg_strength, *, reference_frames=None, steps=None, timeline=None, trace_layers=False):
     global FRAMES
     FRAMES = frames
     noisy = torch.randn(batch, frames, MEL) * 0.4
@@ -182,7 +182,9 @@ def case(batch, frames, tokens, timestep, cfg_strength, *, reference_frames=None
         reference_conditioned = reference.clone()
         reference_conditioned[:, reference_frames:, :] = 0.0
         state = noisy.clone()
-        timeline = [float(index) / float(steps) for index in range(steps + 1)]
+        if timeline is None:
+            timeline = [float(index) / float(steps) for index in range(steps + 1)]
+        assert len(timeline) == steps + 1
         snapshots = []
         for index in range(steps):
             _, _, _, _, _, _, velocity = forward(state, timeline[index], reference_conditioned)

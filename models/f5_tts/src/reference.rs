@@ -1,9 +1,4 @@
-use crate::{
-    F5Error, Result,
-    mel::{SAMPLE_RATE, VocosMel},
-    model::MelFrames,
-    resample::resample_to_24khz,
-};
+use crate::{F5Error, Result, mel::VocosMel, model::MelFrames, resample::resample_to_24khz};
 
 const TARGET_RMS: f32 = 0.1;
 const MAX_REFERENCE_SECONDS: usize = 12;
@@ -124,6 +119,7 @@ impl PreparedCondition {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mel::SAMPLE_RATE;
 
     #[test]
     fn reference_accepts_resampled_audio_and_preserves_source_rms() {
@@ -165,6 +161,7 @@ mod tests {
         let b = vec![0.2; 512];
         assert!(ReferenceAudio::from_channels(&[], SAMPLE_RATE).is_err());
         assert!(ReferenceAudio::from_channels(&[&a, &b], SAMPLE_RATE).is_err());
-        assert!(ReferenceAudio::from_channels(&[&a], 16000).is_err());
+        assert!(ReferenceAudio::from_channels(&[&a], 0).is_err());
+        assert!(ReferenceAudio::from_channels(&[&a], 384_001).is_err());
     }
 }
