@@ -121,50 +121,111 @@ def rope(x):
     first, second = x.chunk(2, dim=-1)
     return x * cos + torch.cat((-second, first), -1) * sin
 
-def backbone(x, time):
+def backbone(x, time, trace=None):
     for i in range(DEPTH):
         root = f'transformer.transformer_blocks.{i}'
         mod = lin(F.silu(time), root + '.attn_norm.linear').chunk(6, 1)
         att_in = norm(x) * (1 + mod[1].unsqueeze(1)) + mod[0].unsqueeze(1)
-        q = rope(lin(att_in, root + '.attn.to_q').reshape(2, FRAMES, HEADS, HEAD_DIM).transpose(1, 2))
-        k = rope(lin(att_in, root + '.attn.to_k').reshape(2, FRAMES, HEADS, HEAD_DIM).transpose(1, 2))
-        v = lin(att_in, root + '.attn.to_v').reshape(2, FRAMES, HEADS, HEAD_DIM).transpose(1, 2)
-        att = F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(2, FRAMES, DIM)
+        q = rope(lin(att_in, root + '.attn.to_q').reshape(x.shape[0], FRAMES, HEADS, HEAD_DIM).transpose(1, 2))
+        k = rope(lin(att_in, root + '.attn.to_k').reshape(x.shape[0], FRAMES, HEADS, HEAD_DIM).transpose(1, 2))
+        v = lin(att_in, root + '.attn.to_v').reshape(x.shape[0], FRAMES, HEADS, HEAD_DIM).transpose(1, 2)
+        att = F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(x.shape[0], FRAMES, DIM)
         x = x + mod[2].unsqueeze(1) * lin(att, root + '.attn.to_out.0')
         ff_in = norm(x) * (1 + mod[4].unsqueeze(1)) + mod[3].unsqueeze(1)
         ff = lin(F.gelu(lin(ff_in, root + '.ff.ff.0.0'), approximate='tanh'), root + '.ff.ff.2')
         x = x + mod[5].unsqueeze(1) * ff
+        if trace is not None:
+            trace.append(x.flatten().tolist())
     final_mod = lin(F.silu(time), 'transformer.norm_out.linear').chunk(2, dim=1)
     x = norm(x) * (1 + final_mod[0].unsqueeze(1)) + final_mod[1].unsqueeze(1)
     return lin(x, 'transformer.proj_out')
 
-noisy = torch.randn(1, FRAMES, MEL) * 0.4
-condition = torch.randn(1, FRAMES, MEL) * 0.2
-tokens = torch.tensor([[2, 4, 1]], dtype=torch.int64)
-t = 0.37
-cfg = 2.1
-conditional_text = text_embedding(tokens, False)
-unconditional_text = text_embedding(tokens, True)
-conditional_input = input_embedding(noisy, condition, conditional_text, False)
-unconditional_input = input_embedding(noisy, condition, unconditional_text, True)
-both = torch.cat((conditional_input, unconditional_input), 0)
-times = time_embedding(torch.tensor([t], dtype=torch.float32)).repeat(2, 1)
-outputs = backbone(both, times)
-combined = outputs[0:1] + cfg * (outputs[0:1] - outputs[1:2])
+def case(batch, frames, tokens, timestep, cfg_strength, *, reference_frames=None, steps=None, trace_layers=False):
+    global FRAMES
+    FRAMES = frames
+    noisy = torch.randn(batch, frames, MEL) * 0.4
+    reference = torch.randn(batch, frames, MEL) * 0.2
+    token_ids = torch.tensor(tokens, dtype=torch.int64)
+    assert token_ids.shape[0] == batch
 
-fixture = {
-    'config': {'dim':DIM,'depth':DEPTH,'heads':HEADS,'head_dim':HEAD_DIM,'text_dim':TEXT_DIM,
-               'ff_mult':FF,'conv_layers':1,'mel_channels':MEL},
-    'noisy': noisy.flatten().tolist(), 'reference': condition.flatten().tolist(),
-    'token_ids': tokens.flatten().tolist(), 'timestep': t, 'cfg_strength': cfg,
-    'conditional_text': conditional_text.flatten().tolist(),
-    'unconditional_text': unconditional_text.flatten().tolist(),
-    'conditional_input': conditional_input.flatten().tolist(),
-    'unconditional_input': unconditional_input.flatten().tolist(),
-    'conditional_output': outputs[0:1].flatten().tolist(),
-    'unconditional_output': outputs[1:2].flatten().tolist(),
-    'cfg_output': combined.flatten().tolist(),
-}
-save_file({key: tensor.detach().clone() for key, tensor in weights.items()}, HERE / 'dit_full_small.safetensors')
-(HERE / 'dit_full_expected.json').write_text(json.dumps(fixture, indent=2) + '\n', encoding='utf-8')
-print('F5 full DiT PyTorch fixture generated:', len(weights), 'weight tensors; output:', fixture['cfg_output'])
+    trace = [] if trace_layers else None
+
+    def forward(noisy_tensor, time, reference_input=reference):
+        text_cond = text_embedding(token_ids, False)
+        text_uncond = text_embedding(token_ids, True)
+        input_cond = input_embedding(noisy_tensor, reference_input, text_cond, False)
+        input_uncond = input_embedding(noisy_tensor, reference_input, text_uncond, True)
+        both = torch.cat((input_cond, input_uncond), 0)
+        time_vec = time_embedding(torch.full((batch,), float(time), dtype=torch.float32))
+        outputs = backbone(both, torch.cat((time_vec, time_vec), 0), trace)
+        cond = outputs[:batch]
+        uncond = outputs[batch:]
+        combined = cond + float(cfg_strength) * (cond - uncond)
+        return text_cond, text_uncond, input_cond, input_uncond, cond, uncond, combined
+
+    a, b, c, d, e, f, g = forward(noisy, timestep)
+    fixture = {
+        'config': {'dim': DIM, 'depth': DEPTH, 'heads': HEADS, 'head_dim': HEAD_DIM,
+                   'text_dim': TEXT_DIM, 'ff_mult': FF, 'conv_layers': 1, 'mel_channels': MEL},
+        'batch':batch, 'frames': frames, 'token_length':len(tokens[0]),
+        'noisy':noisy.flatten().tolist(), 'reference':reference.flatten().tolist(),
+        'token_ids':token_ids.flatten().tolist(), 'timestep': timestep, 'cfg_strength': cfg_strength,
+        'conditional_text':a.flatten().tolist(), 'unconditional_text':b.flatten().tolist(),
+        'conditional_input':c.flatten().tolist(), 'unconditional_input':d.flatten().tolist(),
+        'conditional_output':e.flatten().tolist(), 'unconditional_output':f.flatten().tolist(),
+        'cfg_output':g.flatten().tolist(),
+    }
+    if trace_layers:
+        fixture['layer_states'] = trace
+    if steps is not None:
+        assert 0 < reference_frames < frames
+        reference_conditioned = reference.clone()
+        reference_conditioned[:, reference_frames:, :] = 0.0
+        state = noisy.clone()
+        timeline = [float(index) / float(steps) for index in range(steps + 1)]
+        snapshots = []
+        for index in range(steps):
+            _, _, _, _, _, _, velocity = forward(state, timeline[index], reference_conditioned)
+            state = state + (timeline[index + 1] - timeline[index]) * velocity
+            snapshots.append(state.flatten().tolist())
+        state = torch.cat((reference_conditioned[:, :reference_frames, :],
+                           state[:, reference_frames:, :]), dim=1)
+        fixture.update({
+            'sampling_steps':steps,
+            'reference_frames':reference_frames,
+            'conditioned_reference':reference_conditioned.flatten().tolist(),
+            'trajectory_timesteps':timeline,
+            'trajectory_states':snapshots,
+            'trajectory_final':state.flatten().tolist(),
+        })
+    return fixture
+
+
+if __name__ == '__main__':
+    legacy = case(1, 4, [[2, 4, 1]], 0.37, 2.1)
+    save_file({key: tensor.detach().clone() for key, tensor in weights.items()}, HERE / 'dit_full_small.safetensors')
+    (HERE / 'dit_full_expected.json').write_text(json.dumps(legacy, indent=2) + '\n', encoding='utf-8')
+
+    cases = [
+        case(1, 1, [[1]], 0.0, 0.0),
+        case(1, 7, [[1, 3]], 0.91, 3.5, reference_frames=2, steps=4),
+        case(2, 5, [[1, 3, 2], [0, 4, -1]], 0.125, 0.75, reference_frames=2, steps=3),
+        case(2, 8, [[2, 4, 1, 3, 7, 0, -1, -1, -1], [1, 5, 3, 2, 4, 7, 0, -1, -1]], 0.51, 1.75),
+        case(1, 9, [[0, 3, 4, 6]], 1.0, 1.0),
+    ]
+    (HERE / 'dit_full_grid_expected.json').write_text(json.dumps(cases, indent=2) + '\n', encoding='utf-8')
+
+    torch.manual_seed(22122)
+    template_prefix = 'transformer.transformer_blocks.0.'
+    block_tensors = [(name[len(template_prefix):], value) for name, value in weights.items()
+                     if name.startswith(template_prefix)]
+    for block in range(2, 22):
+        prefix = f'transformer.transformer_blocks.{block}.'
+        for suffix, template in block_tensors:
+            weights[prefix + suffix] = torch.randn_like(template) * (0.025 if suffix.endswith('bias') else 0.07)
+    DEPTH = 22
+    deep = case(1, 3, [[1, 2]], 0.61, 1.9, trace_layers=True)
+    save_file({name: value.detach().contiguous() for name, value in weights.items()}, HERE / 'dit_full_22_blocks.safetensors')
+    (HERE / 'dit_full_22_expected.json').write_text(json.dumps(deep, indent=2) + '\n', encoding='utf-8')
+    print('F5 DiT: legacy +', len(cases), 'dynamic shape/CFG cases,', sum('sampling_steps' in c for c in cases),
+          'Euler trajectories, and', len(deep['layer_states']), 'layer-deep oracle')

@@ -9,6 +9,9 @@
     "conv_layers": 1,
     "mel_channels": 2
   },
+  "batch": 1,
+  "frames": 4,
+  "token_length": 3,
   "noisy": [
     -0.07187255471944809,
     -0.3294328451156616,

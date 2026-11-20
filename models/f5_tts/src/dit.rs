@@ -439,9 +439,19 @@ impl DiTBackbone {
 
     pub fn forward(
         &self,
+        x: Tensor<3>,
+        time: Tensor<2>,
+        rope: &RotaryPositions,
+    ) -> Result<Tensor<3>> {
+        self.forward_with_observer(x, time, rope, |_| {})
+    }
+
+    fn forward_with_observer<F: FnMut(&Tensor<3>)>(
+        &self,
         mut x: Tensor<3>,
         time: Tensor<2>,
         rope: &RotaryPositions,
+        mut observe: F,
     ) -> Result<Tensor<3>> {
         let [batch, sequence, dim] = x.dims();
         if time.dims() != [batch, self.dim] || dim != self.dim {
@@ -451,6 +461,7 @@ impl DiTBackbone {
         }
         for block in &self.blocks {
             x = block.forward(x, time.clone(), rope)?;
+            observe(&x);
         }
         let modulation = self.final_modulation.forward(silu(time)).chunk(2, 1);
         let scale = modulation[0].clone().reshape([batch, 1, dim]);
@@ -460,6 +471,19 @@ impl DiTBackbone {
             .forward(layer_norm(x) * (scale + 1.0) + shift);
         debug_assert_eq!(output.dims()[1], sequence);
         Ok(output)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn forward_traced(
+        &self,
+        x: Tensor<3>,
+        time: Tensor<2>,
+        rope: &RotaryPositions,
+    ) -> Result<(Tensor<3>, Vec<Tensor<3>>)> {
+        let mut states = Vec::with_capacity(self.blocks.len());
+        let output =
+            self.forward_with_observer(x, time, rope, |state| states.push(state.clone()))?;
+        Ok((output, states))
     }
 }
 

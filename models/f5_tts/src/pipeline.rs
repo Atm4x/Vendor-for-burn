@@ -74,6 +74,15 @@ impl StandardNormal {
     }
 }
 
+fn validate_initial_noise(noise: Vec<f32>, required: usize) -> Result<Vec<f32>> {
+    if noise.len() != required || noise.iter().any(|value| !value.is_finite()) {
+        return Err(F5Error::InvalidShape(
+            "F5 initial noise must contain exactly [target_frames, 100] finite values",
+        ));
+    }
+    Ok(noise)
+}
+
 impl StandardF5Runtime {
     pub fn load(
         f5_checkpoint: impl AsRef<Path>,
@@ -264,6 +273,19 @@ impl StandardF5Runtime {
         )
     }
 
+    pub fn synthesize_with_noise(
+        &mut self,
+        reference: &ReferenceAudio,
+        text_tokens: &[i32],
+        total_frames: usize,
+        sampling: SamplingConfig,
+        initial_noise: &[f32],
+    ) -> Result<Vec<f32>> {
+        self.synthesize_from_noise_source(reference, text_tokens, total_frames, sampling, |count| {
+            validate_initial_noise(initial_noise.to_vec(), count)
+        })
+    }
+
     fn synthesize_with_rng(
         &mut self,
         reference: &ReferenceAudio,
@@ -271,6 +293,19 @@ impl StandardF5Runtime {
         total_frames: usize,
         sampling: SamplingConfig,
         generator: &mut StandardNormal,
+    ) -> Result<Vec<f32>> {
+        self.synthesize_from_noise_source(reference, text_tokens, total_frames, sampling, |count| {
+            Ok((0..count).map(|_| generator.sample()).collect())
+        })
+    }
+
+    fn synthesize_from_noise_source(
+        &mut self,
+        reference: &ReferenceAudio,
+        text_tokens: &[i32],
+        total_frames: usize,
+        sampling: SamplingConfig,
+        create_noise: impl FnOnce(usize) -> Result<Vec<f32>>,
     ) -> Result<Vec<f32>> {
         if text_tokens.is_empty() || text_tokens.len() > 8192 {
             return Err(F5Error::InvalidShape(
@@ -296,11 +331,9 @@ impl StandardF5Runtime {
             .target
             .checked_mul(100)
             .ok_or(F5Error::InvalidShape("F5 noise tensor size overflow"))?;
+        let values = validate_initial_noise(create_noise(count)?, count)?;
         let noise = Tensor::from_data(
-            TensorData::new(
-                (0..count).map(|_| generator.sample()).collect::<Vec<_>>(),
-                [1, frames.target, 100],
-            ),
+            TensorData::new(values, [1, frames.target, 100]),
             &self.device,
         );
         let text = Tensor::<2, Int>::from_data(
@@ -323,6 +356,17 @@ impl StandardF5Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deterministic_noise_override_rejects_invalid_shape_and_nonfinite_samples() {
+        assert_eq!(
+            validate_initial_noise(vec![0.0; 300], 300).unwrap().len(),
+            300
+        );
+        assert!(validate_initial_noise(vec![0.0; 299], 300).is_err());
+        assert!(validate_initial_noise(vec![0.0, f32::NAN], 2).is_err());
+        assert!(validate_initial_noise(vec![f32::INFINITY], 1).is_err());
+    }
 
     #[test]
     fn one_rng_stream_serves_all_chunks_without_reseeding() {

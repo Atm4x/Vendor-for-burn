@@ -258,4 +258,221 @@ mod numerical_tests {
         model.release_request_cache();
         assert!(model.cache.is_none());
     }
+    #[test]
+    fn full_dit_dynamic_shapes_and_cfg_match_pytorch() {
+        let device = Device::cpu();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let weights = Checkpoint::open(root.join("dit_full_small.safetensors")).unwrap();
+        let fixtures: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/dit_full_grid_expected.json"
+        ))
+        .unwrap();
+        let config = DiTConfig {
+            dim: 16,
+            depth: 2,
+            heads: 4,
+            head_dim: 4,
+            text_dim: 8,
+            ff_mult: 2,
+            conv_layers: 1,
+            mel_channels: 2,
+            sample_rate: 24_000,
+            hop_length: 256,
+        };
+        let all = fixtures.as_array().unwrap();
+        assert_eq!(all.len(), 5);
+        for (index, expected) in all.iter().enumerate() {
+            if let Ok(only) = std::env::var("F5_DIT_CASE") {
+                if only.parse::<usize>().ok() != Some(index) {
+                    continue;
+                }
+            }
+            eprintln!("F5 full DiT parity case {index} begin");
+            let batch = expected["batch"].as_u64().unwrap() as usize;
+            let frames = expected["frames"].as_u64().unwrap() as usize;
+            let token_length = expected["token_length"].as_u64().unwrap() as usize;
+            let data = |key: &str| -> Vec<f32> {
+                expected[key]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_f64().unwrap() as f32)
+                    .collect()
+            };
+            let tokens: Vec<i64> = expected["token_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_i64().unwrap())
+                .collect();
+            let tokens = Tensor::<2, Int>::from_data(
+                TensorData::new(tokens, [batch, token_length]),
+                &device,
+            );
+            let noisy =
+                Tensor::from_data(TensorData::new(data("noisy"), [batch, frames, 2]), &device);
+            let reference = Tensor::from_data(
+                TensorData::new(data("reference"), [batch, frames, 2]),
+                &device,
+            );
+            let model = F5DiT::from_validated_config(&weights, config, 8, &device).unwrap();
+            check_grid(
+                &format!("{index} conditional text"),
+                model.text.forward(tokens.clone(), frames, false).unwrap(),
+                data("conditional_text"),
+            );
+            check_grid(
+                &format!("{index} unconditional text"),
+                model.text.forward(tokens.clone(), frames, true).unwrap(),
+                data("unconditional_text"),
+            );
+            let mut model = model;
+            let output = model
+                .forward_cfg(
+                    noisy.clone(),
+                    reference.clone(),
+                    tokens.clone(),
+                    expected["timestep"].as_f64().unwrap() as f32,
+                    expected["cfg_strength"].as_f64().unwrap() as f32,
+                )
+                .unwrap();
+            check_grid(&format!("{index} full DiT"), output, data("cfg_output"));
+            model.release_request_cache();
+
+            if let Some(steps) = expected["sampling_steps"].as_u64() {
+                let steps = steps as usize;
+                let cond = Tensor::from_data(
+                    TensorData::new(data("conditioned_reference"), [batch, frames, 2]),
+                    &device,
+                );
+                let reference_frames = expected["reference_frames"].as_u64().unwrap() as usize;
+                let timeline: Vec<f32> = data("trajectory_timesteps");
+                let mut state = noisy.clone();
+                for step in 0..steps {
+                    eprintln!("F5 case {index} step {step} start");
+                    let velocity = model
+                        .forward_cfg(
+                            state.clone(),
+                            cond.clone(),
+                            tokens.clone(),
+                            timeline[step],
+                            expected["cfg_strength"].as_f64().unwrap() as f32,
+                        )
+                        .unwrap();
+                    state = state + velocity * (timeline[step + 1] - timeline[step]);
+                    let target = expected["trajectory_states"][step]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_f64().unwrap() as f32)
+                        .collect();
+                    check_grid(&format!("{index} Euler step {step}"), state.clone(), target);
+                }
+                model.release_request_cache();
+                let integrated = crate::backend::cubecl::integrate_with_channels(
+                    &mut model,
+                    noisy,
+                    cond,
+                    tokens,
+                    reference_frames,
+                    crate::cfm::SamplingConfig {
+                        steps,
+                        cfg_strength: expected["cfg_strength"].as_f64().unwrap() as f32,
+                        sway_sampling_coef: None,
+                        empirically_pruned_steps: false,
+                    },
+                    2,
+                )
+                .unwrap();
+                eprintln!("F5 case {index} CFM integration complete");
+                check_grid(
+                    &format!("{index} inpainted CFM"),
+                    integrated,
+                    data("trajectory_final"),
+                );
+                assert!(model.cache.is_none());
+            }
+        }
+    }
+
+    fn check_grid(label: &str, actual: Tensor<3>, expected: Vec<f32>) {
+        let received = actual.into_data().try_to_vec::<f32>().unwrap();
+        assert_eq!(received.len(), expected.len(), "{label} size");
+        let max_abs = received
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_abs <= 2e-4, "{label}: max_abs={max_abs}");
+    }
+    #[test]
+    fn twenty_two_dit_blocks_match_independent_pytorch_layer_by_layer() {
+        let device = Device::cpu();
+        let folder = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let checkpoint = Checkpoint::open(folder.join("dit_full_22_blocks.safetensors")).unwrap();
+        let oracle: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/dit_full_22_expected.json"))
+                .unwrap();
+        let data = |name: &str| -> Vec<f32> {
+            oracle[name]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item.as_f64().unwrap() as f32)
+                .collect()
+        };
+        let config = DiTConfig {
+            dim: 16,
+            depth: 22,
+            heads: 4,
+            head_dim: 4,
+            text_dim: 8,
+            ff_mult: 2,
+            conv_layers: 1,
+            mel_channels: 2,
+            sample_rate: 24_000,
+            hop_length: 256,
+        };
+        let model = F5DiT::from_validated_config(&checkpoint, config, 8, &device).unwrap();
+        let tokens = Tensor::<2, Int>::from_data(TensorData::new(vec![1_i64, 2], [1, 2]), &device);
+        let noisy = Tensor::from_data(TensorData::new(data("noisy"), [1, 3, 2]), &device);
+        let reference = Tensor::from_data(TensorData::new(data("reference"), [1, 3, 2]), &device);
+        let text_cond = model.text.forward(tokens.clone(), 3, false).unwrap();
+        let text_uncond = model.text.forward(tokens, 3, true).unwrap();
+        let embedded_cond = model
+            .input
+            .forward(noisy.clone(), reference.clone(), text_cond, false)
+            .unwrap();
+        let embedded_uncond = model
+            .input
+            .forward(noisy, reference, text_uncond, true)
+            .unwrap();
+        let embedding = Tensor::cat(vec![embedded_cond, embedded_uncond], 0);
+        let timestep = oracle["timestep"].as_f64().unwrap() as f32;
+        let time = model.time.forward(&[timestep], &device).unwrap();
+        let time = Tensor::cat(vec![time.clone(), time], 0);
+        let positions = RotaryPositions::new(3, config.head_dim, &device).unwrap();
+        let (predicted, states) = model
+            .backbone
+            .forward_traced(embedding, time, &positions)
+            .unwrap();
+        assert_eq!(states.len(), 22);
+        for (index, state) in states.into_iter().enumerate() {
+            let expected = oracle["layer_states"][index]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item.as_f64().unwrap() as f32)
+                .collect();
+            check_grid(&format!("22-block layer {index}"), state, expected);
+        }
+        let conditional = predicted.clone().slice([0..1, 0..3, 0..2]);
+        let unconditional = predicted.slice([1..2, 0..3, 0..2]);
+        let cfg = oracle["cfg_strength"].as_f64().unwrap() as f32;
+        check_grid(
+            "22-block DiT CFG output",
+            conditional.clone() + (conditional - unconditional) * cfg,
+            data("cfg_output"),
+        );
+    }
 }

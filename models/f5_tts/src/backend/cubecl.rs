@@ -17,18 +17,38 @@ pub trait DiTVelocity {
 
 pub fn integrate<N: DiTVelocity>(
     network: &mut N,
-    mut noise: Tensor<3>,
+    noise: Tensor<3>,
     reference_mel: Tensor<3>,
     text_tokens: Tensor<2, Int>,
     reference_frames: usize,
     sampling: SamplingConfig,
 ) -> Result<Tensor<3>> {
+    integrate_with_channels(
+        network,
+        noise,
+        reference_mel,
+        text_tokens,
+        reference_frames,
+        sampling,
+        100,
+    )
+}
+
+pub(crate) fn integrate_with_channels<N: DiTVelocity>(
+    network: &mut N,
+    mut noise: Tensor<3>,
+    reference_mel: Tensor<3>,
+    text_tokens: Tensor<2, Int>,
+    reference_frames: usize,
+    sampling: SamplingConfig,
+    mel_channels: usize,
+) -> Result<Tensor<3>> {
     let result = (|| {
         let timeline = sampling.timeline()?;
         let shape = noise.dims();
-        if reference_mel.dims() != shape || shape[2] != 100 {
+        if reference_mel.dims() != shape || shape[2] != mel_channels {
             return Err(F5Error::InvalidShape(
-                "CFM tensors must have matching [B, frames, 100] shapes",
+                "CFM tensors must have matching mel channels and batch dimensions",
             ));
         }
         if reference_frames == 0 || reference_frames >= shape[1] {
