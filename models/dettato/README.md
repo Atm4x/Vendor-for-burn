@@ -2,9 +2,9 @@
 
 Independent native Rust implementation of the [Dettato](https://github.com/kobimusic/dettato) multi-instrument Audio-to-MIDI pipeline. Original project by Nathan Mills / kobimusic, licensed under Apache-2.0. The original license and notice are retained in this directory.
 
-**Status (cycle 07):** all four learned stages and the end-to-end API are present in Rust. Rust 1.100.0 / Burn 0.22.1 builds and the standard tests pass on Flex CPU; all four released checkpoints load. Selected neural outputs of **each of the four stages** have been compared with the original PyTorch models. **A complete recording-to-MIDI run is not yet verified**; neither eight-second Transcriber performance nor GPU parity is established. See `CYCLE06_REPORT.md` and `CYCLE07_REPORT.md`.
+**Status (cycle 08):** all four learned stages and the end-to-end API are present in Rust. Rust 1.100.0 / Burn 0.22.1 builds and the standard tests pass on Flex CPU; all four released checkpoints load. Selected neural outputs of **each of the four stages** have been compared with the original PyTorch models. **A complete recording-to-MIDI run is not yet verified**; neither eight-second Transcriber performance nor GPU parity is established. See `CYCLE06_REPORT.md`, `CYCLE07_REPORT.md`, and `CYCLE08_REPORT.md`.
 
-This is a separate crate at `models/dettato`. No source changes to `models/beat_this` are required. Model inference uses Burn (Flex/CPU/CUDA/WGPU features); there is no Python or ONNX runtime dependency.
+This is a separate crate at `models/dettato`. No source changes to `models/beat_this` are required. Model inference uses Burn 0.22.1 tensor operators dispatched to **CubeCL** for CUDA/WGPU/CubeCL CPU, or to Flex for a CPU-only reference path. This is a Burn-on-CubeCL implementation, not a new kernel-by-kernel rewrite of all layers in raw CubeCL. No Python or ONNX runtime is required.
 
 ## Implemented stages
 
@@ -45,10 +45,32 @@ The `detatto-evidence` spelling is intentional: the loader accepts the original 
 The crate also provides a `dettato` CLI. Example, with a flat extracted weights directory:
 
 ```sh
-cargo run --release -- --weights /path/to/weights/dettato --input song.wav --output song.mid --separate-instruments --cache-mib 4096
+cargo run --release --no-default-features --features wgpu -- --weights /path/to/weights/dettato --input song.wav --output song.mid --device wgpu:0 --separate-instruments --cache-mib 4096
 ```
 
-`--output` defaults to the input name with `.mid` extension. `--separate-instruments` disables merging tracks with the same instrument label. `--cache-mib` changes the RAM cache budget (default 256 MiB); the larger budget lets longer songs share one Transcriber pass at the expense of RAM. The CLI uses the Burn device selected by the compiled features. It does not itself supply CUDA libraries or weight files.
+`--output` defaults to the input name with `.mid` extension. `--separate-instruments` disables merging tracks with the same instrument label. `--cache-mib` changes the RAM cache budget (default 256 MiB); the larger budget lets longer songs share one Transcriber pass at the expense of RAM. `--device` selects the **actual backend**, not just a label: `auto`, `cuda`, `cuda:N`, `wgpu`, `wgpu:N` (discrete GPU index), `cpu` (CubeCL/LLVM), or `flex`. An explicit backend that was not compiled into the binary produces a clear error rather than silently falling back. `auto` selects Burn's highest-priority compiled backend (CUDA before WGPU/CPU/Flex). `--backend` is accepted as an alias. The CLI does not ship CUDA driver DLLs, the Tracel LLVM bundle, or model weights.
+
+## CubeCL GPU builds
+
+CUDA and WGPU both run the **same learned networks**, without ONNX conversion or network simplifications. The `cuda`, `wgpu`, and `cpu` Cargo features turn on Burn's CubeCL runtime, kernel fusion, and autotuning; `flex` remains a pure-Rust CPU reference backend.
+
+```sh
+cd models/dettato
+cargo build --release --no-default-features --features cuda
+./target/release/dettato --weights /path/to/weights/dettato --input song.wav --device cuda:0
+
+cargo build --release --no-default-features --features wgpu
+./target/release/dettato --weights /path/to/weights/dettato --input song.wav --device wgpu:0
+
+cargo build --release --no-default-features --features 'cuda,wgpu,flex'
+./target/release/dettato --weights /path/to/weights/dettato --input song.wav --device cuda:0
+```
+
+`wgpu` without an index uses adapter auto-selection and can select a software adapter on some systems; use `wgpu:0` to require the first **discrete** adapter. CUDA needs a working NVIDIA driver. CubeCL CPU needs the Tracel LLVM runtime. The offline build in cycle 08 verified WGPU compilation, **not** GPU execution. CUDA compilation in that environment stopped in `tracel-llvm-bundler` because the LLVM archive could not be downloaded; this does not establish a CUDA compile PASS.
+
+## Transcriber device-operation reductions (cycle 08)
+
+`PitchMix` now encodes sparse pitch offsets as a **single depthwise Conv2d** (groups = channels) along the pitch axis instead of repeated slice/concat/zero/multiply/add operations; `AxialAttention` caches relative pitch bias and RoPE sine/cosine tables on its initialized device. For unexpected sequence lengths over 512, RoPE regenerates tables on the current device. These operations execute through CubeCL on CUDA/WGPU, with no repeated CPU tensor upload for standard 8-second windows. Original model weights and output shapes are preserved. Numeric short-forward parity is tested separately; these changes have **not** been benchmarked on an actual GPU.
 
 ## Build and tests
 
@@ -67,6 +89,6 @@ The `transcriber_forward_reference.json` and `grouper_forward_reference.json` co
 
 ## Remaining work
 
-Cycle 07 includes an ignored `full_pipeline_smoke` that exercises the four-stage entrypoint with real weights; it has not been accepted as a completed full-song inference test. Exact numerical parity of the new shared tap buffers remains unverified against the PyTorch full-song accumulation (the stand-alone fine/coarse Hann tests do pass).
+Cycle 08 additionally supports explicit CubeCL device selection and optimized Transcriber kernels/table reuse. It includes an ignored `full_pipeline_smoke` that exercises the four-stage entrypoint with real weights; it has not been accepted as a completed full-song inference test. Exact numerical parity of the new shared tap buffers remains unverified against the PyTorch full-song accumulation (the stand-alone fine/coarse Hann tests do pass).
 
 The eight-second Transcriber Flex CPU smoke still times out after 360 s; optimized-backend completion and full-song MIDI verification, broader numerical comparisons, optimized release/GPU benchmarks, DSP resampling parity with upstream `soxr HQ`, and optional audio decoder/packaging validation. The unoptimized Flex CPU test profile takes approximately 41 seconds to execute a 0.2-second Transcriber input; it must **not** be interpreted as the expected release or CUDA throughput.

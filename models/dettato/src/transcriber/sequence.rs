@@ -51,7 +51,8 @@ pub struct AxialAttention {
     qkv: Linear,
     out: Linear,
     gamma: Tensor<1>,
-    rel_bias: Option<Vec<f32>>,
+    rel_bias: Option<Tensor<4>>,
+    rope_cache: Option<(Tensor<4>, Tensor<4>)>,
     heads: usize,
 }
 
@@ -72,15 +73,23 @@ impl AxialAttention {
         let rel_bias = if matches!(axis, Axis::Pitch) {
             let (shape, bias) = ckpt.values(&format!("{prefix}.rel_bias"))?;
             if shape != [heads, 255] { return Err(format!("{prefix}: wrong pitch relative bias")); }
-            Some(bias)
+            let mut dense = Vec::with_capacity(heads * 128 * 128);
+            for h in 0..heads {
+                for i in 0..128 {
+                    for j in 0..128 {
+                        dense.push(bias[h * 255 + (j as isize - i as isize + 127) as usize]);
+                    }
+                }
+            }
+            Some(Tensor::from_data(TensorData::new(dense, [1, heads, 128, 128]), device))
         } else { None };
-        Ok(Self { axis, norm, qkv, out, gamma, rel_bias, heads })
+        let rope_cache = if matches!(axis, Axis::Time) && c / heads >= 2 {
+            Some(Self::rope_tables(512, (c / heads) / 2, device))
+        } else { None };
+        Ok(Self { axis, norm, qkv, out, gamma, rel_bias, rope_cache, heads })
     }
 
-    fn rope(x: Tensor<4>, device: &Device) -> Tensor<4> {
-        let [batch, heads, time, dim] = x.dims();
-        let half = dim / 2;
-        if half == 0 { return x; }
+    fn rope_tables(time: usize, half: usize, device: &Device) -> (Tensor<4>, Tensor<4>) {
         let mut cos = Vec::with_capacity(time * half);
         let mut sin = Vec::with_capacity(time * half);
         for t in 0..time {
@@ -91,15 +100,28 @@ impl AxialAttention {
                 sin.push(angle.sin());
             }
         }
-        let c = Tensor::<4>::from_data(TensorData::new(cos, [1, 1, time, half]), device);
-        let s = Tensor::<4>::from_data(TensorData::new(sin, [1, 1, time, half]), device);
+        (
+            Tensor::from_data(TensorData::new(cos, [1, 1, time, half]), device),
+            Tensor::from_data(TensorData::new(sin, [1, 1, time, half]), device),
+        )
+    }
+
+    fn rope(x: Tensor<4>, cache: Option<&(Tensor<4>, Tensor<4>)>) -> Tensor<4> {
+        let [_, _, time, dim] = x.dims();
+        let half = dim / 2;
+        if half == 0 { return x; }
+        let tables = if let Some(tables) = cache.filter(|tables| tables.0.dims()[2] >= time) {
+            (tables.0.clone().narrow(2, 0, time), tables.1.clone().narrow(2, 0, time))
+        } else {
+            Self::rope_tables(time, half, &x.device())
+        };
+        let (c, s) = tables;
         let left = x.clone().narrow(3, 0, half);
         let right = x.clone().narrow(3, half, half);
         let first = left.clone() * c.clone() - right.clone() * s.clone();
         let second = left * s + right * c;
         let mut pieces = vec![first, second];
         if dim > 2 * half { pieces.push(x.narrow(3, 2 * half, dim - 2 * half)); }
-        let _ = (batch, heads);
         Tensor::cat(pieces, 3)
     }
 
@@ -123,26 +145,14 @@ impl AxialAttention {
         let mut q = project(0);
         let mut k = project(1);
         let v = project(2);
-        let device = q.device();
         if matches!(self.axis, Axis::Time) {
-            q = Self::rope(q, &device);
-            k = Self::rope(k, &device);
+            q = Self::rope(q, self.rope_cache.as_ref());
+            k = Self::rope(k, self.rope_cache.as_ref());
         }
         let mut logits = q.matmul(k.transpose()) * (dimension as f32).powf(-0.5);
         if let Some(rel_bias) = &self.rel_bias {
             assert!(length <= 128, "original pitch relative-bias table is limited to 128 lanes");
-            let mut dense = Vec::with_capacity(self.heads * length * length);
-            for h in 0..self.heads {
-                for i in 0..length {
-                    for j in 0..length {
-                        dense.push(rel_bias[h * 255 + (j as isize - i as isize + 127) as usize]);
-                    }
-                }
-            }
-            let bias = Tensor::<4>::from_data(
-                TensorData::new(dense, [1, self.heads, length, length]), &device,
-            );
-            logits = logits + bias;
+            logits = logits + rel_bias.clone().narrow(2, 0, length).narrow(3, 0, length);
         }
         let scores = activation::softmax(logits, 3);
         let attention = scores.matmul(v).permute([0, 2, 1, 3]).reshape([n, length, channels]);

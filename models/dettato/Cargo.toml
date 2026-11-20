@@ -10,9 +10,9 @@ description = "Native Rust and Burn implementation of the Dettato multi-instrume
 default = ["flex", "extended-audio"]
 extended-audio = ["symphonia/mp3", "symphonia/aac", "symphonia/isomp4", "symphonia/alac"]
 flex = ["burn/flex"]
-cuda = ["burn/cuda"]
-cpu = ["burn/cpu"]
-wgpu = ["burn/wgpu"]
+cuda = ["burn/cuda", "burn/fusion", "burn/autotune"]
+cpu = ["burn/cpu", "burn/fusion", "burn/autotune"]
+wgpu = ["burn/wgpu", "burn/fusion", "burn/autotune"]
 
 [dependencies]
 burn = { version = "=0.22.1", default-features = false, features = ["std", "cubecl"] }

@@ -121,9 +121,13 @@ impl Stem {
     }
 }
 
+/// Pitch offsets are encoded as a depthwise 2D convolution in the pitch axis.
+/// This replaces one slice/concat/multiply/add chain per offset with a single
+/// CubeCL-compatible convolution on CUDA, WGPU and CubeCL CPU runtimes.
 pub struct PitchMix {
-    taps: Tensor<2>,
-    offsets: Vec<isize>,
+    kernel: Tensor<4>,
+    padding: usize,
+    channels: usize,
 }
 
 impl PitchMix {
@@ -133,38 +137,91 @@ impl PitchMix {
         device: &Device,
         offsets: Vec<isize>,
     ) -> Result<Self, String> {
-        let taps = ckpt.tensor::<2>(&format!("{key}.taps"), device)?;
-        if taps.dims()[1] != offsets.len() {
+        let (shape, taps) = ckpt.values(&format!("{key}.taps"))?;
+        if shape.len() != 2 || shape[1] != offsets.len() || shape[0] == 0 || offsets.is_empty() {
             return Err(format!("{key}: number of offsets differs from taps"));
         }
-        Ok(Self { taps, offsets })
+        let channels = shape[0];
+        let padding = offsets.iter().map(|offset| offset.unsigned_abs()).max().unwrap_or(0);
+        let width = padding.checked_mul(2).and_then(|n| n.checked_add(1))
+            .ok_or_else(|| format!("{key}: pitch kernel width overflow"))?;
+        let count = channels.checked_mul(width)
+            .ok_or_else(|| format!("{key}: pitch kernel size overflow"))?;
+        let mut kernel = vec![0.0f32; count];
+        for channel in 0..channels {
+            for (index, &offset) in offsets.iter().enumerate() {
+                let position = (padding as isize).checked_add(offset)
+                    .ok_or_else(|| format!("{key}: invalid pitch offset"))? as usize;
+                kernel[channel * width + position] += taps[channel * offsets.len() + index];
+            }
+        }
+        Ok(Self {
+            kernel: Tensor::from_data(TensorData::new(kernel, [channels, 1, 1, width]), device),
+            padding,
+            channels,
+        })
     }
 
     pub fn forward(&self, x: Tensor<4>) -> Tensor<4> {
-        let [b, channels, time, pitches] = x.dims();
-        let device = x.device();
-        let mut y = Tensor::<4>::zeros([b, channels, time, pitches], &device);
-        for (k, &offset) in self.offsets.iter().enumerate() {
-            if offset.unsigned_abs() >= pitches { continue; }
-            let shifted = if offset > 0 {
-                let n = offset as usize;
-                Tensor::cat(vec![
-                    x.clone().narrow(3, n, pitches - n),
-                    Tensor::zeros([b, channels, time, n], &device),
-                ], 3)
-            } else if offset < 0 {
-                let n = offset.unsigned_abs();
-                Tensor::cat(vec![
-                    Tensor::zeros([b, channels, time, n], &device),
-                    x.clone().narrow(3, 0, pitches - n),
-                ], 3)
-            } else {
-                x.clone()
-            };
-            let tap = self.taps.clone().narrow(1, k, 1).reshape([1, channels, 1, 1]);
-            y = y + shifted * tap;
+        assert_eq!(x.dims()[1], self.channels, "PitchMix channel mismatch");
+        module::conv2d(
+            x,
+            self.kernel.clone(),
+            None,
+            ConvOptions::new([1, 1], [0, self.padding], [1, 1], self.channels),
+        )
+    }
+}
+
+#[cfg(test)]
+mod pitch_mix_tests {
+    use super::*;
+
+    #[test]
+    fn grouped_pitch_convolution_matches_sparse_shift_sum() {
+        let device = Device::default();
+        let channels = 3;
+        let pitches = 7;
+        let frames = 5;
+        let offsets = [-3isize, -1, 0, 2, 2, 4];
+        let taps = [
+            [0.3f32, -0.4, 0.5, 0.6, -0.2, 0.7],
+            [0.1, 0.25, -0.3, 0.2, 0.9, -0.8],
+            [-0.5, 0.4, 0.0, 0.3, -0.4, 0.2],
+        ];
+        let width = 9;
+        let padding = 4;
+        let mut weights = vec![0.0; channels * width];
+        for ch in 0..channels {
+            for (k, &offset) in offsets.iter().enumerate() {
+                weights[ch * width + (padding as isize + offset) as usize] += taps[ch][k];
+            }
         }
-        y
+        let input = (0..channels * frames * pitches)
+            .map(|i| (i as f32 * 0.19).sin()).collect::<Vec<_>>();
+        let pitch_mix = PitchMix {
+            kernel: Tensor::from_data(TensorData::new(weights, [channels, 1, 1, width]), &device),
+            padding,
+            channels,
+        };
+        let output = pitch_mix.forward(Tensor::from_data(
+            TensorData::new(input.clone(), [1, channels, frames, pitches]), &device,
+        )).into_data().try_to_vec::<f32>().unwrap();
+        for ch in 0..channels {
+            for frame in 0..frames {
+                for pitch in 0..pitches {
+                    let expected = offsets.iter().enumerate().filter_map(|(k, offset)| {
+                        let source = pitch as isize + *offset;
+                        (source >= 0 && source < pitches as isize).then(|| {
+                            input[(ch * frames + frame) * pitches + source as usize] * taps[ch][k]
+                        })
+                    }).sum::<f32>();
+                    let actual = output[(ch * frames + frame) * pitches + pitch];
+                    assert!((actual - expected).abs() < 1e-5,
+                        "channel {ch} frame {frame} pitch {pitch}: {actual} != {expected}");
+                }
+            }
+        }
     }
 }
 
