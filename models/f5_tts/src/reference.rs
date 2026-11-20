@@ -2,6 +2,7 @@ use crate::{
     F5Error, Result,
     mel::{SAMPLE_RATE, VocosMel},
     model::MelFrames,
+    resample::resample_to_24khz,
 };
 
 const TARGET_RMS: f32 = 0.1;
@@ -22,9 +23,9 @@ pub struct PreparedCondition {
 
 impl ReferenceAudio {
     pub fn from_channels(channels: &[&[f32]], sample_rate: usize) -> Result<Self> {
-        if sample_rate != SAMPLE_RATE {
+        if sample_rate == 0 || sample_rate > 384_000 {
             return Err(F5Error::InvalidConfiguration(
-                "F5 frontend currently accepts 24000 Hz PCM only; resampling is not implemented",
+                "Invalid reference sample rate",
             ));
         }
         let Some(first) = channels.first() else {
@@ -32,7 +33,7 @@ impl ReferenceAudio {
                 "Reference audio contains no channels",
             ));
         };
-        let length = first.len().min(MAX_REFERENCE_SECONDS * SAMPLE_RATE);
+        let length = first.len().min(MAX_REFERENCE_SECONDS * sample_rate);
         if length <= 512 || channels.iter().any(|channel| channel.len() != first.len()) {
             return Err(F5Error::InvalidShape(
                 "Reference audio must have aligned channels and at least 513 samples",
@@ -65,6 +66,12 @@ impl ReferenceAudio {
             for sample in &mut samples {
                 *sample *= normalization_gain;
             }
+        }
+        let samples = resample_to_24khz(&samples, sample_rate)?;
+        if samples.len() <= 512 {
+            return Err(F5Error::InvalidShape(
+                "Resampled reference is too short for the mel frontend",
+            ));
         }
         Ok(Self {
             samples,
@@ -117,6 +124,19 @@ impl PreparedCondition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reference_accepts_resampled_audio_and_preserves_source_rms() {
+        for rate in [16_000_usize, 44_100, 48_000] {
+            let left = vec![0.02; rate];
+            let right = vec![0.06; rate];
+            let audio = ReferenceAudio::from_channels(&[&left, &right], rate).unwrap();
+            assert_eq!(audio.samples.len(), SAMPLE_RATE);
+            assert!((audio.original_rms - 0.04).abs() < 1e-6);
+            assert!((audio.normalization_gain - 2.5).abs() < 1e-5);
+            assert!(audio.samples.iter().all(|value| value.is_finite()));
+        }
+    }
 
     #[test]
     fn stereo_downmix_rms_and_generated_mel() {

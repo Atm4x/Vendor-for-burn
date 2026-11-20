@@ -35,6 +35,15 @@ impl F5DiT {
         checkpoint.validate_dit_v1()?;
         let config = DiTConfig::V1_BASE;
         config.verify_v1()?;
+        Self::from_validated_config(checkpoint, config, vocab_size, device)
+    }
+
+    fn from_validated_config(
+        checkpoint: &Checkpoint,
+        config: DiTConfig,
+        vocab_size: usize,
+        device: &Device,
+    ) -> Result<Self> {
         Ok(Self {
             time: TimeEmbedding::from_checkpoint(checkpoint, config.dim, device)?,
             text: TextEmbedding::from_checkpoint(
@@ -152,5 +161,101 @@ impl DiTVelocity for F5DiT {
 
     fn release_request_cache(&mut self) {
         self.cache = None;
+    }
+}
+
+#[cfg(all(test, feature = "cubecl-cpu"))]
+mod numerical_tests {
+    use super::*;
+    use burn::tensor::TensorData;
+    use std::path::Path;
+
+    #[test]
+    fn full_dit_cfg_matches_independent_pytorch_from_text_to_output() {
+        let device = Device::cpu();
+        let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let checkpoint = Checkpoint::open(fixture_dir.join("dit_full_small.safetensors")).unwrap();
+        let expected: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/dit_full_expected.json")).unwrap();
+        let floats = |field: &str| {
+            expected[field]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_f64().unwrap() as f32)
+                .collect::<Vec<_>>()
+        };
+        let config = DiTConfig {
+            dim: 16,
+            depth: 2,
+            heads: 4,
+            head_dim: 4,
+            text_dim: 8,
+            ff_mult: 2,
+            conv_layers: 1,
+            mel_channels: 2,
+            sample_rate: 24_000,
+            hop_length: 256,
+        };
+        let mut model = F5DiT::from_validated_config(&checkpoint, config, 8, &device).unwrap();
+        let tokens: Vec<i64> = expected["token_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_i64().unwrap())
+            .collect();
+        let tokens = Tensor::<2, Int>::from_data(TensorData::new(tokens, [1, 3]), &device);
+        let noisy = Tensor::from_data(TensorData::new(floats("noisy"), [1, 4, 2]), &device);
+        let reference = Tensor::from_data(TensorData::new(floats("reference"), [1, 4, 2]), &device);
+        let check = |label: &str, actual: Tensor<3>, reference: Vec<f32>| {
+            let actual = actual.into_data().try_to_vec::<f32>().unwrap();
+            assert_eq!(actual.len(), reference.len());
+            let max_abs = actual
+                .iter()
+                .zip(reference.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(max_abs <= 2e-4, "{label} PyTorch parity max_abs={max_abs}");
+        };
+        let text_cond = model.text.forward(tokens.clone(), 4, false).unwrap();
+        let text_uncond = model.text.forward(tokens.clone(), 4, true).unwrap();
+        check(
+            "conditional text",
+            text_cond.clone(),
+            floats("conditional_text"),
+        );
+        check(
+            "unconditional text",
+            text_uncond.clone(),
+            floats("unconditional_text"),
+        );
+        check(
+            "conditional input",
+            model
+                .input
+                .forward(noisy.clone(), reference.clone(), text_cond, false)
+                .unwrap(),
+            floats("conditional_input"),
+        );
+        check(
+            "unconditional input",
+            model
+                .input
+                .forward(noisy.clone(), reference.clone(), text_uncond, true)
+                .unwrap(),
+            floats("unconditional_input"),
+        );
+        let result = model
+            .forward_cfg(
+                noisy,
+                reference,
+                tokens,
+                expected["timestep"].as_f64().unwrap() as f32,
+                expected["cfg_strength"].as_f64().unwrap() as f32,
+            )
+            .unwrap();
+        check("complete two-branch DiT CFG", result, floats("cfg_output"));
+        model.release_request_cache();
+        assert!(model.cache.is_none());
     }
 }

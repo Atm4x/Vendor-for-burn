@@ -30,12 +30,14 @@ pub mod model;
 ))]
 pub mod pipeline;
 pub mod reference;
+pub mod resample;
 #[cfg(any(
     feature = "cubecl-cpu",
     feature = "cubecl-cuda",
     feature = "cubecl-wgpu"
 ))]
 pub mod speed_predictor;
+pub mod text_frontend;
 pub mod vocab;
 #[cfg(any(
     feature = "cubecl-cpu",

@@ -58,6 +58,14 @@ impl Vocabulary {
         Ok(Self { ids })
     }
 
+    pub fn token_id(&self, token: &str) -> i32 {
+        *self.ids.get(token).unwrap_or(&0)
+    }
+
+    pub fn char_id(&self, character: char) -> i32 {
+        self.token_id(&character.to_string())
+    }
+
     pub fn size(&self) -> usize {
         self.ids.len()
     }

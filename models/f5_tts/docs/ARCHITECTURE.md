@@ -12,7 +12,7 @@ Reference implementation: user-provided `F5-TTS-main (1).zip`, DiT/CFM v1. Cross
 - Device-resident CFM state: no per-step host reads. CFG, time embeddings and recurrent conditioning remain in the backend. Clear per-request text caches on both success and error.
 - Weight source of truth is the original `.safetensors` with optional `ema_model.` prefix. Import checks names, byte ranges, and shapes; no silent coercion or heuristic renaming.
 
-## Implementation status
+## Initial implementation status (CONT01, historical)
 
 | Slice | Current state |
 |---|---|
@@ -27,7 +27,7 @@ Reference implementation: user-provided `F5-TTS-main (1).zip`, DiT/CFM v1. Cross
 | TensorRT-RTX native backend | Not implemented |
 | Real model parity and Windows CUDA/WGPU runtime verification | Not performed |
 
-## Next vertical slices
+## Original planned vertical slices (historical)
 
 1. Build a strongly validated `V1Weights` schema, reusing only the model-specific keys, and zero-copy/batched weight uploads where possible.
 2. Implement `DiT` with native Burn/CubeCL modules: text embedding + four ConvNeXtV2 blocks, 2× mel input projection, position conv, timestep embedding, 22 adaptive-normalization Transformer blocks, final AdaLN and mel projection. Exact RoPE and CFG packing.
@@ -49,3 +49,17 @@ No original Fish Speech files or legacy code should be changed while implementin
 - `dit_model.rs`: F5 DiT forward with CFG packing, text/RoPE request caching, `DiTVelocity` bridge.
 - Model weights are imported by exact PyTorch names; tensors remain on the selected Burn/CubeCL device during DiT and CFM loops.
 - Only reduced-size PyTorch reference slices have numerical parity tests so far. Complete model inference and Vocos are pending.
+
+## Current architecture after CONT06
+
+- `text_frontend.rs`: model-specific standard reference+generation text contract, English/CJK punctuation normalization, deterministic native tokenization, explicit pinyin provider interface and `[voice]` script parser. No Python processing or tokenizer is required for ASCII English. Chinese tone sandhi is **not bundled**: the caller must supply a correct pinyin provider; with `NoPinyin`, raw Chinese is rejected rather than silently mapped to unknown IDs.
+- `pipeline.rs`: standard text, multi-speaker script and cross-lingual English entrypoints; one seeded RNG stream across sequential chunks, without per-chunk reseeding. The RNG is intentionally **not PyTorch-equivalent** yet.
+- `resample.rs`: audio input resampling to 24 kHz by Hann-windowed sinc polyphase filters, following torchaudio defaults. Reference channel downmix and RMS are computed before resampling, consistent with the reference pipeline. Supported rates are bounded for memory safety.
+- `dit_model.rs`: exact-F5-v1 production configuration is unchanged. A private verified-constructor seam supports a reduced-dimensional end-to-end DiT PyTorch fixture with both CFG branches. The **test has not been run through CubeCL** because this runtime lacks offline Burn crates.
+- Backends: CubeCL CPU/CUDA/WGPU remain Burn-backed. TensorRT-RTX is a separate planned backend, not implemented here. No ONNX.
+
+### Current functional boundaries
+
+- Core DiT/CFM/Vocos path is implemented but the production model is not yet numerically validated end-to-end. Complete DiT fixture is available; running it on CubeCL CPU is a required next step.
+- Chinese `rjieba` segmentation and polyphonic pinyin tone sandhi are not implemented as a self-contained Rust subsystem. Do not claim Chinese end-to-end support until both are numerically validated.
+- `torch.randn` RNG parity, entire model checkpoint mapping and TensorRT-RTX are separate remaining functional work, not evidence of GPU workability.

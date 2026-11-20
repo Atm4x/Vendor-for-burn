@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 use burn::tensor::{Device, Int, Tensor, TensorData};
 
@@ -10,6 +10,7 @@ use crate::{
     dit_model::F5DiT,
     mel::VocosMel,
     reference::ReferenceAudio,
+    text_frontend::{F5TextFrontend, NoPinyin, PinyinProvider, standard_total_frames},
     vocab::Vocabulary,
     vocos::{VocosConfig, VocosDecoder},
 };
@@ -20,6 +21,11 @@ pub struct StandardF5Runtime {
     dit: F5DiT,
     vocoder: VocosDecoder,
     vocabulary: Vocabulary,
+}
+
+pub struct VoiceReference<'a> {
+    pub audio: &'a ReferenceAudio,
+    pub transcript: &'a str,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -87,6 +93,99 @@ impl StandardF5Runtime {
         })
     }
 
+    /// Standard F5 synthesis from text and a transcribed reference. This path matches
+    /// the original reference+generation conditioning and UTF-8 duration heuristic.
+    pub fn synthesize_text(
+        &mut self,
+        reference: &ReferenceAudio,
+        reference_text: &str,
+        generated_text: &str,
+        speed: f32,
+        fixed_seconds: Option<f32>,
+        seed: u64,
+        sampling: SamplingConfig,
+    ) -> Result<Vec<f32>> {
+        self.synthesize_text_with_pinyin(
+            reference,
+            reference_text,
+            generated_text,
+            NoPinyin,
+            speed,
+            fixed_seconds,
+            seed,
+            sampling,
+        )
+    }
+
+    pub fn synthesize_text_with_pinyin<P: PinyinProvider>(
+        &mut self,
+        reference: &ReferenceAudio,
+        reference_text: &str,
+        generated_text: &str,
+        pinyin: P,
+        speed: f32,
+        fixed_seconds: Option<f32>,
+        seed: u64,
+        sampling: SamplingConfig,
+    ) -> Result<Vec<f32>> {
+        let tokens = F5TextFrontend::new(&self.vocabulary, pinyin)
+            .standard_tokens(reference_text, generated_text)?;
+        let reference_frames = reference.samples.len() / 256;
+        let target = standard_total_frames(
+            reference_frames,
+            reference_text,
+            generated_text,
+            speed,
+            fixed_seconds,
+        )?;
+        self.synthesize(
+            reference,
+            &tokens,
+            GenerateOptions {
+                total_frames: target,
+                seed,
+                sampling,
+            },
+        )
+    }
+
+    pub fn synthesize_script(
+        &mut self,
+        script: &str,
+        voices: &BTreeMap<String, VoiceReference<'_>>,
+        speed: f32,
+        seed: u64,
+        sampling: SamplingConfig,
+    ) -> Result<Vec<f32>> {
+        let Some(main) = voices.get("main") else {
+            return Err(F5Error::InvalidConfiguration(
+                "Multi-voice F5 requires a main reference",
+            ));
+        };
+        let segments = crate::text_frontend::parse_voice_segments(script);
+        if segments.is_empty() {
+            return Err(F5Error::InvalidConfiguration("Voice script is empty"));
+        }
+        let mut rng = StandardNormal::new(seed);
+        let mut result = Vec::new();
+        for segment in segments {
+            let voice = voices.get(&segment.voice).unwrap_or(main);
+            let tokens = F5TextFrontend::new(&self.vocabulary, NoPinyin)
+                .standard_tokens(voice.transcript, &segment.text)?;
+            let total_frames = standard_total_frames(
+                voice.audio.samples.len() / 256,
+                voice.transcript,
+                &segment.text,
+                speed,
+                None,
+            )?;
+            let wave =
+                self.synthesize_with_rng(voice.audio, &tokens, total_frames, sampling, &mut rng)?;
+            result.extend(wave);
+        }
+        Ok(result)
+    }
+
     /// `text_tokens` must already contain the F5-normalized reference and generated text.
     /// Text-to-pinyin normalization is intentionally outside this inference runtime.
     pub fn synthesize_wav(
@@ -104,6 +203,24 @@ impl StandardF5Runtime {
         text_tokens: &[i32],
         options: GenerateOptions,
     ) -> Result<Vec<f32>> {
+        let mut rng = StandardNormal::new(options.seed);
+        self.synthesize_with_rng(
+            reference,
+            text_tokens,
+            options.total_frames,
+            options.sampling,
+            &mut rng,
+        )
+    }
+
+    fn synthesize_with_rng(
+        &mut self,
+        reference: &ReferenceAudio,
+        text_tokens: &[i32],
+        total_frames: usize,
+        sampling: SamplingConfig,
+        generator: &mut StandardNormal,
+    ) -> Result<Vec<f32>> {
         if text_tokens.is_empty() || text_tokens.len() > 8192 {
             return Err(F5Error::InvalidShape(
                 "F5 token count is outside valid limits",
@@ -117,7 +234,7 @@ impl StandardF5Runtime {
                 "F5 token ID exceeds model vocabulary",
             ));
         }
-        let prepared = reference.prepare(&self.mel, options.total_frames, text_tokens.len())?;
+        let prepared = reference.prepare(&self.mel, total_frames, text_tokens.len())?;
         let frames = prepared.frames;
         let restoration_gain = prepared.restoration_gain();
         let condition = Tensor::from_data(
@@ -128,7 +245,6 @@ impl StandardF5Runtime {
             .target
             .checked_mul(100)
             .ok_or(F5Error::InvalidShape("F5 noise tensor size overflow"))?;
-        let mut generator = StandardNormal::new(options.seed);
         let noise = Tensor::from_data(
             TensorData::new(
                 (0..count).map(|_| generator.sample()).collect::<Vec<_>>(),
@@ -146,7 +262,7 @@ impl StandardF5Runtime {
             condition,
             text,
             frames.reference,
-            options.sampling,
+            sampling,
         )?;
         let generated = final_mel.slice([0..1, frames.reference..frames.target, 0..100]);
         self.vocoder.decode(generated, restoration_gain)
@@ -156,6 +272,18 @@ impl StandardF5Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_rng_stream_serves_all_chunks_without_reseeding() {
+        let mut sequential = StandardNormal::new(123);
+        let first_chunk: Vec<_> = (0..7).map(|_| sequential.sample()).collect();
+        let second_chunk: Vec<_> = (0..5).map(|_| sequential.sample()).collect();
+        let mut uninterrupted = StandardNormal::new(123);
+        let full: Vec<_> = (0..12).map(|_| uninterrupted.sample()).collect();
+        assert_eq!(&full[..7], first_chunk);
+        assert_eq!(&full[7..], second_chunk);
+        assert_ne!(second_chunk[0], StandardNormal::new(123).sample());
+    }
 
     #[test]
     fn seeded_gaussian_is_deterministic_and_finite() {
@@ -239,20 +367,50 @@ impl CrossLingualF5Runtime {
             ));
         }
         let mut waves = Vec::with_capacity(chunks.len());
-        for (index, chunk) in chunks.iter().enumerate() {
+        let mut rng = StandardNormal::new(options.seed);
+        for chunk in &chunks {
             let tokens = tokenize(&chunk.text)?;
-            let audio = self.base.synthesize(
+            let audio = self.base.synthesize_with_rng(
                 reference,
                 &tokens,
-                GenerateOptions {
-                    total_frames: chunk.total_frames,
-                    seed: options.seed.wrapping_add(index as u64),
-                    sampling: options.sampling,
-                },
+                chunk.total_frames,
+                options.sampling,
+                &mut rng,
             )?;
             waves.push(audio);
         }
         crate::cross_lingual::cross_fade_waves(&waves, options.cross_fade_seconds)
+    }
+
+    /// Native English Cross-Lingual path without a caller-provided tokenizer.
+    /// Han pronunciation must use a pinyin-aware frontend instead.
+    pub fn synthesize_english(
+        &mut self,
+        reference: &ReferenceAudio,
+        text: &str,
+        syllables: &impl crate::cross_lingual::EnglishSyllableCounter,
+        options: CrossLingualGenerateOptions,
+    ) -> Result<Vec<f32>> {
+        self.synthesize_with_pinyin(reference, text, syllables, NoPinyin, options)
+    }
+
+    pub fn synthesize_with_pinyin<P: PinyinProvider>(
+        &mut self,
+        reference: &ReferenceAudio,
+        text: &str,
+        syllables: &impl crate::cross_lingual::EnglishSyllableCounter,
+        pinyin: P,
+        options: CrossLingualGenerateOptions,
+    ) -> Result<Vec<f32>> {
+        let vocabulary = self.base.vocabulary.clone();
+        let frontend = F5TextFrontend::new(&vocabulary, pinyin);
+        self.synthesize_text(
+            reference,
+            text,
+            syllables,
+            |part| frontend.cross_lingual_tokens(part),
+            options,
+        )
     }
 
     pub fn synthesize_wav<E>(
