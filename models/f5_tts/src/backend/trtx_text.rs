@@ -180,6 +180,17 @@ impl TrtChunkKernel for TrtWarmBank {
             .edit_speech(plan, tokens, noise, restoration_gain, sampling)
     }
 
+    fn edit_speech_with_method(
+        &mut self, plan: &SpeechEditPlan, tokens: &[i32], noise: &[f32],
+        restoration_gain: f32, sampling: SamplingConfig, method: OdeMethod,
+    ) -> Result<Vec<f32>> {
+        let key = (0, plan.total_frames);
+        self.ensure(key)?;
+        self.shapes.get_mut(&key)
+            .ok_or(F5Error::InvalidConfiguration("Missing warmed speech-edit engine"))?
+            .edit_speech_with_method(plan, tokens, noise, restoration_gain, sampling, method)
+    }
+
     fn synthesize_chunk(
         &mut self,
         reference: &ReferenceAudio,
@@ -256,6 +267,17 @@ pub trait TrtChunkKernel {
         ))
     }
 
+    fn edit_speech_with_method(
+        &mut self, plan: &SpeechEditPlan, tokens: &[i32], noise: &[f32],
+        restoration_gain: f32, sampling: SamplingConfig, method: OdeMethod,
+    ) -> Result<Vec<f32>> {
+        if method == OdeMethod::Euler {
+            self.edit_speech(plan, tokens, noise, restoration_gain, sampling)
+        } else {
+            Err(F5Error::InvalidConfiguration("TRT kernel does not support midpoint editing"))
+        }
+    }
+
     fn synthesize_chunk(
         &mut self,
         reference: &ReferenceAudio,
@@ -291,6 +313,15 @@ impl<I: CudaTransport, E: TrtExecutor> TrtChunkKernel for TrtF5Session<I, E> {
         sampling: SamplingConfig,
     ) -> Result<Vec<f32>> {
         TrtF5Session::edit_speech(self, plan, tokens, noise, restoration_gain, sampling)
+    }
+
+    fn edit_speech_with_method(
+        &mut self, plan: &SpeechEditPlan, tokens: &[i32], noise: &[f32],
+        restoration_gain: f32, sampling: SamplingConfig, method: OdeMethod,
+    ) -> Result<Vec<f32>> {
+        TrtF5Session::edit_speech_with_method(
+            self, plan, tokens, noise, restoration_gain, sampling, method,
+        )
     }
 
     fn synthesize_chunk(
