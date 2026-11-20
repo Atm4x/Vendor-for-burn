@@ -2798,6 +2798,7 @@ version = "0.1.0"
 dependencies = [
  "burn",
  "jieba-rs",
+ "libloading 0.8.9",
  "serde_json",
  "trtx",
 ]

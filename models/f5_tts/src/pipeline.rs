@@ -9,6 +9,7 @@ use crate::{
     checkpoint::Checkpoint,
     dit_model::F5DiT,
     mel::VocosMel,
+    noise::StandardNormal,
     pinyin::ChinesePinyin,
     reference::ReferenceAudio,
     standard_chunking::plan_standard_chunks,
@@ -36,42 +37,6 @@ pub struct GenerateOptions {
     pub total_frames: usize,
     pub seed: u64,
     pub sampling: SamplingConfig,
-}
-
-struct StandardNormal {
-    state: u64,
-    spare: Option<f32>,
-}
-
-impl StandardNormal {
-    fn new(seed: u64) -> Self {
-        Self {
-            state: if seed == 0x9e37_79b9_7f4a_7c15 {
-                0x2545_f491_4f6c_dd1d
-            } else {
-                seed ^ 0x9e37_79b9_7f4a_7c15
-            },
-            spare: None,
-        }
-    }
-
-    fn uniform(&mut self) -> f64 {
-        self.state ^= self.state >> 12;
-        self.state ^= self.state << 25;
-        self.state ^= self.state >> 27;
-        let value = self.state.wrapping_mul(0x2545_f491_4f6c_dd1d);
-        ((value >> 11) as f64 + 0.5) / ((1_u64 << 53) as f64)
-    }
-
-    fn sample(&mut self) -> f32 {
-        if let Some(sample) = self.spare.take() {
-            return sample;
-        }
-        let radius = (-2.0 * self.uniform().ln()).sqrt();
-        let angle = 2.0 * core::f64::consts::PI * self.uniform();
-        self.spare = Some((radius * angle.sin()) as f32);
-        (radius * angle.cos()) as f32
-    }
 }
 
 fn validate_initial_noise(noise: Vec<f32>, required: usize) -> Result<Vec<f32>> {

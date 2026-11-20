@@ -19,3 +19,12 @@ pub mod trtx_vocos;
 
 #[cfg(any(feature = "tensorrt-api", feature = "tensorrt-mock"))]
 pub mod trtx_speed;
+
+#[cfg(any(feature = "tensorrt-api", feature = "tensorrt-mock"))]
+pub mod trtx_session;
+
+#[cfg(any(feature = "tensorrt-api", feature = "tensorrt-mock"))]
+pub mod trtx_cuda;
+
+#[cfg(any(feature = "tensorrt-api", feature = "tensorrt-mock"))]
+pub mod trtx_text;
