@@ -4,7 +4,7 @@
 use std::{path::PathBuf, sync::mpsc, thread};
 
 use crate::{
-    F5Error, Result, cfm::SamplingConfig, checkpoint::Checkpoint, mel::VocosMel,
+    F5Error, Result, cfm::{CfmSampleMode, OdeMethod, SamplingConfig}, checkpoint::Checkpoint, mel::VocosMel,
     reference::ReferenceAudio, speech_edit::SpeechEditPlan,
 };
 
@@ -198,6 +198,8 @@ enum Request {
         tokens: Vec<i32>,
         restoration_gain: f32,
         sampling: SamplingConfig,
+        method: OdeMethod,
+        mode: CfmSampleMode,
         reply: mpsc::SyncSender<Result<Vec<f32>>>,
     },
     Edit {
@@ -264,15 +266,17 @@ impl TrtCompiledKernel {
                                         tokens,
                                         restoration_gain,
                                         sampling,
+                                        method,
+                                        mode,
                                         reply,
                                     } => {
-                                        let _ = reply.send(session.synthesize(SynthesisInputs {
+                                        let _ = reply.send(session.synthesize_with_sample_mode(SynthesisInputs {
                                             condition: &condition,
                                             initial_noise: &noise,
                                             tokens: &tokens,
                                             restoration_gain,
                                             sampling,
-                                        }));
+                                        }, method, mode));
                                     }
                                     Request::Edit {
                                         plan,
@@ -391,12 +395,37 @@ impl TrtChunkKernel for TrtCompiledKernel {
                 tokens: tokens.to_vec(),
                 restoration_gain,
                 sampling,
+                method: OdeMethod::Euler,
+                mode: CfmSampleMode::default(),
                 reply,
             })
             .map_err(|_| F5Error::ModelExecution("F5 TensorRT engine thread is stopped".into()))?;
         result
             .recv()
             .map_err(|_| F5Error::ModelExecution("F5 TensorRT synthesis interrupted".into()))?
+    }
+
+    fn synthesize_chunk_with_sample_mode(
+        &mut self, reference: &ReferenceAudio, tokens: &[i32],
+        target_frames: usize, noise: &[f32], sampling: SamplingConfig,
+        method: OdeMethod, mode: CfmSampleMode,
+    ) -> Result<Vec<f32>> {
+        let shape = self.shape;
+        if target_frames != shape.cfm.backbone.frames {
+            return Err(F5Error::InvalidShape("Incorrect cached F5 duration"));
+        }
+        let condition = reference.prepare(&VocosMel::new(), target_frames, tokens.len())?;
+        if condition.frames.reference != shape.reference_frames {
+            return Err(F5Error::InvalidShape("Incorrect cached F5 reference duration"));
+        }
+        let (reply, result) = mpsc::sync_channel(1);
+        self.sender.send(Request::Synthesize {
+            condition: condition.conditioning_mel,
+            noise: noise.to_vec(), tokens: tokens.to_vec(),
+            restoration_gain: condition.restoration_gain(),
+            sampling, method, mode, reply,
+        }).map_err(|_| F5Error::ModelExecution("F5 TensorRT engine thread stopped".into()))?;
+        result.recv().map_err(|_| F5Error::ModelExecution("F5 TensorRT synthesis interrupted".into()))?
     }
 
     fn predict_reference_speed(&mut self, reference: &ReferenceAudio) -> Result<f32> {
