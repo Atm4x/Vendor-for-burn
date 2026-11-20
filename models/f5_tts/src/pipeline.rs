@@ -186,7 +186,7 @@ impl StandardF5Runtime {
             )?;
             waves.push(wave);
         }
-        crate::cross_lingual::cross_fade_waves(&waves, cross_fade_seconds)
+        crate::cross_lingual::cross_fade_waves(&waves, cross_fade_seconds as f64)
     }
 
     pub fn synthesize_script(
@@ -357,9 +357,9 @@ pub struct CrossLingualF5Runtime {
 
 #[derive(Debug, Clone, Copy)]
 pub struct CrossLingualGenerateOptions {
-    pub speed: f32,
-    pub fixed_seconds: Option<f32>,
-    pub cross_fade_seconds: f32,
+    pub speed: f64,
+    pub fixed_seconds: Option<f64>,
+    pub cross_fade_seconds: f64,
     pub seed: u64,
     pub sampling: SamplingConfig,
 }

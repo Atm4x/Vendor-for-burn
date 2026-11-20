@@ -9,6 +9,10 @@ pub type Result<T> = std::result::Result<T, F5Error>;
 
 #[path = "../src/cfm.rs"]
 mod cfm;
+#[path = "../src/cross_lingual.rs"]
+mod cross_lingual;
+#[path = "../src/hyphenation.rs"]
+mod hyphenation;
 #[path = "../src/pinyin.rs"]
 mod pinyin;
 #[path = "../src/standard_chunking.rs"]
@@ -229,4 +233,94 @@ fn five_hundred_original_python_pinyin_segment_cases_match_token_ids() {
         count += 1;
     }
     assert_eq!(count, 505);
+}
+
+#[test]
+fn cross_lingual_count_units_and_chunking_match_original_python() {
+    let counter = hyphenation::EnglishHyphenator::us_english().unwrap();
+    let cases = include_str!("fixtures/cross_lingual_frontend_python_expected.tsv");
+    let mut matched = 0;
+    for (index, row) in cases.lines().enumerate() {
+        let columns = row.splitn(5, '\t').collect::<Vec<_>>();
+        assert_eq!(columns.len(), 5);
+        let source = from_hex(columns[0]);
+        let expected_units = columns[1].parse::<usize>().unwrap();
+        let max_units = columns[2].parse::<usize>().unwrap();
+        let chunk_count = columns[3].parse::<usize>().unwrap();
+        let expected_chunks = if chunk_count == 0 {
+            Vec::new()
+        } else {
+            columns[4].split('|').map(from_hex).collect::<Vec<_>>()
+        };
+        assert_eq!(expected_chunks.len(), chunk_count);
+        let actual_units = cross_lingual::count_units(&source, &counter).unwrap();
+        assert_eq!(
+            actual_units, expected_units,
+            "count case={index}, source={source:?}"
+        );
+        let actual_chunks = cross_lingual::chunk_text(&source, max_units, &counter).unwrap();
+        assert_eq!(
+            actual_chunks, expected_chunks,
+            "chunk case={index}, source={source:?}"
+        );
+        matched += 1;
+    }
+    assert_eq!(matched, 2_521);
+}
+
+#[test]
+fn cross_lingual_duration_matches_python_float_arithmetic() {
+    let fixture = include_str!("fixtures/cross_lingual_duration_python_expected.tsv");
+    let mut count = 0;
+    for (index, row) in fixture.lines().enumerate() {
+        let fields: Vec<&str> = row.split('\t').collect();
+        assert_eq!(fields.len(), 6);
+        let reference_samples = fields[0].parse::<usize>().unwrap();
+        let units = fields[1].parse::<usize>().unwrap();
+        let predicted_speed = fields[2].parse::<f32>().unwrap();
+        let user_speed = fields[3].parse::<f64>().unwrap();
+        let expected_available = fields[4].parse::<usize>().unwrap();
+        let expected_total = fields[5].parse::<usize>().unwrap();
+        let available = cross_lingual::available_units(reference_samples, predicted_speed).unwrap();
+        assert_eq!(available, expected_available, "available case={index}");
+        let extra =
+            cross_lingual::generated_frames(units, predicted_speed, user_speed, None).unwrap();
+        let total = reference_samples / cross_lingual::HOP_LENGTH as usize + extra;
+        assert_eq!(total, expected_total, "duration case={index}");
+        count += 1;
+    }
+    assert_eq!(count, 2_200);
+}
+
+#[test]
+fn cross_lingual_crossfade_matches_numpy_float64_reference() {
+    let fixture = include_str!("fixtures/cross_lingual_crossfade_numpy_expected.tsv");
+    let mut count = 0;
+    for (index, row) in fixture.lines().enumerate() {
+        let fields: Vec<&str> = row.splitn(3, '\t').collect();
+        assert_eq!(fields.len(), 3);
+        let seconds = fields[0].parse::<f64>().unwrap();
+        let waves = fields[1]
+            .split(';')
+            .map(|wave| {
+                wave.split(',')
+                    .map(|sample| sample.parse::<f32>().unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let expected = fields[2]
+            .split(',')
+            .map(|sample| sample.parse::<f32>().unwrap())
+            .collect::<Vec<_>>();
+        let output = cross_lingual::cross_fade_waves(&waves, seconds).unwrap();
+        assert_eq!(output.len(), expected.len(), "length case={index}");
+        for (sample_index, (&actual, &reference)) in output.iter().zip(&expected).enumerate() {
+            assert!(
+                (actual - reference).abs() < 2e-6,
+                "crossfade case={index}, sample={sample_index}, actual={actual}, reference={reference}"
+            );
+        }
+        count += 1;
+    }
+    assert_eq!(count, 128);
 }

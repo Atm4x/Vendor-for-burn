@@ -38,12 +38,17 @@ pub fn best_speed_class(logits: &[f32]) -> Result<usize> {
 }
 
 pub fn count_units(text: &str, english: &impl EnglishSyllableCounter) -> Result<usize> {
-    let mut units = 0.0_f32;
+    let mut syllables = 0usize;
+    let mut punctuation = 0.0_f64;
     let mut ascii_word = String::new();
 
-    let flush_word = |word: &mut String, units: &mut f32| -> Result<()> {
+    let flush_word = |word: &mut String, syllables: &mut usize| -> Result<()> {
         if !word.is_empty() {
-            *units += english.count_syllables(&word.to_ascii_lowercase())? as f32;
+            *syllables = syllables
+                .checked_add(english.count_syllables(&word.to_ascii_lowercase())?)
+                .ok_or(F5Error::InvalidShape(
+                    "Cross-Lingual syllable count overflow",
+                ))?;
             word.clear();
         }
         Ok(())
@@ -54,11 +59,13 @@ pub fn count_units(text: &str, english: &impl EnglishSyllableCounter) -> Result<
             ascii_word.push(ch);
             continue;
         }
-        flush_word(&mut ascii_word, &mut units)?;
+        flush_word(&mut ascii_word, &mut syllables)?;
         if ('\u{4e00}'..='\u{9fff}').contains(&ch) {
-            units += 1.0;
+            syllables = syllables.checked_add(1).ok_or(F5Error::InvalidShape(
+                "Cross-Lingual syllable count overflow",
+            ))?;
         }
-        units += match ch {
+        punctuation += match ch {
             '.' | '!' | '?' => 1.5,
             ',' => 0.7,
             ';' | ':' => 1.0,
@@ -68,8 +75,8 @@ pub fn count_units(text: &str, english: &impl EnglishSyllableCounter) -> Result<
             _ => 0.0,
         };
     }
-    flush_word(&mut ascii_word, &mut units)?;
-    Ok(units.round_ties_even().max(1.0) as usize)
+    flush_word(&mut ascii_word, &mut syllables)?;
+    Ok(((syllables as f64 + punctuation).round_ties_even().max(1.0)) as usize)
 }
 
 pub fn chunk_text(
@@ -129,15 +136,16 @@ pub fn available_units(reference_samples: usize, predicted_speed: f32) -> Result
             "Speaking speed must be finite",
         ));
     }
-    let seconds = (MAX_TOTAL_SECONDS - reference_samples as f32 / SAMPLE_RATE).max(1.0);
-    Ok((speed * seconds).floor().max(1.0) as usize)
+    let seconds =
+        (MAX_TOTAL_SECONDS as f64 - reference_samples as f64 / SAMPLE_RATE as f64).max(1.0);
+    Ok(((speed as f64) * seconds).floor().max(1.0) as usize)
 }
 
 pub fn generated_frames(
     units: usize,
     predicted_speed: f32,
-    user_speed: f32,
-    fixed_seconds: Option<f32>,
+    user_speed: f64,
+    fixed_seconds: Option<f64>,
 ) -> Result<usize> {
     if !predicted_speed.is_finite()
         || !user_speed.is_finite()
@@ -149,13 +157,17 @@ pub fn generated_frames(
         ));
     }
     let local_speed = if units < 4 { 0.5 } else { user_speed };
-    let seconds = fixed_seconds.unwrap_or(units as f32 / predicted_speed.max(0.25) / local_speed);
-    if !seconds.is_finite() || seconds < 0.0 || seconds > 65_536.0 * HOP_LENGTH / SAMPLE_RATE {
+    let seconds =
+        fixed_seconds.unwrap_or(units as f64 / predicted_speed.max(0.25) as f64 / local_speed);
+    if !seconds.is_finite()
+        || seconds < 0.0
+        || seconds > 65_536.0 * HOP_LENGTH as f64 / SAMPLE_RATE as f64
+    {
         return Err(F5Error::InvalidConfiguration(
             "Requested generation duration exceeds limit",
         ));
     }
-    Ok((seconds * SAMPLE_RATE / HOP_LENGTH).floor() as usize)
+    Ok((seconds * SAMPLE_RATE as f64 / HOP_LENGTH as f64).floor() as usize)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,8 +181,8 @@ pub fn plan_cross_lingual_chunks(
     text: &str,
     reference_samples: usize,
     predicted_speed: f32,
-    user_speed: f32,
-    fixed_seconds: Option<f32>,
+    user_speed: f64,
+    fixed_seconds: Option<f64>,
     english: &impl EnglishSyllableCounter,
 ) -> Result<Vec<CrossLingualChunk>> {
     if !predicted_speed.is_finite()
@@ -202,7 +214,7 @@ pub fn plan_cross_lingual_chunks(
                             "Invalid fixed Cross-Lingual duration",
                         ));
                     }
-                    (seconds * SAMPLE_RATE / HOP_LENGTH).floor() as usize
+                    (seconds * SAMPLE_RATE as f64 / HOP_LENGTH as f64).floor() as usize
                 }
                 None => reference_frames
                     .checked_add(extra_frames)
@@ -227,7 +239,7 @@ pub fn plan_cross_lingual_chunks(
         .collect()
 }
 
-pub fn cross_fade_waves(waves: &[Vec<f32>], fade_seconds: f32) -> Result<Vec<f32>> {
+pub fn cross_fade_waves(waves: &[Vec<f32>], fade_seconds: f64) -> Result<Vec<f32>> {
     if !fade_seconds.is_finite() || fade_seconds < 0.0 {
         return Err(F5Error::InvalidConfiguration(
             "Cross-fade duration must be nonnegative and finite",
@@ -247,7 +259,7 @@ pub fn cross_fade_waves(waves: &[Vec<f32>], fade_seconds: f32) -> Result<Vec<f32
         ));
     }
     let mut joined = first.clone();
-    let overlap_samples = (fade_seconds * SAMPLE_RATE).floor() as usize;
+    let overlap_samples = (fade_seconds * SAMPLE_RATE as f64).floor() as usize;
     for next_wave in &waves[1..] {
         let overlap = overlap_samples.min(joined.len()).min(next_wave.len());
         if overlap == 0 {
@@ -257,11 +269,12 @@ pub fn cross_fade_waves(waves: &[Vec<f32>], fade_seconds: f32) -> Result<Vec<f32
         let start = joined.len() - overlap;
         for i in 0..overlap {
             let alpha = if overlap == 1 {
-                0.0
+                0.0_f64
             } else {
-                i as f32 / (overlap - 1) as f32
+                i as f64 / (overlap - 1) as f64
             };
-            joined[start + i] = joined[start + i] * (1.0 - alpha) + next_wave[i] * alpha;
+            joined[start + i] =
+                (joined[start + i] as f64 * (1.0 - alpha) + next_wave[i] as f64 * alpha) as f32;
         }
         joined.extend_from_slice(&next_wave[overlap..]);
     }
@@ -282,7 +295,7 @@ mod tests {
     #[test]
     fn linear_cross_fade_matches_numpy_linspace_endpoints() {
         let waves = vec![vec![1.0; 6], vec![3.0; 5]];
-        let result = cross_fade_waves(&waves, 3.0 / SAMPLE_RATE).unwrap();
+        let result = cross_fade_waves(&waves, 3.0 / SAMPLE_RATE as f64).unwrap();
         assert_eq!(result, vec![1.0, 1.0, 1.0, 1.0, 2.0, 3.0, 3.0, 3.0]);
         assert_eq!(cross_fade_waves(&waves, 0.0).unwrap().len(), 11);
         assert!(cross_fade_waves(&[], 0.0).is_err());

@@ -128,17 +128,17 @@ mod tests {
     #[test]
     fn parity_with_independent_pyphen_500_word_corpus() {
         let en = EnglishHyphenator::us_english().unwrap();
-        let expected: serde_json::Value = serde_json::from_str(include_str!(
-            "../tests/fixtures/hyphenation_pyphen_us_expected.json"
-        ))
-        .unwrap();
-        for (word, units) in expected.as_object().unwrap() {
+        let mut checked = 0;
+        for row in include_str!("../tests/fixtures/hyphenation_pyphen_us_expected.tsv").lines() {
+            let (word, units) = row.split_once('\t').unwrap();
             assert_eq!(
                 en.syllables(word).unwrap(),
-                units.as_u64().unwrap() as usize,
+                units.parse::<usize>().unwrap(),
                 "word={word}"
             );
+            checked += 1;
         }
+        assert_eq!(checked, 552);
     }
 
     #[test]
