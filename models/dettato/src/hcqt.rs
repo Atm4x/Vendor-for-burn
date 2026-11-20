@@ -123,6 +123,25 @@ impl Hcqt {
         self.shifts.len() + self.config.extra_nffts.len()
     }
 
+    /// Extended linear HCQT power for Grouper harmonic-demixing, indexed [bin, frame].
+    /// Uses exactly the reference long-window triangular filter bank.
+    pub fn extended_power(&self, audio16k: &[f32]) -> (usize, isize, Vec<f32>) {
+        let frames = audio16k.len() / HOP_SAMPLES;
+        let hi = self.shifts.iter().copied().max().unwrap().max(0);
+        let bins = (self.config.n_bins as isize + hi - self.low_shift) as usize;
+        let fmin = self.config.fmin
+            * 2f64.powf(self.low_shift as f64 / (12 * self.config.bins_per_semitone) as f64);
+        let bank = FilterBank::new(bins, self.config.n_fft, fmin, self.config.bins_per_semitone);
+        let log_power = spectrogram(audio16k, self.config.n_fft, frames, &bank, self.config.log_eps);
+        let mut power = vec![0.0; bins * frames];
+        for frame in 0..frames {
+            for bin in 0..bins {
+                power[bin * frames + frame] = (log_power[frame * bins + bin].exp() - self.config.log_eps).max(0.0);
+            }
+        }
+        (bins, self.low_shift, power)
+    }
+
     pub fn extract(&self, audio16k: &[f32]) -> Features {
         let frames = audio16k.len() / HOP_SAMPLES;
         let channels = self.channels();

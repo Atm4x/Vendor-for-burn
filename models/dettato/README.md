@@ -1,6 +1,6 @@
 # Dettato — native Rust / Burn port
 
-**Status: partial implementation. Two of the four neural stages (Transcriber and Evidence Repairer) have source-level Burn implementations, but have not passed Rust compilation, checkpoint loading, layer parity or end-to-end numerical verification. Grouper and Drums currently provide their decoding/postprocessing algorithms, not their neural networks. The full system cannot yet perform independent end-to-end transcription.**
+**Status: source-level port of three neural stages (Transcriber, Evidence, Grouper) and the Drums decoder. All three neural stages still require Rust compilation, checkpoint/key validation and numerical comparison; the fourth stage (DrumNet/OrchestralExpert/router) is not implemented. End-to-end polyphonic audio-to-MIDI without external predictions is therefore not yet available.**
 
 Original Dettato: Nathan Mills / kobimusic, Apache-2.0, <https://github.com/kobimusic/dettato>. See `LICENSE` and `NOTICE`.
 
@@ -13,7 +13,7 @@ This is an independent crate in `models/dettato`. `models/beat_this` is unchange
 | Checkpoints | `config.json`, named `safetensors` tensors for all four stages, F32/F16/BF16/F64 import | Automated full-key/shape parity on released checkpoints |
 | Transcriber | HCQT frontend, Stem, PitchMix, CNN backbone, pitch/time attention, RoPE, bidirectional GRU, six heads, 8 s Hann overlap, two-slot note decoder | Numerically verified layer outputs and performance optimizations |
 | Evidence | 31 map features, two 368-d hidden summaries, standardization/1/32 quantization, FP16 map feature rounding; CPU note context and beat-grid features; Burn embeddings/9-layer note transformer/RoPE/SwiGLU/heads; candidate decoding; keep/drop/insert repair | Compilation/parity of Burn Evidence network, batched/precision-optimized inference |
-| Grouper | 73-class General MIDI vocabulary, cosine average-linkage clustering, Hungarian overlap matching, tracklet merge/refinement/absorption, naming using instrument-family credit and track-head layers, `merge=false`, MIDI track construction | Frontend/NoteNet tensors and neural inference, retune frontend |
+| Grouper | HCQT extended harmonic power, PCEN, standardisation, HDemix, spectral Prof, LaneFront (depthwise conv/pitch mixing/pitch attention), full 7-layer NoteNet, 73 instrument logits, normalized 32-dimensional embeddings, keep head, weighted 24 s song windows, track-head, Hungarian overlap, optional `merge=false`, MIDI track output, streaming collection of three Transcriber taps | Compile, weight-key/shape and numeric parity; tuning/retuning |
 | Drums | 50 fps peak selection, kit/orchestral routing, 61 drum keys, 13 timpani notes, 40 ms dedup, velocity | 44.1 kHz frontend, DrumNet, expert models, router inference |
 | MIDI | Type-1 multitrack export, programs, dedicated drum channel and MIDI ports for additional melodic tracks | Full end-to-end Dettato inference orchestration |
 
@@ -21,7 +21,7 @@ The Transcriber can now collect Evidence hidden vectors in a bounded-memory **se
 
 The Rust EvidenceNetwork accepts 769-component evidence vectors and uses the original checkpoint key layout (`emb.*`, `bb.blocks.*`, `keep`, `don`, `dur`, `ins.*`). Its CPU-side continuous feature preparation must be numerically compared with PyTorch before the port is considered complete.
 
-The Grouper's decoder accepts predictions emitted by the *future* Burn NoteNet. It does **not** infer instruments from audio on its own yet. `merge_same_instrument=false` preserves independent same-instrument tracklets in the output.
+Grouper now has a source-level Burn NoteNet and `Grouper::group_with_transcriber`. Its input contract includes 12 note scalars and three 368-channel Transcriber taps, gathered using the original coarse (4 s) sub-window stride without materializing whole-song tap maps. HCQT preprocessing, demixing and spectral profile extraction execute in native Rust on CPU; learnable convolutions, attention and projections use Burn. The saved 200-tap PCEN filter is implemented as an equivalent finite geometric recurrence rather than a temporal FFT. `merge_same_instrument=false` preserves independent same-instrument tracklets.
 
 ## Weights layout
 
@@ -39,7 +39,7 @@ weights/
 
 ## Validation and limitations
 
-An original-Python-generated numerical fixture of 3 rows × 769 evidence features is included in `tests/fixtures/evidence_reference.json`. Rust tests cover independent algorithms (note features, insertion deduplication, candidate decoding, hierarchical clusters, Hungarian matching, instrument naming, drum peaks, MIDI output). Their Rust execution is **not confirmed**.
+Original-Python-generated reference fixtures cover 3 rows × 769 evidence features, PCEN/standardisation and HDemix. Python-side PCEN recurrence matched the reference with maximum absolute difference ~5.1e-6 and independent HDemix arithmetic matched within ~1.5e-8; these do **not** certify Rust parity. Rust tests cover independent algorithms (note features, insertion deduplication, candidate decoding, hierarchical clusters, Hungarian matching, instrument naming, drum peaks, MIDI output). Their Rust execution is **not confirmed**.
 
 Recommended validation commands in a Rust 1.100+ environment with accessible Burn dependencies:
 
@@ -52,7 +52,7 @@ The authoring container does not have `cargo` or `rustc` and has no outbound DNS
 
 ## Next functional priorities
 
-1. Port the Grouper `Front`/`HDemix`/`Prof`/`LaneFront`/`NoteNet` and gather the Transcriber `stem` taps required for its input.
-2. Port `drums/features.py`, DrumNet, OrchestralExpert and three-model averaging/router inference.
-3. Port the retuning/resampling stage and the single-call end-to-end pipeline.
-4. Verify all checkpoint names/dimensions and run local per-layer numerical parity (Transcriber, Evidence, Grouper, Drums), then address runtime and GPU performance.
+1. Port `drums/features.py`, DrumNet, OrchestralExpert, router and ensemble inference.
+2. Port the precise A440 retuning/resampling and integrate all stages into one end-to-end API.
+3. Obtain Rust 1.100+ and build/execute the Grouper PCEN/HDemix fixtures and network smoke tests.
+4. Check all published checkpoint keys/dimensions and compare per-layer PyTorch–Burn numeric outputs before any performance optimization.

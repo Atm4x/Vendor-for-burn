@@ -51,10 +51,16 @@ impl Transcriber {
     }
 
     pub fn maps(&self, audio16k: &[f32]) -> Result<FrameMaps, String> {
+        self.maps_with_step(audio16k, 0.25)
+    }
+
+    /// The original Grouper uses the 4-second stride (hop_frac=0.5)
+    /// while the primary Transcriber maps use a 2-second stride.
+    pub fn maps_with_step(&self, audio16k: &[f32], overlap_step: f64) -> Result<FrameMaps, String> {
         if audio16k.is_empty() || audio16k.iter().any(|x| !x.is_finite()) {
             return Err("audio must contain finite mono PCM16k samples".into());
         }
-        let (frames, plan) = windows(audio16k.len(), self.decoder.hop_seconds, 0.25)?;
+        let (frames, plan) = windows(audio16k.len(), self.decoder.hop_seconds, overlap_step)?;
         let frame_len = frames.checked_mul(PITCH_COUNT).ok_or("transcriber frame count overflow")?;
         let mut accumulator: [Vec<f32>; 6] = std::array::from_fn(|_| vec![0.0; frame_len]);
         let mut weights = vec![0.0f32; frames];
@@ -154,6 +160,107 @@ impl Transcriber {
         }
         let evidence = features::assemble(&map_rows, &at, &mean)?;
         Ok((notes, evidence))
+    }
+
+    /// Extract the 12 note scalars and three 368-dimensional taps used by Grouper.
+    /// A second 4-second-stride pass accumulates only frames touched by requested
+    /// notes, rather than materializing three whole-song hidden maps.
+    pub fn grouper_features(&self, audio16k: &[f32], notes: &[DecodedNote])
+        -> Result<(Vec<[f32; 12]>, Vec<[[f32; HIDDEN_CHANNELS]; 3]>), String>
+    {
+        let maps = self.maps_with_step(audio16k, 0.5)?;
+        let decoded = decode(&maps, &self.decoder)?;
+        let total_frames = maps.frames();
+        if total_frames == 0 { return Err("empty Grouper frame map".into()); }
+        let hop = self.decoder.hop_seconds;
+        let mut sorted = notes.to_vec();
+        sorted.sort_by(|a, b| a.onset.total_cmp(&b.onset).then_with(|| a.pitch.cmp(&b.pitch)));
+        let mut meta = Vec::<[f32; 12]>::with_capacity(sorted.len());
+        let mut intervals = Vec::<(usize, usize, usize)>::with_capacity(sorted.len());
+        for note in &sorted {
+            if !note.onset.is_finite()
+                || !note.offset.is_finite() || note.onset < 0.0 || note.offset <= note.onset
+            { return Err("Grouper input requires valid piano-range notes".into()); }
+            let pitch = (note.pitch as isize - 21).clamp(0, PITCH_COUNT as isize - 1) as usize;
+            let t0 = ((note.onset / hop).round() as isize).clamp(0, total_frames as isize - 1) as usize;
+            let te = ((note.offset.max(note.onset + 0.02) / hop).ceil() as isize).clamp(t0 as isize + 1, total_frames as isize) as usize;
+            let slot = decoded.iter().filter(|n| n.pitch == note.pitch)
+                .min_by(|a, b| (a.onset - note.onset).abs().total_cmp(&(b.onset - note.onset).abs()))
+                .filter(|n| (n.onset - note.onset).abs() <= 0.1)
+                .map(|n| (n.slot - 1) as f32).unwrap_or(0.0);
+            let mut row = [0.0; 12];
+            row[0] = note.onset as f32;
+            row[1] = note.offset.max(note.onset + 0.02) as f32;
+            row[2] = note.pitch as f32;
+            row[3] = slot;
+            for (i, head) in [0usize, 3].iter().enumerate() {
+                let m = &maps.heads[*head];
+                row[4+i] = (t0.saturating_sub(1)..=(t0+1).min(total_frames-1))
+                    .map(|t| m[t * PITCH_COUNT + pitch]).fold(0.0f32, f32::max);
+                row[6+i] = maps.heads[*head+1][t0 * PITCH_COUNT + pitch];
+                row[8+i] = (t0..te).map(|t| maps.heads[*head+1][t * PITCH_COUNT + pitch])
+                    .sum::<f32>() / (te - t0) as f32;
+                row[10+i] = ((te-1).saturating_sub(1)..=(te).min(total_frames-1))
+                    .map(|t| maps.heads[*head+2][t * PITCH_COUNT + pitch]).fold(0.0f32, f32::max);
+            }
+            meta.push(row);
+            intervals.push((t0, te, pitch));
+        }
+        let mut taps = vec![[[0.0f32; HIDDEN_CHANNELS]; 3]; sorted.len()];
+        if sorted.is_empty() { return Ok((meta, taps)); }
+        let (_, plan) = windows(audio16k.len(), hop, 0.5)?;
+        let frames_per_window = (WINDOW_SECONDS as f64 / hop).round() as usize;
+        let hann = (0..frames_per_window).map(|t| {
+            (0.5 - 0.5 * (2.0 * std::f64::consts::PI * (t+1) as f64
+                / (frames_per_window+1) as f64).cos()) as f32
+        }).collect::<Vec<_>>();
+        let mut sums = vec![0.0f32; total_frames];
+        for window in &plan {
+            for (local, &w) in hann.iter().enumerate() {
+                let global = window.first_song_frame + local as isize;
+                if (0..total_frames as isize).contains(&global) { sums[global as usize] += w; }
+            }
+        }
+        let mut samples = vec![0.0f32; WINDOW_SAMPLES];
+        for window in plan {
+            for (i, sample) in samples.iter_mut().enumerate() {
+                let absolute = window.start_sample + i;
+                *sample = if absolute >= WINDOW_SAMPLES/2 {
+                    audio16k.get(absolute - WINDOW_SAMPLES/2).copied().unwrap_or(0.0)
+                } else { 0.0 };
+            }
+            let prediction = self.network.infer_features(&self.frontend.extract(&samples))?;
+            let [_, channels, time, hidden_lanes] = prediction.hidden.dims();
+            let [_, stem_channels, stem_time, stem_lanes] = prediction.stem.dims();
+            if channels != HIDDEN_CHANNELS || stem_channels != HIDDEN_CHANNELS
+                || time != frames_per_window || stem_time != time
+                || hidden_lanes != PITCH_COUNT || stem_lanes < PITCH_COUNT
+            { return Err("unexpected Transcriber tap shape".into()); }
+            let hidden = prediction.hidden.into_data().try_into_vec::<f32>()
+                .map_err(|e| format!("Grouper hidden tap readback: {e}"))?;
+            let stem = prediction.stem.into_data().try_into_vec::<f32>()
+                .map_err(|e| format!("Grouper stem tap readback: {e}"))?;
+            for (i, &(start, end, pitch)) in intervals.iter().enumerate() {
+                for (tap_ix, last) in [(0, start+1), (1, end.min(start+50)), (2, end.min(start+10))] {
+                    let first = start.max(window.first_song_frame.max(0) as usize);
+                    let last = last.min((window.first_song_frame + frames_per_window as isize)
+                        .max(0) as usize).min(total_frames);
+                    if last <= first { continue; }
+                    for global in first..last {
+                        let local = (global as isize - window.first_song_frame) as usize;
+                        let weight = hann[local] / sums[global].max(1e-6);
+                        let norm = if tap_ix == 0 { 1.0 }
+                            else if tap_ix == 1 { (end-start).min(50).max(1) as f32 }
+                            else { (end-start).min(10).max(1) as f32 };
+                        for c in 0..channels {
+                            let (source, lanes) = if tap_ix == 2 { (&stem, stem_lanes) } else { (&hidden, hidden_lanes) };
+                            taps[i][tap_ix][c] += source[(c*time + local)*lanes + pitch] * weight / norm;
+                        }
+                    }
+                }
+            }
+        }
+        Ok((meta, taps))
     }
 
     pub fn notes(&self, audio16k: &[f32]) -> Result<Vec<DecodedNote>, String> {
