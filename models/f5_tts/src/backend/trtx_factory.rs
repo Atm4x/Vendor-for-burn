@@ -419,10 +419,11 @@ impl TrtChunkKernel for TrtCompiledKernel {
             return Err(F5Error::InvalidShape("Incorrect cached F5 reference duration"));
         }
         let (reply, result) = mpsc::sync_channel(1);
+        let restoration_gain = condition.restoration_gain();
         self.sender.send(Request::Synthesize {
             condition: condition.conditioning_mel,
             noise: noise.to_vec(), tokens: tokens.to_vec(),
-            restoration_gain: condition.restoration_gain(),
+            restoration_gain,
             sampling, method, mode, reply,
         }).map_err(|_| F5Error::ModelExecution("F5 TensorRT engine thread stopped".into()))?;
         result.recv().map_err(|_| F5Error::ModelExecution("F5 TensorRT synthesis interrupted".into()))?
