@@ -49,11 +49,6 @@ pub mod vocab;
 pub mod vocos;
 pub mod wav;
 
-#[cfg(any(
-    feature = "cubecl-cpu",
-    feature = "cubecl-cuda",
-    feature = "cubecl-wgpu"
-))]
 pub mod backend;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
