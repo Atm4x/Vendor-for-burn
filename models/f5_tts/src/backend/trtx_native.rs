@@ -11,22 +11,22 @@ use super::trtx::{
 };
 use crate::{F5Error, Result};
 
-fn fail(error: trtx::Error) -> F5Error {
+pub(super) fn fail(error: trtx::Error) -> F5Error {
     F5Error::ModelExecution(error.to_string())
 }
 
-fn dims(n: usize) -> i64 {
+pub(super) fn dims(n: usize) -> i64 {
     n as i64
 }
 
-fn scalar<'a>(net: &mut NetworkDefinition<'a>, value: f32) -> Result<Tensor<'a>> {
+pub(super) fn scalar<'a>(net: &mut NetworkDefinition<'a>, value: f32) -> Result<Tensor<'a>> {
     net.add_small_constant_copied(&[1], &value.to_le_bytes(), DataType::kFLOAT, None)
         .map_err(fail)?
         .output(net, 0)
         .map_err(fail)
 }
 
-fn constant<'a>(
+pub(super) fn constant<'a>(
     net: &mut NetworkDefinition<'a>,
     shape: &[i64],
     values: &[f32],
@@ -41,7 +41,7 @@ fn constant<'a>(
         .map_err(fail)
 }
 
-fn binary<'a>(
+pub(super) fn binary<'a>(
     net: &mut NetworkDefinition<'a>,
     a: Tensor<'a>,
     b: Tensor<'a>,
@@ -53,7 +53,7 @@ fn binary<'a>(
         .map_err(fail)
 }
 
-fn unary<'a>(
+pub(super) fn unary<'a>(
     net: &mut NetworkDefinition<'a>,
     x: Tensor<'a>,
     op: UnaryOperation,
@@ -64,7 +64,7 @@ fn unary<'a>(
         .map_err(fail)
 }
 
-fn reshape<'a>(
+pub(super) fn reshape<'a>(
     net: &mut NetworkDefinition<'a>,
     x: Tensor<'a>,
     shape: &[i64],
@@ -74,7 +74,7 @@ fn reshape<'a>(
     layer.output(net, 0).map_err(fail)
 }
 
-fn permute<'a>(
+pub(super) fn permute<'a>(
     net: &mut NetworkDefinition<'a>,
     x: Tensor<'a>,
     order: &[i32],
@@ -99,7 +99,7 @@ fn segment<'a>(
         .map_err(fail)
 }
 
-fn linear<'a>(
+pub(super) fn linear<'a>(
     net: &mut NetworkDefinition<'a>,
     x: Tensor<'a>,
     weight: &TrtLinear,
@@ -143,7 +143,7 @@ fn silu<'a>(net: &mut NetworkDefinition<'a>, x: Tensor<'a>) -> Result<Tensor<'a>
     binary(net, x, sigmoid, Ew::kPROD)
 }
 
-fn gelu_tanh<'a>(net: &mut NetworkDefinition<'a>, x: Tensor<'a>) -> Result<Tensor<'a>> {
+pub(super) fn gelu_tanh<'a>(net: &mut NetworkDefinition<'a>, x: Tensor<'a>) -> Result<Tensor<'a>> {
     let x2 = binary(net, x, x, Ew::kPROD)?;
     let x3 = binary(net, x2, x, Ew::kPROD)?;
     let c = scalar(net, 0.044_715)?;
@@ -312,6 +312,55 @@ fn modulate<'a>(
     binary(net, scaled, shift, Ew::kSUM)
 }
 
+pub(super) fn backbone_graph<'a>(
+    net: &mut NetworkDefinition<'a>,
+    x: Tensor<'a>,
+    t: Tensor<'a>,
+    weights: &TrtBackboneWeights,
+) -> Result<Tensor<'a>> {
+    let shape = weights.shape;
+    let t = silu(net, t)?;
+    let mut x = x;
+    for block in &weights.blocks {
+        let params = linear(net, t, &block.modulation)?;
+        let pieces = (0..6)
+            .map(|i| segment(net, params, shape.batch, shape.dim, i))
+            .collect::<Result<Vec<_>>>()?;
+        let parts = pieces
+            .into_iter()
+            .map(|x| reshape(net, x, &[dims(shape.batch), 1, dims(shape.dim)]))
+            .collect::<Result<Vec<_>>>()?;
+        let normed = layer_norm(net, x)?;
+        let attn_input = modulate(net, normed, parts[1], parts[0])?;
+        let attn = attention(
+            net,
+            attn_input,
+            shape,
+            &block.query,
+            &block.key,
+            &block.value,
+            &block.attention_out,
+        )?;
+        let gated = binary(net, attn, parts[2], Ew::kPROD)?;
+        x = binary(net, x, gated, Ew::kSUM)?;
+        let normalized = layer_norm(net, x)?;
+        let ffn_input = modulate(net, normalized, parts[4], parts[3])?;
+        let ff = linear(net, ffn_input, &block.ff_in)?;
+        let ff = gelu_tanh(net, ff)?;
+        let ff = linear(net, ff, &block.ff_out)?;
+        let gated = binary(net, ff, parts[5], Ew::kPROD)?;
+        x = binary(net, x, gated, Ew::kSUM)?;
+    }
+    let final_params = linear(net, t, &weights.final_modulation)?;
+    let scale = segment(net, final_params, shape.batch, shape.dim, 0)?;
+    let shift = segment(net, final_params, shape.batch, shape.dim, 1)?;
+    let scale = reshape(net, scale, &[dims(shape.batch), 1, dims(shape.dim)])?;
+    let shift = reshape(net, shift, &[dims(shape.batch), 1, dims(shape.dim)])?;
+    let normalized = layer_norm(net, x)?;
+    let output = modulate(net, normalized, scale, shift)?;
+    linear(net, output, &weights.projection)
+}
+
 pub fn build_serialized_backbone(
     logger: &Logger,
     weights: &TrtBackboneWeights,
@@ -328,7 +377,7 @@ pub fn build_serialized_backbone(
     let mut net = builder
         .create_network(trtx::builder::network_flags::EXPLICIT_BATCH)
         .map_err(fail)?;
-    let mut x = net
+    let x = net
         .add_input(
             "hidden",
             DataType::kFLOAT,
@@ -342,45 +391,7 @@ pub fn build_serialized_backbone(
             &[dims(shape.batch), dims(shape.dim)],
         )
         .map_err(fail)?;
-    let t = silu(&mut net, t)?;
-    for block in &weights.blocks {
-        let params = linear(&mut net, t, &block.modulation)?;
-        let pieces = (0..6)
-            .map(|i| segment(&mut net, params, shape.batch, shape.dim, i))
-            .collect::<Result<Vec<_>>>()?;
-        let parts = pieces
-            .into_iter()
-            .map(|x| reshape(&mut net, x, &[dims(shape.batch), 1, dims(shape.dim)]))
-            .collect::<Result<Vec<_>>>()?;
-        let normed = layer_norm(&mut net, x)?;
-        let attn_input = modulate(&mut net, normed, parts[1], parts[0])?;
-        let attn = attention(
-            &mut net,
-            attn_input,
-            shape,
-            &block.query,
-            &block.key,
-            &block.value,
-            &block.attention_out,
-        )?;
-        let gated = binary(&mut net, attn, parts[2], Ew::kPROD)?;
-        x = binary(&mut net, x, gated, Ew::kSUM)?;
-        let normalized = layer_norm(&mut net, x)?;
-        let ffn_input = modulate(&mut net, normalized, parts[4], parts[3])?;
-        let ff = linear(&mut net, ffn_input, &block.ff_in)?;
-        let ff = gelu_tanh(&mut net, ff)?;
-        let ff = linear(&mut net, ff, &block.ff_out)?;
-        let gated = binary(&mut net, ff, parts[5], Ew::kPROD)?;
-        x = binary(&mut net, x, gated, Ew::kSUM)?;
-    }
-    let final_params = linear(&mut net, t, &weights.final_modulation)?;
-    let scale = segment(&mut net, final_params, shape.batch, shape.dim, 0)?;
-    let shift = segment(&mut net, final_params, shape.batch, shape.dim, 1)?;
-    let scale = reshape(&mut net, scale, &[dims(shape.batch), 1, dims(shape.dim)])?;
-    let shift = reshape(&mut net, shift, &[dims(shape.batch), 1, dims(shape.dim)])?;
-    let normalized = layer_norm(&mut net, x)?;
-    let output = modulate(&mut net, normalized, scale, shift)?;
-    let output = linear(&mut net, output, &weights.projection)?;
+    let output = backbone_graph(&mut net, x, t, weights)?;
     output.set_name(&mut net, "output").map_err(fail)?;
     net.mark_output(&output);
     let mut config = builder.create_config().map_err(fail)?;
@@ -394,6 +405,16 @@ pub fn build_serialized_backbone(
         ));
     }
     Ok(engine.as_ref().to_vec())
+}
+
+pub(super) fn time_mlp_graph<'a>(
+    net: &mut NetworkDefinition<'a>,
+    sincos: Tensor<'a>,
+    weights: &TrtTimeWeights,
+) -> Result<Tensor<'a>> {
+    let hidden = linear(net, sincos, &weights.input)?;
+    let hidden = silu(net, hidden)?;
+    linear(net, hidden, &weights.output)
 }
 
 /// Direct TensorRT network for F5's timestep MLP. Input [B, 256], output [B, D].
@@ -414,9 +435,7 @@ pub fn build_serialized_time_mlp(
     let sincos = net
         .add_input("sincos", DataType::kFLOAT, &[dims(weights.batch), 256])
         .map_err(fail)?;
-    let hidden = linear(&mut net, sincos, &weights.input)?;
-    let hidden = silu(&mut net, hidden)?;
-    let result = linear(&mut net, hidden, &weights.output)?;
+    let result = time_mlp_graph(&mut net, sincos, weights)?;
     result.set_name(&mut net, "time_embedding").map_err(fail)?;
     net.mark_output(&result);
     let mut config = builder.create_config().map_err(fail)?;

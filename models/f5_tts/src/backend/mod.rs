@@ -7,3 +7,9 @@ pub mod cubecl;
 pub mod trtx;
 #[cfg(any(feature = "tensorrt-api", feature = "tensorrt-mock"))]
 pub mod trtx_native;
+
+#[cfg(any(feature = "tensorrt-api", feature = "tensorrt-mock"))]
+pub mod trtx_input;
+
+#[cfg(any(feature = "tensorrt-api", feature = "tensorrt-mock"))]
+pub mod trtx_cfm;
