@@ -108,7 +108,14 @@ impl Transcription {
     }
 
     pub fn save_midi(&self, path: impl AsRef<Path>) -> Result<(), String> {
-        fs::write(path, self.to_midi_bytes()?).map_err(|e| e.to_string())
+        let path = path.as_ref();
+        let midi = self.to_midi_bytes()?;
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+        }
+        fs::write(path, midi).map_err(|e| e.to_string())
     }
 }
 
@@ -135,6 +142,16 @@ mod tests {
         assert!(midi.windows(2).any(|w| w == [0xc1, 33]));
         assert!(midi.windows(3).any(|w| w == [0x99, 60, 100]) == false);
     }
+    #[test]
+    fn save_midi_creates_missing_parent_directories() {
+        let root = std::env::temp_dir().join(format!("dettato-midi-test-{}", std::process::id()));
+        let path = root.join("nested").join("result.mid");
+        let song = Transcription {source: "synthetic".into(), seconds: 0.2, tracks: vec![]};
+        song.save_midi(&path).unwrap();
+        assert_eq!(&fs::read(&path).unwrap()[..4], b"MThd");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn note_off_precedes_retrigger_at_same_tick() {
         let track = Track {

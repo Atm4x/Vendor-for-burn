@@ -5,4 +5,5 @@ pub use decode::{DecodeConfig, DecodedNote, FrameMaps, decode};
 pub mod sequence;
 pub mod net;
 pub mod run;
+pub(crate) mod shared;
 pub use run::Transcriber;

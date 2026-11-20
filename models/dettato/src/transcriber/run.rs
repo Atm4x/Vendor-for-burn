@@ -1,4 +1,4 @@
-use super::{decode::{DecodeConfig, DecodedNote, FrameMaps, decode}, net::{LaneNet, Settings}};
+use super::{decode::{DecodeConfig, DecodedNote, FrameMaps, decode}, net::{LaneNet, Settings}, shared::{SharedAccumulator, SharedRun, grouper_metadata}};
 use crate::{AUDIO_SAMPLE_RATE, PITCH_COUNT, checkpoint::{Checkpoint, ModelPaths}, hcqt::{Hcqt, HcqtConfig}, evidence::features::{self, EVIDENCE_FEATURES, HIDDEN_CHANNELS}};
 use burn::tensor::Device;
 use serde_json::Value;
@@ -36,6 +36,7 @@ pub struct Transcriber {
     frontend: Hcqt,
     network: LaneNet,
     decoder: DecodeConfig,
+    shared_cache_budget_bytes: usize,
 }
 
 impl Transcriber {
@@ -47,7 +48,57 @@ impl Transcriber {
         let frontend = Hcqt::new(hcqt_config(&config)?)?;
         let checkpoint = Checkpoint::open(&paths.weights)?;
         let network = LaneNet::load(&checkpoint, device, settings)?;
-        Ok(Self { frontend, network, decoder })
+        Ok(Self { frontend, network, decoder, shared_cache_budget_bytes: 256 * 1024 * 1024 })
+    }
+
+    pub(crate) fn decoder_config(&self) -> &DecodeConfig { &self.decoder }
+
+    /// Upper bound on temporary float32 tap-map storage for a shared window pass.
+    /// Larger clips use the existing multi-pass low-memory implementation.
+    pub fn set_shared_cache_budget_bytes(&mut self, bytes: usize) {
+        self.shared_cache_budget_bytes = bytes;
+    }
+
+    /// Run each 8-second window exactly once, accumulating both the 2-second
+    /// Evidence maps/taps and the 4-second Grouper maps/taps. Caching is bounded
+    /// to short clips; longer recordings retain the low-memory multi-pass path.
+    pub(crate) fn shared_run(&self, audio16k: &[f32]) -> Result<Option<SharedRun>, String> {
+        if audio16k.is_empty() || audio16k.iter().any(|x| !x.is_finite()) {
+            return Err("audio must contain finite mono PCM16k samples".into());
+        }
+        let (frames, plan) = windows(audio16k.len(), self.decoder.hop_seconds, 0.25)?;
+        let required = frames.checked_mul(PITCH_COUNT)
+            .and_then(|n| n.checked_mul(3 * HIDDEN_CHANNELS + 12))
+            .and_then(|n| n.checked_mul(std::mem::size_of::<f32>()))
+            .and_then(|n| n.checked_add(frames.checked_mul(2 * std::mem::size_of::<f32>())?))
+            .ok_or("shared cache size overflow")?;
+        if required > self.shared_cache_budget_bytes { return Ok(None); }
+        let local_frames = (WINDOW_SECONDS as f64 / self.decoder.hop_seconds).round() as usize;
+        let mut accumulator = SharedAccumulator::new(frames, local_frames)?;
+        let mut samples = vec![0.0f32; WINDOW_SAMPLES];
+        for window in plan {
+            for (i, sample) in samples.iter_mut().enumerate() {
+                let absolute = window.start_sample + i;
+                *sample = if absolute >= WINDOW_SAMPLES / 2 {
+                    audio16k.get(absolute - WINDOW_SAMPLES / 2).copied().unwrap_or(0.0)
+                } else { 0.0 };
+            }
+            let result = self.network.infer_features(&self.frontend.extract(&samples))?;
+            let [hidden_batch, hidden_channels, hidden_frames, hidden_lanes] = result.hidden.dims();
+            let [stem_batch, stem_channels, stem_frames, stem_lanes] = result.stem.dims();
+            if hidden_batch != 1 || stem_batch != 1 || hidden_channels != HIDDEN_CHANNELS
+                || stem_channels != HIDDEN_CHANNELS || hidden_frames != local_frames
+                || stem_frames != local_frames || hidden_lanes != PITCH_COUNT
+                || stem_lanes < PITCH_COUNT
+            { return Err("unexpected Transcriber shared tap shapes".into()); }
+            let hidden = result.hidden.into_data().try_into_vec::<f32>()
+                .map_err(|e| format!("shared hidden readback: {e}"))?;
+            let stem = result.stem.into_data().try_into_vec::<f32>()
+                .map_err(|e| format!("shared stem readback: {e}"))?;
+            let coarse = window.start_sample % (WINDOW_SAMPLES / 2) == 0;
+            accumulator.add(window.first_song_frame, coarse, &result.maps, &hidden, &stem, stem_lanes)?;
+        }
+        accumulator.finish().map(Some)
     }
 
     pub fn maps(&self, audio16k: &[f32]) -> Result<FrameMaps, String> {
@@ -173,41 +224,9 @@ impl Transcriber {
         let total_frames = maps.frames();
         if total_frames == 0 { return Err("empty Grouper frame map".into()); }
         let hop = self.decoder.hop_seconds;
-        let mut sorted = notes.to_vec();
-        sorted.sort_by(|a, b| a.onset.total_cmp(&b.onset).then_with(|| a.pitch.cmp(&b.pitch)));
-        let mut meta = Vec::<[f32; 12]>::with_capacity(sorted.len());
-        let mut intervals = Vec::<(usize, usize, usize)>::with_capacity(sorted.len());
-        for note in &sorted {
-            if !note.onset.is_finite()
-                || !note.offset.is_finite() || note.onset < 0.0 || note.offset <= note.onset
-            { return Err("Grouper input requires valid piano-range notes".into()); }
-            let pitch = (note.pitch as isize - 21).clamp(0, PITCH_COUNT as isize - 1) as usize;
-            let t0 = ((note.onset / hop).round() as isize).clamp(0, total_frames as isize - 1) as usize;
-            let te = ((note.offset.max(note.onset + 0.02) / hop).ceil() as isize).clamp(t0 as isize + 1, total_frames as isize) as usize;
-            let slot = decoded.iter().filter(|n| n.pitch == note.pitch)
-                .min_by(|a, b| (a.onset - note.onset).abs().total_cmp(&(b.onset - note.onset).abs()))
-                .filter(|n| (n.onset - note.onset).abs() <= 0.1)
-                .map(|n| (n.slot - 1) as f32).unwrap_or(0.0);
-            let mut row = [0.0; 12];
-            row[0] = note.onset as f32;
-            row[1] = note.offset.max(note.onset + 0.02) as f32;
-            row[2] = note.pitch as f32;
-            row[3] = slot;
-            for (i, head) in [0usize, 3].iter().enumerate() {
-                let m = &maps.heads[*head];
-                row[4+i] = (t0.saturating_sub(1)..=(t0+1).min(total_frames-1))
-                    .map(|t| m[t * PITCH_COUNT + pitch]).fold(0.0f32, f32::max);
-                row[6+i] = maps.heads[*head+1][t0 * PITCH_COUNT + pitch];
-                row[8+i] = (t0..te).map(|t| maps.heads[*head+1][t * PITCH_COUNT + pitch])
-                    .sum::<f32>() / (te - t0) as f32;
-                row[10+i] = ((te-1).saturating_sub(1)..=(te).min(total_frames-1))
-                    .map(|t| maps.heads[*head+2][t * PITCH_COUNT + pitch]).fold(0.0f32, f32::max);
-            }
-            meta.push(row);
-            intervals.push((t0, te, pitch));
-        }
-        let mut taps = vec![[[0.0f32; HIDDEN_CHANNELS]; 3]; sorted.len()];
-        if sorted.is_empty() { return Ok((meta, taps)); }
+        let (meta, intervals) = grouper_metadata(&maps, &decoded, notes, hop)?;
+        let mut taps = vec![[[0.0f32; HIDDEN_CHANNELS]; 3]; intervals.len()];
+        if intervals.is_empty() { return Ok((meta, taps)); }
         let (_, plan) = windows(audio16k.len(), hop, 0.5)?;
         let frames_per_window = (WINDOW_SECONDS as f64 / hop).round() as usize;
         let hann = (0..frames_per_window).map(|t| {

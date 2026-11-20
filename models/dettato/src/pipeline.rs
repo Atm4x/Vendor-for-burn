@@ -75,9 +75,20 @@ impl Dettato {
         let seconds=samples.len() as f64/source_rate as f64;
         let audio16=resample::resample(samples,source_rate,AUDIO_SAMPLE_RATE as f64)?;
         let (retuned,tuning)=retune::normalize(&audio16)?;
-        let (repaired,notes)=self.evidence.transcribe_repaired(&self.transcriber,&retuned)?;
-        let mut tracks=if repaired.is_empty(){Vec::new()}else{
-            self.grouper.group_with_transcriber(&retuned,&to_decoded(&repaired),&self.transcriber,tuning.time_scale)?
+        let shared = self.transcriber.shared_run(&retuned)?;
+        let (repaired, notes) = if let Some(ref run) = shared {
+            let (decoded, evidence) = run.notes_with_evidence(self.transcriber.decoder_config())?;
+            self.evidence.repair_notes(&decoded, &evidence)?
+        } else {
+            self.evidence.transcribe_repaired(&self.transcriber, &retuned)?
+        };
+        let mut tracks = if repaired.is_empty() {
+            Vec::new()
+        } else if let Some(ref run) = shared {
+            let (meta, taps) = run.grouper_features(&to_decoded(&repaired), self.transcriber.decoder_config())?;
+            self.grouper.group(&retuned, &meta, &taps, tuning.time_scale)?
+        } else {
+            self.grouper.group_with_transcriber(&retuned, &to_decoded(&repaired), &self.transcriber, tuning.time_scale)?
         };
         let grouped_notes=tracks.iter().map(|t|t.notes.len()).sum();
         let mut drum_hits=0;

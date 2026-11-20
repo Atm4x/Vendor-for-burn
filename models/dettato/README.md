@@ -2,7 +2,7 @@
 
 Independent native Rust implementation of the [Dettato](https://github.com/kobimusic/dettato) multi-instrument Audio-to-MIDI pipeline. Original project by Nathan Mills / kobimusic, licensed under Apache-2.0. The original license and notice are retained in this directory.
 
-**Status (cycle 06):** all four learned stages and the end-to-end API are present in Rust. Rust 1.100.0 / Burn 0.22.1 builds and the standard tests pass on Flex CPU; all four released checkpoints load. Selected neural outputs of **each of the four stages** have been compared with the original PyTorch models. **A complete recording-to-MIDI run is not yet verified**; neither eight-second Transcriber performance nor GPU parity is established. See `CYCLE05_REPORT.md` and `CYCLE06_REPORT.md`.
+**Status (cycle 07):** all four learned stages and the end-to-end API are present in Rust. Rust 1.100.0 / Burn 0.22.1 builds and the standard tests pass on Flex CPU; all four released checkpoints load. Selected neural outputs of **each of the four stages** have been compared with the original PyTorch models. **A complete recording-to-MIDI run is not yet verified**; neither eight-second Transcriber performance nor GPU parity is established. See `CYCLE06_REPORT.md` and `CYCLE07_REPORT.md`.
 
 This is a separate crate at `models/dettato`. No source changes to `models/beat_this` are required. Model inference uses Burn (Flex/CPU/CUDA/WGPU features); there is no Python or ONNX runtime dependency.
 
@@ -15,7 +15,7 @@ This is a separate crate at `models/dettato`. No source changes to `models/beat_
 | Grouper | Extended HCQT, PCEN, HDemix, Prof, LaneFront, 7-layer NoteNet, 73 instruments, 32-D embeddings, TrackHead, clustering, Hungarian matching and separate MIDI tracks | Real checkpoint forward PASS; probabilities/embeddings/keep/hidden PyTorch comparison PASS (max 1.765e-3) |
 | Drums | 44.1 kHz frontend, drum-kit network, router, three independent orchestral experts, ensemble, 61 GM drum notes, 13 timpani pitches and velocity | Real checkpoint forward PASS; selected PyTorch outputs match within 3.10e-4 |
 
-The Rust code also covers retuning, multi-format audio decoding, time conversion, MIDI Type-1 export and `merge_same_instrument=false` for keeping distinct instances of the same instrument in separate tracks. The complete flow is **implemented, not certified** by a real full-song test.
+The Rust code also covers retuning, multi-format audio decoding, time conversion, MIDI Type-1 export and `merge_same_instrument=false` for keeping distinct instances of the same instrument in separate tracks. The complete flow is **implemented, not certified** by a real full-song test. Cycle 07 adds a shared Transcriber pass with fine/coarse Hann averages and a configurable RAM budget: the three tap maps are cached for one-pass Evidence/Grouper inference when the budget allows; otherwise the prior low-memory multi-pass path remains. This removes redundant learned-network passes without changing model weights.
 
 ## Weights
 
@@ -38,7 +38,17 @@ The `detatto-evidence` spelling is intentional: the loader accepts the original 
 
 ## API
 
-`Dettato::from_directory(root, &device)` initializes the four networks. `Dettato::transcribe(&mono_pcm, sample_rate)` or `transcribe_file(path)` returns a `PipelineResult` containing a `Transcription`. `Transcription::save_midi(path)` exports separate MIDI tracks. Call `set_merge_same_instrument(false)` to retain distinct same-instrument groups. Pitched stages work on retuned mono 16 kHz; the 44.1 kHz drums stage runs only when the input recording has a source sample rate of at least 40 kHz.
+`Dettato::from_directory(root, &device)` initializes the four networks. `Dettato::transcribe(&mono_pcm, sample_rate)` or `transcribe_file(path)` returns a `PipelineResult` containing a `Transcription`. `Transcription::save_midi(path)` exports separate MIDI tracks and creates parent directories. Call `set_merge_same_instrument(false)` to retain distinct same-instrument groups. Call `pipeline.transcriber.set_shared_cache_budget_bytes(bytes)` to control RAM allocated for the shared Transcriber pass (default 256 MiB; zero always uses the low-memory fallback). Pitched stages work on retuned mono 16 kHz; the 44.1 kHz drums stage runs only when the input recording has a source sample rate of at least 40 kHz.
+
+## Command-line executable
+
+The crate also provides a `dettato` CLI. Example, with a flat extracted weights directory:
+
+```sh
+cargo run --release -- --weights /path/to/weights/dettato --input song.wav --output song.mid --separate-instruments --cache-mib 4096
+```
+
+`--output` defaults to the input name with `.mid` extension. `--separate-instruments` disables merging tracks with the same instrument label. `--cache-mib` changes the RAM cache budget (default 256 MiB); the larger budget lets longer songs share one Transcriber pass at the expense of RAM. The CLI uses the Burn device selected by the compiled features. It does not itself supply CUDA libraries or weight files.
 
 ## Build and tests
 
@@ -53,8 +63,10 @@ cargo test --no-default-features --features flex --test evidence_forward_parity 
 
 The full default feature set also enables MP3/AAC/ISO-MP4/ALAC decoders through Symphonia. Those optional dependencies were unavailable in the local offline vendor snapshot, so all current local measurements use `--no-default-features --features flex` and an external Cargo source overlay. They do not establish that every optional codec builds offline.
 
-The new `transcriber_forward_reference.json` and `grouper_forward_reference.json` contain output values generated by the **original PyTorch networks and released weights**, not inferred fixture values. All real-weight tests are marked ignored by default, so the ordinary test suite can run without downloading checkpoints.
+The `transcriber_forward_reference.json` and `grouper_forward_reference.json` contain output values generated by the **original PyTorch networks and released weights**, not inferred fixture values. All real-weight tests are marked ignored by default, so the ordinary test suite can run without downloading checkpoints.
 
 ## Remaining work
 
-Real eight-second Transcriber inference and full-song MIDI verification, broader numerical comparisons, optimized release/GPU benchmarks, DSP resampling parity with upstream `soxr HQ`, and optional audio decoder/packaging validation. The unoptimized Flex CPU test profile takes approximately 41 seconds to execute a 0.2-second Transcriber input; it must **not** be interpreted as the expected release or CUDA throughput.
+Cycle 07 includes an ignored `full_pipeline_smoke` that exercises the four-stage entrypoint with real weights; it has not been accepted as a completed full-song inference test. Exact numerical parity of the new shared tap buffers remains unverified against the PyTorch full-song accumulation (the stand-alone fine/coarse Hann tests do pass).
+
+The eight-second Transcriber Flex CPU smoke still times out after 360 s; optimized-backend completion and full-song MIDI verification, broader numerical comparisons, optimized release/GPU benchmarks, DSP resampling parity with upstream `soxr HQ`, and optional audio decoder/packaging validation. The unoptimized Flex CPU test profile takes approximately 41 seconds to execute a 0.2-second Transcriber input; it must **not** be interpreted as the expected release or CUDA throughput.

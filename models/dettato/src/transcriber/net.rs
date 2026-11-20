@@ -207,14 +207,11 @@ impl LaneNet {
         let skip = h.clone();
         h = self.down.forward(h);
         for layer in &self.layers { h = layer.forward(h); }
-        let down_frames = h.dims()[2];
-        let mut interleaved = Vec::with_capacity(down_frames * 2);
-        for i in 0..down_frames {
-            let frame = h.clone().narrow(2, i, 1);
-            interleaved.push(frame.clone());
-            interleaved.push(frame);
-        }
-        h = Tensor::cat(interleaved, 2).narrow(2, 0, frames);
+        let [batch, channels, down_frames, pitches] = h.dims();
+        h = h.reshape([batch, channels, down_frames, 1, pitches])
+            .repeat_dim(3, 2)
+            .reshape([batch, channels, down_frames * 2, pitches])
+            .narrow(2, 0, frames);
         h = self.up_norm.forward(h + skip);
         for layer in &self.refine { h = layer.forward(h); }
         let hidden = h.narrow(3, 0, PITCH_COUNT);
@@ -230,5 +227,21 @@ impl LaneNet {
             flat[h * length..(h + 1) * length].to_vec()
         }))?;
         Ok(NetworkOutput { maps, stem, hidden })
+    }
+}
+
+#[cfg(test)]
+mod upsample_tests {
+    use burn::tensor::{Device, Tensor, TensorData};
+
+    #[test]
+    fn time_upsampling_repeats_each_frame_instead_of_tiling_sequence() {
+        let x = Tensor::<4>::from_data(
+            TensorData::new(vec![1.0f32, 2.0, 3.0], [1, 1, 3, 1]),
+            &Device::default(),
+        );
+        let y = x.reshape([1, 1, 3, 1, 1]).repeat_dim(3, 2)
+            .reshape([1, 1, 6, 1]).narrow(2, 0, 5);
+        assert_eq!(y.into_data().to_vec::<f32>().unwrap(), vec![1.0, 1.0, 2.0, 2.0, 3.0]);
     }
 }
