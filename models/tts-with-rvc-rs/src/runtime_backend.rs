@@ -132,8 +132,9 @@ mod windows_native {
         path::{Path, PathBuf},
     };
     use windows_sys::Win32::System::LibraryLoader::{
-        GetModuleFileNameW, GetModuleHandleW, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
-        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LoadLibraryExW, SetDllDirectoryW,
+        AddDllDirectory, GetModuleFileNameW, GetModuleHandleW, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_USER_DIRS, LoadLibraryExW,
+        SetDefaultDllDirectories,
     };
 
     fn wide(value: &OsStr) -> Vec<u16> {
@@ -176,9 +177,20 @@ mod windows_native {
     pub(super) fn load(directory: Option<&Path>, libraries: &[PathBuf]) -> Result<(), String> {
         if let Some(directory) = directory {
             let dir_wide = wide(directory.as_os_str());
-            if unsafe { SetDllDirectoryW(dir_wide.as_ptr()) } == 0 {
+            if unsafe { AddDllDirectory(dir_wide.as_ptr()) }.is_null() {
                 return Err(format!(
-                    "cannot configure native DLL directory: {}",
+                    "cannot register native DLL directory: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            if unsafe {
+                SetDefaultDllDirectories(
+                    LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_USER_DIRS,
+                )
+            } == 0
+            {
+                return Err(format!(
+                    "cannot enable registered DLL directories: {}",
                     std::io::Error::last_os_error()
                 ));
             }
