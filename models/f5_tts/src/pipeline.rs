@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::Path};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 use burn::tensor::{Device, Int, Tensor, TensorData};
 
@@ -9,6 +9,7 @@ use crate::{
     checkpoint::Checkpoint,
     dit_model::F5DiT,
     mel::VocosMel,
+    pinyin::ChinesePinyin,
     reference::ReferenceAudio,
     standard_chunking::plan_standard_chunks,
     text_frontend::{F5TextFrontend, NoPinyin, PinyinProvider},
@@ -22,6 +23,7 @@ pub struct StandardF5Runtime {
     dit: F5DiT,
     vocoder: VocosDecoder,
     vocabulary: Vocabulary,
+    native_pinyin: Arc<ChinesePinyin>,
 }
 
 pub struct VoiceReference<'a> {
@@ -83,6 +85,7 @@ impl StandardF5Runtime {
         let vocabulary = Vocabulary::from_path(vocabulary)?;
         let f5_checkpoint = Checkpoint::open(f5_checkpoint)?;
         let vocos_checkpoint = Checkpoint::open(vocos_checkpoint)?;
+        let native_pinyin = Arc::new(ChinesePinyin::bundled()?);
         let dit = F5DiT::from_checkpoint(&f5_checkpoint, vocabulary.size(), &device)?;
         let vocoder = VocosDecoder::from_checkpoint(&vocos_checkpoint, vocos_config, &device)?;
         Ok(Self {
@@ -91,11 +94,16 @@ impl StandardF5Runtime {
             dit,
             vocoder,
             vocabulary,
+            native_pinyin,
         })
     }
 
     /// Standard F5 synthesis from text and a transcribed reference. This path matches
     /// the original reference+generation conditioning and UTF-8 duration heuristic.
+    pub fn replace_native_pinyin(&mut self, dictionary: ChinesePinyin) {
+        self.native_pinyin = Arc::new(dictionary);
+    }
+
     pub fn synthesize_text(
         &mut self,
         reference: &ReferenceAudio,
@@ -106,11 +114,12 @@ impl StandardF5Runtime {
         seed: u64,
         sampling: SamplingConfig,
     ) -> Result<Vec<f32>> {
+        let native_pinyin = Arc::clone(&self.native_pinyin);
         self.synthesize_text_with_pinyin(
             reference,
             reference_text,
             generated_text,
-            NoPinyin,
+            native_pinyin,
             speed,
             fixed_seconds,
             seed,
@@ -210,7 +219,7 @@ impl StandardF5Runtime {
                 0.15,
             )?;
             let vocabulary = self.vocabulary.clone();
-            let frontend = F5TextFrontend::new(&vocabulary, NoPinyin);
+            let frontend = F5TextFrontend::new(&vocabulary, Arc::clone(&self.native_pinyin));
             let mut chunk_waves = Vec::with_capacity(chunks.len());
             for chunk in chunks {
                 let tokens = frontend.standard_tokens(voice.transcript, &chunk.text)?;
@@ -434,6 +443,23 @@ impl CrossLingualF5Runtime {
         options: CrossLingualGenerateOptions,
     ) -> Result<Vec<f32>> {
         self.synthesize_with_pinyin(reference, text, syllables, NoPinyin, options)
+    }
+
+    /// Native mixed Chinese/English path with bundled lexicon and bounded tone sandhi.
+    /// The dictionary can be overridden for precise polyphonic word coverage.
+    pub fn synthesize_chinese(
+        &mut self,
+        reference: &ReferenceAudio,
+        text: &str,
+        syllables: &impl crate::cross_lingual::EnglishSyllableCounter,
+        options: CrossLingualGenerateOptions,
+    ) -> Result<Vec<f32>> {
+        let pinyin = Arc::clone(&self.base.native_pinyin);
+        self.synthesize_with_pinyin(reference, text, syllables, pinyin, options)
+    }
+
+    pub fn replace_native_pinyin(&mut self, dictionary: ChinesePinyin) {
+        self.base.native_pinyin = Arc::new(dictionary);
     }
 
     pub fn synthesize_with_pinyin<P: PinyinProvider>(

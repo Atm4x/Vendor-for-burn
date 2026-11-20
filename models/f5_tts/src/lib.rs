@@ -23,6 +23,7 @@ pub mod fft;
 pub mod hyphenation;
 pub mod mel;
 pub mod model;
+pub mod pinyin;
 #[cfg(any(
     feature = "cubecl-cpu",
     feature = "cubecl-cuda",

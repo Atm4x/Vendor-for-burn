@@ -63,3 +63,10 @@ No original Fish Speech files or legacy code should be changed while implementin
 - Core DiT/CFM/Vocos path is implemented but the production model is not yet numerically validated end-to-end. Complete DiT fixture is available; running it on CubeCL CPU is a required next step.
 - Chinese `rjieba` segmentation and polyphonic pinyin tone sandhi are not implemented as a self-contained Rust subsystem. Do not claim Chinese end-to-end support until both are numerically validated.
 - `torch.randn` RNG parity, entire model checkpoint mapping and TensorRT-RTX are separate remaining functional work, not evidence of GPU workability.
+
+## CONT08 — Native Chinese pronunciation (partial parity)
+
+- `pinyin.rs` is a native model-specific `PinyinProvider`, not an external Python bridge.
+- `han_pinyin_unihan.tsv` carries LPPL data terms separately from the crate's MIT license; the build-time converter is available under `tests/tools/`.
+- `ChinesePinyin` resolves curated word pronunciations before character readings and applies bounded word-local sandhi. Word overrides are replaceable. A complete `rjieba` + `pypinyin` lexicon is still required for general Chinese parity.
+- `StandardF5Runtime` and `CrossLingualF5Runtime` share the provider through request-safe `Arc` ownership. `synthesize_text` / `synthesize_script` now accept native Chinese by default; `synthesize_chinese` is available for Cross-Lingual. Both keep explicit exact-provider entrypoints.

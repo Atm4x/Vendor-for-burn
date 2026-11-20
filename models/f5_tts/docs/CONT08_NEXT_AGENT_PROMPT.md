@@ -1,0 +1,7 @@
+# CONT08 → CONT09 continuation
+
+Work in `Atm4x/Vendor-for-burn`, parent branch `codex/f5-tts-rust-cont08` (verify remote HEAD). No edits outside `models/f5_tts` or Legacy/Obsolete. User prioritizes functional feature coverage and numerical parity, not environment/hardware test progress. Keep two distinct progress bars. Work locally; publish one separate branch via GitHub Connector at the end of each cycle. No ONNX; no `maryml` modifications or inspection until comparison is explicitly needed.
+
+Current: 72% functional (estimated), 3/7 hardware gates (43%). CONT08 implements a native Unihan-backed `ChinesePinyin` and curated word-local sandhi, but **does not provide full pypinyin/rjieba correctness**. The text-to-token path is compiled in a standalone Rust 1.100.0 harness: 22/22 PASS. Native DiT numerical test remains blocked by missing Burn Cargo cache. Source-only ZIP and the independent PyTorch full-DiT fixture are inside `models/f5_tts`.
+
+Prioritize functional correctness: (a) direct full DiT parity with PyTorch on fixed small checkpoint once Burn source/Cargo registry can be restored via Git Bridge/offline package; (b) licensed complete Chinese segmentation and phonology corpus with direct Python differential tests, not unverifiable ad-hoc mappings; (c) model-specific integration and numerical parity; (d) native TensorRT-RTX. Do not count merely compiling CUDA/WGPU as functional coverage.

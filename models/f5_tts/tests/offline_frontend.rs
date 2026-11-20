@@ -9,6 +9,8 @@ pub type Result<T> = std::result::Result<T, F5Error>;
 
 #[path = "../src/cfm.rs"]
 mod cfm;
+#[path = "../src/pinyin.rs"]
+mod pinyin;
 #[path = "../src/standard_chunking.rs"]
 mod standard_chunking;
 #[path = "../src/text_frontend.rs"]
