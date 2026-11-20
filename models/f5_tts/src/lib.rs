@@ -19,10 +19,24 @@ pub mod dit_input;
     feature = "cubecl-wgpu"
 ))]
 pub mod dit_model;
+pub mod fft;
 pub mod mel;
 pub mod model;
+#[cfg(any(
+    feature = "cubecl-cpu",
+    feature = "cubecl-cuda",
+    feature = "cubecl-wgpu"
+))]
+pub mod pipeline;
 pub mod reference;
 pub mod vocab;
+#[cfg(any(
+    feature = "cubecl-cpu",
+    feature = "cubecl-cuda",
+    feature = "cubecl-wgpu"
+))]
+pub mod vocos;
+pub mod wav;
 
 #[cfg(any(
     feature = "cubecl-cpu",

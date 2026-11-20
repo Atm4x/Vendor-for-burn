@@ -1,4 +1,4 @@
-use crate::{F5Error, Result};
+use crate::{F5Error, Result, fft::transform};
 
 pub const SAMPLE_RATE: usize = 24_000;
 pub const FFT_SIZE: usize = 1024;
@@ -36,47 +36,6 @@ fn reflected_index(index: isize, length: usize) -> usize {
     } else {
         wrapped
     }) as usize
-}
-
-fn fft_in_place(real: &mut [f32; FFT_SIZE], imag: &mut [f32; FFT_SIZE]) {
-    let mut j = 0;
-    for i in 1..FFT_SIZE {
-        let mut bit = FFT_SIZE >> 1;
-        while j & bit != 0 {
-            j ^= bit;
-            bit >>= 1;
-        }
-        j ^= bit;
-        if i < j {
-            real.swap(i, j);
-            imag.swap(i, j);
-        }
-    }
-
-    let mut width = 2;
-    while width <= FFT_SIZE {
-        let angle = -2.0 * core::f32::consts::PI / width as f32;
-        let twiddle_r = angle.cos();
-        let twiddle_i = angle.sin();
-        for start in (0..FFT_SIZE).step_by(width) {
-            let mut wr = 1.0;
-            let mut wi = 0.0;
-            for offset in 0..width / 2 {
-                let left = start + offset;
-                let right = left + width / 2;
-                let tr = wr * real[right] - wi * imag[right];
-                let ti = wr * imag[right] + wi * real[right];
-                real[right] = real[left] - tr;
-                imag[right] = imag[left] - ti;
-                real[left] += tr;
-                imag[left] += ti;
-                let next_r = wr * twiddle_r - wi * twiddle_i;
-                wi = wr * twiddle_i + wi * twiddle_r;
-                wr = next_r;
-            }
-        }
-        width <<= 1;
-    }
 }
 
 impl VocosMel {
@@ -136,7 +95,7 @@ impl VocosMel {
                 real[bin] = samples[reflected_index(position, samples.len())] * self.window[bin];
                 imag[bin] = 0.0;
             }
-            fft_in_place(&mut real, &mut imag);
+            transform(&mut real, &mut imag, false);
             for bin in 0..FFT_BINS {
                 magnitudes[bin] = real[bin].hypot(imag[bin]);
             }
