@@ -554,6 +554,7 @@ mod tests {
         observed_mel: Vec<f32>,
         stages: usize,
         fail_step: bool,
+        affine_velocity: bool,
     }
 
     impl TestGpu {
@@ -643,7 +644,7 @@ mod tests {
             if data.fail_step {
                 return Err(F5Error::ModelExecution("Injected CFM failure".into()));
             }
-            let _state = data.floats(bindings.state);
+            let state = data.floats(bindings.state);
             let base = data.floats(bindings.base_state);
             let condition = data.floats(bindings.condition);
             let reference = data.floats(bindings.reference_mask);
@@ -651,11 +652,13 @@ mod tests {
             let dt = data.floats(bindings.dt)[0];
             let restore = data.floats(bindings.restore)[0];
             let guided_velocity = 0.1 + cfg * (0.1 - (-0.05));
+            let affine = data.affine_velocity;
             let output: Vec<f32> = base
                 .iter()
                 .enumerate()
                 .map(|(i, value)| {
-                    let sample = *value + guided_velocity * dt;
+                    let velocity = if affine { 0.5 * state[i] + 0.1 } else { guided_velocity };
+                    let sample = *value + velocity * dt;
                     if restore > 0.5 && reference[i / 100] > 0.5 {
                         condition[i]
                     } else {
@@ -864,6 +867,60 @@ mod tests {
         let state = data.borrow();
         assert_eq!(state.stages, 10);
         assert!(state.observed_mel.iter().all(|x| (*x - 0.25).abs() < 1e-5));
+    }
+
+    #[test]
+    fn midpoint_state_dependent_velocity_agrees_with_torch_midpoint_not_euler() {
+        let data = Rc::new(RefCell::new(TestGpu { affine_velocity: true, ..Default::default() }));
+        let mut session = TrtF5Session::open(
+            TestIo(data.clone()), TestExecutor(data.clone()), test_shape()
+        ).unwrap();
+        let condition = vec![0.0; 600];
+        let noise = vec![0.25; 600];
+        let sampling = SamplingConfig {
+            steps: 2, cfg_strength: 0.0,
+            sway_sampling_coef: None, empirically_pruned_steps: false,
+        };
+        session.synthesize_with_method(SynthesisInputs {
+            condition: &condition, initial_noise: &noise, tokens: &[1, 2],
+            restoration_gain: 1.0, sampling,
+        }, OdeMethod::Midpoint).unwrap();
+        let observed = data.borrow();
+        assert_eq!(observed.stages, 4);
+        for value in &observed.observed_mel {
+            // Independent PyTorch torch.float32 explicit midpoint, f(x)=0.5*x+0.1.
+            assert!((*value - 0.5387207).abs() < 2e-7, "midpoint state {value}");
+            assert!((*value - 0.503125).abs() > 0.03, "incorrectly used Euler");
+        }
+    }
+
+    #[test]
+    fn duplicate_test_no_ref_and_t_inter_reuse_warmed_cfm_engine() {
+        let data = Rc::new(RefCell::new(TestGpu::default()));
+        let mut session = TrtF5Session::open(
+            TestIo(data.clone()), TestExecutor(data.clone()), test_shape()
+        ).unwrap();
+        let mut condition = vec![0.0; 600];
+        condition[..200].fill(0.8);
+        let noise = vec![0.25; 600];
+        let sampling = SamplingConfig {
+            steps: 4, cfg_strength: 1.0,
+            sway_sampling_coef: None, empirically_pruned_steps: true,
+        };
+        let mode = CfmSampleMode {
+            no_ref_audio: true, duplicate_test: true, t_inter: 0.5,
+        };
+        session.synthesize_with_sample_mode(SynthesisInputs {
+            condition: &condition, initial_noise: &noise, tokens: &[1, 2],
+            restoration_gain: 1.0, sampling,
+        }, OdeMethod::Euler, mode).unwrap();
+        let state = data.borrow();
+        assert_eq!(state.stages, 2);
+        assert_eq!(state.observed_mel.len(), 400);
+        for (i, value) in state.observed_mel.iter().enumerate() {
+            let expected = if i < 200 { 0.65 } else { 0.25 };
+            assert!((*value - expected).abs() < 2e-7, "sample {i}: {value}");
+        }
     }
 
     #[test]
