@@ -1,0 +1,51 @@
+name: F5 TTS CONT21 Apply Verified Local Source
+on:
+  push:
+    branches:
+      - codex/f5-tts-rust-cont21
+    paths:
+      - .github/workflows/f5-tts-cont21-apply.yml
+permissions:
+  contents: write
+jobs:
+  apply-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Verify imported source patch and apply
+        shell: bash
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor 2d138f597ab40c582b6817cc8cec0ee39d86fd73 HEAD
+          printf '%s  %s\n' 7f6d3f17ee828b5219ac8eb1f70f1bf0822d4ddd28fca90924061848a9ae963b .github/f5-tts-cont21.patch | sha256sum -c -
+          git apply --unidiff-zero --check .github/f5-tts-cont21.patch
+          git apply --unidiff-zero .github/f5-tts-cont21.patch
+          git diff --check
+          python - <<'PY'
+          import subprocess
+          expected = {
+            'models/f5_tts/src/backend/trtx_session.rs',
+            'models/f5_tts/src/backend/trtx_text.rs',
+            'models/f5_tts/src/backend/trtx_worker.rs',
+            'models/f5_tts/src/model.rs',
+            'models/f5_tts/src/pipeline.rs',
+            'models/f5_tts/src/standard_chunking.rs',
+          }
+          actual = set(subprocess.check_output(['git','diff','--name-only'],text=True).splitlines())
+          if actual != expected:
+              raise SystemExit(f'Unexpected paths: {actual ^ expected}')
+          print('Verified local F5-TTS-only source patch:', len(actual), 'files')
+          PY
+      - name: Commit exact tested sources to branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add -- models/f5_tts/src
+          git diff --cached --check
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'feat(f5-tts): complete streaming PCM and optional generated spectrogram inference'
+          git push origin HEAD:refs/heads/codex/f5-tts-rust-cont21
+          git rev-parse HEAD
