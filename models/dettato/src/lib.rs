@@ -1,9 +1,13 @@
 pub mod checkpoint;
+pub mod audio;
 pub mod evidence;
 pub mod grouper;
 pub mod drums;
 pub mod hcqt;
 pub mod midi;
+pub mod resample;
+pub mod retune;
+pub mod pipeline;
 pub mod transcriber;
 
 pub const AUDIO_SAMPLE_RATE: usize = 16_000;

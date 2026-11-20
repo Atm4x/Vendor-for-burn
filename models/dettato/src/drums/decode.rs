@@ -71,8 +71,8 @@ pub fn peaks(probs: &[f32], frames: usize, lanes: usize, threshold: f32, gap: us
 fn hit(time: usize, pitch: u8, velocity: f32) -> Result<Note, String> {
     let on = (time as f64 / DRUM_FPS * 10_000.0).round_ties_even() / 10_000.0;
     let off = ((on + 0.1) * 10_000.0).round_ties_even() / 10_000.0;
-    let v = velocity.clamp(0.05, 1.0);
-    let strength = (f64::from(v) * 127.0).round_ties_even().clamp(1.0, 127.0) as u8;
+    let v = (f64::from(velocity.clamp(0.05, 1.0)) * 1000.0).round_ties_even() / 1000.0;
+    let strength = (v * 127.0).round_ties_even().clamp(1.0, 127.0) as u8;
     Note::new(on, off, pitch, strength)
 }
 
