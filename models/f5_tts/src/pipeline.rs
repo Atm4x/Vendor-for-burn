@@ -4,14 +4,15 @@ use burn::tensor::{Device, Int, Tensor, TensorData};
 
 use crate::{
     F5Error, Result,
-    backend::cubecl::integrate,
-    cfm::SamplingConfig,
+    backend::cubecl::{integrate_with_edit_mask_ode, integrate_with_ode_method},
+    cfm::{OdeMethod, SamplingConfig},
     checkpoint::Checkpoint,
     dit_model::F5DiT,
     mel::VocosMel,
     noise::StandardNormal,
     pinyin::ChinesePinyin,
     reference::ReferenceAudio,
+    speech_edit::{EditSpan, SpeechEditPlan},
     standard_chunking::plan_standard_chunks,
     text_frontend::{F5TextFrontend, NoPinyin, PinyinProvider},
     vocab::Vocabulary,
@@ -222,6 +223,121 @@ impl StandardF5Runtime {
         crate::wav::mono_pcm16(&self.synthesize(reference, text_tokens, options)?)
     }
 
+    /// Edit arbitrary disjoint intervals in an existing recording. The input audio
+    /// should be created with `ReferenceAudio::from_channels_full`, not the
+    /// reference-prompt constructor that truncates after twelve seconds.
+    pub fn edit_speech(
+        &mut self,
+        audio: &ReferenceAudio,
+        target_text: &str,
+        spans: &[EditSpan],
+        seed: u64,
+        sampling: SamplingConfig,
+    ) -> Result<Vec<f32>> {
+        let frontend = F5TextFrontend::new(&self.vocabulary, Arc::clone(&self.native_pinyin));
+        let tokens = frontend.cross_lingual_tokens(target_text)?;
+        let mut rng = StandardNormal::new(seed);
+        self.edit_speech_with_noise_source(
+            audio,
+            &tokens,
+            spans,
+            sampling,
+            OdeMethod::Euler,
+            |count| Ok((0..count).map(|_| rng.sample()).collect()),
+        )
+    }
+
+    /// Supplies a caller-owned FP32 noise tensor to reproduce an independent
+    /// PyTorch speech-edit trajectory without depending on the PyTorch RNG.
+    pub fn edit_speech_with_noise(
+        &mut self,
+        audio: &ReferenceAudio,
+        target_text: &str,
+        spans: &[EditSpan],
+        sampling: SamplingConfig,
+        initial_noise: &[f32],
+    ) -> Result<Vec<f32>> {
+        self.edit_speech_with_noise_and_method(
+            audio,
+            target_text,
+            spans,
+            sampling,
+            OdeMethod::Euler,
+            initial_noise,
+        )
+    }
+
+    pub fn edit_speech_with_noise_and_method(
+        &mut self,
+        audio: &ReferenceAudio,
+        target_text: &str,
+        spans: &[EditSpan],
+        sampling: SamplingConfig,
+        method: OdeMethod,
+        initial_noise: &[f32],
+    ) -> Result<Vec<f32>> {
+        let frontend = F5TextFrontend::new(&self.vocabulary, Arc::clone(&self.native_pinyin));
+        let tokens = frontend.cross_lingual_tokens(target_text)?;
+        self.edit_speech_with_noise_source(audio, &tokens, spans, sampling, method, |count| {
+            validate_initial_noise(initial_noise.to_vec(), count)
+        })
+    }
+
+    fn edit_speech_with_noise_source(
+        &mut self,
+        audio: &ReferenceAudio,
+        tokens: &[i32],
+        spans: &[EditSpan],
+        sampling: SamplingConfig,
+        method: OdeMethod,
+        create_noise: impl FnOnce(usize) -> Result<Vec<f32>>,
+    ) -> Result<Vec<f32>> {
+        if tokens.is_empty()
+            || tokens.len() > 8192
+            || tokens
+                .iter()
+                .any(|&id| id < 0 || id as usize >= self.vocabulary.size())
+        {
+            return Err(F5Error::InvalidShape(
+                "Speech edit tokens exceed vocabulary limits",
+            ));
+        }
+        let original = self.mel.extract(&audio.samples)?;
+        let plan = SpeechEditPlan::new(&original.values, original.frames, spans, tokens.len())?;
+        let count = plan
+            .total_frames
+            .checked_mul(100)
+            .ok_or(F5Error::InvalidShape("Speech edit noise length overflow"))?;
+        let noise = validate_initial_noise(create_noise(count)?, count)?;
+        let state = Tensor::from_data(
+            TensorData::new(noise, [1, plan.total_frames, 100]),
+            &self.device,
+        );
+        let condition = Tensor::from_data(
+            TensorData::new(plan.conditioning_mel, [1, plan.total_frames, 100]),
+            &self.device,
+        );
+        let tokens = Tensor::<2, Int>::from_data(
+            TensorData::new(tokens.to_vec(), [1, tokens.len()]),
+            &self.device,
+        );
+        let restored = integrate_with_edit_mask_ode(
+            &mut self.dit,
+            state,
+            condition,
+            tokens,
+            &plan.keep_frames,
+            sampling,
+            method,
+        )?;
+        let gain = if audio.normalization_gain > 1.0 {
+            1.0 / audio.normalization_gain
+        } else {
+            1.0
+        };
+        self.vocoder.decode(restored, gain)
+    }
+
     pub fn synthesize(
         &mut self,
         reference: &ReferenceAudio,
@@ -235,6 +351,45 @@ impl StandardF5Runtime {
             options.total_frames,
             options.sampling,
             &mut rng,
+        )
+    }
+
+    /// Standard text conditioning using the original CFM's alternate ODE solver.
+    /// Existing `synthesize` and chunked APIs retain Euler as their default.
+    pub fn synthesize_with_ode_method(
+        &mut self,
+        reference: &ReferenceAudio,
+        text_tokens: &[i32],
+        options: GenerateOptions,
+        method: OdeMethod,
+    ) -> Result<Vec<f32>> {
+        let mut rng = StandardNormal::new(options.seed);
+        self.synthesize_from_noise_source_with_method(
+            reference,
+            text_tokens,
+            options.total_frames,
+            options.sampling,
+            method,
+            |count| Ok((0..count).map(|_| rng.sample()).collect()),
+        )
+    }
+
+    pub fn synthesize_with_noise_and_method(
+        &mut self,
+        reference: &ReferenceAudio,
+        text_tokens: &[i32],
+        total_frames: usize,
+        sampling: SamplingConfig,
+        method: OdeMethod,
+        initial_noise: &[f32],
+    ) -> Result<Vec<f32>> {
+        self.synthesize_from_noise_source_with_method(
+            reference,
+            text_tokens,
+            total_frames,
+            sampling,
+            method,
+            |count| validate_initial_noise(initial_noise.to_vec(), count),
         )
     }
 
@@ -272,6 +427,25 @@ impl StandardF5Runtime {
         sampling: SamplingConfig,
         create_noise: impl FnOnce(usize) -> Result<Vec<f32>>,
     ) -> Result<Vec<f32>> {
+        self.synthesize_from_noise_source_with_method(
+            reference,
+            text_tokens,
+            total_frames,
+            sampling,
+            OdeMethod::Euler,
+            create_noise,
+        )
+    }
+
+    fn synthesize_from_noise_source_with_method(
+        &mut self,
+        reference: &ReferenceAudio,
+        text_tokens: &[i32],
+        total_frames: usize,
+        sampling: SamplingConfig,
+        method: OdeMethod,
+        create_noise: impl FnOnce(usize) -> Result<Vec<f32>>,
+    ) -> Result<Vec<f32>> {
         if text_tokens.is_empty() || text_tokens.len() > 8192 {
             return Err(F5Error::InvalidShape(
                 "F5 token count is outside valid limits",
@@ -305,13 +479,14 @@ impl StandardF5Runtime {
             TensorData::new(text_tokens.to_vec(), [1, text_tokens.len()]),
             &self.device,
         );
-        let final_mel = integrate(
+        let final_mel = integrate_with_ode_method(
             &mut self.dit,
             noise,
             condition,
             text,
             frames.reference,
             sampling,
+            method,
         )?;
         let generated = final_mel.slice([0..1, frames.reference..frames.target, 0..100]);
         self.vocoder.decode(generated, restoration_gain)

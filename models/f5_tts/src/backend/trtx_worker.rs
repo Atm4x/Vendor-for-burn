@@ -6,14 +6,17 @@ use crate::{
     F5Error, Result,
     cfm::SamplingConfig,
     cross_lingual::EnglishSyllableCounter,
+    mel::VocosMel,
+    noise::StandardNormal,
     reference::ReferenceAudio,
+    speech_edit::{EditSpan, SpeechEditPlan},
     text_frontend::{PinyinProvider, normalized_reference_transcript},
     vocab::Vocabulary,
 };
 
 use super::trtx_text::{
-    CrossLingualTextOptions, StandardTextOptions, TrtKernelFactory, TrtVoice, TrtWarmBank,
-    synthesize_cross_lingual, synthesize_multi_voice, synthesize_standard_text,
+    CrossLingualTextOptions, StandardTextOptions, TrtChunkKernel, TrtKernelFactory, TrtVoice,
+    TrtWarmBank, synthesize_cross_lingual, synthesize_multi_voice, synthesize_standard_text,
 };
 
 #[derive(Debug, Clone)]
@@ -155,6 +158,35 @@ impl<P: PinyinProvider + Clone> TrtModelWorker<P> {
             active.selected_voice = "main".to_owned();
         }
         Ok(removed)
+    }
+
+    pub fn edit_speech(
+        &mut self,
+        recording: &ReferenceAudio,
+        target_text: &str,
+        spans: &[EditSpan],
+        seed: u64,
+        sampling: SamplingConfig,
+    ) -> Result<Vec<f32>> {
+        let active = self
+            .active
+            .as_mut()
+            .ok_or(F5Error::InvalidConfiguration("No F5 model loaded"))?;
+        let tokens =
+            crate::text_frontend::F5TextFrontend::new(&active.vocabulary, active.pinyin.clone())
+                .cross_lingual_tokens(target_text)?;
+        let original = VocosMel::new().extract(&recording.samples)?;
+        let plan = SpeechEditPlan::new(&original.values, original.frames, spans, tokens.len())?;
+        let mut rng = StandardNormal::new(seed);
+        let noise = rng.sample_vec(plan.total_frames * 100)?;
+        let gain = if recording.normalization_gain > 1.0 {
+            1.0 / recording.normalization_gain
+        } else {
+            1.0
+        };
+        active
+            .engines
+            .edit_speech(&plan, &tokens, &noise, gain, sampling)
     }
 
     pub fn synthesize(&mut self, text: &str, options: StandardTextOptions) -> Result<Vec<f32>> {

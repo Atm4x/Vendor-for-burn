@@ -5,7 +5,7 @@ use std::ffi::c_void;
 
 use crate::{
     F5Error, Result, cfm::SamplingConfig, mel::VocosMel, noise::StandardNormal,
-    reference::ReferenceAudio,
+    reference::ReferenceAudio, speech_edit::SpeechEditPlan,
 };
 
 use super::{
@@ -76,7 +76,6 @@ impl SessionShape {
         let cfg = self.cfm.backbone;
         if cfg.batch != 2
             || cfg.mel_channels != 100
-            || self.reference_frames == 0
             || self.reference_frames >= cfg.frames
             || self.vocos.frames != cfg.frames - self.reference_frames
             || self.vocos.mel_channels != cfg.mel_channels
@@ -86,6 +85,11 @@ impl SessionShape {
             ));
         }
         if let Some(speed) = self.speed {
+            if self.reference_frames == 0 {
+                return Err(F5Error::InvalidConfiguration(
+                    "Speech edit TRT engine has no reference speed model",
+                ));
+            }
             speed.validate()?;
             if speed.batch != 1 {
                 return Err(F5Error::InvalidConfiguration(
@@ -196,6 +200,51 @@ impl<I: CudaTransport, E: TrtExecutor> TrtF5Session<I, E> {
         }
     }
 
+    /// Speech editing runs CFM with an arbitrary preserved-frame mask and
+    /// decodes the complete waveform, instead of trimming off a reference prefix.
+    /// Requires an edit-shaped engine (reference_frames=0, vocos.frames=total).
+    pub fn edit_speech(
+        &mut self,
+        plan: &SpeechEditPlan,
+        tokens: &[i32],
+        noise: &[f32],
+        restoration_gain: f32,
+        sampling: SamplingConfig,
+    ) -> Result<Vec<f32>> {
+        let frames = self.shape.cfm.backbone.frames;
+        if self.shape.reference_frames != 0
+            || self.shape.vocos.frames != frames
+            || plan.total_frames != frames
+            || plan.keep_frames.len() != frames
+        {
+            return Err(F5Error::InvalidShape(
+                "Speech editing needs a full-length TRT edit engine",
+            ));
+        }
+        let mask: Vec<f32> = plan
+            .keep_frames
+            .iter()
+            .map(|&keep| if keep { 1.0 } else { 0.0 })
+            .collect();
+        let result = self.synthesize_inner_masked(
+            SynthesisInputs {
+                condition: &plan.conditioning_mel,
+                initial_noise: noise,
+                tokens,
+                restoration_gain,
+                sampling,
+            },
+            &mask,
+            0,
+        );
+        let synchronized = self.io.synchronize();
+        match (result, synchronized) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(waveform), Ok(())) => Ok(waveform),
+        }
+    }
+
     pub fn synthesize_seeded(
         &mut self,
         reference: &ReferenceAudio,
@@ -227,9 +276,33 @@ impl<I: CudaTransport, E: TrtExecutor> TrtF5Session<I, E> {
     }
 
     fn synthesize_inner(&mut self, request: SynthesisInputs<'_>) -> Result<Vec<f32>> {
+        let frames = self.shape.cfm.backbone.frames;
+        let r = self.shape.reference_frames;
+        if r == 0 {
+            return Err(F5Error::InvalidConfiguration(
+                "Standard synthesis requires a reference prefix",
+            ));
+        }
+        if request.condition.len() != frames * 100
+            || request.condition[r * 100..].iter().any(|v| *v != 0.0)
+        {
+            return Err(F5Error::InvalidShape(
+                "Reference conditioning has nonzero generated suffix",
+            ));
+        }
+        let mut mask = vec![0.0; frames];
+        mask[..r].fill(1.0);
+        self.synthesize_inner_masked(request, &mask, r)
+    }
+
+    fn synthesize_inner_masked(
+        &mut self,
+        request: SynthesisInputs<'_>,
+        mask: &[f32],
+        decoded_from: usize,
+    ) -> Result<Vec<f32>> {
         let cfg = self.shape.cfm;
         let frames = cfg.backbone.frames;
-        let r = self.shape.reference_frames;
         if request.condition.len() != frames * 100
             || request.initial_noise.len() != frames * 100
             || request.tokens.is_empty()
@@ -241,9 +314,14 @@ impl<I: CudaTransport, E: TrtExecutor> TrtF5Session<I, E> {
                 .iter()
                 .chain(request.initial_noise.iter())
                 .any(|value| !value.is_finite())
-            || request.condition[r * 100..]
+            || mask.len() != frames
+            || decoded_from != self.shape.reference_frames
+            || mask.iter().any(|value| *value != 0.0 && *value != 1.0)
+            || request
+                .condition
                 .iter()
-                .any(|value| *value != 0.0)
+                .enumerate()
+                .any(|(i, &value)| mask[i / 100] == 0.0 && value != 0.0)
         {
             return Err(F5Error::InvalidShape(
                 "Invalid TensorRT synthesis mel, tokens or gain",
@@ -261,9 +339,7 @@ impl<I: CudaTransport, E: TrtExecutor> TrtF5Session<I, E> {
         self.upload_i32(TOKENS, &cfg_inputs.tokens)?;
         self.upload_i32(TEXT_MASK, &cfg_inputs.text_mask)?;
         self.upload_f32(CFG, &[request.sampling.cfg_strength])?;
-        let mut mask = vec![0.0; frames];
-        mask[..r].fill(1.0);
-        self.upload_f32(REFERENCE_MASK, &mask)?;
+        self.upload_f32(REFERENCE_MASK, mask)?;
 
         let timeline = request.sampling.timeline()?;
         let mut current = A;
@@ -292,7 +368,7 @@ impl<I: CudaTransport, E: TrtExecutor> TrtF5Session<I, E> {
         }
         let generated_bytes = self.shape.vocos.mel_bytes()?;
         let mel = DeviceBuffer {
-            address: self.buffers[current].address + r * 100 * 4,
+            address: self.buffers[current].address + decoded_from * 100 * 4,
             bytes: generated_bytes,
         };
         let bindings = TrtVocosBindings {
@@ -584,6 +660,73 @@ mod tests {
     }
 
     #[test]
+    fn speech_edit_reuses_gpu_cfm_and_decodes_full_mel() {
+        let data = Rc::new(RefCell::new(TestGpu::default()));
+        let mut shape = test_shape();
+        shape.reference_frames = 0;
+        shape.vocos.frames = shape.cfm.backbone.frames;
+        shape.speed = None;
+        let mut session =
+            TrtF5Session::open(TestIo(data.clone()), TestExecutor(data.clone()), shape).unwrap();
+        let mel = vec![0.75; 5 * 100];
+        let second = crate::mel::HOP_SIZE as f64 / crate::mel::SAMPLE_RATE as f64;
+        let plan = SpeechEditPlan::new(
+            &mel,
+            5,
+            &[crate::speech_edit::EditSpan {
+                start_seconds: second,
+                end_seconds: 3.0 * second,
+                replacement_seconds: Some(2.0 * second),
+            }],
+            3,
+        )
+        .unwrap();
+        assert_eq!(plan.total_frames, 6);
+        assert_eq!(
+            plan.keep_frames,
+            vec![true, false, false, true, true, false]
+        );
+        let audio = session
+            .edit_speech(
+                &plan,
+                &[1, 2, 3],
+                &vec![0.25; 600],
+                1.0,
+                SamplingConfig {
+                    steps: 5,
+                    cfg_strength: 2.0,
+                    sway_sampling_coef: None,
+                    empirically_pruned_steps: true,
+                },
+            )
+            .unwrap();
+        assert!(!audio.is_empty());
+        assert!(audio.iter().all(|v| v.is_finite()));
+        let observed = data.borrow().observed_mel.clone();
+        assert_eq!(observed.len(), 600);
+        for (frame, &keep) in plan.keep_frames.iter().enumerate() {
+            let expected = if keep { 0.75 } else { 0.65 };
+            let actual = &observed[frame * 100..(frame + 1) * 100];
+            assert!(
+                actual.iter().all(|v| (v - expected).abs() < 2e-5),
+                "incorrect edit restoration at frame {frame}"
+            );
+        }
+        assert_eq!(data.borrow().stages, 5);
+        assert!(
+            session
+                .synthesize(SynthesisInputs {
+                    condition: &plan.conditioning_mel,
+                    initial_noise: &vec![0.25; 600],
+                    tokens: &[1, 2, 3],
+                    restoration_gain: 1.0,
+                    sampling: SamplingConfig::default(),
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
     fn full_session_keeps_cfm_states_on_gpu_and_reuses_memory() {
         let data = Rc::new(RefCell::new(TestGpu::default()));
         let shape = test_shape();
@@ -708,6 +851,14 @@ pub struct TrtLibraryPaths<'a> {
 
 pub trait TrtSynthesis {
     fn synthesize(&mut self, request: SynthesisInputs<'_>) -> Result<Vec<f32>>;
+    fn edit_speech(
+        &mut self,
+        plan: &SpeechEditPlan,
+        tokens: &[i32],
+        noise: &[f32],
+        restoration_gain: f32,
+        sampling: SamplingConfig,
+    ) -> Result<Vec<f32>>;
     fn synthesize_seeded(
         &mut self,
         reference: &ReferenceAudio,
@@ -719,6 +870,17 @@ pub trait TrtSynthesis {
 }
 
 impl<I: CudaTransport, E: TrtExecutor> TrtSynthesis for TrtF5Session<I, E> {
+    fn edit_speech(
+        &mut self,
+        plan: &SpeechEditPlan,
+        tokens: &[i32],
+        noise: &[f32],
+        restoration_gain: f32,
+        sampling: SamplingConfig,
+    ) -> Result<Vec<f32>> {
+        TrtF5Session::edit_speech(self, plan, tokens, noise, restoration_gain, sampling)
+    }
+
     fn synthesize(&mut self, request: SynthesisInputs<'_>) -> Result<Vec<f32>> {
         TrtF5Session::synthesize(self, request)
     }

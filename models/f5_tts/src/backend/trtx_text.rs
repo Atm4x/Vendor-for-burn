@@ -9,6 +9,7 @@ use crate::{
     cross_lingual::{EnglishSyllableCounter, cross_fade_waves, plan_cross_lingual_chunks},
     noise::StandardNormal,
     reference::ReferenceAudio,
+    speech_edit::SpeechEditPlan,
     standard_chunking::plan_standard_chunks,
     text_frontend::{F5TextFrontend, PinyinProvider, parse_voice_segments},
     vocab::Vocabulary,
@@ -73,7 +74,7 @@ impl TrtWarmBank {
             return Ok(());
         }
         let (reference_frames, target_frames) = key;
-        if reference_frames == 0 || target_frames <= reference_frames || target_frames > 65_536 {
+        if target_frames <= reference_frames || target_frames > 65_536 {
             return Err(F5Error::InvalidShape("Invalid F5 engine shape"));
         }
         let factory = self.factory.as_mut().ok_or(F5Error::InvalidShape(
@@ -103,8 +104,7 @@ impl TrtWarmBank {
         target_frames: usize,
         engine: Box<dyn TrtChunkKernel>,
     ) -> Result<()> {
-        if reference_frames == 0
-            || target_frames <= reference_frames
+        if target_frames <= reference_frames
             || self.shapes.contains_key(&(reference_frames, target_frames))
         {
             return Err(F5Error::InvalidConfiguration(
@@ -162,6 +162,24 @@ impl Default for TrtWarmBank {
 }
 
 impl TrtChunkKernel for TrtWarmBank {
+    fn edit_speech(
+        &mut self,
+        plan: &SpeechEditPlan,
+        tokens: &[i32],
+        noise: &[f32],
+        restoration_gain: f32,
+        sampling: SamplingConfig,
+    ) -> Result<Vec<f32>> {
+        let key = (0, plan.total_frames);
+        self.ensure(key)?;
+        self.shapes
+            .get_mut(&key)
+            .ok_or(F5Error::InvalidConfiguration(
+                "Speech edit TRT engine is missing",
+            ))?
+            .edit_speech(plan, tokens, noise, restoration_gain, sampling)
+    }
+
     fn synthesize_chunk(
         &mut self,
         reference: &ReferenceAudio,
@@ -214,6 +232,19 @@ impl TrtChunkKernel for TrtWarmBank {
 }
 
 pub trait TrtChunkKernel {
+    fn edit_speech(
+        &mut self,
+        _plan: &SpeechEditPlan,
+        _tokens: &[i32],
+        _noise: &[f32],
+        _restoration_gain: f32,
+        _sampling: SamplingConfig,
+    ) -> Result<Vec<f32>> {
+        Err(F5Error::InvalidConfiguration(
+            "TRT kernel does not support speech editing",
+        ))
+    }
+
     fn synthesize_chunk(
         &mut self,
         reference: &ReferenceAudio,
@@ -227,6 +258,17 @@ pub trait TrtChunkKernel {
 }
 
 impl<I: CudaTransport, E: TrtExecutor> TrtChunkKernel for TrtF5Session<I, E> {
+    fn edit_speech(
+        &mut self,
+        plan: &SpeechEditPlan,
+        tokens: &[i32],
+        noise: &[f32],
+        restoration_gain: f32,
+        sampling: SamplingConfig,
+    ) -> Result<Vec<f32>> {
+        TrtF5Session::edit_speech(self, plan, tokens, noise, restoration_gain, sampling)
+    }
+
     fn synthesize_chunk(
         &mut self,
         reference: &ReferenceAudio,

@@ -7,6 +7,13 @@ const EPSS_10: &[u8] = &[0, 2, 4, 6, 8, 12, 16, 20, 24, 28, 32];
 const EPSS_12: &[u8] = &[0, 2, 4, 6, 8, 10, 12, 14, 16, 20, 24, 28, 32];
 const EPSS_16: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28, 32];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OdeMethod {
+    #[default]
+    Euler,
+    Midpoint,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SamplingConfig {
     pub steps: usize,

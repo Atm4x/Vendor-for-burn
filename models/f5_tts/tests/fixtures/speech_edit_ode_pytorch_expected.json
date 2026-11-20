@@ -1,0 +1,1 @@
+{"frames":8,"keep":[true,true,false,true,false,false,true,false],"cases":[{"method":"euler","steps":3,"epss":false,"sway":null,"cfg":1.4,"offset":0,"count":800},{"method":"midpoint","steps":3,"epss":false,"sway":null,"cfg":1.4,"offset":800,"count":800},{"method":"midpoint","steps":5,"epss":true,"sway":-1.0,"cfg":2.2,"offset":1600,"count":800}]}

@@ -5,7 +5,7 @@ use std::{path::PathBuf, sync::mpsc, thread};
 
 use crate::{
     F5Error, Result, cfm::SamplingConfig, checkpoint::Checkpoint, mel::VocosMel,
-    reference::ReferenceAudio,
+    reference::ReferenceAudio, speech_edit::SpeechEditPlan,
 };
 
 use super::{
@@ -70,7 +70,7 @@ impl TrtDirectFactory {
     }
 
     fn shape(&self, reference_frames: usize, target_frames: usize) -> Result<SessionShape> {
-        if reference_frames == 0 || target_frames <= reference_frames {
+        if target_frames <= reference_frames || target_frames > 65_536 {
             return Err(F5Error::InvalidShape(
                 "Invalid F5 reference or target frames",
             ));
@@ -87,10 +87,15 @@ impl TrtDirectFactory {
             frames: target_frames - reference_frames,
             ..TrtVocosShape::V1
         };
-        let speed = self.files.speed_checkpoint.as_ref().map(|_| TrtSpeedShape {
-            frames: reference_frames,
-            ..TrtSpeedShape::CROSS_LINGUAL
-        });
+        let speed = self
+            .files
+            .speed_checkpoint
+            .as_ref()
+            .filter(|_| reference_frames > 0)
+            .map(|_| TrtSpeedShape {
+                frames: reference_frames,
+                ..TrtSpeedShape::CROSS_LINGUAL
+            });
         let shape = SessionShape {
             cfm,
             vocos,
@@ -195,6 +200,14 @@ enum Request {
         sampling: SamplingConfig,
         reply: mpsc::SyncSender<Result<Vec<f32>>>,
     },
+    Edit {
+        plan: SpeechEditPlan,
+        noise: Vec<f32>,
+        tokens: Vec<i32>,
+        restoration_gain: f32,
+        sampling: SamplingConfig,
+        reply: mpsc::SyncSender<Result<Vec<f32>>>,
+    },
     Speed {
         mel: Vec<f32>,
         reply: mpsc::SyncSender<Result<f32>>,
@@ -261,6 +274,22 @@ impl TrtCompiledKernel {
                                             sampling,
                                         }));
                                     }
+                                    Request::Edit {
+                                        plan,
+                                        noise,
+                                        tokens,
+                                        restoration_gain,
+                                        sampling,
+                                        reply,
+                                    } => {
+                                        let _ = reply.send(session.edit_speech(
+                                            &plan,
+                                            &tokens,
+                                            &noise,
+                                            restoration_gain,
+                                            sampling,
+                                        ));
+                                    }
                                     Request::Speed { mel, reply } => {
                                         let _ = reply.send(session.predict_speed(&mel));
                                     }
@@ -308,6 +337,33 @@ impl Drop for TrtCompiledKernel {
 }
 
 impl TrtChunkKernel for TrtCompiledKernel {
+    fn edit_speech(
+        &mut self,
+        plan: &SpeechEditPlan,
+        tokens: &[i32],
+        noise: &[f32],
+        restoration_gain: f32,
+        sampling: SamplingConfig,
+    ) -> Result<Vec<f32>> {
+        if self.shape.reference_frames != 0 || plan.total_frames != self.shape.cfm.backbone.frames {
+            return Err(F5Error::InvalidShape("Wrong warmed TRT speech edit shape"));
+        }
+        let (reply, receive) = mpsc::sync_channel(1);
+        self.sender
+            .send(Request::Edit {
+                plan: plan.clone(),
+                noise: noise.to_vec(),
+                tokens: tokens.to_vec(),
+                restoration_gain,
+                sampling,
+                reply,
+            })
+            .map_err(|_| F5Error::ModelExecution("TRT speech edit worker stopped".into()))?;
+        receive
+            .recv()
+            .map_err(|_| F5Error::ModelExecution("TRT speech edit interrupted".into()))?
+    }
+
     fn synthesize_chunk(
         &mut self,
         reference: &ReferenceAudio,

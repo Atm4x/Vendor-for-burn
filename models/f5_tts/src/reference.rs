@@ -18,6 +18,20 @@ pub struct PreparedCondition {
 
 impl ReferenceAudio {
     pub fn from_channels(channels: &[&[f32]], sample_rate: usize) -> Result<Self> {
+        Self::from_channels_limited(channels, sample_rate, Some(MAX_REFERENCE_SECONDS))
+    }
+
+    /// Speech editing must retain all original audio, unlike reference prompting,
+    /// where the original inference frontend clips the reference to 12 seconds.
+    pub fn from_channels_full(channels: &[&[f32]], sample_rate: usize) -> Result<Self> {
+        Self::from_channels_limited(channels, sample_rate, None)
+    }
+
+    fn from_channels_limited(
+        channels: &[&[f32]],
+        sample_rate: usize,
+        limit_seconds: Option<usize>,
+    ) -> Result<Self> {
         if sample_rate == 0 || sample_rate > 384_000 {
             return Err(F5Error::InvalidConfiguration(
                 "Invalid reference sample rate",
@@ -28,7 +42,14 @@ impl ReferenceAudio {
                 "Reference audio contains no channels",
             ));
         };
-        let length = first.len().min(MAX_REFERENCE_SECONDS * sample_rate);
+        let length = first
+            .len()
+            .min(limit_seconds.map_or(usize::MAX, |limit| limit * sample_rate));
+        if length > 30 * 60 * sample_rate {
+            return Err(F5Error::InvalidConfiguration(
+                "Speech edit input exceeds 30 minutes",
+            ));
+        }
         if length <= 512 || channels.iter().any(|channel| channel.len() != first.len()) {
             return Err(F5Error::InvalidShape(
                 "Reference audio must have aligned channels and at least 513 samples",
@@ -120,6 +141,16 @@ impl PreparedCondition {
 mod tests {
     use super::*;
     use crate::mel::SAMPLE_RATE;
+
+    #[test]
+    fn speech_edit_audio_is_not_truncated_at_reference_prompt_limit() {
+        let audio = vec![0.03; 13 * SAMPLE_RATE];
+        let prompt = ReferenceAudio::from_channels(&[&audio], SAMPLE_RATE).unwrap();
+        let edit = ReferenceAudio::from_channels_full(&[&audio], SAMPLE_RATE).unwrap();
+        assert_eq!(prompt.samples.len(), 12 * SAMPLE_RATE);
+        assert_eq!(edit.samples.len(), 13 * SAMPLE_RATE);
+        assert!((edit.original_rms - 0.03).abs() < 1e-6);
+    }
 
     #[test]
     fn reference_accepts_resampled_audio_and_preserves_source_rms() {

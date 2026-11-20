@@ -33,6 +33,7 @@ pub mod pinyin;
 pub mod pipeline;
 pub mod reference;
 pub mod resample;
+pub mod speech_edit;
 #[cfg(any(
     feature = "cubecl-cpu",
     feature = "cubecl-cuda",
