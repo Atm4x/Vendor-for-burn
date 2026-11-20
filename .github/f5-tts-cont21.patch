@@ -1,0 +1,1581 @@
+diff --git a/models/f5_tts/src/backend/trtx_session.rs b/models/f5_tts/src/backend/trtx_session.rs
+index 4708882d..3e384eea 100644
+--- a/models/f5_tts/src/backend/trtx_session.rs
++++ b/models/f5_tts/src/backend/trtx_session.rs
+@@ -7,2 +7,7 @@ use crate::{
+-    F5Error, Result, cfm::{CfmSampleMode, OdeMethod, SamplingConfig, duplicate_test_initial_state}, mel::VocosMel, noise::StandardNormal,
+-    reference::ReferenceAudio, speech_edit::SpeechEditPlan,
++    F5Error, Result,
++    cfm::{CfmSampleMode, OdeMethod, SamplingConfig, duplicate_test_initial_state},
++    mel::VocosMel,
++    model::{GeneratedSpectrogram, InferenceOutput},
++    noise::StandardNormal,
++    reference::ReferenceAudio,
++    speech_edit::SpeechEditPlan,
+@@ -201 +206,5 @@ impl<I: CudaTransport, E: TrtExecutor> TrtF5Session<I, E> {
+-    pub fn synthesize_with_method(&mut self, request: SynthesisInputs<'_>, method: OdeMethod) -> Result<Vec<f32>> {
++    pub fn synthesize_with_method(
++        &mut self,
++        request: SynthesisInputs<'_>,
++        method: OdeMethod,
++    ) -> Result<Vec<f32>> {
+@@ -206 +215,4 @@ impl<I: CudaTransport, E: TrtExecutor> TrtF5Session<I, E> {
+-        &mut self, request: SynthesisInputs<'_>, method: OdeMethod, mode: CfmSampleMode,
++        &mut self,
++        request: SynthesisInputs<'_>,
++        method: OdeMethod,
++        mode: CfmSampleMode,
+@@ -216,0 +229,22 @@ impl<I: CudaTransport, E: TrtExecutor> TrtF5Session<I, E> {
++    pub fn synthesize_with_spectrogram(
++        &mut self,
++        request: SynthesisInputs<'_>,
++        method: OdeMethod,
++        mode: CfmSampleMode,
++    ) -> Result<InferenceOutput> {
++        let mut spectrogram = None;
++        let result = self.synthesize_inner_capture(request, method, mode, Some(&mut spectrogram));
++        let synchronized = self.io.synchronize();
++        match (result, synchronized) {
++            (Err(error), _) => Err(error),
++            (Ok(_), Err(error)) => Err(error),
++            (Ok(waveform), Ok(())) => Ok(InferenceOutput {
++                waveform,
++                sample_rate: crate::mel::SAMPLE_RATE,
++                spectrogram: spectrogram.ok_or(F5Error::ModelExecution(
++                    "TensorRT mel capture was not produced".into(),
++                ))?,
++            }),
++        }
++    }
++
+@@ -221,2 +255,6 @@ impl<I: CudaTransport, E: TrtExecutor> TrtF5Session<I, E> {
+-        &mut self, plan: &SpeechEditPlan, tokens: &[i32], noise: &[f32],
+-        restoration_gain: f32, sampling: SamplingConfig,
++        &mut self,
++        plan: &SpeechEditPlan,
++        tokens: &[i32],
++        noise: &[f32],
++        restoration_gain: f32,
++        sampling: SamplingConfig,
+@@ -224 +262,8 @@ impl<I: CudaTransport, E: TrtExecutor> TrtF5Session<I, E> {
+-        self.edit_speech_with_method(plan, tokens, noise, restoration_gain, sampling, OdeMethod::Euler)
++        self.edit_speech_with_method(
++            plan,
++            tokens,
++            noise,
++            restoration_gain,
++            sampling,
++            OdeMethod::Euler,
++        )
+@@ -228,2 +273,7 @@ impl<I: CudaTransport, E: TrtExecutor> TrtF5Session<I, E> {
+-        &mut self, plan: &SpeechEditPlan, tokens: &[i32], noise: &[f32],
+-        restoration_gain: f32, sampling: SamplingConfig, method: OdeMethod,
++        &mut self,
++        plan: &SpeechEditPlan,
++        tokens: &[i32],
++        noise: &[f32],
++        restoration_gain: f32,
++        sampling: SamplingConfig,
++        method: OdeMethod,
+@@ -257,0 +308 @@ impl<I: CudaTransport, E: TrtExecutor> TrtF5Session<I, E> {
++            None,
+@@ -298 +349,14 @@ impl<I: CudaTransport, E: TrtExecutor> TrtF5Session<I, E> {
+-        &mut self, request: SynthesisInputs<'_>, method: OdeMethod, mode: CfmSampleMode,
++        &mut self,
++        request: SynthesisInputs<'_>,
++        method: OdeMethod,
++        mode: CfmSampleMode,
++    ) -> Result<Vec<f32>> {
++        self.synthesize_inner_capture(request, method, mode, None)
++    }
++
++    fn synthesize_inner_capture(
++        &mut self,
++        request: SynthesisInputs<'_>,
++        method: OdeMethod,
++        mode: CfmSampleMode,
++        spectrogram: Option<&mut Option<GeneratedSpectrogram>>,
+@@ -316 +380 @@ impl<I: CudaTransport, E: TrtExecutor> TrtF5Session<I, E> {
+-        self.synthesize_inner_masked(request, &mask, r, method, mode)
++        self.synthesize_inner_masked(request, &mask, r, method, mode, spectrogram)
+@@ -325,0 +390 @@ impl<I: CudaTransport, E: TrtExecutor> TrtF5Session<I, E> {
++        spectrogram: Option<&mut Option<GeneratedSpectrogram>>,
+@@ -364 +429,5 @@ impl<I: CudaTransport, E: TrtExecutor> TrtF5Session<I, E> {
+-                &mut initial_state, request.condition, decoded_from.max(1), 100, mode.t_inter,
++                &mut initial_state,
++                request.condition,
++                decoded_from.max(1),
++                100,
++                mode.t_inter,
+@@ -407 +476,5 @@ impl<I: CudaTransport, E: TrtExecutor> TrtF5Session<I, E> {
+-            let eval_time = if method == OdeMethod::Midpoint { times[0] + 0.5 * dt } else { times[0] };
++            let eval_time = if method == OdeMethod::Midpoint {
++                times[0] + 0.5 * dt
++            } else {
++                times[0]
++            };
+@@ -444,0 +518,10 @@ impl<I: CudaTransport, E: TrtExecutor> TrtF5Session<I, E> {
++        if let Some(output) = spectrogram {
++            let mut frame_major = vec![0.0_f32; generated_bytes / 4];
++            self.io.download(mel, unsafe {
++                std::slice::from_raw_parts_mut(
++                    frame_major.as_mut_ptr().cast::<u8>(),
++                    generated_bytes,
++                )
++            })?;
++            *output = Some(GeneratedSpectrogram::from_frame_major(&frame_major, 100)?);
++        }
+@@ -660 +743,5 @@ mod tests {
+-                    let velocity = if affine { 0.5 * state[i] + 0.1 } else { guided_velocity };
++                    let velocity = if affine {
++                        0.5 * state[i] + 0.1
++                    } else {
++                        guided_velocity
++                    };
+@@ -796,0 +884,43 @@ mod tests {
++    #[test]
++    fn optional_spectrogram_matches_generated_cfm_mel_and_downloads_only_on_request() {
++        let gpu = Rc::new(RefCell::new(TestGpu::default()));
++        let mut session =
++            TrtF5Session::open(TestIo(gpu.clone()), TestExecutor(gpu.clone()), test_shape())
++                .unwrap();
++        let mut condition = vec![0.0; 600];
++        condition[..200].fill(0.75);
++        let noise = vec![0.25; 600];
++        let sampling = SamplingConfig {
++            steps: 3,
++            cfg_strength: 2.0,
++            sway_sampling_coef: None,
++            empirically_pruned_steps: false,
++        };
++        let inputs = || SynthesisInputs {
++            condition: &condition,
++            initial_noise: &noise,
++            tokens: &[1, 2, 3],
++            restoration_gain: 1.0,
++            sampling,
++        };
++        let without_mel = session.synthesize(inputs()).unwrap();
++        assert_eq!(gpu.borrow().downloads.len(), 1);
++        let output = session
++            .synthesize_with_spectrogram(inputs(), OdeMethod::Euler, CfmSampleMode::default())
++            .unwrap();
++        assert_eq!(output.waveform, without_mel);
++        assert_eq!(output.sample_rate, 24_000);
++        assert_eq!(output.spectrogram.channels, 100);
++        assert_eq!(output.spectrogram.frames, 4);
++        assert_eq!(gpu.borrow().downloads.len(), 3);
++        let observed = gpu.borrow().observed_mel.clone();
++        for channel in 0..100 {
++            for frame in 0..4 {
++                assert_eq!(
++                    output.spectrogram.values[channel * 4 + frame],
++                    observed[frame * 100 + channel],
++                );
++            }
++        }
++    }
++
+@@ -855,2 +985,5 @@ mod tests {
+-            TestIo(data.clone()), TestExecutor(data.clone()), test_shape()
+-        ).unwrap();
++            TestIo(data.clone()),
++            TestExecutor(data.clone()),
++            test_shape(),
++        )
++        .unwrap();
+@@ -860 +993,4 @@ mod tests {
+-            steps: 5, cfg_strength: 1.0, sway_sampling_coef: None, empirically_pruned_steps: true,
++            steps: 5,
++            cfg_strength: 1.0,
++            sway_sampling_coef: None,
++            empirically_pruned_steps: true,
+@@ -862,4 +998,12 @@ mod tests {
+-        let audio = session.synthesize_with_method(SynthesisInputs {
+-            condition: &condition, initial_noise: &vec![0.0; 600], tokens: &[1, 2],
+-            restoration_gain: 1.0, sampling,
+-        }, OdeMethod::Midpoint).unwrap();
++        let audio = session
++            .synthesize_with_method(
++                SynthesisInputs {
++                    condition: &condition,
++                    initial_noise: &vec![0.0; 600],
++                    tokens: &[1, 2],
++                    restoration_gain: 1.0,
++                    sampling,
++                },
++                OdeMethod::Midpoint,
++            )
++            .unwrap();
+@@ -874 +1018,4 @@ mod tests {
+-        let data = Rc::new(RefCell::new(TestGpu { affine_velocity: true, ..Default::default() }));
++        let data = Rc::new(RefCell::new(TestGpu {
++            affine_velocity: true,
++            ..Default::default()
++        }));
+@@ -876,2 +1023,5 @@ mod tests {
+-            TestIo(data.clone()), TestExecutor(data.clone()), test_shape()
+-        ).unwrap();
++            TestIo(data.clone()),
++            TestExecutor(data.clone()),
++            test_shape(),
++        )
++        .unwrap();
+@@ -881,2 +1031,4 @@ mod tests {
+-            steps: 2, cfg_strength: 0.0,
+-            sway_sampling_coef: None, empirically_pruned_steps: false,
++            steps: 2,
++            cfg_strength: 0.0,
++            sway_sampling_coef: None,
++            empirically_pruned_steps: false,
+@@ -884,4 +1036,12 @@ mod tests {
+-        session.synthesize_with_method(SynthesisInputs {
+-            condition: &condition, initial_noise: &noise, tokens: &[1, 2],
+-            restoration_gain: 1.0, sampling,
+-        }, OdeMethod::Midpoint).unwrap();
++        session
++            .synthesize_with_method(
++                SynthesisInputs {
++                    condition: &condition,
++                    initial_noise: &noise,
++                    tokens: &[1, 2],
++                    restoration_gain: 1.0,
++                    sampling,
++                },
++                OdeMethod::Midpoint,
++            )
++            .unwrap();
+@@ -901,2 +1061,5 @@ mod tests {
+-            TestIo(data.clone()), TestExecutor(data.clone()), test_shape()
+-        ).unwrap();
++            TestIo(data.clone()),
++            TestExecutor(data.clone()),
++            test_shape(),
++        )
++        .unwrap();
+@@ -907,2 +1070,4 @@ mod tests {
+-            steps: 4, cfg_strength: 1.0,
+-            sway_sampling_coef: None, empirically_pruned_steps: true,
++            steps: 4,
++            cfg_strength: 1.0,
++            sway_sampling_coef: None,
++            empirically_pruned_steps: true,
+@@ -911 +1076,3 @@ mod tests {
+-            no_ref_audio: true, duplicate_test: true, t_inter: 0.5,
++            no_ref_audio: true,
++            duplicate_test: true,
++            t_inter: 0.5,
+@@ -913,4 +1080,13 @@ mod tests {
+-        session.synthesize_with_sample_mode(SynthesisInputs {
+-            condition: &condition, initial_noise: &noise, tokens: &[1, 2],
+-            restoration_gain: 1.0, sampling,
+-        }, OdeMethod::Euler, mode).unwrap();
++        session
++            .synthesize_with_sample_mode(
++                SynthesisInputs {
++                    condition: &condition,
++                    initial_noise: &noise,
++                    tokens: &[1, 2],
++                    restoration_gain: 1.0,
++                    sampling,
++                },
++                OdeMethod::Euler,
++                mode,
++            )
++            .unwrap();
+@@ -998 +1174,4 @@ pub trait TrtSynthesis {
+-        &mut self, request: SynthesisInputs<'_>, method: OdeMethod, mode: CfmSampleMode,
++        &mut self,
++        request: SynthesisInputs<'_>,
++        method: OdeMethod,
++        mode: CfmSampleMode,
+@@ -1009,2 +1188,7 @@ pub trait TrtSynthesis {
+-        &mut self, plan: &SpeechEditPlan, tokens: &[i32], noise: &[f32],
+-        restoration_gain: f32, sampling: SamplingConfig, method: OdeMethod,
++        &mut self,
++        plan: &SpeechEditPlan,
++        tokens: &[i32],
++        noise: &[f32],
++        restoration_gain: f32,
++        sampling: SamplingConfig,
++        method: OdeMethod,
+@@ -1039 +1223,4 @@ impl<I: CudaTransport, E: TrtExecutor> TrtSynthesis for TrtF5Session<I, E> {
+-        &mut self, request: SynthesisInputs<'_>, method: OdeMethod, mode: CfmSampleMode,
++        &mut self,
++        request: SynthesisInputs<'_>,
++        method: OdeMethod,
++        mode: CfmSampleMode,
+@@ -1045,2 +1232,7 @@ impl<I: CudaTransport, E: TrtExecutor> TrtSynthesis for TrtF5Session<I, E> {
+-        &mut self, plan: &SpeechEditPlan, tokens: &[i32], noise: &[f32],
+-        restoration_gain: f32, sampling: SamplingConfig, method: OdeMethod,
++        &mut self,
++        plan: &SpeechEditPlan,
++        tokens: &[i32],
++        noise: &[f32],
++        restoration_gain: f32,
++        sampling: SamplingConfig,
++        method: OdeMethod,
+@@ -1049 +1241,7 @@ impl<I: CudaTransport, E: TrtExecutor> TrtSynthesis for TrtF5Session<I, E> {
+-            self, plan, tokens, noise, restoration_gain, sampling, method
++            self,
++            plan,
++            tokens,
++            noise,
++            restoration_gain,
++            sampling,
++            method,
+diff --git a/models/f5_tts/src/backend/trtx_text.rs b/models/f5_tts/src/backend/trtx_text.rs
+index 30100a85..0187b860 100644
+--- a/models/f5_tts/src/backend/trtx_text.rs
++++ b/models/f5_tts/src/backend/trtx_text.rs
+@@ -9,0 +10 @@ use crate::{
++    model::{GeneratedSpectrogram, InferenceOutput},
+@@ -13 +14 @@ use crate::{
+-    standard_chunking::plan_standard_chunks,
++    standard_chunking::{emit_pcm_chunks, plan_standard_chunks},
+@@ -184,2 +185,7 @@ impl TrtChunkKernel for TrtWarmBank {
+-        &mut self, plan: &SpeechEditPlan, tokens: &[i32], noise: &[f32],
+-        restoration_gain: f32, sampling: SamplingConfig, method: OdeMethod,
++        &mut self,
++        plan: &SpeechEditPlan,
++        tokens: &[i32],
++        noise: &[f32],
++        restoration_gain: f32,
++        sampling: SamplingConfig,
++        method: OdeMethod,
+@@ -189,2 +195,5 @@ impl TrtChunkKernel for TrtWarmBank {
+-        self.shapes.get_mut(&key)
+-            .ok_or(F5Error::InvalidConfiguration("Missing warmed speech-edit engine"))?
++        self.shapes
++            .get_mut(&key)
++            .ok_or(F5Error::InvalidConfiguration(
++                "Missing warmed speech-edit engine",
++            ))?
+@@ -216,2 +225,8 @@ impl TrtChunkKernel for TrtWarmBank {
+-        &mut self, reference: &ReferenceAudio, tokens: &[i32], target_frames: usize,
+-        noise: &[f32], sampling: SamplingConfig, method: OdeMethod, mode: CfmSampleMode,
++        &mut self,
++        reference: &ReferenceAudio,
++        tokens: &[i32],
++        target_frames: usize,
++        noise: &[f32],
++        sampling: SamplingConfig,
++        method: OdeMethod,
++        mode: CfmSampleMode,
+@@ -219 +234,3 @@ impl TrtChunkKernel for TrtWarmBank {
+-        let reference_frames = crate::mel::VocosMel::new().extract(&reference.samples)?.frames;
++        let reference_frames = crate::mel::VocosMel::new()
++            .extract(&reference.samples)?
++            .frames;
+@@ -221 +238,2 @@ impl TrtChunkKernel for TrtWarmBank {
+-        self.shapes.get_mut(&(reference_frames, target_frames))
++        self.shapes
++            .get_mut(&(reference_frames, target_frames))
+@@ -223 +241,55 @@ impl TrtChunkKernel for TrtWarmBank {
+-            .synthesize_chunk_with_sample_mode(reference, tokens, target_frames, noise, sampling, method, mode)
++            .synthesize_chunk_with_sample_mode(
++                reference,
++                tokens,
++                target_frames,
++                noise,
++                sampling,
++                method,
++                mode,
++            )
++    }
++
++    fn synthesize_chunk_with_spectrogram(
++        &mut self,
++        reference: &ReferenceAudio,
++        tokens: &[i32],
++        target_frames: usize,
++        noise: &[f32],
++        sampling: SamplingConfig,
++    ) -> Result<InferenceOutput> {
++        let reference_frames = crate::mel::VocosMel::new()
++            .extract(&reference.samples)?
++            .frames;
++        self.ensure((reference_frames, target_frames))?;
++        self.shapes
++            .get_mut(&(reference_frames, target_frames))
++            .ok_or(F5Error::InvalidShape("Warmed TRT shape missing"))?
++            .synthesize_chunk_with_spectrogram(reference, tokens, target_frames, noise, sampling)
++    }
++
++    fn synthesize_chunk_with_spectrogram_and_sample_mode(
++        &mut self,
++        reference: &ReferenceAudio,
++        tokens: &[i32],
++        target_frames: usize,
++        noise: &[f32],
++        sampling: SamplingConfig,
++        method: OdeMethod,
++        mode: CfmSampleMode,
++    ) -> Result<InferenceOutput> {
++        let reference_frames = crate::mel::VocosMel::new()
++            .extract(&reference.samples)?
++            .frames;
++        self.ensure((reference_frames, target_frames))?;
++        self.shapes
++            .get_mut(&(reference_frames, target_frames))
++            .ok_or(F5Error::InvalidShape("Warmed TRT shape missing"))?
++            .synthesize_chunk_with_spectrogram_and_sample_mode(
++                reference,
++                tokens,
++                target_frames,
++                noise,
++                sampling,
++                method,
++                mode,
++            )
+@@ -271,2 +343,7 @@ pub trait TrtChunkKernel {
+-        &mut self, plan: &SpeechEditPlan, tokens: &[i32], noise: &[f32],
+-        restoration_gain: f32, sampling: SamplingConfig, method: OdeMethod,
++        &mut self,
++        plan: &SpeechEditPlan,
++        tokens: &[i32],
++        noise: &[f32],
++        restoration_gain: f32,
++        sampling: SamplingConfig,
++        method: OdeMethod,
+@@ -277 +354,3 @@ pub trait TrtChunkKernel {
+-            Err(F5Error::InvalidConfiguration("TRT kernel does not support midpoint editing"))
++            Err(F5Error::InvalidConfiguration(
++                "TRT kernel does not support midpoint editing",
++            ))
+@@ -292,3 +371,7 @@ pub trait TrtChunkKernel {
+-        reference: &ReferenceAudio, tokens: &[i32], target_frames: usize,
+-        noise: &[f32], sampling: SamplingConfig,
+-        method: OdeMethod, mode: CfmSampleMode,
++        reference: &ReferenceAudio,
++        tokens: &[i32],
++        target_frames: usize,
++        noise: &[f32],
++        sampling: SamplingConfig,
++        method: OdeMethod,
++        mode: CfmSampleMode,
+@@ -299 +382,42 @@ pub trait TrtChunkKernel {
+-            Err(F5Error::InvalidConfiguration("TRT kernel does not support CFM sample modes"))
++            Err(F5Error::InvalidConfiguration(
++                "TRT kernel does not support CFM sample modes",
++            ))
++        }
++    }
++
++    fn synthesize_chunk_with_spectrogram(
++        &mut self,
++        reference: &ReferenceAudio,
++        tokens: &[i32],
++        target_frames: usize,
++        noise: &[f32],
++        sampling: SamplingConfig,
++    ) -> Result<InferenceOutput> {
++        let _ = (reference, tokens, target_frames, noise, sampling);
++        Err(F5Error::InvalidConfiguration(
++            "TRT kernel does not expose generated mel spectrogram",
++        ))
++    }
++
++    fn synthesize_chunk_with_spectrogram_and_sample_mode(
++        &mut self,
++        reference: &ReferenceAudio,
++        tokens: &[i32],
++        target_frames: usize,
++        noise: &[f32],
++        sampling: SamplingConfig,
++        method: OdeMethod,
++        mode: CfmSampleMode,
++    ) -> Result<InferenceOutput> {
++        if method == OdeMethod::Euler && mode == CfmSampleMode::default() {
++            self.synthesize_chunk_with_spectrogram(
++                reference,
++                tokens,
++                target_frames,
++                noise,
++                sampling,
++            )
++        } else {
++            Err(F5Error::InvalidConfiguration(
++                "TRT kernel does not support mel capture with CFM sample modes",
++            ))
+@@ -319,2 +443,7 @@ impl<I: CudaTransport, E: TrtExecutor> TrtChunkKernel for TrtF5Session<I, E> {
+-        &mut self, plan: &SpeechEditPlan, tokens: &[i32], noise: &[f32],
+-        restoration_gain: f32, sampling: SamplingConfig, method: OdeMethod,
++        &mut self,
++        plan: &SpeechEditPlan,
++        tokens: &[i32],
++        noise: &[f32],
++        restoration_gain: f32,
++        sampling: SamplingConfig,
++        method: OdeMethod,
+@@ -323 +452,7 @@ impl<I: CudaTransport, E: TrtExecutor> TrtChunkKernel for TrtF5Session<I, E> {
+-            self, plan, tokens, noise, restoration_gain, sampling, method,
++            self,
++            plan,
++            tokens,
++            noise,
++            restoration_gain,
++            sampling,
++            method,
+@@ -359,2 +494,8 @@ impl<I: CudaTransport, E: TrtExecutor> TrtChunkKernel for TrtF5Session<I, E> {
+-        &mut self, reference: &ReferenceAudio, tokens: &[i32], target_frames: usize,
+-        noise: &[f32], sampling: SamplingConfig, method: OdeMethod, mode: CfmSampleMode,
++        &mut self,
++        reference: &ReferenceAudio,
++        tokens: &[i32],
++        target_frames: usize,
++        noise: &[f32],
++        sampling: SamplingConfig,
++        method: OdeMethod,
++        mode: CfmSampleMode,
+@@ -365 +506,2 @@ impl<I: CudaTransport, E: TrtExecutor> TrtChunkKernel for TrtF5Session<I, E> {
+-        let condition = reference.prepare(&crate::mel::VocosMel::new(), target_frames, tokens.len())?;
++        let condition =
++            reference.prepare(&crate::mel::VocosMel::new(), target_frames, tokens.len())?;
+@@ -369,5 +511,71 @@ impl<I: CudaTransport, E: TrtExecutor> TrtChunkKernel for TrtF5Session<I, E> {
+-        self.synthesize_with_sample_mode(SynthesisInputs {
+-            condition: &condition.conditioning_mel,
+-            initial_noise: noise, tokens,
+-            restoration_gain: condition.restoration_gain(), sampling,
+-        }, method, mode)
++        self.synthesize_with_sample_mode(
++            SynthesisInputs {
++                condition: &condition.conditioning_mel,
++                initial_noise: noise,
++                tokens,
++                restoration_gain: condition.restoration_gain(),
++                sampling,
++            },
++            method,
++            mode,
++        )
++    }
++
++    fn synthesize_chunk_with_spectrogram(
++        &mut self,
++        reference: &ReferenceAudio,
++        tokens: &[i32],
++        target_frames: usize,
++        noise: &[f32],
++        sampling: SamplingConfig,
++    ) -> Result<InferenceOutput> {
++        if target_frames != self.shape().cfm.backbone.frames {
++            return Err(F5Error::InvalidShape("Wrong warmed F5 duration"));
++        }
++        let condition =
++            reference.prepare(&crate::mel::VocosMel::new(), target_frames, tokens.len())?;
++        if condition.frames.reference != self.shape().reference_frames {
++            return Err(F5Error::InvalidShape("Wrong warmed F5 reference length"));
++        }
++        self.synthesize_with_spectrogram(
++            SynthesisInputs {
++                condition: &condition.conditioning_mel,
++                initial_noise: noise,
++                tokens,
++                restoration_gain: condition.restoration_gain(),
++                sampling,
++            },
++            OdeMethod::Euler,
++            CfmSampleMode::default(),
++        )
++    }
++
++    fn synthesize_chunk_with_spectrogram_and_sample_mode(
++        &mut self,
++        reference: &ReferenceAudio,
++        tokens: &[i32],
++        target_frames: usize,
++        noise: &[f32],
++        sampling: SamplingConfig,
++        method: OdeMethod,
++        mode: CfmSampleMode,
++    ) -> Result<InferenceOutput> {
++        if target_frames != self.shape().cfm.backbone.frames {
++            return Err(F5Error::InvalidShape("Wrong warmed F5 duration"));
++        }
++        let condition =
++            reference.prepare(&crate::mel::VocosMel::new(), target_frames, tokens.len())?;
++        if condition.frames.reference != self.shape().reference_frames {
++            return Err(F5Error::InvalidShape("Wrong warmed F5 reference length"));
++        }
++        self.synthesize_with_spectrogram(
++            SynthesisInputs {
++                condition: &condition.conditioning_mel,
++                initial_noise: noise,
++                tokens,
++                restoration_gain: condition.restoration_gain(),
++                sampling,
++            },
++            method,
++            mode,
++        )
+@@ -429,2 +637,8 @@ pub fn synthesize_standard_text<K: TrtChunkKernel, P: PinyinProvider>(
+-        kernel, reference, generated_text, vocabulary, pinyin, options,
+-        OdeMethod::Euler, CfmSampleMode::default(),
++        kernel,
++        reference,
++        generated_text,
++        vocabulary,
++        pinyin,
++        options,
++        OdeMethod::Euler,
++        CfmSampleMode::default(),
+@@ -435,3 +649,8 @@ pub fn synthesize_standard_text_with_sample_mode<K: TrtChunkKernel, P: PinyinPro
+-    kernel: &mut K, reference: TrtVoice<'_>, generated_text: &str,
+-    vocabulary: &Vocabulary, pinyin: P, options: StandardTextOptions,
+-    method: OdeMethod, mode: CfmSampleMode,
++    kernel: &mut K,
++    reference: TrtVoice<'_>,
++    generated_text: &str,
++    vocabulary: &Vocabulary,
++    pinyin: P,
++    options: StandardTextOptions,
++    method: OdeMethod,
++    mode: CfmSampleMode,
+@@ -452 +671,3 @@ pub fn synthesize_standard_text_with_sample_mode<K: TrtChunkKernel, P: PinyinPro
+-        let count = chunk.total_frames.checked_mul(100)
++        let count = chunk
++            .total_frames
++            .checked_mul(100)
+@@ -456,2 +677,7 @@ pub fn synthesize_standard_text_with_sample_mode<K: TrtChunkKernel, P: PinyinPro
+-            reference.audio, &tokens, chunk.total_frames,
+-            &noise, options.sampling, method, mode,
++            reference.audio,
++            &tokens,
++            chunk.total_frames,
++            &noise,
++            options.sampling,
++            method,
++            mode,
+@@ -462,0 +689,146 @@ pub fn synthesize_standard_text_with_sample_mode<K: TrtChunkKernel, P: PinyinPro
++pub fn synthesize_standard_text_with_spectrogram<K: TrtChunkKernel, P: PinyinProvider>(
++    kernel: &mut K,
++    reference: TrtVoice<'_>,
++    generated_text: &str,
++    vocabulary: &Vocabulary,
++    pinyin: P,
++    options: StandardTextOptions,
++) -> Result<InferenceOutput> {
++    synthesize_standard_text_with_spectrogram_and_sample_mode(
++        kernel,
++        reference,
++        generated_text,
++        vocabulary,
++        pinyin,
++        options,
++        OdeMethod::Euler,
++        CfmSampleMode::default(),
++    )
++}
++
++pub fn synthesize_standard_text_with_spectrogram_and_sample_mode<
++    K: TrtChunkKernel,
++    P: PinyinProvider,
++>(
++    kernel: &mut K,
++    reference: TrtVoice<'_>,
++    generated_text: &str,
++    vocabulary: &Vocabulary,
++    pinyin: P,
++    options: StandardTextOptions,
++    method: OdeMethod,
++    mode: CfmSampleMode,
++) -> Result<InferenceOutput> {
++    mode.validate()?;
++    let plans = plan_standard_chunks(
++        generated_text,
++        reference.transcript,
++        reference.audio.samples.len(),
++        options.speed,
++        options.fixed_seconds,
++        options.cross_fade_seconds,
++    )?;
++    let frontend = F5TextFrontend::new(vocabulary, pinyin);
++    let mut rng = StandardNormal::new(options.seed);
++    let mut waves = Vec::with_capacity(plans.len());
++    let mut spectra = Vec::with_capacity(plans.len());
++    for chunk in plans {
++        let tokens = frontend.standard_tokens(reference.transcript, &chunk.text)?;
++        let noise = rng.sample_vec(
++            chunk
++                .total_frames
++                .checked_mul(100)
++                .ok_or(F5Error::InvalidShape("Noise size overflow"))?,
++        )?;
++        let output = kernel.synthesize_chunk_with_spectrogram_and_sample_mode(
++            reference.audio,
++            &tokens,
++            chunk.total_frames,
++            &noise,
++            options.sampling,
++            method,
++            mode,
++        )?;
++        waves.push(output.waveform);
++        spectra.push(output.spectrogram);
++    }
++    Ok(InferenceOutput {
++        waveform: cross_fade_waves(&waves, options.cross_fade_seconds as f64)?,
++        sample_rate: crate::mel::SAMPLE_RATE,
++        spectrogram: GeneratedSpectrogram::concatenate(&spectra)?,
++    })
++}
++
++pub fn stream_standard_text<K: TrtChunkKernel, P: PinyinProvider>(
++    kernel: &mut K,
++    reference: TrtVoice<'_>,
++    generated_text: &str,
++    vocabulary: &Vocabulary,
++    pinyin: P,
++    options: StandardTextOptions,
++    chunk_size: usize,
++    emit: impl FnMut(&[f32], usize) -> Result<()>,
++) -> Result<()> {
++    stream_standard_text_with_sample_mode(
++        kernel,
++        reference,
++        generated_text,
++        vocabulary,
++        pinyin,
++        options,
++        OdeMethod::Euler,
++        CfmSampleMode::default(),
++        chunk_size,
++        emit,
++    )
++}
++
++pub fn stream_standard_text_with_sample_mode<K: TrtChunkKernel, P: PinyinProvider>(
++    kernel: &mut K,
++    reference: TrtVoice<'_>,
++    generated_text: &str,
++    vocabulary: &Vocabulary,
++    pinyin: P,
++    options: StandardTextOptions,
++    method: OdeMethod,
++    mode: CfmSampleMode,
++    chunk_size: usize,
++    mut emit: impl FnMut(&[f32], usize) -> Result<()>,
++) -> Result<()> {
++    if chunk_size == 0 {
++        return Err(F5Error::InvalidConfiguration(
++            "Streaming chunk size must be nonzero",
++        ));
++    }
++    mode.validate()?;
++    let plans = plan_standard_chunks(
++        generated_text,
++        reference.transcript,
++        reference.audio.samples.len(),
++        options.speed,
++        options.fixed_seconds,
++        options.cross_fade_seconds,
++    )?;
++    let frontend = F5TextFrontend::new(vocabulary, pinyin);
++    let mut rng = StandardNormal::new(options.seed);
++    for chunk in plans {
++        let tokens = frontend.standard_tokens(reference.transcript, &chunk.text)?;
++        let count = chunk
++            .total_frames
++            .checked_mul(100)
++            .ok_or(F5Error::InvalidShape("Noise size overflow"))?;
++        let noise = rng.sample_vec(count)?;
++        let wave = kernel.synthesize_chunk_with_sample_mode(
++            reference.audio,
++            &tokens,
++            chunk.total_frames,
++            &noise,
++            options.sampling,
++            method,
++            mode,
++        )?;
++        emit_pcm_chunks(&wave, chunk_size, &mut emit)?;
++    }
++    Ok(())
++}
++
+@@ -579,0 +952,22 @@ mod tests {
++        fn synthesize_chunk_with_spectrogram(
++            &mut self,
++            reference: &ReferenceAudio,
++            tokens: &[i32],
++            target_frames: usize,
++            noise: &[f32],
++            sampling: SamplingConfig,
++        ) -> Result<InferenceOutput> {
++            let waveform =
++                self.synthesize_chunk(reference, tokens, target_frames, noise, sampling)?;
++            let frames = target_frames
++                - crate::mel::VocosMel::new()
++                    .extract(&reference.samples)?
++                    .frames;
++            let mel = vec![target_frames as f32; frames * 100];
++            Ok(InferenceOutput {
++                waveform,
++                sample_rate: 24_000,
++                spectrogram: GeneratedSpectrogram::from_frame_major(&mel, 100)?,
++            })
++        }
++
+@@ -685,0 +1080,135 @@ mod tests {
++    #[test]
++    fn standard_streaming_emits_original_pcm_chunks_without_crossfade() {
++        let reference = reference();
++        let text = "Hello world. Another sentence. More words here!";
++        let options = StandardTextOptions {
++            speed: 1.0,
++            fixed_seconds: Some(9.0),
++            cross_fade_seconds: 0.15,
++            seed: 42,
++            sampling: SamplingConfig::default(),
++        };
++        let mut backend = RecordingKernel::default();
++        let mut audio = Vec::new();
++        let mut sizes = Vec::new();
++        stream_standard_text(
++            &mut backend,
++            TrtVoice {
++                audio: &reference,
++                transcript: "Hi",
++            },
++            text,
++            &vocab(),
++            NoPinyin,
++            options,
++            700,
++            |chunk, rate| {
++                assert_eq!(rate, 24_000);
++                sizes.push(chunk.len());
++                audio.extend_from_slice(chunk);
++                Ok(())
++            },
++        )
++        .unwrap();
++        let planned =
++            plan_standard_chunks(text, "Hi", reference.samples.len(), 1.0, Some(9.0), 0.15)
++                .unwrap();
++        assert_eq!(backend.calls.len(), planned.len());
++        assert_eq!(audio.len(), 2048 * planned.len());
++        assert_eq!(sizes, [700, 700, 648].repeat(planned.len()));
++        for (i, call) in backend.calls.iter().enumerate() {
++            assert_eq!(call.0, planned[i].total_frames);
++            assert!(
++                audio[i * 2048..(i + 1) * 2048]
++                    .iter()
++                    .all(|v| *v == call.0 as f32 / 10_000.0)
++            );
++        }
++        assert!(
++            stream_standard_text(
++                &mut RecordingKernel::default(),
++                TrtVoice {
++                    audio: &reference,
++                    transcript: "Hi"
++                },
++                text,
++                &vocab(),
++                NoPinyin,
++                options,
++                0,
++                |_, _| Ok(()),
++            )
++            .is_err()
++        );
++        assert_eq!(backend.calls.len(), planned.len());
++    }
++
++    #[test]
++    fn streaming_sink_failure_prevents_generation_of_later_batches() {
++        let reference = reference();
++        let mut backend = RecordingKernel::default();
++        let result = stream_standard_text(
++            &mut backend,
++            TrtVoice {
++                audio: &reference,
++                transcript: "Hi",
++            },
++            "Hello world. Another sentence. More words here!",
++            &vocab(),
++            NoPinyin,
++            StandardTextOptions {
++                speed: 1.0,
++                fixed_seconds: None,
++                cross_fade_seconds: 0.15,
++                seed: 13,
++                sampling: SamplingConfig::default(),
++            },
++            128,
++            |_, _| Err(F5Error::ModelExecution("consumer closed".into())),
++        );
++        assert!(result.is_err());
++        assert_eq!(backend.calls.len(), 1);
++    }
++
++    #[test]
++    fn spectrogram_batches_are_concatenated_on_frame_axis() {
++        let reference = reference();
++        let mut backend = RecordingKernel::default();
++        let text = "Hello world. Another sentence. More words here!";
++        let options = StandardTextOptions {
++            speed: 1.0,
++            fixed_seconds: Some(9.0),
++            cross_fade_seconds: 0.15,
++            seed: 21,
++            sampling: SamplingConfig::default(),
++        };
++        let output = synthesize_standard_text_with_spectrogram(
++            &mut backend,
++            TrtVoice {
++                audio: &reference,
++                transcript: "Hi",
++            },
++            text,
++            &vocab(),
++            NoPinyin,
++            options,
++        )
++        .unwrap();
++        let ref_frames = crate::mel::VocosMel::new()
++            .extract(&reference.samples)
++            .unwrap()
++            .frames;
++        let generated_frames = backend
++            .calls
++            .iter()
++            .map(|x| x.0 - ref_frames)
++            .sum::<usize>();
++        assert_eq!(output.spectrogram.channels, 100);
++        assert_eq!(output.spectrogram.frames, generated_frames);
++        assert_eq!(output.spectrogram.values.len(), generated_frames * 100);
++        assert_eq!(output.sample_rate, 24_000);
++        assert_eq!(output.waveform.len(), 2048);
++        let first = backend.calls[0].0 as f32;
++        assert_eq!(output.spectrogram.values[0], first);
++    }
++
+diff --git a/models/f5_tts/src/backend/trtx_worker.rs b/models/f5_tts/src/backend/trtx_worker.rs
+index 1aa084a8..8211bb6e 100644
+--- a/models/f5_tts/src/backend/trtx_worker.rs
++++ b/models/f5_tts/src/backend/trtx_worker.rs
+@@ -9,0 +10 @@ use crate::{
++    model::InferenceOutput,
+@@ -19,2 +20,4 @@ use super::trtx_text::{
+-    TrtWarmBank, synthesize_cross_lingual, synthesize_multi_voice, synthesize_standard_text,
+-    synthesize_standard_text_with_sample_mode,
++    TrtWarmBank, stream_standard_text, stream_standard_text_with_sample_mode,
++    synthesize_cross_lingual, synthesize_multi_voice, synthesize_standard_text,
++    synthesize_standard_text_with_sample_mode, synthesize_standard_text_with_spectrogram,
++    synthesize_standard_text_with_spectrogram_and_sample_mode,
+@@ -194,2 +197,7 @@ impl<P: PinyinProvider + Clone> TrtModelWorker<P> {
+-        &mut self, recording: &ReferenceAudio, target_text: &str,
+-        spans: &[EditSpan], seed: u64, sampling: SamplingConfig, method: OdeMethod,
++        &mut self,
++        recording: &ReferenceAudio,
++        target_text: &str,
++        spans: &[EditSpan],
++        seed: u64,
++        sampling: SamplingConfig,
++        method: OdeMethod,
+@@ -197 +205,3 @@ impl<P: PinyinProvider + Clone> TrtModelWorker<P> {
+-        let active = self.active.as_mut()
++        let active = self
++            .active
++            .as_mut()
+@@ -199,3 +209,3 @@ impl<P: PinyinProvider + Clone> TrtModelWorker<P> {
+-        let tokens = crate::text_frontend::F5TextFrontend::new(
+-            &active.vocabulary, active.pinyin.clone(),
+-        ).cross_lingual_tokens(target_text)?;
++        let tokens =
++            crate::text_frontend::F5TextFrontend::new(&active.vocabulary, active.pinyin.clone())
++                .cross_lingual_tokens(target_text)?;
+@@ -211,3 +221,3 @@ impl<P: PinyinProvider + Clone> TrtModelWorker<P> {
+-        active.engines.edit_speech_with_method(
+-            &plan, &tokens, &noise, gain, sampling, method,
+-        )
++        active
++            .engines
++            .edit_speech_with_method(&plan, &tokens, &noise, gain, sampling, method)
+@@ -237,2 +247,5 @@ impl<P: PinyinProvider + Clone> TrtModelWorker<P> {
+-        &mut self, text: &str, options: StandardTextOptions,
+-        method: OdeMethod, mode: CfmSampleMode,
++        &mut self,
++        text: &str,
++        options: StandardTextOptions,
++        method: OdeMethod,
++        mode: CfmSampleMode,
+@@ -241 +254,3 @@ impl<P: PinyinProvider + Clone> TrtModelWorker<P> {
+-        let active = self.active.as_mut()
++        let active = self
++            .active
++            .as_mut()
+@@ -243 +258,3 @@ impl<P: PinyinProvider + Clone> TrtModelWorker<P> {
+-        let voice = active.voices.get(&active.selected_voice)
++        let voice = active
++            .voices
++            .get(&active.selected_voice)
+@@ -246,2 +263,116 @@ impl<P: PinyinProvider + Clone> TrtModelWorker<P> {
+-            &mut active.engines, voice.borrowed(), text,
+-            &active.vocabulary, active.pinyin.clone(), options, method, mode,
++            &mut active.engines,
++            voice.borrowed(),
++            text,
++            &active.vocabulary,
++            active.pinyin.clone(),
++            options,
++            method,
++            mode,
++        )
++    }
++
++    pub fn synthesize_with_spectrogram(
++        &mut self,
++        text: &str,
++        options: StandardTextOptions,
++    ) -> Result<InferenceOutput> {
++        let active = self
++            .active
++            .as_mut()
++            .ok_or(F5Error::InvalidConfiguration("No F5 model loaded"))?;
++        let voice = active
++            .voices
++            .get(&active.selected_voice)
++            .ok_or(F5Error::InvalidConfiguration("Active F5 voice missing"))?;
++        synthesize_standard_text_with_spectrogram(
++            &mut active.engines,
++            voice.borrowed(),
++            text,
++            &active.vocabulary,
++            active.pinyin.clone(),
++            options,
++        )
++    }
++
++    pub fn synthesize_with_spectrogram_and_sample_mode(
++        &mut self,
++        text: &str,
++        options: StandardTextOptions,
++        method: OdeMethod,
++        mode: CfmSampleMode,
++    ) -> Result<InferenceOutput> {
++        let active = self
++            .active
++            .as_mut()
++            .ok_or(F5Error::InvalidConfiguration("No F5 model loaded"))?;
++        let voice = active
++            .voices
++            .get(&active.selected_voice)
++            .ok_or(F5Error::InvalidConfiguration("Active F5 voice missing"))?;
++        synthesize_standard_text_with_spectrogram_and_sample_mode(
++            &mut active.engines,
++            voice.borrowed(),
++            text,
++            &active.vocabulary,
++            active.pinyin.clone(),
++            options,
++            method,
++            mode,
++        )
++    }
++
++    pub fn stream_synthesize(
++        &mut self,
++        text: &str,
++        options: StandardTextOptions,
++        chunk_size: usize,
++        emit: impl FnMut(&[f32], usize) -> Result<()>,
++    ) -> Result<()> {
++        let active = self
++            .active
++            .as_mut()
++            .ok_or(F5Error::InvalidConfiguration("No F5 model loaded"))?;
++        let voice = active
++            .voices
++            .get(&active.selected_voice)
++            .ok_or(F5Error::InvalidConfiguration("Active F5 voice missing"))?;
++        stream_standard_text(
++            &mut active.engines,
++            voice.borrowed(),
++            text,
++            &active.vocabulary,
++            active.pinyin.clone(),
++            options,
++            chunk_size,
++            emit,
++        )
++    }
++
++    pub fn stream_synthesize_with_sample_mode(
++        &mut self,
++        text: &str,
++        options: StandardTextOptions,
++        method: OdeMethod,
++        mode: CfmSampleMode,
++        chunk_size: usize,
++        emit: impl FnMut(&[f32], usize) -> Result<()>,
++    ) -> Result<()> {
++        let active = self
++            .active
++            .as_mut()
++            .ok_or(F5Error::InvalidConfiguration("No F5 model loaded"))?;
++        let voice = active
++            .voices
++            .get(&active.selected_voice)
++            .ok_or(F5Error::InvalidConfiguration("Active F5 voice missing"))?;
++        stream_standard_text_with_sample_mode(
++            &mut active.engines,
++            voice.borrowed(),
++            text,
++            &active.vocabulary,
++            active.pinyin.clone(),
++            options,
++            method,
++            mode,
++            chunk_size,
++            emit,
+diff --git a/models/f5_tts/src/model.rs b/models/f5_tts/src/model.rs
+index d62ab1a4..e47f6906 100644
+--- a/models/f5_tts/src/model.rs
++++ b/models/f5_tts/src/model.rs
+@@ -2,0 +3,71 @@ use crate::{F5Error, Result};
++#[derive(Debug, Clone, PartialEq)]
++pub struct GeneratedSpectrogram {
++    pub channels: usize,
++    pub frames: usize,
++    pub values: Vec<f32>,
++}
++
++impl GeneratedSpectrogram {
++    pub fn from_frame_major(frame_major: &[f32], channels: usize) -> Result<Self> {
++        if channels == 0 || frame_major.is_empty() || frame_major.len() % channels != 0 {
++            return Err(F5Error::InvalidShape("Invalid generated mel dimensions"));
++        }
++        let frames = frame_major.len() / channels;
++        let mut values = vec![0.0; frame_major.len()];
++        for frame in 0..frames {
++            for channel in 0..channels {
++                values[channel * frames + frame] = frame_major[frame * channels + channel];
++            }
++        }
++        Ok(Self {
++            channels,
++            frames,
++            values,
++        })
++    }
++
++    pub fn concatenate(chunks: &[Self]) -> Result<Self> {
++        let first = chunks
++            .first()
++            .ok_or(F5Error::InvalidShape("No generated mel chunks"))?;
++        let channels = first.channels;
++        if channels == 0
++            || chunks.iter().any(|c| {
++                c.channels != channels
++                    || c.frames == 0
++                    || c.frames.checked_mul(channels) != Some(c.values.len())
++            })
++        {
++            return Err(F5Error::InvalidShape("Incompatible generated mel chunks"));
++        }
++        let frames = chunks.iter().try_fold(0usize, |acc, c| {
++            acc.checked_add(c.frames)
++                .ok_or(F5Error::InvalidShape("Generated mel length overflow"))
++        })?;
++        let length = frames
++            .checked_mul(channels)
++            .ok_or(F5Error::InvalidShape("Generated mel size overflow"))?;
++        let mut values = vec![0.0; length];
++        for channel in 0..channels {
++            let mut cursor = channel * frames;
++            for chunk in chunks {
++                let span = &chunk.values[channel * chunk.frames..(channel + 1) * chunk.frames];
++                values[cursor..cursor + span.len()].copy_from_slice(span);
++                cursor += span.len();
++            }
++        }
++        Ok(Self {
++            channels,
++            frames,
++            values,
++        })
++    }
++}
++
++#[derive(Debug, Clone, PartialEq)]
++pub struct InferenceOutput {
++    pub waveform: Vec<f32>,
++    pub sample_rate: usize,
++    pub spectrogram: GeneratedSpectrogram,
++}
++
+@@ -106,0 +178,12 @@ mod tests {
++    #[test]
++    fn generated_spectrogram_transposition_and_python_style_batch_concat() {
++        let left = GeneratedSpectrogram::from_frame_major(&[1.0, 10.0, 2.0, 20.0], 2).unwrap();
++        let right = GeneratedSpectrogram::from_frame_major(&[3.0, 30.0], 2).unwrap();
++        assert_eq!(left.values, [1.0, 2.0, 10.0, 20.0]);
++        let joined = GeneratedSpectrogram::concatenate(&[left, right]).unwrap();
++        assert_eq!(joined.frames, 3);
++        assert_eq!(joined.values, [1.0, 2.0, 3.0, 10.0, 20.0, 30.0]);
++        assert!(GeneratedSpectrogram::from_frame_major(&[1.0], 2).is_err());
++        assert!(GeneratedSpectrogram::concatenate(&[]).is_err());
++    }
++
+diff --git a/models/f5_tts/src/pipeline.rs b/models/f5_tts/src/pipeline.rs
+index 853bd227..ca0a1e47 100644
+--- a/models/f5_tts/src/pipeline.rs
++++ b/models/f5_tts/src/pipeline.rs
+@@ -12,0 +13 @@ use crate::{
++    model::{GeneratedSpectrogram, InferenceOutput},
+@@ -17 +18 @@ use crate::{
+-    standard_chunking::plan_standard_chunks,
++    standard_chunking::{emit_pcm_chunks, plan_standard_chunks},
+@@ -209,0 +211,211 @@ impl StandardF5Runtime {
++    pub fn synthesize_text_with_spectrogram(
++        &mut self,
++        reference: &ReferenceAudio,
++        reference_text: &str,
++        generated_text: &str,
++        speed: f32,
++        fixed_seconds: Option<f32>,
++        seed: u64,
++        sampling: SamplingConfig,
++    ) -> Result<InferenceOutput> {
++        let pinyin = Arc::clone(&self.native_pinyin);
++        self.synthesize_text_with_pinyin_and_spectrogram(
++            reference,
++            reference_text,
++            generated_text,
++            pinyin,
++            speed,
++            fixed_seconds,
++            0.15,
++            seed,
++            sampling,
++        )
++    }
++
++    pub fn synthesize_text_with_pinyin_and_spectrogram<P: PinyinProvider>(
++        &mut self,
++        reference: &ReferenceAudio,
++        reference_text: &str,
++        generated_text: &str,
++        pinyin: P,
++        speed: f32,
++        fixed_seconds: Option<f32>,
++        cross_fade_seconds: f32,
++        seed: u64,
++        sampling: SamplingConfig,
++    ) -> Result<InferenceOutput> {
++        self.synthesize_text_with_pinyin_and_spectrogram_and_sample_mode(
++            reference,
++            reference_text,
++            generated_text,
++            pinyin,
++            speed,
++            fixed_seconds,
++            cross_fade_seconds,
++            seed,
++            sampling,
++            OdeMethod::Euler,
++            CfmSampleMode::default(),
++        )
++    }
++
++    pub fn synthesize_text_with_pinyin_and_spectrogram_and_sample_mode<P: PinyinProvider>(
++        &mut self,
++        reference: &ReferenceAudio,
++        reference_text: &str,
++        generated_text: &str,
++        pinyin: P,
++        speed: f32,
++        fixed_seconds: Option<f32>,
++        cross_fade_seconds: f32,
++        seed: u64,
++        sampling: SamplingConfig,
++        method: OdeMethod,
++        mode: CfmSampleMode,
++    ) -> Result<InferenceOutput> {
++        mode.validate()?;
++        let planned = plan_standard_chunks(
++            generated_text,
++            reference_text,
++            reference.samples.len(),
++            speed,
++            fixed_seconds,
++            cross_fade_seconds,
++        )?;
++        let vocabulary = self.vocabulary.clone();
++        let frontend = F5TextFrontend::new(&vocabulary, pinyin);
++        let mut generator = StandardNormal::new(seed);
++        let mut waves = Vec::with_capacity(planned.len());
++        let mut spectra = Vec::with_capacity(planned.len());
++        for chunk in planned {
++            let tokens = frontend.standard_tokens(reference_text, &chunk.text)?;
++            let (wave, spec) = self.synthesize_from_noise_source_with_mode_output(
++                reference,
++                &tokens,
++                chunk.total_frames,
++                sampling,
++                method,
++                mode,
++                true,
++                |count| Ok((0..count).map(|_| generator.sample()).collect()),
++            )?;
++            waves.push(wave);
++            spectra.push(spec.ok_or(F5Error::ModelExecution(
++                "Mel capture was not produced".into(),
++            ))?);
++        }
++        Ok(InferenceOutput {
++            waveform: crate::cross_lingual::cross_fade_waves(&waves, cross_fade_seconds as f64)?,
++            sample_rate: crate::mel::SAMPLE_RATE,
++            spectrogram: GeneratedSpectrogram::concatenate(&spectra)?,
++        })
++    }
++
++    pub fn stream_text(
++        &mut self,
++        reference: &ReferenceAudio,
++        reference_text: &str,
++        generated_text: &str,
++        speed: f32,
++        fixed_seconds: Option<f32>,
++        seed: u64,
++        sampling: SamplingConfig,
++        chunk_size: usize,
++        emit: impl FnMut(&[f32], usize) -> Result<()>,
++    ) -> Result<()> {
++        let pinyin = Arc::clone(&self.native_pinyin);
++        self.stream_text_with_pinyin(
++            reference,
++            reference_text,
++            generated_text,
++            pinyin,
++            speed,
++            fixed_seconds,
++            0.15,
++            seed,
++            sampling,
++            chunk_size,
++            emit,
++        )
++    }
++
++    pub fn stream_text_with_pinyin<P: PinyinProvider>(
++        &mut self,
++        reference: &ReferenceAudio,
++        reference_text: &str,
++        generated_text: &str,
++        pinyin: P,
++        speed: f32,
++        fixed_seconds: Option<f32>,
++        cross_fade_seconds: f32,
++        seed: u64,
++        sampling: SamplingConfig,
++        chunk_size: usize,
++        emit: impl FnMut(&[f32], usize) -> Result<()>,
++    ) -> Result<()> {
++        self.stream_text_with_pinyin_and_sample_mode(
++            reference,
++            reference_text,
++            generated_text,
++            pinyin,
++            speed,
++            fixed_seconds,
++            cross_fade_seconds,
++            seed,
++            sampling,
++            OdeMethod::Euler,
++            CfmSampleMode::default(),
++            chunk_size,
++            emit,
++        )
++    }
++
++    pub fn stream_text_with_pinyin_and_sample_mode<P: PinyinProvider>(
++        &mut self,
++        reference: &ReferenceAudio,
++        reference_text: &str,
++        generated_text: &str,
++        pinyin: P,
++        speed: f32,
++        fixed_seconds: Option<f32>,
++        cross_fade_seconds: f32,
++        seed: u64,
++        sampling: SamplingConfig,
++        method: OdeMethod,
++        mode: CfmSampleMode,
++        chunk_size: usize,
++        mut emit: impl FnMut(&[f32], usize) -> Result<()>,
++    ) -> Result<()> {
++        if chunk_size == 0 {
++            return Err(F5Error::InvalidConfiguration(
++                "Streaming chunk size must be nonzero",
++            ));
++        }
++        mode.validate()?;
++        let planned = plan_standard_chunks(
++            generated_text,
++            reference_text,
++            reference.samples.len(),
++            speed,
++            fixed_seconds,
++            cross_fade_seconds,
++        )?;
++        let vocabulary = self.vocabulary.clone();
++        let frontend = F5TextFrontend::new(&vocabulary, pinyin);
++        let mut generator = StandardNormal::new(seed);
++        for chunk in planned {
++            let tokens = frontend.standard_tokens(reference_text, &chunk.text)?;
++            let wave = self.synthesize_from_noise_source_with_mode(
++                reference,
++                &tokens,
++                chunk.total_frames,
++                sampling,
++                method,
++                mode,
++                |count| Ok((0..count).map(|_| generator.sample()).collect()),
++            )?;
++            emit_pcm_chunks(&wave, chunk_size, &mut emit)?;
++        }
++        Ok(())
++    }
++
+@@ -423,0 +636,44 @@ impl StandardF5Runtime {
++    pub fn synthesize_with_spectrogram(
++        &mut self,
++        reference: &ReferenceAudio,
++        text_tokens: &[i32],
++        options: GenerateOptions,
++    ) -> Result<InferenceOutput> {
++        self.synthesize_with_spectrogram_and_sample_mode(
++            reference,
++            text_tokens,
++            options,
++            OdeMethod::Euler,
++            CfmSampleMode::default(),
++        )
++    }
++
++    pub fn synthesize_with_spectrogram_and_sample_mode(
++        &mut self,
++        reference: &ReferenceAudio,
++        text_tokens: &[i32],
++        options: GenerateOptions,
++        method: OdeMethod,
++        mode: CfmSampleMode,
++    ) -> Result<InferenceOutput> {
++        mode.validate()?;
++        let mut rng = StandardNormal::new(options.seed);
++        let (waveform, mel) = self.synthesize_from_noise_source_with_mode_output(
++            reference,
++            text_tokens,
++            options.total_frames,
++            options.sampling,
++            method,
++            mode,
++            true,
++            |count| Ok((0..count).map(|_| rng.sample()).collect()),
++        )?;
++        Ok(InferenceOutput {
++            waveform,
++            sample_rate: crate::mel::SAMPLE_RATE,
++            spectrogram: mel.ok_or(F5Error::ModelExecution(
++                "Mel capture was not produced".into(),
++            ))?,
++        })
++    }
++
+@@ -578,0 +835,24 @@ impl StandardF5Runtime {
++        self.synthesize_from_noise_source_with_mode_output(
++            reference,
++            text_tokens,
++            total_frames,
++            sampling,
++            method,
++            mode,
++            false,
++            create_noise,
++        )
++        .map(|result| result.0)
++    }
++
++    fn synthesize_from_noise_source_with_mode_output(
++        &mut self,
++        reference: &ReferenceAudio,
++        text_tokens: &[i32],
++        total_frames: usize,
++        sampling: SamplingConfig,
++        method: OdeMethod,
++        mode: CfmSampleMode,
++        capture_spectrogram: bool,
++        create_noise: impl FnOnce(usize) -> Result<Vec<f32>>,
++    ) -> Result<(Vec<f32>, Option<GeneratedSpectrogram>)> {
+@@ -623 +903,12 @@ impl StandardF5Runtime {
+-        self.vocoder.decode(generated, restoration_gain)
++        let spectrogram = if capture_spectrogram {
++            let data = generated
++                .clone()
++                .into_data()
++                .try_to_vec::<f32>()
++                .map_err(|e| F5Error::ModelExecution(format!("F5 mel download: {e}")))?;
++            Some(GeneratedSpectrogram::from_frame_major(&data, 100)?)
++        } else {
++            None
++        };
++        let waveform = self.vocoder.decode(generated, restoration_gain)?;
++        Ok((waveform, spectrogram))
+diff --git a/models/f5_tts/src/standard_chunking.rs b/models/f5_tts/src/standard_chunking.rs
+index 03c3258c..0c151b95 100644
+--- a/models/f5_tts/src/standard_chunking.rs
++++ b/models/f5_tts/src/standard_chunking.rs
+@@ -131,0 +132,16 @@ pub fn plan_standard_chunks(
++pub fn emit_pcm_chunks(
++    waveform: &[f32],
++    chunk_size: usize,
++    emit: &mut impl FnMut(&[f32], usize) -> Result<()>,
++) -> Result<()> {
++    if chunk_size == 0 {
++        return Err(F5Error::InvalidConfiguration(
++            "Streaming chunk size must be nonzero",
++        ));
++    }
++    for chunk in waveform.chunks(chunk_size) {
++        emit(chunk, SAMPLE_RATE as usize)?;
++    }
++    Ok(())
++}
++
+@@ -135,0 +152,31 @@ mod tests {
++    #[test]
++    fn streaming_pcm_keeps_sample_order_and_propagates_errors() {
++        let samples = (0..21).map(|i| i as f32).collect::<Vec<_>>();
++        let mut reconstructed = Vec::new();
++        let mut sizes = Vec::new();
++        emit_pcm_chunks(&samples, 8, &mut |chunk, sample_rate| {
++            assert_eq!(sample_rate, 24_000);
++            sizes.push(chunk.len());
++            reconstructed.extend_from_slice(chunk);
++            Ok(())
++        })
++        .unwrap();
++        assert_eq!(sizes, [8, 8, 5]);
++        assert_eq!(reconstructed, samples);
++        assert!(emit_pcm_chunks(&samples, 0, &mut |_, _| Ok(())).is_err());
++        let mut calls = 0;
++        let failure = emit_pcm_chunks(&samples, 8, &mut |_, _| {
++            calls += 1;
++            Err(F5Error::ModelExecution("sink closed".into()))
++        });
++        assert!(failure.is_err());
++        assert_eq!(calls, 1);
++        let mut empty_calls = 0;
++        emit_pcm_chunks(&[], 8, &mut |_, _| {
++            empty_calls += 1;
++            Ok(())
++        })
++        .unwrap();
++        assert_eq!(empty_calls, 0);
++    }
++
