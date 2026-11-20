@@ -1,27 +1,27 @@
 # Dettato — native Rust / Burn port
 
-**Status: partial implementation. The transcriber network is implemented in Rust/Burn but is not yet numerically verified or tested with real model weights. Complete multi-instrument audio-to-MIDI inference is not available.**
+**Status: partial implementation. Two of the four neural stages (Transcriber and Evidence Repairer) have source-level Burn implementations, but have not passed Rust compilation, checkpoint loading, layer parity or end-to-end numerical verification. Grouper and Drums currently provide their decoding/postprocessing algorithms, not their neural networks. The full system cannot yet perform independent end-to-end transcription.**
 
-The original Dettato project is by Nathan Mills / kobimusic (Apache-2.0). Original source: <https://github.com/kobimusic/dettato>. See `LICENSE` and `NOTICE`.
+Original Dettato: Nathan Mills / kobimusic, Apache-2.0, <https://github.com/kobimusic/dettato>. See `LICENSE` and `NOTICE`.
 
-The crate is independent of `models/beat_this`; it has its own manifest and workspace.
+This is an independent crate in `models/dettato`. `models/beat_this` is unchanged. It uses Burn 0.22.1 and can be configured for Flex, CPU, CUDA and WGPU backends where the upstream Burn kernels support the operations. There is no ONNX or Python dependency at runtime.
 
-## Delivered in the first development cycle
+## Covered source features
 
-- Original four-stage directory layout and independent local paths for `config.json` / `model.safetensors` (`dettato`, `dettato-evidence`, `dettato-grouper`, `dettato-drums`). No download or Python required.
-- Safetensors reader for F32, F64, F16 and BF16, preserving named tensor shapes and loading them to Burn tensors.
-- Transcriber HCQT frontend for 16 kHz mono input: 2048-point Hann/STFT, 3 bins/semitone, eight harmonic channels, 512-point short-window channel, zero-centered padding and 10 ms hop. CPU frontend uses RustFFT; it is not CUDA optimized.
-- Full structural Burn transcriber network: `Stem`, sparse `PitchMix`, dilated `LaneBlock`, pitch/time axial attention with RoPE and relative bias, bidirectional GRU, refine blocks and six output heads. Reference GRU implementation is frame-sequential and not optimized for GPU.
-- Overlapping 8 s windows (2 s hop), Hann-weighted six-map aggregation and two-voice peak decoder with interpolation, NMS, offset/frame termination and confidence. This early runner does not aggregate intermediate hidden/stem taps for the later models.
-- Multi-track Standard MIDI File (type 1) serialization with instrument programs, drum channel 10, velocities and independent MIDI ports for more than fifteen melodic tracks.
+| Component | Rust code currently present | Still missing |
+|---|---|---|
+| Checkpoints | `config.json`, named `safetensors` tensors for all four stages, F32/F16/BF16/F64 import | Automated full-key/shape parity on released checkpoints |
+| Transcriber | HCQT frontend, Stem, PitchMix, CNN backbone, pitch/time attention, RoPE, bidirectional GRU, six heads, 8 s Hann overlap, two-slot note decoder | Numerically verified layer outputs and performance optimizations |
+| Evidence | 31 map features, two 368-d hidden summaries, standardization/1/32 quantization, FP16 map feature rounding; CPU note context and beat-grid features; Burn embeddings/9-layer note transformer/RoPE/SwiGLU/heads; candidate decoding; keep/drop/insert repair | Compilation/parity of Burn Evidence network, batched/precision-optimized inference |
+| Grouper | 73-class General MIDI vocabulary, cosine average-linkage clustering, Hungarian overlap matching, tracklet merge/refinement/absorption, naming using instrument-family credit and track-head layers, `merge=false`, MIDI track construction | Frontend/NoteNet tensors and neural inference, retune frontend |
+| Drums | 50 fps peak selection, kit/orchestral routing, 61 drum keys, 13 timpani notes, 40 ms dedup, velocity | 44.1 kHz frontend, DrumNet, expert models, router inference |
+| MIDI | Type-1 multitrack export, programs, dedicated drum channel and MIDI ports for additional melodic tracks | Full end-to-end Dettato inference orchestration |
 
-## Not implemented yet
+The Transcriber can now collect Evidence hidden vectors in a bounded-memory **second inference pass**, without storing the entire song's `[frames,88,368]` hidden tensor. It accumulates only notes' onset and mean vectors, with the same per-frame Hann-normalized weights used for the output maps. The first pass still provides the shared note maps.
 
-- Transcriber numerical parity with PyTorch, proper BF16 CUDA GRU execution, speed/memory optimization and collection of overlap-averaged intermediate hidden/stem taps (mandatory for Evidence and Grouper).
-- Evidence transformer and insertion/repair algorithm.
-- Grouper front, instrument embeddings, clustering, naming, and `merge=false` track separation.
-- Drum expert models / routing, tuning correction and resampling.
-- End-to-end model inference, checkpoint parity and GPU benchmark.
+The Rust EvidenceNetwork accepts 769-component evidence vectors and uses the original checkpoint key layout (`emb.*`, `bb.blocks.*`, `keep`, `don`, `dur`, `ins.*`). Its CPU-side continuous feature preparation must be numerically compared with PyTorch before the port is considered complete.
+
+The Grouper's decoder accepts predictions emitted by the *future* Burn NoteNet. It does **not** infer instruments from audio on its own yet. `merge_same_instrument=false` preserves independent same-instrument tracklets in the output.
 
 ## Weights layout
 
@@ -37,8 +37,22 @@ weights/
   dettato-drums/model.safetensors
 ```
 
-## Validation
+## Validation and limitations
 
-`cargo test --manifest-path models/dettato/Cargo.toml` from the repository root, with Rust 1.100.0 and dependencies available. The container that authored this cycle did not have `cargo`/`rustc`, so tests have **not** been run; this is a source-only first pass.
+An original-Python-generated numerical fixture of 3 rows × 769 evidence features is included in `tests/fixtures/evidence_reference.json`. Rust tests cover independent algorithms (note features, insertion deduplication, candidate decoding, hierarchical clusters, Hungarian matching, instrument naming, drum peaks, MIDI output). Their Rust execution is **not confirmed**.
 
-The next cycle must compare HCQT and decoding with the supplied original Python sources, then implement the full network under parity fixtures. Functional coverage and runtime verification are tracked separately.
+Recommended validation commands in a Rust 1.100+ environment with accessible Burn dependencies:
+
+```sh
+cargo fmt --manifest-path models/dettato/Cargo.toml --check
+cargo test --manifest-path models/dettato/Cargo.toml --features flex
+```
+
+The authoring container does not have `cargo` or `rustc` and has no outbound DNS. Thus the new source has **not** been compiled or executed as Rust, and all compiler/API issues remain possible. Original Python modules were used to generate the reference evidence fixture. No CUDA benchmark or weight-based inference was attempted.
+
+## Next functional priorities
+
+1. Port the Grouper `Front`/`HDemix`/`Prof`/`LaneFront`/`NoteNet` and gather the Transcriber `stem` taps required for its input.
+2. Port `drums/features.py`, DrumNet, OrchestralExpert and three-model averaging/router inference.
+3. Port the retuning/resampling stage and the single-call end-to-end pipeline.
+4. Verify all checkpoint names/dimensions and run local per-layer numerical parity (Transcriber, Evidence, Grouper, Drums), then address runtime and GPU performance.

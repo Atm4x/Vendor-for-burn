@@ -1,5 +1,5 @@
 use super::{decode::{DecodeConfig, DecodedNote, FrameMaps, decode}, net::{LaneNet, Settings}};
-use crate::{AUDIO_SAMPLE_RATE, PITCH_COUNT, checkpoint::{Checkpoint, ModelPaths}, hcqt::{Hcqt, HcqtConfig}};
+use crate::{AUDIO_SAMPLE_RATE, PITCH_COUNT, checkpoint::{Checkpoint, ModelPaths}, hcqt::{Hcqt, HcqtConfig}, evidence::features::{self, EVIDENCE_FEATURES, HIDDEN_CHANNELS}};
 use burn::tensor::Device;
 use serde_json::Value;
 use std::path::Path;
@@ -91,6 +91,69 @@ impl Transcriber {
             }
         }
         FrameMaps::new(frames, accumulator)
+    }
+
+    pub fn notes_with_evidence(&self, audio16k: &[f32])
+        -> Result<(Vec<DecodedNote>, Vec<[f32; EVIDENCE_FEATURES]>), String>
+    {
+        let maps = self.maps(audio16k)?;
+        let notes = decode(&maps, &self.decoder)?;
+        let frames = features::note_frames(&notes, maps.frames(), self.decoder.hop_seconds)?;
+        if notes.is_empty() { return Ok((notes, Vec::new())); }
+        let map_rows = features::map_evidence(&maps, &frames)?;
+        let (song_frames, plan) = windows(audio16k.len(), self.decoder.hop_seconds, 0.25)?;
+        let window_frames = (WINDOW_SECONDS as f64 / self.decoder.hop_seconds).round() as usize;
+        let hann = (0..window_frames).map(|t| {
+            (0.5 - 0.5 * (2.0 * std::f64::consts::PI
+                * (t + 1) as f64 / (window_frames + 1) as f64).cos()) as f32
+        }).collect::<Vec<_>>();
+        let mut weight_sum = vec![0.0f32; song_frames];
+        for window in &plan {
+            for (local, &weight) in hann.iter().enumerate() {
+                let global = window.first_song_frame + local as isize;
+                if (0..song_frames as isize).contains(&global) {
+                    weight_sum[global as usize] += weight;
+                }
+            }
+        }
+        let mut at = vec![vec![0.0; HIDDEN_CHANNELS]; notes.len()];
+        let mut mean = vec![vec![0.0; HIDDEN_CHANNELS]; notes.len()];
+        let mut samples = vec![0.0f32; WINDOW_SAMPLES];
+        let pad = WINDOW_SAMPLES / 2;
+        for window in &plan {
+            for (i, sample) in samples.iter_mut().enumerate() {
+                let pos = window.start_sample + i;
+                *sample = if pos >= pad { audio16k.get(pos - pad).copied().unwrap_or(0.0) } else { 0.0 };
+            }
+            let prediction = self.network.infer_features(&self.frontend.extract(&samples))?;
+            let [batch, channels, time, lanes] = prediction.hidden.dims();
+            if batch != 1 || channels != HIDDEN_CHANNELS || lanes != PITCH_COUNT || time != window_frames {
+                return Err(format!("unexpected hidden tap: [{batch}, {channels}, {time}, {lanes}]"));
+            }
+            let tap: Vec<f32> = prediction.hidden.into_data().try_into_vec::<f32>()
+                .map_err(|e| format!("reading hidden tap: {e}"))?;
+            let lo = window.first_song_frame.max(0) as usize;
+            let hi = (window.first_song_frame + window_frames as isize)
+                .min(song_frames as isize).max(0) as usize;
+            if hi <= lo { continue; }
+            for (index, note) in frames.iter().enumerate() {
+                let left = lo.max(note.start);
+                let right = hi.min(note.end);
+                if left >= right { continue; }
+                let span = (note.end - note.start) as f32;
+                for global in left..right {
+                    let local = (global as isize - window.first_song_frame) as usize;
+                    let weight = hann[local] / weight_sum[global].max(1e-6);
+                    for channel in 0..channels {
+                        let x = tap[(channel * time + local) * lanes + note.pitch_index];
+                        mean[index][channel] += weight * x / span;
+                        if global == note.start { at[index][channel] += weight * x; }
+                    }
+                }
+            }
+        }
+        let evidence = features::assemble(&map_rows, &at, &mean)?;
+        Ok((notes, evidence))
     }
 
     pub fn notes(&self, audio16k: &[f32]) -> Result<Vec<DecodedNote>, String> {

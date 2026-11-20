@@ -1,4 +1,7 @@
 pub mod checkpoint;
+pub mod evidence;
+pub mod grouper;
+pub mod drums;
 pub mod hcqt;
 pub mod midi;
 pub mod transcriber;
