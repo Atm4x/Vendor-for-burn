@@ -937,6 +937,9 @@ pub struct TrtLibraryPaths<'a> {
 
 pub trait TrtSynthesis {
     fn synthesize(&mut self, request: SynthesisInputs<'_>) -> Result<Vec<f32>>;
+    fn synthesize_with_sample_mode(
+        &mut self, request: SynthesisInputs<'_>, method: OdeMethod, mode: CfmSampleMode,
+    ) -> Result<Vec<f32>>;
     fn edit_speech(
         &mut self,
         plan: &SpeechEditPlan,
@@ -969,6 +972,12 @@ impl<I: CudaTransport, E: TrtExecutor> TrtSynthesis for TrtF5Session<I, E> {
 
     fn synthesize(&mut self, request: SynthesisInputs<'_>) -> Result<Vec<f32>> {
         TrtF5Session::synthesize(self, request)
+    }
+
+    fn synthesize_with_sample_mode(
+        &mut self, request: SynthesisInputs<'_>, method: OdeMethod, mode: CfmSampleMode,
+    ) -> Result<Vec<f32>> {
+        TrtF5Session::synthesize_with_sample_mode(self, request, method, mode)
     }
 
     fn synthesize_seeded(
