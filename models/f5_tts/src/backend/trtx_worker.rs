@@ -190,6 +190,29 @@ impl<P: PinyinProvider + Clone> TrtModelWorker<P> {
             .edit_speech(&plan, &tokens, &noise, gain, sampling)
     }
 
+    pub fn edit_speech_with_method(
+        &mut self, recording: &ReferenceAudio, target_text: &str,
+        spans: &[EditSpan], seed: u64, sampling: SamplingConfig, method: OdeMethod,
+    ) -> Result<Vec<f32>> {
+        let active = self.active.as_mut()
+            .ok_or(F5Error::InvalidConfiguration("No F5 model loaded"))?;
+        let tokens = crate::text_frontend::F5TextFrontend::new(
+            &active.vocabulary, active.pinyin.clone(),
+        ).cross_lingual_tokens(target_text)?;
+        let original = VocosMel::new().extract(&recording.samples)?;
+        let plan = SpeechEditPlan::new(&original.values, original.frames, spans, tokens.len())?;
+        let mut rng = StandardNormal::new(seed);
+        let noise = rng.sample_vec(plan.total_frames * 100)?;
+        let gain = if recording.normalization_gain > 1.0 {
+            1.0 / recording.normalization_gain
+        } else {
+            1.0
+        };
+        active.engines.edit_speech_with_method(
+            &plan, &tokens, &noise, gain, sampling, method,
+        )
+    }
+
     pub fn synthesize(&mut self, text: &str, options: StandardTextOptions) -> Result<Vec<f32>> {
         let active = self
             .active
