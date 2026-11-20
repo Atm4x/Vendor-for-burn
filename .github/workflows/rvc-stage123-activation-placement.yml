@@ -1,0 +1,80 @@
+name: RVC Stage123 activation placement Windows full-RVC profiler
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rvc-stage123-activation-placement-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cache/tracel
+          key: rvc-stage123-rust100-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            rvc-stage121-
+            rvc-rust100-stage120-
+      - name: Validate Rust math, PowerShell runner, Python exporter
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $script = 'research/stage123-activation-placement/windows/Run-Stage123-Activation-Placement.ps1'
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $script).Path, [ref]$tokens, [ref]$errors)
+          if ($errors.Count -gt 0) { $errors | Format-List | Out-String | Write-Host; throw 'Stage123 PowerShell parser failed' }
+          python -m py_compile research/stage123-activation-placement/windows/Export-Stage123-NCU-Metrics.py
+          if ($LASTEXITCODE -ne 0) { throw 'Stage123 NCU exporter syntax error' }
+          rustc --edition=2024 --test -O research/stage123-activation-placement/reference.rs -o "$env:RUNNER_TEMP/stage123_reference.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Stage123 numerical reference compilation failed' }
+          & "$env:RUNNER_TEMP/stage123_reference.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Stage123 numerical reference 3/3 FAIL' }
+      - name: Validate vendored crate checksums
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Vendored crate checksum verification failed' }
+      - name: Build Rust 1.100.0 release CPU CUDA WGPU
+        shell: pwsh
+        run: |
+          cargo build --release --offline --locked -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs --bin stage123_activation_placement_probe
+          if ($LASTEXITCODE -ne 0) { throw 'Stage123 Rust Windows release build failed' }
+          & target/release/tts-with-rvc-rs.exe doctor
+          if ($LASTEXITCODE -ne 0) { throw 'Stage123 doctor failed' }
+      - name: Package one Stage123 Windows artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dest = 'dist/rvc-stage123-activation-placement-windows-x64'
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Copy-Item target/release/tts-with-rvc-rs.exe $dest
+          Copy-Item target/release/stage123_activation_placement_probe.exe $dest
+          Copy-Item research/stage123-activation-placement/windows/Run-Stage123-Activation-Placement.ps1 $dest
+          Copy-Item research/stage123-activation-placement/windows/Export-Stage123-NCU-Metrics.py $dest
+          Copy-Item research/stage123-activation-placement/README.md $dest
+          Copy-Item research/stage123-activation-placement/REPORT.md (Join-Path $dest 'STAGE123_REPORT.md')
+          Copy-Item research/stage123-activation-placement/WORKFLOW_CONTRACT.md (Join-Path $dest 'RVC_RND_WORKFLOW_CONTRACT.md')
+          Set-Content -Path (Join-Path $dest 'BUILD_STATUS.txt') -Value "Stage123 Rust Windows release PASS; SHA=$env:GITHUB_SHA; no GPU on CI; RTX 4060 CUDA/PCM probe mandatory." -Encoding utf8
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rvc-stage123-activation-placement-windows-x64
+          path: dist/rvc-stage123-activation-placement-windows-x64/
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,355 @@
+{
+  "kind": "NSF real synthetic checkpoint CPU execution",
+  "backend": "CubeCL CPU JIT (Burn)",
+  "semantics": "end-to-end NSF forward including eager dispatch and blocking output readback; detailed profile separately inserts a blocking readback at each operator boundary",
+  "iterations": 7,
+  "warmup": 3,
+  "cases": [
+    {
+      "frames": 4,
+      "zero_seeded_ms": 42.764354,
+      "first_branch_ms": 44.009973,
+      "flush_per_branch_ms": 28.087249,
+      "flush_per_stage_ms": 35.348902,
+      "sync_per_branch_ms": 24.11775,
+      "flush_per_pair_ms": 8.682451,
+      "flush_per_conv_ms": 12.329512000000001,
+      "sync_per_pair_ms": 12.26017,
+      "relative_speedup": 0.971696892429359,
+      "max_abs_error": 0.0,
+      "reference_max_error": 2.2351742e-8
+    },
+    {
+      "frames": 64,
+      "zero_seeded_ms": 43.113861,
+      "first_branch_ms": 43.968638999999996,
+      "flush_per_branch_ms": 24.326829,
+      "flush_per_stage_ms": 35.471965000000004,
+      "sync_per_branch_ms": 24.183737999999998,
+      "flush_per_pair_ms": 9.124587,
+      "flush_per_conv_ms": 12.567554999999999,
+      "sync_per_pair_ms": 12.147892,
+      "relative_speedup": 0.9805593709643822,
+      "max_abs_error": 0.0,
+      "reference_max_error": null
+    },
+    {
+      "frames": 256,
+      "zero_seeded_ms": 46.305827,
+      "first_branch_ms": 44.136337999999995,
+      "flush_per_branch_ms": 28.172415,
+      "flush_per_stage_ms": 39.722531,
+      "sync_per_branch_ms": 27.780813000000002,
+      "flush_per_pair_ms": 13.133954999999998,
+      "flush_per_conv_ms": 15.627594000000002,
+      "sync_per_pair_ms": 12.831966,
+      "relative_speedup": 1.049154259240991,
+      "max_abs_error": 0.0,
+      "reference_max_error": null
+    }
+  ],
+  "profile": [
+    {
+      "section": "pre_conv",
+      "milliseconds": 0.073329
+    },
+    {
+      "section": "conditioning",
+      "milliseconds": 0.061692000000000004
+    },
+    {
+      "section": "stage0.upsample",
+      "milliseconds": 0.337171
+    },
+    {
+      "section": "stage0.noise_conv",
+      "milliseconds": 0.089803
+    },
+    {
+      "section": "stage0.prepare_add",
+      "milliseconds": 0.013210000000000001
+    },
+    {
+      "section": "stage0.residual0.pair0.first_activation",
+      "milliseconds": 0.024797
+    },
+    {
+      "section": "stage0.residual0.pair0.first_conv",
+      "milliseconds": 0.26909900000000003
+    },
+    {
+      "section": "stage0.residual0.pair0.second_activation",
+      "milliseconds": 0.031235999999999996
+    },
+    {
+      "section": "stage0.residual0.pair0.second_conv",
+      "milliseconds": 0.064896
+    },
+    {
+      "section": "stage0.residual0.pair0.residual_add",
+      "milliseconds": 0.016164
+    },
+    {
+      "section": "stage0.residual0.pair1.first_activation",
+      "milliseconds": 0.028362000000000002
+    },
+    {
+      "section": "stage0.residual0.pair1.first_conv",
+      "milliseconds": 0.064115
+    },
+    {
+      "section": "stage0.residual0.pair1.second_activation",
+      "milliseconds": 0.255669
+    },
+    {
+      "section": "stage0.residual0.pair1.second_conv",
+      "milliseconds": 0.06703
+    },
+    {
+      "section": "stage0.residual0.pair1.residual_add",
+      "milliseconds": 0.016855000000000002
+    },
+    {
+      "section": "stage0.residual0.pair2.first_activation",
+      "milliseconds": 0.029873999999999998
+    },
+    {
+      "section": "stage0.residual0.pair2.first_conv",
+      "milliseconds": 0.0606
+    },
+    {
+      "section": "stage0.residual0.pair2.second_activation",
+      "milliseconds": 0.103824
+    },
+    {
+      "section": "stage0.residual0.pair2.second_conv",
+      "milliseconds": 0.28676500000000005
+    },
+    {
+      "section": "stage0.residual0.pair2.residual_add",
+      "milliseconds": 0.02027
+    },
+    {
+      "section": "stage0.residual0.total",
+      "milliseconds": 1.34181
+    },
+    {
+      "section": "stage0.residual1.pair0.first_activation",
+      "milliseconds": 0.027270000000000003
+    },
+    {
+      "section": "stage0.residual1.pair0.first_conv",
+      "milliseconds": 0.061291000000000005
+    },
+    {
+      "section": "stage0.residual1.pair0.second_activation",
+      "milliseconds": 0.029314
+    },
+    {
+      "section": "stage0.residual1.pair0.second_conv",
+      "milliseconds": 0.31281400000000004
+    },
+    {
+      "section": "stage0.residual1.pair0.residual_add",
+      "milliseconds": 0.022554
+    },
+    {
+      "section": "stage0.residual1.pair1.first_activation",
+      "milliseconds": 0.032437999999999995
+    },
+    {
+      "section": "stage0.residual1.pair1.first_conv",
+      "milliseconds": 0.06833099999999999
+    },
+    {
+      "section": "stage0.residual1.pair1.second_activation",
+      "milliseconds": 0.027912
+    },
+    {
+      "section": "stage0.residual1.pair1.second_conv",
+      "milliseconds": 0.067159
+    },
+    {
+      "section": "stage0.residual1.pair1.residual_add",
+      "milliseconds": 0.218383
+    },
+    {
+      "section": "stage0.residual1.pair2.first_activation",
+      "milliseconds": 0.028762
+    },
+    {
+      "section": "stage0.residual1.pair2.first_conv",
+      "milliseconds": 0.06053
+    },
+    {
+      "section": "stage0.residual1.pair2.second_activation",
+      "milliseconds": 0.02698
+    },
+    {
+      "section": "stage0.residual1.pair2.second_conv",
+      "milliseconds": 0.067049
+    },
+    {
+      "section": "stage0.residual1.pair2.residual_add",
+      "milliseconds": 0.015012
+    },
+    {
+      "section": "stage0.residual1.total",
+      "milliseconds": 1.067934
+    },
+    {
+      "section": "stage0.aggregate",
+      "milliseconds": 0.028332
+    },
+    {
+      "section": "stage1.upsample",
+      "milliseconds": 0.34867699999999996
+    },
+    {
+      "section": "stage1.noise_conv",
+      "milliseconds": 0.394105
+    },
+    {
+      "section": "stage1.prepare_add",
+      "milliseconds": 0.018357000000000002
+    },
+    {
+      "section": "stage1.residual0.pair0.first_activation",
+      "milliseconds": 0.031186000000000002
+    },
+    {
+      "section": "stage1.residual0.pair0.first_conv",
+      "milliseconds": 0.279234
+    },
+    {
+      "section": "stage1.residual0.pair0.second_activation",
+      "milliseconds": 0.070104
+    },
+    {
+      "section": "stage1.residual0.pair0.second_conv",
+      "milliseconds": 0.070324
+    },
+    {
+      "section": "stage1.residual0.pair0.residual_add",
+      "milliseconds": 0.018838
+    },
+    {
+      "section": "stage1.residual0.pair1.first_activation",
+      "milliseconds": 0.030275
+    },
+    {
+      "section": "stage1.residual0.pair1.first_conv",
+      "milliseconds": 0.271112
+    },
+    {
+      "section": "stage1.residual0.pair1.second_activation",
+      "milliseconds": 0.027410999999999998
+    },
+    {
+      "section": "stage1.residual0.pair1.second_conv",
+      "milliseconds": 0.063895
+    },
+    {
+      "section": "stage1.residual0.pair1.residual_add",
+      "milliseconds": 0.016905000000000003
+    },
+    {
+      "section": "stage1.residual0.pair2.first_activation",
+      "milliseconds": 0.027591
+    },
+    {
+      "section": "stage1.residual0.pair2.first_conv",
+      "milliseconds": 0.266606
+    },
+    {
+      "section": "stage1.residual0.pair2.second_activation",
+      "milliseconds": 0.028612
+    },
+    {
+      "section": "stage1.residual0.pair2.second_conv",
+      "milliseconds": 0.065798
+    },
+    {
+      "section": "stage1.residual0.pair2.residual_add",
+      "milliseconds": 0.016725
+    },
+    {
+      "section": "stage1.residual0.total",
+      "milliseconds": 1.285838
+    },
+    {
+      "section": "stage1.residual1.pair0.first_activation",
+      "milliseconds": 0.022444000000000002
+    },
+    {
+      "section": "stage1.residual1.pair0.first_conv",
+      "milliseconds": 0.292724
+    },
+    {
+      "section": "stage1.residual1.pair0.second_activation",
+      "milliseconds": 0.031457
+    },
+    {
+      "section": "stage1.residual1.pair0.second_conv",
+      "milliseconds": 0.065968
+    },
+    {
+      "section": "stage1.residual1.pair0.residual_add",
+      "milliseconds": 0.017546000000000003
+    },
+    {
+      "section": "stage1.residual1.pair1.first_activation",
+      "milliseconds": 0.032458
+    },
+    {
+      "section": "stage1.residual1.pair1.first_conv",
+      "milliseconds": 0.349389
+    },
+    {
+      "section": "stage1.residual1.pair1.second_activation",
+      "milliseconds": 0.039168
+    },
+    {
+      "section": "stage1.residual1.pair1.second_conv",
+      "milliseconds": 0.07138599999999999
+    },
+    {
+      "section": "stage1.residual1.pair1.residual_add",
+      "milliseconds": 0.018377
+    },
+    {
+      "section": "stage1.residual1.pair2.first_activation",
+      "milliseconds": 0.028433
+    },
+    {
+      "section": "stage1.residual1.pair2.first_conv",
+      "milliseconds": 0.319454
+    },
+    {
+      "section": "stage1.residual1.pair2.second_activation",
+      "milliseconds": 0.036704
+    },
+    {
+      "section": "stage1.residual1.pair2.second_conv",
+      "milliseconds": 0.068953
+    },
+    {
+      "section": "stage1.residual1.pair2.residual_add",
+      "milliseconds": 0.018337
+    },
+    {
+      "section": "stage1.residual1.total",
+      "milliseconds": 1.414799
+    },
+    {
+      "section": "stage1.aggregate",
+      "milliseconds": 0.030996
+    },
+    {
+      "section": "post_conv_activation",
+      "milliseconds": 0.310851
+    }
+  ],
+  "profiled_total_ms": 6.885956,
+  "profiled_vs_baseline_max_abs_error": 0.0
+}

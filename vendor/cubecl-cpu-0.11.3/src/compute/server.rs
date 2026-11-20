@@ -70,13 +70,18 @@ impl CpuServer {
             ScheduledCpuBackend::new(memory_properties, memory_config, utilities.logger.clone());
         let config = CubeClRuntimeConfig::get();
         let max_streams = config.streaming.max_streams;
+        let max_tasks = std::env::var("CUBECL_CPU_MAX_TASKS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| (1..=256).contains(value))
+            .unwrap_or(8);
 
         let scheduler = SchedulerMultiStream::new(
             utilities.logger.clone(),
             backend,
             SchedulerMultiStreamOptions {
                 max_streams,
-                max_tasks: 8,
+                max_tasks,
                 strategy: SchedulerStrategy::Interleave,
             },
         );

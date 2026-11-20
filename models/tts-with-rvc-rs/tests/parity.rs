@@ -152,6 +152,50 @@ fn decoder_first_stage_matches_original_pytorch() {
 }
 
 #[test]
+fn nsf_residual_execution_modes_are_bitwise_equal() {
+    use tts_with_rvc_rs::{
+        checkpoint::RvcCheckpoint,
+        decoder::{NsfDecoderFixture, ResidualExecution},
+    };
+    let checkpoint = RvcCheckpoint::open(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/synthetic_nsf_decoder.pth")).unwrap();
+    let fixture: NsfDecoderFixture = serde_json::from_str(include_str!("fixtures/nsf_decoder.json")).unwrap();
+    let device = Device::flex();
+    let decoder = fixture.load(&checkpoint, &device).unwrap();
+    let (input, source, condition) = fixture.tensors(&device);
+    let sequential = decoder.forward_with_execution(
+        input.clone(), source.clone(), condition.clone(), ResidualExecution::Sequential,
+    ).into_data().try_into_vec::<f32>().unwrap();
+    let parallel = decoder.forward_with_execution(
+        input, source, condition, ResidualExecution::Parallel,
+    ).into_data().try_into_vec::<f32>().unwrap();
+    assert_eq!(sequential, parallel);
+    assert!(max_abs_error(&parallel, &fixture.expected_waveform) < 1e-4);
+}
+
+#[test]
+fn nsf_first_branch_aggregation_matches_original_execution() {
+    use tts_with_rvc_rs::{
+        checkpoint::RvcCheckpoint,
+        decoder::{NsfDecoderFixture, ResidualAggregation, ResidualExecution},
+    };
+    let checkpoint = RvcCheckpoint::open(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/synthetic_nsf_decoder.pth")).unwrap();
+    let fixture: NsfDecoderFixture = serde_json::from_str(include_str!("fixtures/nsf_decoder.json")).unwrap();
+    let device = Device::flex();
+    let decoder = fixture.load(&checkpoint, &device).unwrap();
+    for execution in [ResidualExecution::Sequential, ResidualExecution::Parallel] {
+        let (input, source, condition) = fixture.tensors(&device);
+        let baseline = decoder.forward_with_aggregation(
+            input.clone(), source.clone(), condition.clone(), execution, ResidualAggregation::ZeroSeeded,
+        ).into_data().try_into_vec::<f32>().unwrap();
+        let optimized = decoder.forward_with_aggregation(
+            input, source, condition, execution, ResidualAggregation::FirstBranch,
+        ).into_data().try_into_vec::<f32>().unwrap();
+        assert_eq!(baseline, optimized);
+        assert!(max_abs_error(&optimized, &fixture.expected_waveform) < 1e-4);
+    }
+}
+
+#[test]
 fn complete_nsf_decoder_with_external_harmonic_matches_original_pytorch() {
     use tts_with_rvc_rs::{checkpoint::RvcCheckpoint, decoder::NsfDecoderFixture};
     let checkpoint = RvcCheckpoint::open(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/synthetic_nsf_decoder.pth")).unwrap();
@@ -574,4 +618,16 @@ fn tensor_batch_nsf_from_f0_matches_individual_waveforms() {
     let actual = batched.into_data().try_into_vec::<f32>().unwrap();
     assert_eq!(actual.len(), expected.len());
     assert!(max_abs_error(&actual, &expected) < 2e-4);
+}
+
+#[test]
+fn relative_attention_online_matches_pytorch_reference() {
+    let fixture: tts_with_rvc_rs::attention::AttentionFixture =
+        serde_json::from_str(include_str!("fixtures/relative_attention.json")).unwrap();
+    let device = Device::flex();
+    let (inputs, mask) = fixture.inputs(&device);
+    let actual = fixture.model(&device).forward_online(inputs, mask)
+        .into_data().try_into_vec::<f32>().unwrap();
+    let error = max_abs_error(&actual, &fixture.expected);
+    assert!(error <= 1e-4, "online relative attention vs PyTorch max abs deviation {error}");
 }

@@ -1,0 +1,218 @@
+[
+  {
+    "name": "parallel8",
+    "run": 1,
+    "cases": [
+      {
+        "frames": 4,
+        "median_ms": 43.969993,
+        "iterations": 6,
+        "sum": 0.18699266598559916,
+        "samples": 16
+      },
+      {
+        "frames": 64,
+        "median_ms": 47.965029,
+        "iterations": 6,
+        "sum": 3.379754826426506,
+        "samples": 256
+      },
+      {
+        "frames": 256,
+        "median_ms": 47.912401,
+        "iterations": 6,
+        "sum": 13.588609755039215,
+        "samples": 1024
+      }
+    ]
+  },
+  {
+    "name": "sequential32",
+    "run": 1,
+    "cases": [
+      {
+        "frames": 4,
+        "median_ms": 36.001400000000004,
+        "iterations": 6,
+        "sum": 0.18699266598559916,
+        "samples": 16
+      },
+      {
+        "frames": 64,
+        "median_ms": 36.116310999999996,
+        "iterations": 6,
+        "sum": 3.379754826426506,
+        "samples": 256
+      },
+      {
+        "frames": 256,
+        "median_ms": 36.563481,
+        "iterations": 6,
+        "sum": 13.588609755039215,
+        "samples": 1024
+      }
+    ]
+  },
+  {
+    "name": "packed32",
+    "run": 1,
+    "cases": [
+      {
+        "frames": 4,
+        "median_ms": 27.9934,
+        "iterations": 6,
+        "sum": 0.18699269474018365,
+        "samples": 16
+      },
+      {
+        "frames": 64,
+        "median_ms": 28.117995,
+        "iterations": 6,
+        "sum": 3.3797547930153087,
+        "samples": 256
+      },
+      {
+        "frames": 256,
+        "median_ms": 28.174999,
+        "iterations": 6,
+        "sum": 13.588609587517567,
+        "samples": 1024
+      }
+    ]
+  },
+  {
+    "name": "quad_interior32",
+    "run": 1,
+    "cases": [
+      {
+        "frames": 4,
+        "median_ms": 28.022403,
+        "iterations": 6,
+        "sum": 0.18699269474018365,
+        "samples": 16
+      },
+      {
+        "frames": 64,
+        "median_ms": 28.018247,
+        "iterations": 6,
+        "sum": 3.3797547930153087,
+        "samples": 256
+      },
+      {
+        "frames": 256,
+        "median_ms": 32.082916000000004,
+        "iterations": 6,
+        "sum": 13.588609587517567,
+        "samples": 1024
+      }
+    ]
+  },
+  {
+    "name": "quad_interior32",
+    "run": 2,
+    "cases": [
+      {
+        "frames": 4,
+        "median_ms": 28.002333,
+        "iterations": 6,
+        "sum": 0.18699269474018365,
+        "samples": 16
+      },
+      {
+        "frames": 64,
+        "median_ms": 27.996133999999998,
+        "iterations": 6,
+        "sum": 3.3797547930153087,
+        "samples": 256
+      },
+      {
+        "frames": 256,
+        "median_ms": 28.252663000000002,
+        "iterations": 6,
+        "sum": 13.588609587517567,
+        "samples": 1024
+      }
+    ]
+  },
+  {
+    "name": "packed32",
+    "run": 2,
+    "cases": [
+      {
+        "frames": 4,
+        "median_ms": 28.025387,
+        "iterations": 6,
+        "sum": 0.18699269474018365,
+        "samples": 16
+      },
+      {
+        "frames": 64,
+        "median_ms": 27.96644,
+        "iterations": 6,
+        "sum": 3.3797547930153087,
+        "samples": 256
+      },
+      {
+        "frames": 256,
+        "median_ms": 28.430266,
+        "iterations": 6,
+        "sum": 13.588609587517567,
+        "samples": 1024
+      }
+    ]
+  },
+  {
+    "name": "sequential32",
+    "run": 2,
+    "cases": [
+      {
+        "frames": 4,
+        "median_ms": 36.026858000000004,
+        "iterations": 6,
+        "sum": 0.18699266598559916,
+        "samples": 16
+      },
+      {
+        "frames": 64,
+        "median_ms": 36.327775,
+        "iterations": 6,
+        "sum": 3.379754826426506,
+        "samples": 256
+      },
+      {
+        "frames": 256,
+        "median_ms": 39.785147,
+        "iterations": 6,
+        "sum": 13.588609755039215,
+        "samples": 1024
+      }
+    ]
+  },
+  {
+    "name": "parallel8",
+    "run": 2,
+    "cases": [
+      {
+        "frames": 4,
+        "median_ms": 47.950671,
+        "iterations": 6,
+        "sum": 0.18699266598559916,
+        "samples": 16
+      },
+      {
+        "frames": 64,
+        "median_ms": 44.530584,
+        "iterations": 6,
+        "sum": 3.379754826426506,
+        "samples": 256
+      },
+      {
+        "frames": 256,
+        "median_ms": 47.505433,
+        "iterations": 6,
+        "sum": 13.588609755039215,
+        "samples": 1024
+      }
+    ]
+  }
+]

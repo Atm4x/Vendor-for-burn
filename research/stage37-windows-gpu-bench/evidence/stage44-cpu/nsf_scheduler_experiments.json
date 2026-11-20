@@ -1,0 +1,333 @@
+{
+  "stage": 44,
+  "date": "2026-11-10",
+  "machine": "virtualized AMD EPYC 9V74; affinity one logical CPU 0 or 5 logical CPUs 0-4",
+  "rust": "1.98.1",
+  "llvm": "tracel 23.1.0-4",
+  "model": "synthetic NSF checkpoint, real Burn/CubeCL CPU JIT forward, full blocking CPU readback",
+  "source": "experiment/conv-kernel-rnd-stage33-20261110",
+  "warmup": 4,
+  "iterations": [
+    8,
+    10
+  ],
+  "notes": [
+    "All timings are per-invocation warmed medians, milliseconds.",
+    "Configuration via CUBECL_CPU_MAX_TASKS, default=8, plus explicit NSF ResidualExecution Sequential/Parallel.",
+    "Single host with performance variance; per-run samples are not confidence intervals.",
+    "Unmodified mathematical NSF graph and inputs across compared variants.",
+    "The optional inline fast path is disabled in all batch-vs-execution-mode trials."
+  ],
+  "runs": [
+    {
+      "kind": "batch sweep",
+      "affinity": "5cpu",
+      "batch": 4,
+      "mode": "parallel",
+      "ms": {
+        "4": 181.59,
+        "64": 198.124,
+        "256": 199.648
+      }
+    },
+    {
+      "kind": "batch sweep",
+      "affinity": "5cpu",
+      "batch": 8,
+      "mode": "parallel",
+      "ms": {
+        "4": 104.296,
+        "64": 111.949,
+        "256": 107.965
+      }
+    },
+    {
+      "kind": "batch sweep",
+      "affinity": "5cpu",
+      "batch": 16,
+      "mode": "parallel",
+      "ms": {
+        "4": 64.029,
+        "64": 71.97,
+        "256": 79.979
+      }
+    },
+    {
+      "kind": "batch sweep",
+      "affinity": "5cpu",
+      "batch": 32,
+      "mode": "parallel",
+      "ms": {
+        "4": 43.798,
+        "64": 43.886,
+        "256": 41.834
+      }
+    },
+    {
+      "kind": "batch sweep",
+      "affinity": "5cpu",
+      "batch": 64,
+      "mode": "parallel",
+      "ms": {
+        "4": 35.79,
+        "64": 15.86,
+        "256": 31.901
+      }
+    },
+    {
+      "kind": "batch sweep",
+      "affinity": "5cpu",
+      "batch": 128,
+      "mode": "parallel",
+      "ms": {
+        "4": 37.681,
+        "64": 36.069,
+        "256": 39.931
+      }
+    },
+    {
+      "kind": "batch sweep",
+      "affinity": "5cpu",
+      "batch": 256,
+      "mode": "parallel",
+      "ms": {
+        "4": 36.168,
+        "64": 27.981,
+        "256": 40.119
+      }
+    },
+    {
+      "kind": "batch sweep",
+      "affinity": "1cpu",
+      "batch": 8,
+      "mode": "parallel",
+      "ms": {
+        "4": 44.159,
+        "64": 44.026,
+        "256": 44.136
+      }
+    },
+    {
+      "kind": "batch sweep",
+      "affinity": "1cpu",
+      "batch": 16,
+      "mode": "parallel",
+      "ms": {
+        "4": 38.179,
+        "64": 39.958,
+        "256": 38.277
+      }
+    },
+    {
+      "kind": "batch sweep",
+      "affinity": "1cpu",
+      "batch": 32,
+      "mode": "parallel",
+      "ms": {
+        "4": 39.62,
+        "64": 40.044,
+        "256": 39.881
+      }
+    },
+    {
+      "kind": "parallel-vs-sequential",
+      "affinity": "5cpu",
+      "batch": 8,
+      "mode": "parallel",
+      "ms": {
+        "4": 119.97,
+        "64": 107.942,
+        "256": 112.13
+      }
+    },
+    {
+      "kind": "parallel-vs-sequential",
+      "affinity": "5cpu",
+      "batch": 8,
+      "mode": "sequential",
+      "ms": {
+        "4": 96.302,
+        "64": 95.979,
+        "256": 96.155
+      }
+    },
+    {
+      "kind": "parallel-vs-sequential",
+      "affinity": "5cpu",
+      "batch": 32,
+      "mode": "parallel",
+      "ms": {
+        "4": 39.524,
+        "64": 37.422,
+        "256": 28.205
+      }
+    },
+    {
+      "kind": "parallel-vs-sequential",
+      "affinity": "5cpu",
+      "batch": 32,
+      "mode": "sequential",
+      "ms": {
+        "4": 16.133,
+        "64": 17.77,
+        "256": 19.31
+      }
+    },
+    {
+      "kind": "parallel-vs-sequential",
+      "affinity": "1cpu",
+      "batch": 8,
+      "mode": "parallel",
+      "ms": {
+        "4": 44.593,
+        "64": 44.439,
+        "256": 47.251
+      }
+    },
+    {
+      "kind": "parallel-vs-sequential",
+      "affinity": "1cpu",
+      "batch": 8,
+      "mode": "sequential",
+      "ms": {
+        "4": 44.08,
+        "64": 43.999,
+        "256": 44.91
+      }
+    },
+    {
+      "kind": "parallel-vs-sequential",
+      "affinity": "1cpu",
+      "batch": 32,
+      "mode": "parallel",
+      "ms": {
+        "4": 40.027,
+        "64": 39.84,
+        "256": 39.732
+      }
+    },
+    {
+      "kind": "parallel-vs-sequential",
+      "affinity": "1cpu",
+      "batch": 32,
+      "mode": "sequential",
+      "ms": {
+        "4": 35.989,
+        "64": 36.063,
+        "256": 36.003
+      }
+    },
+    {
+      "kind": "repeat",
+      "affinity": "5cpu",
+      "batch": 8,
+      "mode": "parallel",
+      "ms": {
+        "4": 107.987039,
+        "64": 111.950393,
+        "256": 103.773434
+      }
+    },
+    {
+      "kind": "repeat",
+      "affinity": "5cpu",
+      "batch": 32,
+      "mode": "sequential",
+      "ms": {
+        "4": 16.020746,
+        "64": 17.148404,
+        "256": 20.158027
+      }
+    },
+    {
+      "kind": "repeat",
+      "affinity": "5cpu",
+      "batch": 32,
+      "mode": "parallel",
+      "ms": {
+        "4": 36.396224,
+        "64": 24.032821,
+        "256": 28.480322
+      }
+    },
+    {
+      "kind": "repeat",
+      "affinity": "5cpu",
+      "batch": 8,
+      "mode": "sequential",
+      "ms": {
+        "4": 96.003033,
+        "64": 99.967321,
+        "256": 96.02181
+      }
+    },
+    {
+      "kind": "repeat",
+      "affinity": "5cpu",
+      "batch": 32,
+      "mode": "sequential",
+      "ms": {
+        "4": 16.1644,
+        "64": 16.055228,
+        "256": 16.066875
+      }
+    },
+    {
+      "kind": "repeat",
+      "affinity": "5cpu",
+      "batch": 32,
+      "mode": "parallel",
+      "ms": {
+        "4": 20.406267,
+        "64": 22.997271,
+        "256": 47.876121
+      }
+    },
+    {
+      "kind": "full tensor parity",
+      "affinity": "5cpu",
+      "batch": 8,
+      "mode": "parallel",
+      "ms": {
+        "4": 114.558917,
+        "64": 126.224136,
+        "256": 104.592676
+      }
+    },
+    {
+      "kind": "full tensor parity",
+      "affinity": "5cpu",
+      "batch": 32,
+      "mode": "sequential",
+      "ms": {
+        "4": 16.046688,
+        "64": 16.055081,
+        "256": 17.716718
+      }
+    }
+  ],
+  "full_tensor_parity": {
+    "status": "byte identical across baseline and batch32 sequential",
+    "format": "little-endian FP32",
+    "sha256_by_frames": {
+      "4": "62484aa879281b76da3b31ec5f409200b57c9e629c0f0ab58f47bd22e0061ea8",
+      "64": "892aec83a6b4b7a0935487f3e183db7d47dada12a3277405d658d12c7b85358d",
+      "256": "a9ae3996a9659ccd5b7bc99b6865fa37adb54dd6d12cb1476d5104d72db85f19"
+    }
+  },
+  "output_sums": {
+    "4": 0.18699266598559916,
+    "64": 3.379754826426506,
+    "256": 13.588609755039215
+  },
+  "inline_single_unit_smoke": {
+    "one_cpu": {
+      "standard_64_ms": 44.506456,
+      "inline_64_ms": 36.458908
+    },
+    "five_cpu": {
+      "standard_64_ms": 107.8405,
+      "inline_64_ms": 107.828415
+    }
+  }
+}

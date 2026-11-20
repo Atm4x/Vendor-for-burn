@@ -1,3 +1,15 @@
+pub mod chunk_plan;
+pub mod diagnostic;
+pub mod nvtx;
+mod online_attention;
+mod f0_audit;
+mod conv1d_layout;
+mod nsf_precision;
+mod nsf_phase;
+mod nsf_noise_field;
+mod phone_features;
+#[cfg(any(feature = "cuda", feature = "cpu", feature = "wgpu"))]
+mod faiss_gpu;
 use burn::tensor::{Int, Tensor, TensorData, activation, module};
 use burn::tensor::Device;
 use serde::Deserialize;
@@ -146,9 +158,20 @@ pub mod checkpoint;
 pub mod flow;
 
 pub mod decoder;
+pub mod nsf_tiling;
+mod nsf_fused_pair;
+mod nsf_pair_tile;
+mod cubecl_conv;
+mod tf32_compensated;
 
 pub mod rmvpe;
+
+#[cfg(any(feature = "cpu", feature = "cuda", feature = "wgpu"))]
+mod rmvpe_fused;
+#[cfg(any(feature = "cuda", feature = "cpu", feature = "wgpu"))]
+mod rmvpe_gpu_f0;
 pub mod rmvpe_gru;
+mod rmvpe_persistent;
 pub mod rmvpe_mel;
 pub mod hubert;
 
@@ -169,3 +192,7 @@ pub mod chunked;
 pub mod preprocess;
 
 pub mod rvc_inference;
+
+pub mod conversion;
+pub mod runtime_backend;
+pub mod worker;

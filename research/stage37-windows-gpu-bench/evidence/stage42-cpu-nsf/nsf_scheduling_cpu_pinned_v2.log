@@ -1,0 +1,3 @@
+NSF 4 frames: default 42.764 first 44.010 branch-flush 28.087 stage-flush 35.349 branch-sync 24.118 pair-flush 8.682 conv-flush 12.330 pair-sync 12.260 ms, error=0e0
+NSF 64 frames: default 43.114 first 43.969 branch-flush 24.327 stage-flush 35.472 branch-sync 24.184 pair-flush 9.125 conv-flush 12.568 pair-sync 12.148 ms, error=0e0
+NSF 256 frames: default 46.306 first 44.136 branch-flush 28.172 stage-flush 39.723 branch-sync 27.781 pair-flush 13.134 conv-flush 15.628 pair-sync 12.832 ms, error=0e0

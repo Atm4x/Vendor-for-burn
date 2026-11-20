@@ -1,0 +1,7 @@
+# Next — Stage 65, diagnose and fix the dominant full-RVC bottleneck
+
+The Stage 64 Windows diagnostic runner emits `RVC_STAGE64_FULL_DIAGNOSTIC_RESULTS.zip` with a *single measured full-length CUDA baseline*, per-stage synchronized JSON traces and GPU/CPU telemetry. Inspect that archive before writing new optimizations. Validate that `single-full-wav-summary.json` reports one measured run, ~89.94s input, expected 32 chunks, no Graph, and CPU FAISS/FP64 F0.
+
+Analyze aggregate times only from `phase=measured`, avoiding double-counting nested spans. Check the time distribution over batch IDs and chunk shapes, warmup and model load separately, and GPU utilization/VRAM/clock changes. Distinguish CPU stalls, transfers, kernel launches, actual GPU compute and copy/readback. Stage 64's trace adds device sync after each recorded step: treat RTF as diagnostic, not as a direct performance target.
+
+Pick the largest cause supported by evidence; implement a structural fix, compare numerical/audible output and then remeasure a *normal, uninstrumented* whole-WAV run against Stage 63 and against a truly like-for-like PyTorch/cuDNN baseline. Do not add another isolated kernel optimization without a measurable full-route benefit. Preserve one executable with runtime CPU/CUDA/WGPU selection; no fallback without explicit request; no private assets in commits. Use source-only ZIP, MD report, and next-agent prompt for handoff. Do not touch obsolete Flex benchmarks.

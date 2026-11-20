@@ -1,4 +1,4 @@
-use burn::tensor::{activation, module, Device, Int, Tensor, TensorData};
+use burn::tensor::{activation, Device, Int, Tensor, TensorData};
 use serde::Deserialize;
 
 pub struct PointwiseProjection {
@@ -59,6 +59,14 @@ impl RelativeSelfAttention {
     }
 
     pub fn forward(&self, x: Tensor<3>, x_mask: Tensor<3>) -> Tensor<3> {
+        self.forward_with_online(x, x_mask, std::env::var("RVC_ATTENTION_ONLINE").as_deref() == Ok("1"))
+    }
+
+    pub fn forward_online(&self, x: Tensor<3>, x_mask: Tensor<3>) -> Tensor<3> {
+        self.forward_with_online(x, x_mask, true)
+    }
+
+    fn forward_with_online(&self, x: Tensor<3>, x_mask: Tensor<3>, use_online: bool) -> Tensor<3> {
         let [batch, channels, time] = x.dims();
         assert_eq!(x_mask.dims(), [batch, 1, time]);
         let head_channels = channels / self.heads;
@@ -75,14 +83,22 @@ impl RelativeSelfAttention {
             .permute([0, 1, 3, 2]);
 
         let scaled_q = q * (1.0 / (head_channels as f64).sqrt());
-        let relative_k = relative_positions(self.relative_keys.clone(), time, self.window);
-        let relative_v = relative_positions(self.relative_values.clone(), time, self.window);
-
+        if use_online {
+            let valid = x_mask.reshape([batch, time]);
+            let attended = crate::online_attention::forward(
+                scaled_q, k, v, Some(valid.clone()), Some(valid),
+                Some(crate::online_attention::RelativeAttention {
+                    keys: self.relative_keys.clone(),
+                    values: self.relative_values.clone(),
+                    window: self.window,
+                }), 32, 64,
+            );
+            let combined = attended.permute([0, 1, 3, 2]).reshape([batch, channels, time]);
+            return self.output.forward(combined);
+        }
+        let band = RelativeBand::new(time, self.window, &scaled_q.device());
         let content_scores = scaled_q.clone().matmul(k.transpose());
-        let relative_scores = (scaled_q.reshape([batch, self.heads, time, 1, head_channels])
-            * relative_k)
-            .sum_dim(4)
-            .reshape([batch, self.heads, time, time]);
+        let relative_scores = band.scores(scaled_q, self.relative_keys.clone());
 
         let attention_mask = x_mask.clone().reshape([batch, 1, time, 1])
             * x_mask.reshape([batch, 1, 1, time]);
@@ -92,9 +108,7 @@ impl RelativeSelfAttention {
         let weights = activation::softmax(scores, 3);
 
         let content = weights.clone().matmul(v);
-        let relative = (weights.reshape([batch, self.heads, time, time, 1]) * relative_v)
-            .sum_dim(3)
-            .reshape(head_shape);
+        let relative = band.values(weights, self.relative_values.clone()).reshape(head_shape);
         let combined = (content + relative)
             .permute([0, 1, 3, 2])
             .reshape([batch, channels, time]);
@@ -102,23 +116,59 @@ impl RelativeSelfAttention {
     }
 }
 
-fn relative_positions(embeddings: Tensor<2>, time: usize, window: usize) -> Tensor<5> {
-    let device = embeddings.device();
-    let dimension = embeddings.dims()[1];
-    let mut indices = Vec::with_capacity(time * time);
-    let mut valid = Vec::with_capacity(time * time);
-    for query in 0..time {
-        for key in 0..time {
-            let delta = key as isize - query as isize;
-            let in_window = delta.unsigned_abs() <= window;
-            indices.push(if in_window { (window as isize + delta) as i64 } else { 0 });
-            valid.push(if in_window { 1.0f32 } else { 0.0f32 });
+struct RelativeBand {
+    time: usize,
+    width: usize,
+    embedding_start: usize,
+    score_index: Tensor<4, Int>,
+    value_index: Tensor<4, Int>,
+}
+
+impl RelativeBand {
+    fn new(time: usize, window: usize, device: &Device) -> Self {
+        let radius = window.min(time.saturating_sub(1));
+        let width = radius * 2 + 1;
+        let mut score_index = Vec::with_capacity(time * time);
+        let mut value_index = Vec::with_capacity(time * width);
+        for query in 0..time {
+            for key in 0..time {
+                let index = if query.abs_diff(key) <= radius { key + radius - query } else { width };
+                score_index.push(index as i64);
+            }
+            for offset in 0..width {
+                let key = (query + offset).checked_sub(radius).filter(|&key| key < time);
+                value_index.push(key.unwrap_or(time) as i64);
+            }
+        }
+        Self {
+            time, width, embedding_start: window - radius,
+            score_index: Tensor::from_data(TensorData::new(score_index, [1, 1, time, time]), device),
+            value_index: Tensor::from_data(TensorData::new(value_index, [1, 1, time, width]), device),
         }
     }
-    let indices = Tensor::<2, Int>::from_data(TensorData::new(indices, [time, time]), &device);
-    let valid = Tensor::<5>::from_data(TensorData::new(valid, [1, 1, time, time, 1]), &device);
-    module::embedding(embeddings, indices)
-        .reshape([1, 1, time, time, dimension]) * valid
+
+    fn embeddings(&self, table: Tensor<2>, depth: usize) -> Tensor<5> {
+        table.narrow(0, self.embedding_start, self.width).reshape([1, 1, 1, self.width, depth])
+    }
+
+    fn scores(&self, query: Tensor<4>, table: Tensor<2>) -> Tensor<4> {
+        let [batch, heads, time, depth] = query.dims();
+        let zero = Tensor::zeros([batch, heads, time, 1], &query.device());
+        let compact = (query.unsqueeze_dim::<5>(3) * self.embeddings(table, depth))
+            .sum_dim(4).reshape([batch, heads, time, self.width]);
+        Tensor::cat(vec![compact, zero], 3)
+            .gather(3, self.score_index.clone().expand([batch, heads, time, time]))
+    }
+
+    fn values(&self, weights: Tensor<4>, table: Tensor<2>) -> Tensor<4> {
+        let [batch, heads, time, _] = weights.dims();
+        let depth = table.dims()[1];
+        let zero = Tensor::zeros([batch, heads, time, 1], &weights.device());
+        let local = Tensor::cat(vec![weights, zero], 3)
+            .gather(3, self.value_index.clone().expand([batch, heads, self.time, self.width]));
+        (local.unsqueeze_dim::<5>(4) * self.embeddings(table, depth))
+            .sum_dim(3).reshape([batch, heads, time, depth])
+    }
 }
 
 #[derive(Debug, Deserialize)]

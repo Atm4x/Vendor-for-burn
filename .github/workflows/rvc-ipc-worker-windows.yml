@@ -1,0 +1,110 @@
+name: RVC Native IPC Worker Windows x64
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - experiment/conv-kernel-rnd-stage33-20261110
+    paths:
+      - 'models/tts-with-rvc-rs/src/worker.rs'
+      - 'models/tts-with-rvc-rs/src/rvc_inference.rs'
+      - 'models/tts-with-rvc-rs/src/runtime_backend.rs'
+      - 'models/tts-with-rvc-rs/src/user_cli.rs'
+      - 'models/tts-with-rvc-rs/Cargo.toml'
+      - 'crates/gpu-device-resolver/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'models/tts-with-rvc-rs/src/conversion.rs'
+      - 'models/tts-with-rvc-rs/src/audio_io.rs'
+      - 'models/tts-with-rvc-rs/src/bin/rvc-worker.rs'
+      - 'models/tts-with-rvc-rs/smoke_worker.py'
+      - 'models/tts-with-rvc-rs/IPC_STDIO_WORKER.md'
+      - 'models/tts-with-rvc-rs/package_windows.ps1'
+      - '.github/workflows/rvc-ipc-worker-windows.yml'
+permissions:
+  contents: read
+concurrency:
+  group: rvc-ipc-worker-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cache/tracel
+          key: rvc-ipc-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            rvc-stage132-
+            rvc-stage131-
+      - name: Validate IPC scripts and packaging syntax
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ps1 = 'models/tts-with-rvc-rs/package_windows.ps1'
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $ps1).Path,[ref]$tokens,[ref]$errors)
+          if ($errors.Count -ne 0) { $errors | Format-List | Out-String | Write-Host; throw 'RVC package script syntax error' }
+          python -m py_compile models/tts-with-rvc-rs/smoke_worker.py
+          if ($LASTEXITCODE -ne 0) { throw 'Python worker smoke script syntax error' }
+      - name: Restore vendored crate checksums
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Vendor restore failed' }
+      - name: Validate physical GPU resolver contracts on Windows
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo test --locked --offline -p gpu-device-resolver --features 'cuda,wgpu' --lib
+          if ($LASTEXITCODE -ne 0) { throw 'Physical GPU resolver Windows tests failed' }
+      - name: Verify typed Rust IPC lifecycle and WAV helpers
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo test --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --lib runtime_backend::native_runtime_tests
+          if ($LASTEXITCODE -ne 0) { throw 'Explicit native DLL loader tests failed' }
+          cargo test --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --lib worker::tests
+          if ($LASTEXITCODE -ne 0) { throw 'RVC lifecycle tests failed' }
+          cargo test --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --lib audio_io::tests
+          if ($LASTEXITCODE -ne 0) { throw 'RVC audio helpers failed' }
+      - name: Compile native Windows worker and existing CLI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --release --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin rvc-worker --bin tts-with-rvc-rs
+          if ($LASTEXITCODE -ne 0) { throw 'RVC worker release build failed' }
+          & target/release/tts-with-rvc-rs.exe doctor
+          if ($LASTEXITCODE -ne 0) { throw 'RVC original CLI doctor failed' }
+          python models/tts-with-rvc-rs/smoke_worker.py --exe target/release/rvc-worker.exe --backend cpu
+          if ($LASTEXITCODE -ne 0) { throw 'RVC supervisor IPC smoke failed' }
+      - name: Stage source-only external-model worker package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = 'dist/rvc-ipc-worker-windows-x64'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item target/release/rvc-worker.exe $out
+          Copy-Item target/release/tts-with-rvc-rs.exe $out
+          Copy-Item models/tts-with-rvc-rs/IPC_STDIO_WORKER.md $out
+          Copy-Item crates/gpu-device-resolver/README.md (Join-Path $out GPU_DEVICE_RESOLVER_README.md)
+          Copy-Item models/tts-with-rvc-rs/distribution.json $out
+          Copy-Item models/tts-with-rvc-rs/package_windows.ps1 $out
+          Copy-Item models/tts-with-rvc-rs/smoke_worker.py $out
+          Set-Content -LiteralPath (Join-Path $out 'BUILD_STATUS.txt') -Encoding utf8 -Value "Windows CPU IPC smoke, Rust lifecycle, CUDA/WGPU compilation PASS; private-model CUDA JIT and audio parity NOT VERIFIED; commit=$env:GITHUB_SHA"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rvc-ipc-worker-windows-x64
+          path: dist/rvc-ipc-worker-windows-x64/
+          if-no-files-found: error
+          retention-days: 14

@@ -11,6 +11,7 @@ on:
       - 'tools/restore_vendor_checksums.py'
       - '.github/workflows/rvc-windows-cpu.yml'
   pull_request:
+    branches: [main]
     paths:
       - 'models/tts-with-rvc-rs/**'
       - 'Cargo.toml'

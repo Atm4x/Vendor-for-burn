@@ -99,6 +99,10 @@ impl GruDirection {
 pub struct RmvpeBiGru {
     forward_direction: GruDirection,
     reverse_direction: GruDirection,
+    fused_input_weight: Tensor<2>,
+    fused_input_bias: Tensor<1>,
+    fused_hidden_weight: Tensor<3>,
+    fused_hidden_bias: Tensor<2>,
 }
 
 impl RmvpeBiGru {
@@ -110,9 +114,43 @@ impl RmvpeBiGru {
         {
             return Err("RMVPE bidirectional GRU dimensions differ".into());
         }
+        let fused_input_weight = Tensor::cat(vec![
+            forward_direction.input_weight.clone(), reverse_direction.input_weight.clone(),
+        ], 0);
+        let fused_input_bias = Tensor::cat(vec![
+            forward_direction.input_bias.clone(), reverse_direction.input_bias.clone(),
+        ], 0);
+        let fused_hidden_weight = Tensor::stack(vec![
+            forward_direction.hidden_weight.clone(), reverse_direction.hidden_weight.clone(),
+        ], 0);
+        if std::env::var("RVC_RMVPE_GRU_COLUMN_SPLIT").ok().as_deref().is_some_and(|s| s != "1")
+            && std::env::var("RVC_RMVPE_GRU_WEIGHT_COALESCED").as_deref() != Ok("1") {
+            return Err("RVC_RMVPE_GRU_COLUMN_SPLIT requires RVC_RMVPE_GRU_WEIGHT_COALESCED=1".into());
+        }
+        if std::env::var("RVC_RMVPE_GRU_GATE_PARALLEL").as_deref() == Ok("1")
+            && (std::env::var("RVC_RMVPE_GRU_PERSISTENT").as_deref() != Ok("1")
+                || std::env::var("RVC_RMVPE_GRU_WEIGHT_COALESCED").as_deref() != Ok("1")
+                || std::env::var("RVC_RMVPE_GRU_COLUMN_SPLIT").ok().as_deref().is_some_and(|s| s != "1")) {
+            return Err("RVC_RMVPE_GRU_GATE_PARALLEL requires persistent GRU, coalesced weights, and COLUMN_SPLIT=1".into());
+        }
+        let fused_hidden_weight = if std::env::var("RVC_RMVPE_GRU_WEIGHT_COALESCED").as_deref() == Ok("1") {
+            if std::env::var("RVC_RMVPE_GRU_PERSISTENT").as_deref() != Ok("1") {
+                return Err("RVC_RMVPE_GRU_WEIGHT_COALESCED requires RVC_RMVPE_GRU_PERSISTENT=1".into());
+            }
+            crate::rmvpe_persistent::pack_hidden_weight(fused_hidden_weight)?
+        } else {
+            fused_hidden_weight
+        };
+        let fused_hidden_bias = Tensor::stack(vec![
+            forward_direction.hidden_bias.clone(), reverse_direction.hidden_bias.clone(),
+        ], 0);
         Ok(Self {
             forward_direction,
             reverse_direction,
+            fused_input_weight,
+            fused_input_bias,
+            fused_hidden_weight,
+            fused_hidden_bias,
         })
     }
 
@@ -124,13 +162,34 @@ impl RmvpeBiGru {
     }
 
     pub fn forward(&self, input: Tensor<3>) -> Tensor<3> {
-        Tensor::cat(
-            vec![
-                self.forward_direction.forward(input.clone(), false),
-                self.reverse_direction.forward(input, true),
-            ],
-            2,
-        )
+        if std::env::var("RVC_RMVPE_GRU_PERSISTENT").as_deref() == Ok("1") {
+            let [batch, time, features] = input.dims();
+            let device = input.device();
+            let started = std::time::Instant::now();
+            let gates = (input.reshape([batch * time, features])
+                .matmul(self.fused_input_weight.clone().transpose())
+                + self.fused_input_bias.clone().reshape([1, 6 * self.hidden_size()]))
+            .reshape([batch, time, 6 * self.hidden_size()]);
+            crate::diagnostic::measure(&device, "rmvpe.gru_fused_input_projection", started,
+                serde_json::json!({"batch": batch, "frames": time, "hidden": self.hidden_size()}));
+            let started = std::time::Instant::now();
+            let output = crate::rmvpe_persistent::forward(
+                gates, self.fused_hidden_weight.clone(), self.fused_hidden_bias.clone(),
+            ).expect("persistent RMVPE BiGRU explicitly requested but unavailable");
+            crate::diagnostic::measure(&device, "rmvpe.gru_persistent_recurrent", started,
+                serde_json::json!({"batch": batch, "frames": time, "hidden": self.hidden_size()}));
+            return output;
+        }
+        let device = input.device();
+        let started = std::time::Instant::now();
+        let forward = self.forward_direction.forward(input.clone(), false);
+        crate::diagnostic::measure(&device, "rmvpe.gru_stepwise_forward", started,
+            serde_json::json!({"shape": forward.dims()}));
+        let started = std::time::Instant::now();
+        let reverse = self.reverse_direction.forward(input, true);
+        crate::diagnostic::measure(&device, "rmvpe.gru_stepwise_reverse", started,
+            serde_json::json!({"shape": reverse.dims()}));
+        Tensor::cat(vec![forward, reverse], 2)
     }
 }
 
@@ -168,8 +227,23 @@ impl RmvpeNetwork {
             frames > 0 && frames % factor == 0,
             "RMVPE mel frames must be padded to a multiple of the downsampling factor"
         );
+        let device = mel.device();
         let input = mel.swap_dims(1, 2).reshape([batch, 1, frames, bins]);
-        self.head
-            .forward(self.gru.forward(self.unet.forward_gru_features(input)))
+        let started = std::time::Instant::now();
+        let _nvtx = crate::nvtx::Range::new("stage104_rmvpe_unet");
+        let unet = self.unet.forward_gru_features(input);
+        drop(_nvtx);
+        crate::diagnostic::measure(&device, "rmvpe.unet", started, serde_json::json!({"output_shape":unet.dims()}));
+        let started = std::time::Instant::now();
+        let _nvtx = crate::nvtx::Range::new("stage104_rmvpe_gru");
+        let gru = self.gru.forward(unet);
+        drop(_nvtx);
+        crate::diagnostic::measure(&device, "rmvpe.bidirectional_gru", started, serde_json::json!({"output_shape":gru.dims()}));
+        let started = std::time::Instant::now();
+        let _nvtx = crate::nvtx::Range::new("stage104_rmvpe_head");
+        let out = self.head.forward(gru);
+        drop(_nvtx);
+        crate::diagnostic::measure(&device, "rmvpe.f0_head", started, serde_json::json!({"output_shape":out.dims()}));
+        out
     }
 }

@@ -1,0 +1,7 @@
+# Stage 73 GPU R&D continuation
+
+Retrieve latest PR #2 Git Bridge, read `research/STAGE72_GPU_FULL_WAV_PROFILE_AND_NEXT_KERNELS_2026-11-12.md`, and analyze user's `RVC_STAGE72_FULL_WAV_RESULTS.zip` when provided.
+
+Grounded Stage67 on RTX4060 warm full-WAV 89.94s: baseline 39.9087s, NSF ImplicitGemm only 15.9475s, persistent GRU only 35.8983s, both 12.3673s (RTF 0.13751); numerical deviation combined PCM16 RMSE1.552 max86; deterministic WAV. Stage68 synchronized diagnostic both: NSF residual 4.473s, HuBERT frontend conv 2.612s, RMVPE UNet 2.439s, TextEncoder attention/FFN 1.744s, GRU 0.506s (nested sync, do not sum with parent).
+
+Stage72 added opt-in CUDA-only HuBERT Conv1d ImplicitGemm and RMVPE UNet Conv2d/ConvTranspose2d GEMM with separate flags. Stage72 runner on top of known-fast NSF+GRU provides baseline/hubert/unet/both, preserves errors and PCM16 A/B. Analyze numeric fidelity, any unsupported kernels, RTX VRAM utilization, warm end-to-end and first-pass JIT before promoting. GitHub CI only verifies compile, not CUDA JIT. Follow up actual NSF residual bottleneck using per-layer shapes and CUDA event timings; compare prior Stage50 Prepacked/Packed/Quad vs implicit GEMM on **real full RVC**, not CPU synthetic timings. Avoid unrelated obsolete scripts and keep Stage71 CPU Auto CpuGemm intact.

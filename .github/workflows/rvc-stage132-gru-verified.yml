@@ -1,0 +1,77 @@
+name: RVC Stage132 verified GRU + compact Nsight RTX package
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - experiment/conv-kernel-rnd-stage33-20261110
+    paths:
+      - 'models/tts-with-rvc-rs/src/main.rs'
+      - 'research/stage132-gru-verified/**'
+      - '.github/workflows/rvc-stage132-gru-verified.yml'
+permissions:
+  contents: read
+concurrency:
+  group: rvc-stage132-gru-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cache/tracel
+          key: rvc-stage132-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            rvc-stage131-
+            rvc-stage127-
+      - name: Validate profiler scripts and route contracts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = 'research/stage132-gru-verified'
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path "$root/Run-Stage132-GRU-AB.ps1").Path,[ref]$tokens,[ref]$errors)
+          if ($errors.Count -ne 0) { $errors | Format-List | Out-String | Write-Host; throw 'Stage132 PowerShell syntax error' }
+          python -m compileall -q $root
+          if ($LASTEXITCODE -ne 0) { throw 'Stage132 Python compile failed' }
+          python -m unittest discover -s $root -p 'test_stage132_contract.py' -v
+          if ($LASTEXITCODE -ne 0) { throw 'Stage132 contract tests failed' }
+      - name: Restore vendored crate checksums
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Vendor source verification failed' }
+      - name: Build Rust CUDA CPU WGPU release
+        shell: pwsh
+        run: |
+          cargo build --release --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs
+          if ($LASTEXITCODE -ne 0) { throw 'Stage132 release build failed' }
+          & target/release/tts-with-rvc-rs.exe doctor
+          if ($LASTEXITCODE -ne 0) { throw 'Stage132 doctor failed' }
+      - name: Package tested executable, profiler and report
+        shell: pwsh
+        run: |
+          $out = 'dist/rvc-stage132-gru-verified-windows-x64'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item target/release/tts-with-rvc-rs.exe $out
+          Copy-Item research/stage132-gru-verified/Run-Stage132-GRU-AB.ps1 $out
+          Copy-Item research/stage132-gru-verified/*.py $out
+          Copy-Item research/stage132-gru-verified/README.md $out
+          Copy-Item research/stage132-gru-verified/REPORT.md (Join-Path $out 'STAGE132_REPORT.md')
+          Set-Content -LiteralPath (Join-Path $out 'BUILD_STATUS.txt') -Encoding utf8 -Value "Stage132 Windows release and contracts PASS; RTX4060 revalidation PENDING; commit=$env:GITHUB_SHA"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rvc-stage132-gru-verified-windows-x64
+          path: dist/rvc-stage132-gru-verified-windows-x64/
+          if-no-files-found: error
+          retention-days: 14

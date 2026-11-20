@@ -5,7 +5,7 @@ struct BatchNorm2d {
     weight: Tensor<1>,
     bias: Tensor<1>,
     mean: Tensor<1>,
-    variance: Tensor<1>,
+    stddev: Tensor<1>,
 }
 
 impl BatchNorm2d {
@@ -18,7 +18,26 @@ impl BatchNorm2d {
         if channels[0] == 0 || bias.dims() != channels || mean.dims() != channels || variance.dims() != channels {
             return Err(format!("{prefix}: incompatible BatchNorm2d parameter dimensions"));
         }
-        Ok(Self { weight, bias, mean, variance })
+        Ok(Self { weight, bias, mean, stddev: (variance + 1e-5).sqrt() })
+    }
+
+    fn fuse_conv(self, mut conv: Conv2d) -> Conv2d {
+        let channels = self.weight.dims()[0];
+        let scale = self.weight / self.stddev;
+        let offset = self.bias - self.mean * scale.clone();
+        conv.weight = conv.weight * scale.clone().reshape([channels, 1, 1, 1]);
+        conv.bias = Some(match conv.bias.take() {
+            Some(bias) => bias * scale + offset,
+            None => offset,
+        });
+        conv
+    }
+
+    fn fuse_transpose(self, weight: Tensor<4>) -> (Tensor<4>, Tensor<1>) {
+        let channels = self.weight.dims()[0];
+        let scale = self.weight / self.stddev;
+        let offset = self.bias - self.mean * scale.clone();
+        (weight * scale.reshape([1, channels, 1, 1]), offset)
     }
 
     fn forward(&self, input: Tensor<4>) -> Tensor<4> {
@@ -26,7 +45,7 @@ impl BatchNorm2d {
         assert_eq!(input.dims()[1], channels, "BatchNorm2d channel mismatch");
         let shape = [1, channels, 1, 1];
         (input - self.mean.clone().reshape(shape))
-            / (self.variance.clone().reshape(shape) + 1e-5).sqrt()
+            / self.stddev.clone().reshape(shape)
             * self.weight.clone().reshape(shape)
             + self.bias.clone().reshape(shape)
     }
@@ -36,6 +55,7 @@ struct Conv2d {
     weight: Tensor<4>,
     bias: Option<Tensor<1>>,
     padding: usize,
+    winograd_weights: Option<Tensor<3>>,
 }
 
 impl Conv2d {
@@ -51,20 +71,63 @@ impl Conv2d {
         if bias.as_ref().is_some_and(|bias| bias.dims()[0] != shape[0]) {
             return Err(format!("{prefix}: Conv2d bias channels mismatch"));
         }
-        Ok(Self { weight, bias, padding: kernel / 2 })
+        Ok(Self { weight, bias, padding: kernel / 2, winograd_weights: None })
+    }
+
+    fn prepack_winograd(mut self) -> Self {
+        if self.padding == 1 {
+            self.winograd_weights = Some(crate::cubecl_conv::prepack_winograd(self.weight.clone()));
+        }
+        self
     }
 
     fn forward(&self, input: Tensor<4>) -> Tensor<4> {
-        module::conv2d(input, self.weight.clone(), self.bias.clone(),
-            ConvOptions::new([1, 1], [self.padding, self.padding], [1, 1], 1))
+        let options = ConvOptions::new([1, 1], [self.padding, self.padding], [1, 1], 1);
+        if let Some(packed) = &self.winograd_weights {
+            crate::cubecl_conv::conv2d_winograd(
+                input, packed.clone(), self.bias.clone(), self.weight.dims()[0],
+            )
+        } else if std::env::var("RVC_RMVPE_UNET_SPATIAL_PAIR").as_deref() == Ok("1")
+            && self.padding == 1
+            && self.weight.dims()[2] == 3
+            && self.weight.dims()[3] == 3
+        {
+            crate::cubecl_conv::conv2d_spatial_pair(
+                input, self.weight.clone(), self.bias.clone(), options,
+            )
+        } else if std::env::var("RVC_RMVPE_UNET_SPATIAL_REUSE").as_deref() == Ok("1")
+            && self.padding == 1
+        {
+            crate::cubecl_conv::conv2d_spatial_reuse(
+                input, self.weight.clone(), self.bias.clone(), options,
+            )
+        } else if std::env::var("RVC_RMVPE_UNET_SPATIAL_QUAD").as_deref() == Ok("1") {
+            crate::cubecl_conv::conv2d_spatial_quad(
+                input, self.weight.clone(), self.bias.clone(), options,
+            )
+        } else if std::env::var("RVC_RMVPE_UNET_COMPENSATED_BATCH_TF32").as_deref() == Ok("1") {
+            crate::cubecl_conv::conv2d_compensated_tf32_batched(
+                input, self.weight.clone(), self.bias.clone(), options,
+            )
+        } else if std::env::var("RVC_RMVPE_UNET_COMPENSATED_TF32").as_deref() == Ok("1") {
+            crate::cubecl_conv::conv2d_compensated_tf32(
+                input, self.weight.clone(), self.bias.clone(), options,
+            )
+        } else if std::env::var("RVC_RMVPE_UNET_GEMM").as_deref() == Ok("1")
+            || std::env::var("RVC_RMVPE_UNET_CONV2D_GEMM").as_deref() == Ok("1")
+        {
+            crate::cubecl_conv::conv2d(input, self.weight.clone(), self.bias.clone(), options)
+        } else {
+            module::conv2d(input, self.weight.clone(), self.bias.clone(), options)
+        }
     }
 }
 
 struct ConvBlockRes {
     conv1: Conv2d,
-    norm1: BatchNorm2d,
+    norm1: Option<BatchNorm2d>,
     conv2: Conv2d,
-    norm2: BatchNorm2d,
+    norm2: Option<BatchNorm2d>,
     shortcut: Option<Conv2d>,
 }
 
@@ -91,6 +154,17 @@ impl ConvBlockRes {
         } else if input_channels != hidden_channels {
             return Err(format!("{prefix}: required shortcut missing"));
         }
+        let (conv1, norm1, conv2, norm2) =
+            if std::env::var("RVC_RMVPE_BN_FOLD").as_deref() == Ok("1") {
+                (norm1.fuse_conv(conv1), None, norm2.fuse_conv(conv2), None)
+            } else {
+                (conv1, Some(norm1), conv2, Some(norm2))
+            };
+        let (conv1, conv2) = if std::env::var("RVC_RMVPE_UNET_WINOGRAD").as_deref() == Ok("1") {
+            (conv1.prepack_winograd(), conv2.prepack_winograd())
+        } else {
+            (conv1, conv2)
+        };
         Ok(Self { conv1, norm1, conv2, norm2, shortcut })
     }
 
@@ -99,8 +173,12 @@ impl ConvBlockRes {
             Some(shortcut) => shortcut.forward(x.clone()),
             None => x.clone(),
         };
-        let y = activation::relu(self.norm1.forward(self.conv1.forward(x)));
-        activation::relu(self.norm2.forward(self.conv2.forward(y))) + residual
+        let y = self.conv1.forward(x);
+        let y = match &self.norm1 { Some(norm) => norm.forward(y), None => y };
+        let y = activation::relu(y);
+        let y = self.conv2.forward(y);
+        let y = match &self.norm2 { Some(norm) => norm.forward(y), None => y };
+        activation::relu(y) + residual
     }
 }
 
@@ -201,7 +279,8 @@ impl RmvpeIntermediate {
 
 struct TransposedConv2d {
     weight: Tensor<4>,
-    norm: BatchNorm2d,
+    bias: Option<Tensor<1>>,
+    norm: Option<BatchNorm2d>,
     stride: [usize; 2],
     padding_out: [usize; 2],
 }
@@ -220,20 +299,32 @@ impl TransposedConv2d {
         if norm.weight.dims()[0] != dims[1] {
             return Err(format!("{prefix}: ConvTranspose2d / BatchNorm2d output channels differ"));
         }
+        let (weight, bias, norm) =
+            if std::env::var("RVC_RMVPE_BN_FOLD").as_deref() == Ok("1") {
+                let (weight, bias) = norm.fuse_transpose(weight);
+                (weight, Some(bias), None)
+            } else {
+                (weight, None, Some(norm))
+            };
         Ok(Self {
-            weight, norm, stride,
+            weight, bias, norm, stride,
             padding_out: if stride == [1, 2] { [0, 1] } else { [1, 1] },
         })
     }
 
     fn forward(&self, input: Tensor<4>) -> Tensor<4> {
-        let value = module::conv_transpose2d(
-            input, self.weight.clone(), None,
-            burn::tensor::ops::ConvTransposeOptions::new(
-                self.stride, [1, 1], self.padding_out, [1, 1], 1,
-            ),
+        let options = burn::tensor::ops::ConvTransposeOptions::new(
+            self.stride, [1, 1], self.padding_out, [1, 1], 1,
         );
-        activation::relu(self.norm.forward(value))
+        let value = if std::env::var("RVC_RMVPE_UNET_GEMM").as_deref() == Ok("1")
+            || std::env::var("RVC_RMVPE_UNET_TRANSPOSE2D_GEMM").as_deref() == Ok("1")
+        {
+            crate::cubecl_conv::conv_transpose2d_gemm(input, self.weight.clone(), self.bias.clone(), options)
+        } else {
+            module::conv_transpose2d(input, self.weight.clone(), self.bias.clone(), options)
+        };
+        let value = match &self.norm { Some(norm) => norm.forward(value), None => value };
+        activation::relu(value)
     }
 }
 

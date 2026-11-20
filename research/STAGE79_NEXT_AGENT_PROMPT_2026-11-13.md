@@ -1,0 +1,7 @@
+# Stage79 continuation — real CUDA results of batched compensated TF32
+
+Use latest PR #2 Git Bridge; read `research/STAGE78_TF32_PACKED_BATCH_RND_2026-11-13.md`. Analyze user-uploaded `RVC_STAGE78_FULL_WAV_RESULTS.zip` from RTX4060.
+
+Stage77 verified full WAV 89.94s: Direct 12.444s, unsafe unconstrained TF32 GEMM 10.586s (PCM RMSE985.61, max31490), correct compensated TF32×2 two GEMMs 11.084s (PCM RMSE1.3768, max46; SNR63.13dB). New Stage78 packs high/low in one contiguous doubled batch and performs one Conv2d launch, preserving the same mathematical expression. It might be faster or slower; no CUDA GPU test has run yet. For Stage78, compare full WAV accuracy to Direct and separate TF32×2, build status/JIT errors, warm median across 3 passes and resident memory. Avoid claiming 1-GEMM = 1/2 FLOPs; arithmetic remains roughly 2×. Do not promote until tested on multiple recordings/voices.
+
+If packed wins, next R&D may fuse split+GEMM and dual accumulators at tile level to eliminate packed scratch/write and output split/sum, with hard numerical constraints vs FP32/PyTorch. If packed loses, retain separate compensated TF32×2 and explore alternate threadblock tiling, precision modes or a native compensated fused matmul. Keep Direct as production default until full parity/quality acceptance. No "fix three F0 frames" or reference-dependent algorithms. CUDA Graph replay in production is still disabled.

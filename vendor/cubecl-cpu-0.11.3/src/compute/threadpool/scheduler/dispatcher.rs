@@ -75,8 +75,57 @@ impl DispatcherScheduler {
             }
             best
         };
-        let _ = self.tx[target].send(task);
-        self.lens[target].fetch_add(1, atomic::Ordering::Relaxed);
+        if send_accounted(&self.tx[target], &self.lens[target], task).is_err() {
+            panic!("CubeCL CPU worker disconnected while dispatching a task");
+        }
+    }
+}
+
+fn send_accounted<T>(
+    tx: &mpsc::Sender<T>,
+    len: &AtomicUsize,
+    task: T,
+) -> Result<(), mpsc::SendError<T>> {
+    len.fetch_add(1, atomic::Ordering::Relaxed);
+    match tx.send(task) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            len.fetch_sub(1, atomic::Ordering::Relaxed);
+            Err(error)
+        }
+    }
+}
+
+#[cfg(test)]
+mod accounting_tests {
+    use super::*;
+
+    #[test]
+    fn message_is_accounted_before_it_becomes_visible_to_worker() {
+        let (tx, rx) = mpsc::channel();
+        let depth = Arc::new(AtomicUsize::new(0));
+        let receiver_depth = Arc::clone(&depth);
+        let worker = std::thread::spawn(move || {
+            for _ in 0..10_000 {
+                rx.recv().expect("dispatcher dropped");
+                assert!(receiver_depth.load(atomic::Ordering::Relaxed) > 0);
+                receiver_depth.fetch_sub(1, atomic::Ordering::Relaxed);
+            }
+        });
+        for _ in 0..10_000 {
+            send_accounted(&tx, &depth, ()).expect("worker disconnected");
+        }
+        worker.join().unwrap();
+        assert_eq!(depth.load(atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn disconnected_worker_does_not_leave_phantom_work() {
+        let (tx, rx) = mpsc::channel::<()>();
+        drop(rx);
+        let depth = AtomicUsize::new(0);
+        assert!(send_accounted(&tx, &depth, ()).is_err());
+        assert_eq!(depth.load(atomic::Ordering::Relaxed), 0);
     }
 }
 

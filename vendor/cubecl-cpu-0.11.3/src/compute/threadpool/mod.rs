@@ -57,6 +57,7 @@ impl Threadpool {
         failures: &mut ErrorGraph,
         next_counter_step: u64,
         atomic_counter: &Arc<CachePadded<AtomicU64>>,
+        inline_single_unit: bool,
     ) {
         let requirements = pliron_engine.requirements().clone();
 
@@ -102,7 +103,13 @@ impl Threadpool {
                         next_counter_step,
                         atomic_counter,
                     };
-                    self.scheduler.send(i, compute_task);
+                    if inline_single_unit {
+                        debug_assert_eq!(cube_dim.num_elems(), 1);
+                        let mut compute_task = compute_task;
+                        compute_task.compute();
+                    } else {
+                        self.scheduler.send(i, compute_task);
+                    }
                     i += 1;
                 }
             }

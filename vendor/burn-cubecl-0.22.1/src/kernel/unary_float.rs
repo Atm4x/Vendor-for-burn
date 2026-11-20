@@ -124,6 +124,7 @@ pub(crate) mod unary_basic {
         Log1p,
         Sqrt,
         Abs,
+        Relu,
         Sign,
         ArcCos,
         ArcCosh,
@@ -158,6 +159,10 @@ pub(crate) mod unary_basic {
 
         fn execute(input: Vector<F, N>, options: &Self::Options) -> Vector<F, N> {
             match comptime![options.kind] {
+                BasicFloatUnaryKind::Relu => {
+                    let zero = Vector::zero();
+                    select_many(input.less_equal(&zero), zero, input)
+                }
                 BasicFloatUnaryKind::Exp => Vector::exp(input),
                 BasicFloatUnaryKind::Log => Vector::ln(input),
                 BasicFloatUnaryKind::Log1p => Vector::log1p(input),

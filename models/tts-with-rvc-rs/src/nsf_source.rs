@@ -39,6 +39,17 @@ impl SineGen {
         initial_phases: Tensor<3>,
         gaussian_noise: Tensor<3>,
     ) -> Result<SineOutput, String> {
+        self.forward_with_random_and_global_phase(f0, upsample, initial_phases, gaussian_noise, None)
+    }
+
+    pub fn forward_with_random_and_global_phase(
+        &self,
+        f0: Tensor<2>,
+        upsample: usize,
+        initial_phases: Tensor<3>,
+        gaussian_noise: Tensor<3>,
+        global_phase: Option<Tensor<3>>,
+    ) -> Result<SineOutput, String> {
         let [batch, frames] = f0.dims();
         let dimension = self.harmonics + 1;
         if upsample == 0 || frames == 0 || batch == 0 {
@@ -73,7 +84,16 @@ impl SineGen {
             TensorData::new((0..dimension).map(|i| if i == 0 { 0.0 } else { 1.0 }).collect::<Vec<f32>>(), [1, 1, dimension]),
             &device,
         );
-        let sine = ((rad * harmonics + initial_phases * phase_mask) * (2.0 * std::f32::consts::PI)).sin() * self.sine_amp;
+        let angle = rad * harmonics + initial_phases * phase_mask;
+        let angle = if let Some(offset) = global_phase {
+            if offset.dims() != [batch, 1, dimension] {
+                return Err("global NSF phase tensor must be [batch, 1, harmonics+1]".into());
+            }
+            angle + offset
+        } else {
+            angle
+        };
+        let sine = (angle * (2.0 * std::f32::consts::PI)).sin() * self.sine_amp;
         let voiced_frames = f0.greater_elem(self.voiced_threshold).float().unsqueeze_dim::<4>(2);
         let voiced = (voiced_frames * Tensor::<4>::ones([1, 1, upsample, 1], &device))
             .reshape([batch, samples, 1]);
@@ -114,7 +134,20 @@ impl SourceModuleHnNSF {
         initial_phases: Tensor<3>,
         gaussian_noise: Tensor<3>,
     ) -> Result<(Tensor<3>, SineOutput), String> {
-        let output = self.generator.forward_with_random(f0, upsample, initial_phases, gaussian_noise)?;
+        self.forward_with_random_and_global_phase(f0, upsample, initial_phases, gaussian_noise, None)
+    }
+
+    pub fn forward_with_random_and_global_phase(
+        &self,
+        f0: Tensor<2>,
+        upsample: usize,
+        initial_phases: Tensor<3>,
+        gaussian_noise: Tensor<3>,
+        global_phase: Option<Tensor<3>>,
+    ) -> Result<(Tensor<3>, SineOutput), String> {
+        let output = self.generator.forward_with_random_and_global_phase(
+            f0, upsample, initial_phases, gaussian_noise, global_phase,
+        )?;
         let [batch, time, dimensions] = output.waves.dims();
         let merged = activation::tanh(
             output.waves.clone().reshape([batch * time, dimensions])

@@ -124,11 +124,17 @@ impl TextEncoder {
         lengths: &[usize],
         skip_head: Option<usize>,
     ) -> TextEncoderOutput {
+        let device = phone.device();
+        let started = std::time::Instant::now();
         let front = self.front.forward(phone, pitch, lengths);
         let mut mask = front.mask;
         let mut x = front.features * mask.clone();
-        for layer in &self.layers {
+        crate::diagnostic::measure(&device, "text_encoder.front", started, serde_json::json!({"output_shape":x.dims()}));
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            let started = std::time::Instant::now();
             x = layer.forward(x, mask.clone());
+            crate::diagnostic::measure(&device, "text_encoder.attention_ffn_layer", started,
+                serde_json::json!({"layer":layer_index,"output_shape":x.dims()}));
         }
         x = x * mask.clone();
         if let Some(skip) = skip_head {
@@ -137,7 +143,9 @@ impl TextEncoder {
             x = x.slice([0..batch, 0..channels, skip..time]);
             mask = mask.slice([0..batch, 0..1, skip..time]);
         }
+        let started = std::time::Instant::now();
         let stats = self.stats_projection.forward(x) * mask.clone();
+        crate::diagnostic::measure(&device, "text_encoder.stats_projection", started, serde_json::json!({"output_shape":stats.dims()}));
         let [batch, channels, time] = stats.dims();
         assert_eq!(channels, self.output_channels * 2);
         let mean = stats.clone().slice([0..batch, 0..self.output_channels, 0..time]);

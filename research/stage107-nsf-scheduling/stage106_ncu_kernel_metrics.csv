@@ -1,0 +1,9 @@
+capture,kernel,kernel_us,fma_pct,l1_lsu_pct,occupancy_pct,eligible_warps_per_scheduler,issued_warps_per_scheduler,registers_per_thread,grid_blocks,block_threads
+noise-noise40-direct.ncu,direct_conv2d_kernel_e_f32_nin_1_nout_4_9f297f02,639.488,3.944,94.223,83.244,0.1578,0.0797,40,321,256
+noise-noise40-tiled.ncu,noise_temporal_pair_kernel_e_f32_n_4_d0128890,56.256,20.975,39.346,87.327,1.6875,0.5637,33,161,256
+noise-noise8-direct.ncu,direct_conv2d_kernel_e_f32_nin_1_nout_4_9f297f02,29.408,15.329,87.491,79.829,0.7679,0.3265,40,257,256
+noise-noise8-tiled.ncu,noise_temporal_pair_kernel_e_f32_n_4_d0128890,11.776,18.115,39.319,82.749,1.4723,0.4395,33,129,256
+transpose-upsample10-direct.ncu,conv_transpose2d_direct_nhwc_kernel_e_f32_n_4_722e09ea,134.848,27.278,58.612,63.793,0.8581,0.4604,62,320,256
+transpose-upsample10-polyphase.ncu,polyphase_pair_kernel_e_f32_n_4_1c0c23c7,136.256,24.18,34.126,59.578,0.6388,0.3308,54,160,256
+transpose-upsample8-direct.ncu,conv_transpose2d_direct_nhwc_kernel_e_f32_n_4_722e09ea,59.008,26.902,53.491,62.096,0.9843,0.4518,62,256,256
+transpose-upsample8-polyphase.ncu,polyphase_pair_kernel_e_f32_n_4_1c0c23c7,70.144,19.516,27.535,55.346,0.5654,0.2928,54,128,256

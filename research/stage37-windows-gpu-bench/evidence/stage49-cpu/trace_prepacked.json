@@ -1,0 +1,23 @@
+{
+  "stage": 48,
+  "measurement": "host layout conversions at Burn ConvNd callsites",
+  "frames": {
+    "64": {
+      "aligned_materializations": 13,
+      "contiguous_materializations": 0,
+      "aligned_logical_elems": 4768,
+      "aligned_shapes": {
+        "(1, 64, 4)": 1,
+        "(8, 4, 1, 4)": 1,
+        "(1, 64, 1, 8)": 1,
+        "(1, 256, 1)": 2,
+        "(1, 128, 4)": 2,
+        "(4, 4, 1, 2)": 1,
+        "(1, 128, 1, 4)": 1,
+        "(1, 256, 2)": 3,
+        "(1, 1, 256)": 1
+      },
+      "aligned_estimated_f32_mib": 0.0182
+    }
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "worker_protocol": 1,
+  "worker_name_default": "rvc_v2",
+  "service": "voice_conversion",
+  "model_registry_required": false,
+  "execution_variants": [
+    "burn_cubecl_cuda_fp32",
+    "burn_cubecl_wgpu_fp32",
+    "burn_cubecl_cpu_fp32"
+  ],
+  "gpu_selectors": ["pci", "windows_luid"],
+  "startup_arguments": {
+    "required": ["backend", "voice", "hubert", "rmvpe", "input-dir", "output-dir"],
+    "optional": ["name", "backend-path", "gpu-id", "index", "batch-size"]
+  },
+  "input_formats": ["wav"],
+  "output_formats": ["wav"],
+  "output_sample_rate_hz": 40000,
+  "max_source_bytes": 67108864,
+  "max_request_frame_bytes": 1048576
+}

@@ -8,13 +8,13 @@ use crate::{
     kernel::conv::{
         backward_data::{fallback::conv_data_backward_fallback, implicit_gemm::*},
         backward_weight::{fallback::conv_weight_backward_fallback, implicit_gemm::*},
-        forward::implicit_gemm::conv_gemm_simple_sync,
+        forward::implicit_gemm::{conv_gemm_simple_async, conv_gemm_simple_sync},
     },
     ops::{permute_nchw_to_nhwc, permute_nchw_to_nhwc_shape, permute_nhwc_to_nchw},
     tensor::CubeTensor,
 };
 
-use super::conv_direct;
+use super::{conv_direct, direct::{conv_spatial_quad, conv_spatial_reuse, conv_spatial_pair}};
 #[cfg(feature = "autotune")]
 use super::forward::conv_autotune;
 
@@ -40,6 +40,59 @@ impl Default for ConvStrategy {
         #[cfg(not(feature = "autotune"))]
         ConvStrategy::Direct
     }
+}
+
+/// Opt-in 3x3 register-footprint reuse for dense FP32-style 2x2 spatial tiles.
+/// Only compatible with 3x3 stride=1, padding=1, dilation=1, groups=1.
+pub fn conv_forward_spatial_reuse(
+    input: CubeTensor, weight: CubeTensor, bias: Option<CubeTensor>,
+    options: ConvOptions<2>,
+) -> Result<CubeTensor, ConvSetupError> {
+    let input = permute_nchw_to_nhwc(input);
+    let weight = permute_nchw_to_nhwc(weight);
+    let output = conv_spatial_reuse(input, weight, bias, options)?;
+    Ok(permute_nhwc_to_nchw(output))
+}
+
+pub fn conv_forward_spatial_pair(
+    input: CubeTensor, weight: CubeTensor, bias: Option<CubeTensor>,
+    options: ConvOptions<2>,
+) -> Result<CubeTensor, ConvSetupError> {
+    let input = permute_nchw_to_nhwc(input);
+    let weight = permute_nchw_to_nhwc(weight);
+    let output = conv_spatial_pair(input, weight, bias, options)?;
+    Ok(permute_nhwc_to_nchw(output))
+}
+
+/// Run the experimental 2x2 spatial direct convolution, preserving NCHW API layout.
+pub fn conv_forward_spatial_quad(
+    input: CubeTensor,
+    weight: CubeTensor,
+    bias: Option<CubeTensor>,
+    options: ConvOptions<2>,
+) -> Result<CubeTensor, ConvSetupError> {
+    let input = permute_nchw_to_nhwc(input);
+    let weight = permute_nchw_to_nhwc(weight);
+    let output = conv_spatial_quad(input, weight, bias, options)?;
+    Ok(permute_nhwc_to_nchw(output))
+}
+
+/// Experimental asynchronous implicit GEMM forward route with the same convolution
+/// geometry and output contract as the synchronous CMMA route.
+pub fn conv_forward_async<const N: usize>(
+    input: CubeTensor,
+    weight: CubeTensor,
+    bias: Option<CubeTensor>,
+    options: ConvOptions<N>,
+) -> Result<CubeTensor, ConvSetupError> {
+    let input = permute_nchw_to_nhwc(input);
+    let weight = permute_nchw_to_nhwc(weight);
+    let output = if options.groups == 1 {
+        conv_gemm_simple_async::<N>(input, weight, bias, options, AcceleratedTileKind::Cmma)?
+    } else {
+        conv_direct::<N>(input, weight, bias, options)?
+    };
+    Ok(permute_nhwc_to_nchw(output))
 }
 
 /// Performs an N-dimensional convolution with the given strategy

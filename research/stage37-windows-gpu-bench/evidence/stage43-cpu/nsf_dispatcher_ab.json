@@ -1,0 +1,120 @@
+{
+  "stage": 43,
+  "date": "2026-11-10",
+  "hardware": "virtualized AMD EPYC 9V74, CPU affinity 0 or 0-4",
+  "rust": "1.98.1",
+  "llvm": "23.1.0",
+  "algorithm": "full synthetic NSF Burn CubeCL CPU forward, output CPU readback",
+  "variant_note": "baseline and fixed are independently built release executables; no explicit flush",
+  "warmup": 4,
+  "iterations": 12,
+  "frames": [
+    4,
+    64,
+    256
+  ],
+  "runs": [
+    {
+      "trial": 1,
+      "affinity": "1cpu",
+      "variant": "baseline",
+      "median_ms_by_frames": [
+        44.547893,
+        47.924948,
+        44.21418
+      ]
+    },
+    {
+      "trial": 2,
+      "affinity": "1cpu",
+      "variant": "fixed",
+      "median_ms_by_frames": [
+        44.483628,
+        44.540162,
+        44.042824
+      ]
+    },
+    {
+      "trial": 3,
+      "affinity": "5cpu",
+      "variant": "fixed",
+      "median_ms_by_frames": [
+        99.998059,
+        106.918121,
+        99.945977
+      ]
+    },
+    {
+      "trial": 4,
+      "affinity": "5cpu",
+      "variant": "baseline",
+      "median_ms_by_frames": [
+        109.01352,
+        108.897268,
+        111.910667
+      ]
+    },
+    {
+      "trial": 5,
+      "affinity": "1cpu",
+      "variant": "fixed",
+      "median_ms_by_frames": [
+        44.192072,
+        44.077522,
+        43.975041
+      ]
+    },
+    {
+      "trial": 6,
+      "affinity": "1cpu",
+      "variant": "baseline",
+      "median_ms_by_frames": [
+        44.406306,
+        44.483071,
+        48.067001
+      ]
+    },
+    {
+      "trial": 7,
+      "affinity": "5cpu",
+      "variant": "baseline",
+      "median_ms_by_frames": [
+        104.324765,
+        103.902305,
+        104.592605
+      ]
+    },
+    {
+      "trial": 8,
+      "affinity": "5cpu",
+      "variant": "fixed",
+      "median_ms_by_frames": [
+        127.93369,
+        103.980405,
+        119.963881
+      ]
+    },
+    {
+      "trial": 9,
+      "affinity": "5cpu",
+      "variant": "baseline",
+      "median_ms_by_frames": [
+        108.389374,
+        104.031789,
+        120.036065
+      ]
+    }
+  ],
+  "output_sums": {
+    "4": 0.18699266598559916,
+    "64": 3.379754826426506,
+    "256": 13.588609755039215
+  },
+  "caveats": [
+    "Per-trial medians are not kernel-only latency.",
+    "Short A/B on a virtualized 5-vCPU host; variation prevents meaningful speedup claim.",
+    "One aggregate harness sequence was interrupted before its eighth trial; independent follow-ups completed.",
+    "The local benchmark uses the default NSF forward from the restored Stage40 source; Stage42 scheduling instrumentation was not included in that local checkout.",
+    "Matching output sums do not establish full-tensor cross-process parity."
+  ]
+}

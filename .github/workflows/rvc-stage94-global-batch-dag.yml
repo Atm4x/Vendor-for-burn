@@ -1,0 +1,77 @@
+name: RVC Stage94 batch-aware execution Windows gate
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+jobs:
+  batch-aware-windows:
+    runs-on: windows-latest
+    timeout-minutes: 115
+    env:
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cache/tracel
+          key: stage94-batch-aware-${{ hashFiles('Cargo.lock') }}
+      - name: Restore vendored checksums
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Vendored checksum restore failed' }
+      - name: Check Stage94 PowerShell syntax
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          $path = 'research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage94.ps1'
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $path).Path, [ref]$tokens, [ref]$errors)
+          if ($errors.Count -gt 0) { $errors | Format-List | Out-String | Write-Host; throw 'Invalid Stage94 runner' }
+      - name: Verify global plan, batch scheduling and chunk regressions
+        shell: pwsh
+        run: |
+          rustc --edition=2024 --test research/stage90-global-chunks/chunk_test_harness.rs -o stage94_chunk_tests.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Stage94 test compilation failed' }
+          & ./stage94_chunk_tests.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Stage94 tests failed' }
+      - name: Build unified CPU CUDA WGPU Windows executable
+        shell: pwsh
+        run: |
+          cargo check --offline --locked -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --lib --bin tts-with-rvc-rs
+          if ($LASTEXITCODE -ne 0) { throw 'Stage94 check failed' }
+          cargo build --release --offline --locked -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs
+          if ($LASTEXITCODE -ne 0) { throw 'Stage94 release build failed' }
+          & target/release/tts-with-rvc-rs.exe doctor
+          if ($LASTEXITCODE -ne 0) { throw 'Stage94 doctor failed' }
+      - name: Package Stage94 batch-aware global DAG execution A/B comparison
+        shell: pwsh
+        run: |
+          $folder = 'dist/stage94-batch-aware'
+          New-Item -ItemType Directory -Force -Path $folder | Out-Null
+          Copy-Item target/release/tts-with-rvc-rs.exe $folder
+          Copy-Item research/stage37-windows-gpu-bench/windows/Run-RVC-Full-Stage94.ps1 $folder
+          @'
+          Stage94: shape-aware gather batching and batch-lattice global planning (experimental).
+          Put private .pth/.pt/.index/.wav under .\embed\.
+          Run Run-RVC-Full-Stage94.ps1 using the same Voice, Hubert, Rmvpe, Index and InputWav arguments.
+          A/B/C/C/B/A: Stage93 cost-aware contiguous, same plan with shape-gather, and new batch-aware plan with shape-gather.
+          -LaunchCost/-LinearCost/-AttentionMilli/-SpliceCost configure an uncalibrated work proxy. No padding is used.
+          Do not assume that fewer batches equal lower latency: tensor batch throughput and seam quality need RTX validation.
+          Windows CI has no CUDA GPU, and cannot establish speed or audio quality.
+          '@ | Set-Content (Join-Path $folder 'README.txt')
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rvc-stage94-batch-aware-windows-x64
+          path: dist/stage94-batch-aware/
+          retention-days: 14
+          if-no-files-found: warn

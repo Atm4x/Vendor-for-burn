@@ -1,0 +1,311 @@
+name: RVC Stage112 fused two-tap polyphase shared-memory Windows profiler
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rvc-stage112-fused-two-tap-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  stage104-windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cache/tracel
+          key: stage101-winograd-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            stage94-batch-aware-
+            stage62-unified-
+      - name: Restore vendored crates
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'zerocopy-0.8.63.crate'
+          Invoke-WebRequest -Uri 'https://static.crates.io/crates/zerocopy/zerocopy-0.8.63.crate' -OutFile $archive
+          python tools/restore_vendor_checksums.py --zerocopy-archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Vendor checksum repair failed' }
+      - name: Validate Stage101-112 analyzers, references, and PowerShell runners
+        shell: pwsh
+        run: |
+          python research/stage101-winograd/windows/test_stage101_analyzer.py
+          if ($LASTEXITCODE -ne 0) { throw 'Analyzer tests failed' }
+          $script = 'research/stage101-winograd/windows/Run-RVC-Stage101-Winograd-CUDA.ps1'
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $script).Path, [ref]$tokens, [ref]$errors)
+          if ($errors.Count -gt 0) { $errors | Format-List | Out-String | Write-Host; throw 'Stage101 PowerShell syntax invalid' }
+          python research/stage102-cuda-profile/windows/test_stage102_profiler.py
+          if ($LASTEXITCODE -ne 0) { throw 'Stage102 profile contract tests failed' }
+          python research/stage103-l1-reuse/windows/test_stage103.py
+          if ($LASTEXITCODE -ne 0) { throw 'Stage103 compare contract tests failed' }
+          python research/stage104-ncu-matrix/windows/test_stage104.py
+          if ($LASTEXITCODE -ne 0) { throw 'Stage104 plan tests failed' }
+          python research/stage105-register-budget/windows/test_stage105.py
+          if ($LASTEXITCODE -ne 0) { throw 'Stage105 pair contract tests failed' }
+          python research/stage106-nsf-polyphase/windows/test_stage106.py
+          if ($LASTEXITCODE -ne 0) { throw 'Stage106 source contract failed' }
+          python research/stage112-fused-polyphase/windows/test_stage112.py
+          if ($LASTEXITCODE -ne 0) { throw 'Stage112 analyzer contract failed' }
+          python -m compileall -q research/stage112-fused-polyphase/windows
+          if ($LASTEXITCODE -ne 0) { throw 'Stage112 Python validation failed' }
+          $stage112Ref = Join-Path $env:RUNNER_TEMP 'stage112-fused-reference.exe'
+          rustc --edition=2024 --test research/stage112-fused-polyphase/reference.rs -o $stage112Ref
+          if ($LASTEXITCODE -ne 0) { throw 'Stage112 reference compilation failed' }
+          & $stage112Ref
+          if ($LASTEXITCODE -ne 0) { throw 'Stage112 reference parity failed' }
+          $stage112 = 'research/stage112-fused-polyphase/windows/Run-RVC-Stage112-Fused-Polyphase.ps1'
+          $tokens112 = $null
+          $errors112 = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $stage112).Path,[ref]$tokens112,[ref]$errors112)
+          if ($errors112.Count -gt 0) { $errors112 | Format-List | Out-String | Write-Host; throw 'Stage112 PowerShell invalid' }
+          & $stage112 -DryRun -Profiler ncu
+          python research/stage111-phase-gemm/windows/test_stage111.py
+          if ($LASTEXITCODE -ne 0) { throw 'Stage111 comparator contract failed' }
+          python -m compileall -q research/stage111-phase-gemm/windows
+          if ($LASTEXITCODE -ne 0) { throw 'Stage111 Python source invalid' }
+          $stage111Ref = Join-Path $env:RUNNER_TEMP 'stage111-reference.exe'
+          rustc --edition=2024 --test research/stage111-phase-gemm/reference.rs -o $stage111Ref
+          if ($LASTEXITCODE -ne 0) { throw 'Stage111 phase math test compile failed' }
+          & $stage111Ref
+          if ($LASTEXITCODE -ne 0) { throw 'Stage111 phase math test failed' }
+          $stage111 = 'research/stage111-phase-gemm/windows/Run-RVC-Stage111-Phase-GEMM.ps1'
+          $stage111Tokens = $null
+          $stage111Errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $stage111).Path, [ref]$stage111Tokens, [ref]$stage111Errors)
+          if ($stage111Errors.Count -gt 0) { $stage111Errors | Format-List | Out-String | Write-Host; throw 'Stage111 PowerShell invalid' }
+          & $stage111 -DryRun -Profiler ncu
+          if ($LASTEXITCODE -ne 0) { throw 'Stage111 dry-run failed' }
+          python research/stage110-channel-tile2/windows/test_stage110.py
+          if ($LASTEXITCODE -ne 0) { throw 'Stage110 Python analyzer contract failed' }
+          $stage110Ref = Join-Path $env:RUNNER_TEMP 'stage110-reference.exe'
+          rustc --edition=2024 --test research/stage110-channel-tile2/reference.rs -o $stage110Ref
+          if ($LASTEXITCODE -ne 0) { throw 'Stage110 math reference compilation failed' }
+          & $stage110Ref
+          if ($LASTEXITCODE -ne 0) { throw 'Stage110 math reference parity failed' }
+          $stage110 = 'research/stage110-channel-tile2/windows/Run-RVC-Stage110-Channel-Tile2.ps1'
+          $stage110Tokens = $null
+          $stage110Errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $stage110).Path,[ref]$stage110Tokens,[ref]$stage110Errors)
+          if ($stage110Errors.Count -gt 0) { $stage110Errors | Format-List | Out-String | Write-Host; throw 'Stage110 PowerShell invalid' }
+          & $stage110 -DryRun -Profiler ncu
+          python research/stage109-polyphase-ilp/windows/test_stage109.py
+          if ($LASTEXITCODE -ne 0) { throw 'Stage109 analyzer contracts failed' }
+          $stage109Ref = Join-Path $env:RUNNER_TEMP 'stage109-reference.exe'
+          rustc --edition=2024 --test research/stage109-polyphase-ilp/reference.rs -o $stage109Ref
+          if ($LASTEXITCODE -ne 0) { throw 'Stage109 reference compilation failed' }
+          & $stage109Ref
+          if ($LASTEXITCODE -ne 0) { throw 'Stage109 reference failed' }
+          $stage109 = 'research/stage109-polyphase-ilp/windows/Run-RVC-Stage109-ILP.ps1'
+          $stage109Tokens = $null
+          $stage109Errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $stage109).Path,[ref]$stage109Tokens,[ref]$stage109Errors)
+          if ($stage109Errors.Count -gt 0) { $stage109Errors | Format-List | Out-String | Write-Host; throw 'Stage109 PowerShell invalid' }
+          & $stage109 -DryRun -Profiler ncu
+          python research/stage108-polyphase-transport/windows/test_stage108.py
+          if ($LASTEXITCODE -ne 0) { throw 'Stage108 analyzer tests failed' }
+          $stage108Ref = Join-Path $env:RUNNER_TEMP 'stage108-reference.exe'
+          rustc --edition=2024 --test research/stage108-polyphase-transport/reference.rs -o $stage108Ref
+          if ($LASTEXITCODE -ne 0) { throw 'Stage108 reference compile failed' }
+          & $stage108Ref
+          if ($LASTEXITCODE -ne 0) { throw 'Stage108 reference failed' }
+          $stage108 = 'research/stage108-polyphase-transport/windows/Run-RVC-Stage108-Transport.ps1'
+          $stage108Tokens = $null
+          $stage108Errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $stage108).Path,[ref]$stage108Tokens,[ref]$stage108Errors)
+          if ($stage108Errors.Count -gt 0) { $stage108Errors | Format-List | Out-String | Write-Host; throw 'Stage108 PowerShell invalid' }
+          & $stage108 -DryRun -Profiler ncu
+          python research/stage107-nsf-scheduling/windows/test_stage107.py
+          if ($LASTEXITCODE -ne 0) { throw 'Stage107 analyzer contracts failed' }
+          python -m compileall -q research/stage107-nsf-scheduling/windows
+          if ($LASTEXITCODE -ne 0) { throw 'Stage107 Python syntax invalid' }
+          $stage107 = 'research/stage107-nsf-scheduling/windows/Run-RVC-Stage107-NSF-Scheduling.ps1'
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $stage107).Path, [ref]$tokens, [ref]$errors)
+          if ($errors.Count -gt 0) { $errors | Format-List | Out-String | Write-Host; throw 'Stage107 PowerShell invalid' }
+          & $stage107 -DryRun -Profiler ncu
+          if ($LASTEXITCODE -ne 0) { throw 'Stage107 dry run failed' }
+          foreach ($reference in @('polyphase_single_reference.rs','noise_interior_reference.rs')) {
+            $referenceTest = Join-Path $env:RUNNER_TEMP "stage107-$reference.exe"
+            rustc --edition=2024 --test "research/stage107-nsf-scheduling/$reference" -o $referenceTest
+            if ($LASTEXITCODE -ne 0) { throw "Stage107 reference compile failed: $reference" }
+            & $referenceTest
+            if ($LASTEXITCODE -ne 0) { throw "Stage107 reference failed: $reference" }
+          }
+          foreach ($reference in @('reference.rs','noise_reference.rs')) {
+            $referenceTest = Join-Path $env:RUNNER_TEMP "stage106-$reference.exe"
+            rustc --edition=2024 --test "research/stage106-nsf-polyphase/$reference" -o $referenceTest
+            if ($LASTEXITCODE -ne 0) { throw "Stage106 reference test compile failed: $reference" }
+            & $referenceTest
+            if ($LASTEXITCODE -ne 0) { throw "Stage106 reference test failed: $reference" }
+          }
+          $referenceTest = Join-Path $env:RUNNER_TEMP 'stage105-reference-test.exe'
+          rustc --edition=2021 --test research/stage105-register-budget/reference.rs -o $referenceTest
+          if ($LASTEXITCODE -ne 0) { throw 'Stage105 math tests failed to compile' }
+          & $referenceTest
+          if ($LASTEXITCODE -ne 0) { throw 'Stage105 math parity failed' }
+          python -m compileall -q research/stage105-register-budget/windows
+          if ($LASTEXITCODE -ne 0) { throw 'Stage105 Python parse failed' }
+          python -m compileall -q research/stage104-ncu-matrix/windows
+          if ($LASTEXITCODE -ne 0) { throw 'Stage104 Python parse failed' }
+          $stage106 = 'research/stage106-nsf-polyphase/windows/Run-RVC-Stage106-NSF-Dataflow.ps1'
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $stage106).Path, [ref]$tokens, [ref]$errors)
+          if ($errors.Count -gt 0) { $errors | Format-List | Out-String | Write-Host; throw 'Stage106 PowerShell invalid' }
+          & $stage106 -DryRun -Profiler ncu
+          if ($LASTEXITCODE -ne 0) { throw 'Stage106 dry-run failed' }
+          $stage104 = 'research/stage104-ncu-matrix/windows/Run-RVC-Stage104-NCU-Matrix.ps1'
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $stage104).Path,[ref]$tokens,[ref]$errors)
+          if ($errors.Count -gt 0) { $errors | Format-List | Out-String | Write-Host; throw 'Stage104 PowerShell syntax invalid' }
+          & $stage104 -DryRun -Scope all -NoTorch -PythonExe (Get-Command python).Source
+          if ($LASTEXITCODE -ne 0) { throw 'Stage104 dry run failed' }
+          python -m compileall -q research/stage103-l1-reuse/windows
+          if ($LASTEXITCODE -ne 0) { throw 'Stage103 Python parse failed' }
+          python -m compileall -q research/stage102-cuda-profile/windows
+          if ($LASTEXITCODE -ne 0) { throw 'Stage102 Python parse failed' }
+          $stage103 = 'research/stage103-l1-reuse/windows/Run-RVC-Stage103-Conv2d-Reuse.ps1'
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $stage103).Path,[ref]$tokens,[ref]$errors)
+          if ($errors.Count -gt 0) { $errors | Format-List | Out-String | Write-Host; throw 'Stage103 PowerShell syntax invalid' }
+          foreach ($script in @('Run-RVC-Stage102-Nsight.ps1','Run-RVC-Stage102-Matched-Conv2d.ps1')) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path "research/stage102-cuda-profile/windows/$script").Path,[ref]$tokens,[ref]$errors)
+            if ($errors.Count -gt 0) { $errors | Format-List | Out-String | Write-Host; throw "Invalid PowerShell: $script" }
+          }
+      - name: Build Stage112 unified CPU CUDA WGPU and probes
+        shell: pwsh
+        run: |
+          cargo build --release --locked --offline -p tts-with-rvc-rs --no-default-features --features 'cpu,cuda,wgpu' --bin tts-with-rvc-rs --bin stage102_conv2d_probe --bin stage103_conv2d_probe --bin stage106_polyphase_probe --bin stage106_noise_probe --bin stage111_phase_gemm_probe --bin stage112_fused_probe
+          if ($LASTEXITCODE -ne 0) { throw 'Stage112 unified build failed' }
+          & target/release/tts-with-rvc-rs.exe doctor
+          if ($LASTEXITCODE -ne 0) { throw 'Stage101 doctor failed' }
+          & target/release/tts-with-rvc-rs.exe nvtx-status
+          if ($LASTEXITCODE -ne 0) { throw 'Stage102 NVTX status failed' }
+          & target/release/stage103_conv2d_probe.exe nvtx-status
+          if ($LASTEXITCODE -ne 0) { throw 'Stage103 probe NVTX status failed' }
+          & target/release/stage102_conv2d_probe.exe nvtx-status
+          if ($LASTEXITCODE -ne 0) { throw 'Stage102 probe NVTX status failed' }
+          & target/release/stage106_polyphase_probe.exe nvtx-status
+          if ($LASTEXITCODE -ne 0) { throw 'Stage106 polyphase NVTX probe failed' }
+          & target/release/stage106_noise_probe.exe nvtx-status
+          if ($LASTEXITCODE -ne 0) { throw 'Stage106 noise NVTX probe failed' }
+          & target/release/stage111_phase_gemm_probe.exe nvtx-status
+          if ($LASTEXITCODE -ne 0) { throw 'Stage111 NVTX probe failed' }
+          & target/release/stage112_fused_probe.exe nvtx-status
+          if ($LASTEXITCODE -ne 0) { throw 'Stage112 NVTX probe failed' }
+          foreach ($case in @('grouped2','odd2')) {
+            & target/release/stage112_fused_probe.exe cpu $case ilp4 3
+            if ($LASTEXITCODE -ne 0) { throw "Stage112 CPU geometry baseline failed: $case" }
+          }
+          & target/release/stage111_phase_gemm_probe.exe cpu small phase_f32 3
+          if ($LASTEXITCODE -ne 0) { throw 'Stage111 full-output CubeCL CPU phase GEMM parity failed' }
+
+          & target/release/stage106_polyphase_probe.exe cpu small polyphase 3
+          if ($LASTEXITCODE -ne 0) { throw 'Stage106 polyphase CPU parity failed' }
+          & target/release/stage106_polyphase_probe.exe cpu small single 3
+          if ($LASTEXITCODE -ne 0) { throw 'Stage107 polyphase single CPU parity failed' }
+          & target/release/stage106_polyphase_probe.exe cpu small kic 3
+          if ($LASTEXITCODE -ne 0) { throw 'Stage108 KIC CPU parity failed' }
+          & target/release/stage106_polyphase_probe.exe cpu small kic_ntc 3
+          if ($LASTEXITCODE -ne 0) { throw 'Stage108 KIC NTC CPU parity failed' }
+          foreach ($mode in @('pipe4','ilp4','pipe4_kic','ilp4_kic')) {
+            & target/release/stage106_polyphase_probe.exe cpu small $mode 3
+            if ($LASTEXITCODE -ne 0) { throw "Stage109 CPU parity failed: $mode" }
+          }
+          foreach ($case in @('small','grouped','odd_cin','upsample8')) {
+            foreach ($mode in @('tile2','tile2_split')) {
+              & target/release/stage106_polyphase_probe.exe cpu $case $mode 3
+              if ($LASTEXITCODE -ne 0) { throw "Stage110 CubeCL CPU parity failed: $case/$mode" }
+            }
+          }
+          & target/release/stage106_noise_probe.exe cpu small tiled 3
+          if ($LASTEXITCODE -ne 0) { throw 'Stage106 noise CPU parity failed' }
+          & target/release/stage106_noise_probe.exe cpu small interior 3
+          if ($LASTEXITCODE -ne 0) { throw 'Stage107 noise interior CPU parity failed' }
+          & target/release/tts-with-rvc-rs.exe --help
+          if ($LASTEXITCODE -ne 0) { throw 'Stage101 help failed' }
+      - name: Package Stage112 fused two-tap profiler package
+        shell: pwsh
+        run: |
+          $folder = 'dist/stage104-ncu-matrix'
+          New-Item -ItemType Directory -Force -Path $folder | Out-Null
+          Copy-Item target/release/tts-with-rvc-rs.exe (Join-Path $folder 'tts-with-rvc-rs-stage104.exe')
+          Copy-Item target/release/stage102_conv2d_probe.exe (Join-Path $folder 'stage102-conv2d-probe.exe')
+          Copy-Item target/release/stage103_conv2d_probe.exe (Join-Path $folder 'stage103-conv2d-probe.exe')
+          Copy-Item target/release/stage106_polyphase_probe.exe (Join-Path $folder 'stage106_polyphase_probe.exe')
+          Copy-Item target/release/stage106_noise_probe.exe (Join-Path $folder 'stage106_noise_probe.exe')
+          Copy-Item target/release/stage111_phase_gemm_probe.exe (Join-Path $folder 'stage111_phase_gemm_probe.exe')
+          Copy-Item target/release/stage112_fused_probe.exe (Join-Path $folder 'stage112_fused_probe.exe')
+          Copy-Item research/stage112-fused-polyphase/windows/Run-RVC-Stage112-Fused-Polyphase.ps1 $folder
+          Copy-Item research/stage112-fused-polyphase/windows/compare_stage112.py $folder
+          Copy-Item research/stage112-fused-polyphase/windows/torch_reference.py (Join-Path $folder 'torch_reference_stage112.py')
+          Copy-Item research/stage112-fused-polyphase/README.md (Join-Path $folder 'STAGE112_README.md')
+          Copy-Item research/stage111-phase-gemm/windows/Run-RVC-Stage111-Phase-GEMM.ps1 $folder
+          Copy-Item research/stage111-phase-gemm/windows/compare_stage111.py $folder
+          Copy-Item research/stage111-phase-gemm/windows/torch_reference.py $folder
+          Copy-Item research/stage111-phase-gemm/README.md (Join-Path $folder 'STAGE111_README.md')
+          Copy-Item research/stage106-nsf-polyphase/windows/*.ps1 $folder
+          Copy-Item research/stage106-nsf-polyphase/windows/compare_stage106.py $folder
+          Copy-Item research/stage107-nsf-scheduling/windows/*.ps1 $folder
+          Copy-Item research/stage107-nsf-scheduling/windows/compare_stage107.py $folder
+          Copy-Item research/stage107-nsf-scheduling/README.md (Join-Path $folder 'STAGE107_README.md')
+          Copy-Item research/stage108-polyphase-transport/windows/Run-RVC-Stage108-Transport.ps1 $folder
+          Copy-Item research/stage108-polyphase-transport/windows/compare_stage108.py $folder
+          Copy-Item research/stage108-polyphase-transport/README.md (Join-Path $folder 'STAGE108_README.md')
+          Copy-Item research/stage110-channel-tile2/windows/Run-RVC-Stage110-Channel-Tile2.ps1 $folder
+          Copy-Item research/stage110-channel-tile2/windows/compare_stage110.py $folder
+          Copy-Item research/stage110-channel-tile2/README.md (Join-Path $folder 'STAGE110_README.md')
+          Copy-Item research/stage109-polyphase-ilp/windows/Run-RVC-Stage109-ILP.ps1 $folder
+          Copy-Item research/stage109-polyphase-ilp/windows/compare_stage109.py $folder
+          Copy-Item research/stage109-polyphase-ilp/README.md (Join-Path $folder 'STAGE109_README.md')
+          Copy-Item research/stage106-nsf-polyphase/README.md (Join-Path $folder 'STAGE106_README.md')
+          Copy-Item research/stage104-ncu-matrix/windows/*.ps1 $folder
+          Copy-Item research/stage104-ncu-matrix/windows/*.py $folder
+          Copy-Item research/stage105-register-budget/windows/compare_stage105_pair.py $folder
+          Copy-Item research/stage104-ncu-matrix/README.md (Join-Path $folder 'STAGE104_README.md')
+          Copy-Item research/stage103-l1-reuse/windows/*.ps1 $folder
+          Copy-Item research/stage103-l1-reuse/windows/compare_stage103.py $folder
+          Copy-Item research/stage101-winograd/windows/Run-RVC-Stage101-Winograd-CUDA.ps1 $folder
+          Copy-Item research/stage101-winograd/windows/Analyze-Stage101-Winograd-CUDA.py $folder
+          Copy-Item research/stage102-cuda-profile/windows/*.ps1 $folder
+          Copy-Item research/stage102-cuda-profile/windows/*.py $folder
+          @'
+          STAGE 104: complete NCU matrix for Conv2d kernels and 17 Rust full-RVC blocks.
+          CI compiles and checks CLI only: Windows CI has no CUDA GPU.
+          Requires nsys, ncu, CUDA PyTorch, and nvToolsExt64_1.dll on PATH on your RTX machine.
+          First run Run-RVC-Stage104-NCU-Matrix.ps1 -Scope micro -PythonExe <python>.
+          For all RVC stages: Run-RVC-Stage104-NCU-Matrix.ps1 -Scope all -PythonExe <python>.
+          Profile compact 12-second WAV by default; -ProfileSeconds 0 uses original full WAV.
+          NCU 2025.1 process-scope NVTX, bounded captures, no unstable CLI CSV export.
+          Use -MetricSet full for deep metrics, optional -Families conv,gemm,recurrent,elementwise.
+          Run PowerShell as Administrator if ERR_NVGPUCTRPERM blocks counters.
+          The Stage104 ZIP excludes WAV, pth/pt, index and other audio/model artifacts.
+          For full RVC profiles run Run-RVC-Stage102-Nsight.ps1 -PythonExe <python> -OriginalRoot <upstream-source-root>.
+          The full RVC profiler requires embed/ with voice, HuBERT, RMVPE, index, and WAV.
+          NSYS/NCU outputs can be large, but result archives exclude all WAVs and weights.
+          For strict comparison use FP32 NCHW in matched microbench; FP16 and NHWC are diagnostics.
+          Stage101 A/B runner remains available; pass -ReferenceExe and -CandidateExe pointing to tts-with-rvc-rs-stage104.exe.
+          Stage101 A/B archive also excludes WAVs.
+          '@ | Set-Content (Join-Path $folder 'README.txt')
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rvc-stage112-fused-two-tap-windows-x64
+          path: dist/stage104-ncu-matrix/
+          retention-days: 14
+          if-no-files-found: error

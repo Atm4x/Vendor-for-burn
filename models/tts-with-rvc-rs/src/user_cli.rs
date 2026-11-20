@@ -17,56 +17,45 @@ pub(crate) fn process_wave_job(
     config: tts_with_rvc_rs::chunked::ChunkConfig,
     tensor_batch_size: usize,
 ) -> Result<(), String> {
-    use tts_with_rvc_rs::audio_io;
+    use tts_with_rvc_rs::conversion::{convert_file, ConversionSettings};
     if job.input.is_empty() || job.output.is_empty() || job.input == job.output {
         return Err("batch input and output paths must be nonempty and distinct".into());
     }
-    let audio = audio_io::read_mono_wav(&job.input)?;
-    let pcm = audio_io::resample(&audio.samples, audio.sample_rate, 16_000)?;
-    let mut settings = options.clone();
-    if let Some(rate) = job.index_rate {
-        settings.index_rate = rate;
-    }
-    if let Some(shift) = job.pitch_shift_semitones {
-        settings.pitch_shift_semitones = shift;
-    }
-    eprintln!(
-        "RVC processing {} input_samples={} input_sr={}",
-        job.input,
-        audio.samples.len(),
-        audio.sample_rate
-    );
-    let mut converted = inferencer.infer_long_16khz_batched(&pcm, &settings, config, tensor_batch_size, |p| {
-        eprintln!(
-            "RVC chunks={}/{} output_samples={}",
-            p.chunk_index, p.chunk_count, p.output_samples
-        );
+    let mut inference = options.clone();
+    if let Some(rate) = job.index_rate { inference.index_rate = rate; }
+    if let Some(shift) = job.pitch_shift_semitones { inference.pitch_shift_semitones = shift; }
+    let settings = ConversionSettings {
+        inference, chunk: config, batch_size: tensor_batch_size,
+        rms_mix_rate: job.rms_mix_rate.unwrap_or(0.5),
+    };
+    let report = convert_file(inferencer, &job.input, &job.output, &settings, |p| {
+        eprintln!("RVC chunks={}/{} output_samples={}", p.chunk_index, p.chunk_count, p.output_samples);
     })?;
-    let mix = job.rms_mix_rate.unwrap_or(0.5);
-    let filtered = tts_with_rvc_rs::preprocess::highpass_48hz_zero_phase(&pcm)?;
-    audio_io::mix_rms_envelope(&filtered, 16_000, &mut converted, 40_000, mix)?;
-    audio_io::normalize_peak(&mut converted)?;
-    audio_io::write_mono_wav(&job.output, &converted, 40_000)?;
-    println!(
-        "RVC WAV→WAV complete: samples={} sr=40000 path={}",
-        converted.len(),
-        job.output
-    );
+    println!("RVC WAV→WAV complete: samples={} sr={} path={}",
+        report.output_samples, report.output_sample_rate, job.output);
     Ok(())
 }
 
 use std::{collections::{HashMap, HashSet}, fs, process::Command};
 use burn::tensor::Device;
+
+pub(crate) fn selected_device(name: &str) -> Result<Device, String> {
+    tts_with_rvc_rs::runtime_backend::selected_device(name)
+}
+
 use tts_with_rvc_rs::{chunked::ChunkConfig, rvc_inference::{InferenceOptions, RvcV2Inferencer}};
 
-const USAGE: &str = r#"RVC Rust/Burn CPU CLI
+const USAGE: &str = r#"RVC native Rust/Burn CLI
 Usage:
   tts-with-rvc-rs convert --model voice.pth --hubert hubert_base.pt --rmvpe rmvpe.pt --input source.wav --output converted.wav [options]
   tts-with-rvc-rs convert-batch --model voice.pth --hubert hubert_base.pt --rmvpe rmvpe.pt --manifest jobs.json [options]
   tts-with-rvc-rs doctor
+  tts-with-rvc-rs list-gpus cuda|wgpu
 Options:
   --index FILE             FAISS IVF index (.index); omit to disable retrieval
-  --device cpu             CPU/Flex is supported; CUDA is not yet implemented
+  --device cpu|cuda|wgpu  Select a compiled backend (default cpu); never silently falls back
+  --gpu-id pci:0000:01:00.0  Bind exactly to one physical GPU; no fallback
+  --gpu-id luid:<16 hex digits>  Optional Windows session-local GPU selector
   --batch-size N           Tensor batch size 1..32 (default 2)
   --index-rate R           FAISS mix 0..1 (default 0.75 with index, else 0)
   --pitch N                Pitch shift, semitones (default 0)
@@ -85,7 +74,7 @@ fn parse_options(args: impl Iterator<Item=String>) -> Result<HashMap<String,Stri
     let mut args = args;
     while let Some(key) = args.next() {
         if !matches!(key.as_str(), "--model" | "--hubert" | "--rmvpe" | "--input" | "--output" | "--manifest" |
-            "--index" | "--device" | "--batch-size" | "--index-rate" | "--pitch" | "--rms-mix" |
+            "--index" | "--device" | "--gpu-id" | "--batch-size" | "--index-rate" | "--pitch" | "--rms-mix" |
             "--core-frames" | "--overlap-frames" | "--context-frames") {
             return Err(format!("unknown argument {key}; run --help"));
         }
@@ -109,21 +98,38 @@ where T::Err: std::fmt::Display {
 
 pub(crate) fn run_named(command: &str, args: impl Iterator<Item=String>) -> Result<(),String> {
     if matches!(command,"help" | "--help" | "-h") {print!("{USAGE}"); return Ok(());}
+    if command == "list-gpus" {
+        let backend = args.collect::<Vec<_>>();
+        if backend.len() != 1 { return Err("usage: list-gpus cuda|wgpu".into()); }
+        let backend = backend[0].parse::<gpu_device_resolver::Backend>().map_err(|e|e.to_string())?;
+        let available = gpu_device_resolver::enumerate(backend).map_err(|e|e.to_string())?;
+        for gpu in available {
+            println!("id={} name={} pci={} luid={}",
+                gpu.id.map(|id| id.to_string()).unwrap_or_else(|| "unavailable".into()),
+                gpu.name,
+                gpu.pci_address.map(|v|v.to_string()).unwrap_or_else(|| "none".into()),
+                gpu.windows_luid.map(|l|l.iter().map(|v|format!("{v:02x}")).collect::<String>()).unwrap_or_else(||"none".into()));
+        }
+        return Ok(());
+    }
     if command == "doctor" {
         if args.count() != 0 {return Err("doctor takes no arguments".into());}
-        println!("RVC native: Rust/Burn; compiled backend: Flex CPU; tensor batching available");
+        println!("RVC native Rust/Burn; tensor batching supported");
+        println!("Compiled backends: cpu={} cuda={} wgpu={}",
+            cfg!(any(feature = "flex", feature = "cpu")),
+            cfg!(feature = "cuda"), cfg!(feature = "wgpu"));
         match Command::new("nvidia-smi").arg("--query-gpu=name,driver_version").arg("--format=csv,noheader").output() {
             Ok(output) if output.status.success() => print!("NVIDIA GPU (driver): {}", String::from_utf8_lossy(&output.stdout)),
             _ => println!("NVIDIA driver not detected by nvidia-smi"),
         }
-        println!("CUDA backend: NOT BUILT / NOT WIRED; installing CUDA runtime cannot activate it in this executable.");
+        println!("CUDA selection requires a binary built with the cuda feature and a compatible driver/runtime; no CPU fallback");
         return Ok(());
     }
     let map = parse_options(args)?;
-    let device_name = map.get("--device").map(String::as_str).unwrap_or("cpu");
-    if device_name != "cpu" {
-        return Err(format!("unsupported device {device_name}; this executable supports CPU/Flex only. CUDA requires a separate GPU-enabled build and validation, not just CUDA runtime installation"));
-    }
+    let device = tts_with_rvc_rs::runtime_backend::selected_physical_device(
+        map.get("--device").map(String::as_str).unwrap_or("cpu"),
+        map.get("--gpu-id").map(String::as_str),
+    )?;
     let voice = required(&map,"--model")?;
     let hubert = required(&map,"--hubert")?;
     let rmvpe = required(&map,"--rmvpe")?;
@@ -169,7 +175,7 @@ pub(crate) fn run_named(command: &str, args: impl Iterator<Item=String>) -> Resu
         }
     }
     eprintln!("Loading RVC, HuBERT, RMVPE and optional FAISS index...");
-    let inferencer = RvcV2Inferencer::load(voice, hubert, rmvpe, index, Device::flex())?;
+    let inferencer = RvcV2Inferencer::load(voice, hubert, rmvpe, index, device)?;
     for (i, job) in jobs.iter().enumerate() {
         eprintln!("RVC {}/{}: {}",i+1,jobs.len(),job.input);
         process_wave_job(&inferencer,job,&options,config,batch_size)?;
@@ -187,8 +193,15 @@ mod cli_tests {
         assert!(parse_options(["--model","--input"].into_iter().map(str::to_owned)).is_err());
     }
     #[test]
-    fn cuda_cannot_silently_fall_back_to_cpu() {
-        let args = ["--device","cuda"].into_iter().map(str::to_owned);
-        assert!(run_named("convert",args).unwrap_err().contains("CUDA"));
+    fn device_selection_does_not_silently_fall_back_to_cpu() {
+        assert!(selected_device("unknown").is_err());
+        #[cfg(not(feature = "cuda"))]
+        assert!(selected_device("cuda").unwrap_err().contains("not compiled"));
+        #[cfg(not(feature = "wgpu"))]
+        assert!(selected_device("wgpu").unwrap_err().contains("not compiled"));
+        #[cfg(feature = "cpu")]
+        assert_eq!(selected_device("cpu").unwrap(), Device::cpu());
+        #[cfg(all(not(feature = "cpu"), feature = "flex"))]
+        assert_eq!(selected_device("cpu").unwrap(), Device::flex());
     }
 }

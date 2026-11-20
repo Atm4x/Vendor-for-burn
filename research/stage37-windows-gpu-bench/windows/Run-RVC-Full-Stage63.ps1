@@ -1,0 +1,146 @@
+param(
+    [ValidateSet('cpu','cuda','wgpu')][string]$Device = 'cuda',
+    [string]$Voice = '.\embed\CrazyMita.pth',
+    [string]$Hubert = '.\embed\hubert_base.pt',
+    [string]$Rmvpe = '.\embed\rmvpe.pt',
+    [string]$Index = '.\embed\CrazyMita.index',
+    [string]$InputWav = '.\embed\MitaKind.wav',
+    [ValidateRange(2,16)][int]$WarmRuns = 2,
+    [ValidateRange(1,32)][int]$TensorBatchSize = 2,
+    [ValidateRange(1,900)][int]$CoreFrames = 300,
+    [ValidateRange(0,1)][double]$IndexRate = 0.75,
+    [ValidateSet('all','baseline','resident','resident-f0')][string]$Modes = 'all'
+)
+$ErrorActionPreference = 'Stop'
+$exe = Join-Path $PSScriptRoot 'tts-with-rvc-rs.exe'
+foreach ($p in @($exe,$Voice,$Hubert,$Rmvpe,$InputWav)) {
+    if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { throw "Missing input: $p" }
+}
+if ($IndexRate -gt 0 -and -not (Test-Path -LiteralPath $Index -PathType Leaf)) { throw "Missing index: $Index" }
+if ($IndexRate -gt 0 -and $Index -eq '-') { throw 'IndexRate>0 requires an index' }
+$culture = [Globalization.CultureInfo]::InvariantCulture
+$root = Join-Path $PSScriptRoot 'stage63_full_results'
+$zip = Join-Path $PSScriptRoot 'RVC_STAGE63_FULL_WAV_RESULTS.zip'
+if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+New-Item -ItemType Directory -Path $root -Force | Out-Null
+$previous = @{}
+foreach ($key in @('RVC_GPU_FAISS','RVC_GPU_F0','RVC_PROFILE','RVC_CONV_WEIGHT_PREPACK')) {
+    $previous[$key] = [Environment]::GetEnvironmentVariable($key,'Process')
+}
+$allCases = @(
+    [pscustomobject]@{ name='baseline'; gpuIvf=$false; gpuF0=$false },
+    [pscustomobject]@{ name='resident'; gpuIvf=$true; gpuF0=$false },
+    [pscustomobject]@{ name='resident-f0'; gpuIvf=$true; gpuF0=$true }
+)
+$cases = @($allCases | Where-Object { $Modes -eq 'all' -or $_.name -eq $Modes })
+if ($cases.Count -eq 0) { throw 'No mode was selected' }
+$rows = @()
+try {
+    Remove-Item Env:RVC_PROFILE -ErrorAction SilentlyContinue
+    $env:RVC_CONV_WEIGHT_PREPACK = '1'
+    if ($Device -eq 'cuda') {
+        try { & nvidia-smi -q > (Join-Path $root 'nvidia-smi.txt') 2>&1 }
+        catch { $_ | Out-String | Set-Content (Join-Path $root 'nvidia-smi-error.txt') }
+    }
+    foreach ($case in $cases) {
+        Remove-Item Env:RVC_GPU_FAISS,Env:RVC_GPU_F0 -ErrorAction SilentlyContinue
+        if ($case.gpuIvf) { $env:RVC_GPU_FAISS = '1' }
+        if ($case.gpuF0) { $env:RVC_GPU_F0 = '1' }
+        $id = $case.name
+        $wav = Join-Path $root "${id}.wav"
+        $stdout = Join-Path $root "${id}.stdout.log"
+        $stderr = Join-Path $root "${id}.stderr.log"
+        $argsArray = @('infer-wav-full-benchmark',$Voice,$Hubert,$Rmvpe,$Index,$InputWav,$wav,
+            $IndexRate.ToString($culture),$Device,[string]$WarmRuns,[string]$CoreFrames,[string]$TensorBatchSize)
+        $quoted = @($argsArray | ForEach-Object { '"' + $_.Replace('"','\"') + '"' })
+        Write-Host "Stage63 full WAV ${id}: device=$Device, repeats=$WarmRuns, chunk=$CoreFrames frames, batch=$TensorBatchSize"
+        $process = Start-Process -FilePath $exe -ArgumentList $quoted -WorkingDirectory $PSScriptRoot -RedirectStandardOutput $stdout -RedirectStandardError $stderr -Wait -PassThru -NoNewWindow
+        if ($process.ExitCode -ne 0) {
+            Get-Content -LiteralPath $stderr -Tail 35 -ErrorAction SilentlyContinue
+            throw "Stage63 ${id} failed (exit $($process.ExitCode))"
+        }
+        $report = Get-Content -LiteralPath "${wav}.benchmark.json" -Raw | ConvertFrom-Json
+        if ($report.stage -ne 63 -or $report.graph_replay -ne $false -or $report.backend -ne $Device -or $report.inference_ms.Count -ne $WarmRuns -or $report.model_input_seconds -lt 10) {
+            throw "Stage63 ${id}: invalid report or source WAV is shorter than 10 seconds"
+        }
+        $expected = [int64]$report.output_samples
+        $wavBytes = [IO.File]::ReadAllBytes($wav)
+        $position = 12
+        $pcm = $null
+        while ($position + 8 -le $wavBytes.Length) {
+            $chunk = [Text.Encoding]::ASCII.GetString($wavBytes,$position,4)
+            $size = [BitConverter]::ToInt32($wavBytes,$position+4)
+            if ($size -lt 0 -or $position + 8 + $size -gt $wavBytes.Length) { throw "Invalid output WAV chunk: $wav" }
+            if ($chunk -eq 'data') {
+                if (($size % 2) -ne 0) { throw "Not PCM16 aligned: $wav" }
+                $pcm = [int16[]]::new($size / 2)
+                [Buffer]::BlockCopy($wavBytes,$position+8,$pcm,0,$size)
+            }
+            $position += 8 + $size + ($size % 2)
+        }
+        if ($null -eq $pcm -or $pcm.Length -ne $expected) { throw "Stage63 ${id}: output PCM size mismatch" }
+        $record = [pscustomobject]@{
+            mode = $id
+            backend = $Device
+            source_seconds = $report.source_seconds
+            output_samples = $report.output_samples
+            duration_seconds = $report.output_samples / 40000.0
+            load_ms = $report.load_ms
+            first_inference_ms = $report.first_inference_ms
+            warm_median_ms = $report.warm_median_ms
+            warm_rtf = $report.warm_rtf
+            prepare_ms = $report.prepare_ms
+            postprocess_write_ms = $report.postprocess_write_ms
+            iteration_exact = $report.iterations_exact_f32
+            max_abs_iteration_delta = $report.max_abs_iteration_delta
+            chunk_counts = $report.chunk_counts
+            inference_ms = $report.inference_ms
+            sha256 = (Get-FileHash -LiteralPath $wav -Algorithm SHA256).Hash
+        }
+        $rows += $record
+        Write-Host ('  full={0:N2}s, load={1:N0}ms, first={2:N1}ms, warm={3:N1}ms, RTF={4:N3}, chunks={5}, stable={6}' -f $record.source_seconds,$record.load_ms,$record.first_inference_ms,$record.warm_median_ms,$record.warm_rtf,$record.chunk_counts[0],$record.iteration_exact)
+    }
+    $pairwise = @()
+    if (@($rows | Where-Object { $_.mode -eq 'baseline' }).Count -eq 1) {
+        $base = Join-Path $root 'baseline.wav'
+        foreach ($other in @($rows | Where-Object { $_.mode -ne 'baseline' })) {
+            $a = [IO.File]::ReadAllBytes($base)
+            $b = [IO.File]::ReadAllBytes((Join-Path $root ($other.mode + '.wav')))
+            if ($a.Length -ne $b.Length) { throw "Stage63 output byte count differs: $($other.mode)" }
+            $different = 0
+            $maxAbs = 0
+            $squared = 0.0
+            $sampleCount = [int64]$other.output_samples
+            $sourcePcm = [int16[]]::new($sampleCount)
+            $otherPcm = [int16[]]::new($sampleCount)
+                    $dataStart = 44
+            if ($a.Length -ne $dataStart + $sampleCount*2) { throw 'Unexpected WAV data layout for PCM comparison' }
+            [Buffer]::BlockCopy($a,$dataStart,$sourcePcm,0,$sampleCount*2)
+            [Buffer]::BlockCopy($b,$dataStart,$otherPcm,0,$sampleCount*2)
+            for ($i=0; $i -lt $sampleCount; $i++) {
+                $delta = [int]$sourcePcm[$i] - [int]$otherPcm[$i]
+                if ($delta -ne 0) { $different++ }
+                $maxAbs = [Math]::Max($maxAbs,[Math]::Abs($delta))
+                $squared += [double]$delta*$delta
+            }
+            $pairwise += [pscustomobject]@{mode=$other.mode; unequal_samples=$different; sample_count=$sampleCount; max_abs_pcm16=$maxAbs; rmse_pcm16=[Math]::Sqrt($squared/$sampleCount)}
+            Write-Host ('  baseline vs {0}: max_abs={1}, unequal={2}/{3}, RMSE={4:N5}' -f $other.mode,$maxAbs,$different,$sampleCount,[Math]::Sqrt($squared/$sampleCount))
+        }
+    }
+    $summary = [pscustomobject]@{
+        stage = 63
+        experiment = 'full-wav-resident-rvc'
+        backend = $Device
+        entire_source = $true
+        graph_replay = $false
+        warm_runs = $WarmRuns
+        cases = $rows
+        parity = $pairwise
+    }
+    $summary | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath (Join-Path $root 'summary.json') -Encoding UTF8
+} finally {
+    foreach ($key in $previous.Keys) { [Environment]::SetEnvironmentVariable($key,$previous[$key],'Process') }
+    if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
+    Compress-Archive -Path (Join-Path $root '*') -DestinationPath $zip -CompressionLevel Optimal
+    Write-Host "Stage63 results: $zip"
+}
