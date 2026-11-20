@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use crate::{
     F5Error, Result,
-    cfm::SamplingConfig,
+    cfm::{CfmSampleMode, OdeMethod, SamplingConfig},
     cross_lingual::{EnglishSyllableCounter, cross_fade_waves, plan_cross_lingual_chunks},
     noise::StandardNormal,
     reference::ReferenceAudio,
@@ -201,6 +201,17 @@ impl TrtChunkKernel for TrtWarmBank {
         kernel.synthesize_chunk(reference, tokens, target_frames, noise, sampling)
     }
 
+    fn synthesize_chunk_with_sample_mode(
+        &mut self, reference: &ReferenceAudio, tokens: &[i32], target_frames: usize,
+        noise: &[f32], sampling: SamplingConfig, method: OdeMethod, mode: CfmSampleMode,
+    ) -> Result<Vec<f32>> {
+        let reference_frames = crate::mel::VocosMel::new().extract(&reference.samples)?.frames;
+        self.ensure((reference_frames, target_frames))?;
+        self.shapes.get_mut(&(reference_frames, target_frames))
+            .ok_or(F5Error::InvalidConfiguration("Warmed F5 shape not found"))?
+            .synthesize_chunk_with_sample_mode(reference, tokens, target_frames, noise, sampling, method, mode)
+    }
+
     fn predict_reference_speed(&mut self, reference: &ReferenceAudio) -> Result<f32> {
         let reference_frames = crate::mel::VocosMel::new()
             .extract(&reference.samples)?
@@ -254,6 +265,19 @@ pub trait TrtChunkKernel {
         sampling: SamplingConfig,
     ) -> Result<Vec<f32>>;
 
+    fn synthesize_chunk_with_sample_mode(
+        &mut self,
+        reference: &ReferenceAudio, tokens: &[i32], target_frames: usize,
+        noise: &[f32], sampling: SamplingConfig,
+        method: OdeMethod, mode: CfmSampleMode,
+    ) -> Result<Vec<f32>> {
+        if method == OdeMethod::Euler && mode == CfmSampleMode::default() {
+            self.synthesize_chunk(reference, tokens, target_frames, noise, sampling)
+        } else {
+            Err(F5Error::InvalidConfiguration("TRT kernel does not support CFM sample modes"))
+        }
+    }
+
     fn predict_reference_speed(&mut self, reference: &ReferenceAudio) -> Result<f32>;
 }
 
@@ -298,6 +322,24 @@ impl<I: CudaTransport, E: TrtExecutor> TrtChunkKernel for TrtF5Session<I, E> {
             restoration_gain: condition.restoration_gain(),
             sampling,
         })
+    }
+
+    fn synthesize_chunk_with_sample_mode(
+        &mut self, reference: &ReferenceAudio, tokens: &[i32], target_frames: usize,
+        noise: &[f32], sampling: SamplingConfig, method: OdeMethod, mode: CfmSampleMode,
+    ) -> Result<Vec<f32>> {
+        if target_frames != self.shape().cfm.backbone.frames {
+            return Err(F5Error::InvalidShape("Wrong warmed duration"));
+        }
+        let condition = reference.prepare(&crate::mel::VocosMel::new(), target_frames, tokens.len())?;
+        if condition.frames.reference != self.shape().reference_frames {
+            return Err(F5Error::InvalidShape("Wrong warmed reference length"));
+        }
+        self.synthesize_with_sample_mode(SynthesisInputs {
+            condition: &condition.conditioning_mel,
+            initial_noise: noise, tokens,
+            restoration_gain: condition.restoration_gain(), sampling,
+        }, method, mode)
     }
 
     fn predict_reference_speed(&mut self, reference: &ReferenceAudio) -> Result<f32> {
@@ -352,6 +394,17 @@ pub fn synthesize_standard_text<K: TrtChunkKernel, P: PinyinProvider>(
     pinyin: P,
     options: StandardTextOptions,
 ) -> Result<Vec<f32>> {
+    synthesize_standard_text_with_sample_mode(
+        kernel, reference, generated_text, vocabulary, pinyin, options,
+        OdeMethod::Euler, CfmSampleMode::default(),
+    )
+}
+
+pub fn synthesize_standard_text_with_sample_mode<K: TrtChunkKernel, P: PinyinProvider>(
+    kernel: &mut K, reference: TrtVoice<'_>, generated_text: &str,
+    vocabulary: &Vocabulary, pinyin: P, options: StandardTextOptions,
+    method: OdeMethod, mode: CfmSampleMode,
+) -> Result<Vec<f32>> {
     let plans = plan_standard_chunks(
         generated_text,
         reference.transcript,
@@ -365,13 +418,12 @@ pub fn synthesize_standard_text<K: TrtChunkKernel, P: PinyinProvider>(
     let mut waves = Vec::with_capacity(plans.len());
     for chunk in plans {
         let tokens = frontend.standard_tokens(reference.transcript, &chunk.text)?;
-        waves.push(generate_chunk(
-            kernel,
-            reference.audio,
-            &tokens,
-            chunk.total_frames,
-            &mut rng,
-            options.sampling,
+        let count = chunk.total_frames.checked_mul(100)
+            .ok_or(F5Error::InvalidShape("Noise size overflow"))?;
+        let noise = rng.sample_vec(count)?;
+        waves.push(kernel.synthesize_chunk_with_sample_mode(
+            reference.audio, &tokens, chunk.total_frames,
+            &noise, options.sampling, method, mode,
         )?);
     }
     cross_fade_waves(&waves, options.cross_fade_seconds as f64)
