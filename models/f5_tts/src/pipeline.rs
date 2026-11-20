@@ -223,6 +223,24 @@ impl StandardF5Runtime {
         crate::wav::mono_pcm16(&self.synthesize(reference, text_tokens, options)?)
     }
 
+    /// Optional pydub-compatible 24kHz PCM16 silence trimming.
+    pub fn synthesize_wav_with_silence_removal(
+        &mut self, reference: &ReferenceAudio, text_tokens: &[i32],
+        options: GenerateOptions, remove_silence: bool,
+    ) -> Result<Vec<u8>> {
+        let wav = self.synthesize_wav(reference, text_tokens, options)?;
+        if !remove_silence {
+            return Ok(wav);
+        }
+        let samples: Vec<i16> = wav[44..].chunks_exact(2)
+            .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]])).collect();
+        let trimmed = crate::postprocess::remove_generated_silence(
+            &samples, crate::mel::SAMPLE_RATE as u32,
+            crate::postprocess::SilenceRemoval::default(),
+        )?;
+        crate::wav::mono_pcm16_from_i16(&trimmed)
+    }
+
     /// Edit arbitrary disjoint intervals in an existing recording. The input audio
     /// should be created with `ReferenceAudio::from_channels_full`, not the
     /// reference-prompt constructor that truncates after twelve seconds.
