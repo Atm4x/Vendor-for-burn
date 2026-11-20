@@ -2,7 +2,7 @@ use burn::{
     module::Param,
     nn::{Linear, LinearConfig},
     tensor::{
-        Device, Tensor, TensorData,
+        Bool, Device, Tensor, TensorData,
         activation::{sigmoid, softmax},
     },
 };
@@ -216,9 +216,33 @@ impl DiTAttention {
     }
 
     pub fn forward(&self, x: Tensor<3>, rope: &RotaryPositions) -> Result<Tensor<3>> {
+        self.forward_inner(x, rope, None)
+    }
+
+    pub fn forward_masked(
+        &self,
+        x: Tensor<3>,
+        rope: &RotaryPositions,
+        mask: Tensor<3, Bool>,
+    ) -> Result<Tensor<3>> {
+        self.forward_inner(x, rope, Some(mask))
+    }
+
+    fn forward_inner(
+        &self,
+        x: Tensor<3>,
+        rope: &RotaryPositions,
+        mask: Option<Tensor<3, Bool>>,
+    ) -> Result<Tensor<3>> {
         let [batch, sequence, dim] = x.dims();
-        if dim != self.heads * self.head_dim {
-            return Err(F5Error::InvalidShape("Attention input dimension mismatch"));
+        if dim != self.heads * self.head_dim
+            || mask
+                .as_ref()
+                .is_some_and(|m| m.dims() != [batch, sequence, 1])
+        {
+            return Err(F5Error::InvalidShape(
+                "Attention input dimensions do not match model and mask",
+            ));
         }
         let reshape = |tensor: Tensor<3>| {
             tensor
@@ -228,12 +252,23 @@ impl DiTAttention {
         let q = rope.apply(reshape(self.q.forward(x.clone())))?;
         let k = rope.apply(reshape(self.k.forward(x.clone())))?;
         let v = reshape(self.v.forward(x));
-        let scores = q.matmul(k.swap_dims(2, 3)) * (self.head_dim as f32).sqrt().recip();
+        let mut scores = q.matmul(k.swap_dims(2, 3)) * (self.head_dim as f32).sqrt().recip();
+        if let Some(valid) = &mask {
+            scores = scores.mask_fill(
+                valid.clone().reshape([batch, 1, 1, sequence]).bool_not(),
+                -f32::MAX,
+            );
+        }
         let output = softmax(scores, 3)
             .matmul(v)
             .swap_dims(1, 2)
             .reshape([batch, sequence, dim]);
-        Ok(self.out.forward(output))
+        let output = self.out.forward(output);
+        Ok(if let Some(valid) = mask {
+            output.mask_fill(valid.bool_not(), 0.0)
+        } else {
+            output
+        })
     }
 }
 

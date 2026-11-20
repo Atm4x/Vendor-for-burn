@@ -20,6 +20,7 @@ pub mod dit_input;
 ))]
 pub mod dit_model;
 pub mod fft;
+pub mod hyphenation;
 pub mod mel;
 pub mod model;
 #[cfg(any(
@@ -29,6 +30,12 @@ pub mod model;
 ))]
 pub mod pipeline;
 pub mod reference;
+#[cfg(any(
+    feature = "cubecl-cpu",
+    feature = "cubecl-cuda",
+    feature = "cubecl-wgpu"
+))]
+pub mod speed_predictor;
 pub mod vocab;
 #[cfg(any(
     feature = "cubecl-cpu",

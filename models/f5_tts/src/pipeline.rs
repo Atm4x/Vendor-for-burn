@@ -170,3 +170,104 @@ mod tests {
         assert!(mean.abs() < 0.15);
     }
 }
+
+pub struct CrossLingualF5Runtime {
+    base: StandardF5Runtime,
+    speed: crate::speed_predictor::CrossLingualSpeedPredictor,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CrossLingualGenerateOptions {
+    pub speed: f32,
+    pub fixed_seconds: Option<f32>,
+    pub cross_fade_seconds: f32,
+    pub seed: u64,
+    pub sampling: SamplingConfig,
+}
+
+impl CrossLingualF5Runtime {
+    pub fn load(
+        f5_checkpoint: impl AsRef<Path>,
+        vocos_checkpoint: impl AsRef<Path>,
+        speed_checkpoint: impl AsRef<Path>,
+        vocabulary: impl AsRef<Path>,
+        vocos_config: VocosConfig,
+        device: Device,
+    ) -> Result<Self> {
+        let base = StandardF5Runtime::load(
+            f5_checkpoint,
+            vocos_checkpoint,
+            vocabulary,
+            vocos_config,
+            device.clone(),
+        )?;
+        let speed = crate::speed_predictor::CrossLingualSpeedPredictor::from_checkpoint(
+            &Checkpoint::open(speed_checkpoint)?,
+            &device,
+        )?;
+        Ok(Self { base, speed })
+    }
+
+    pub fn predict_speed(&self, reference: &ReferenceAudio) -> Result<f32> {
+        self.speed
+            .predict_audio(&reference.samples, &self.base.device)
+    }
+
+    pub fn synthesize_text<E>(
+        &mut self,
+        reference: &ReferenceAudio,
+        text: &str,
+        syllables: &impl crate::cross_lingual::EnglishSyllableCounter,
+        mut tokenize: E,
+        options: CrossLingualGenerateOptions,
+    ) -> Result<Vec<f32>>
+    where
+        E: FnMut(&str) -> Result<Vec<i32>>,
+    {
+        let predicted_speed = self.predict_speed(reference)?;
+        let chunks = crate::cross_lingual::plan_cross_lingual_chunks(
+            text,
+            reference.samples.len(),
+            predicted_speed,
+            options.speed,
+            options.fixed_seconds,
+            syllables,
+        )?;
+        if chunks.is_empty() {
+            return Err(F5Error::InvalidShape(
+                "Cross-Lingual generated text is empty",
+            ));
+        }
+        let mut waves = Vec::with_capacity(chunks.len());
+        for (index, chunk) in chunks.iter().enumerate() {
+            let tokens = tokenize(&chunk.text)?;
+            let audio = self.base.synthesize(
+                reference,
+                &tokens,
+                GenerateOptions {
+                    total_frames: chunk.total_frames,
+                    seed: options.seed.wrapping_add(index as u64),
+                    sampling: options.sampling,
+                },
+            )?;
+            waves.push(audio);
+        }
+        crate::cross_lingual::cross_fade_waves(&waves, options.cross_fade_seconds)
+    }
+
+    pub fn synthesize_wav<E>(
+        &mut self,
+        reference: &ReferenceAudio,
+        text: &str,
+        syllables: &impl crate::cross_lingual::EnglishSyllableCounter,
+        tokenize: E,
+        options: CrossLingualGenerateOptions,
+    ) -> Result<Vec<u8>>
+    where
+        E: FnMut(&str) -> Result<Vec<i32>>,
+    {
+        crate::wav::mono_pcm16(
+            &self.synthesize_text(reference, text, syllables, tokenize, options)?,
+        )
+    }
+}

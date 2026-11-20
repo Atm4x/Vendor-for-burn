@@ -158,6 +158,116 @@ pub fn generated_frames(
     Ok((seconds * SAMPLE_RATE / HOP_LENGTH).floor() as usize)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrossLingualChunk {
+    pub text: String,
+    pub syllable_units: usize,
+    pub total_frames: usize,
+}
+
+pub fn plan_cross_lingual_chunks(
+    text: &str,
+    reference_samples: usize,
+    predicted_speed: f32,
+    user_speed: f32,
+    fixed_seconds: Option<f32>,
+    english: &impl EnglishSyllableCounter,
+) -> Result<Vec<CrossLingualChunk>> {
+    if !predicted_speed.is_finite()
+        || predicted_speed <= 0.0
+        || !user_speed.is_finite()
+        || user_speed <= 0.0
+    {
+        return Err(F5Error::InvalidConfiguration(
+            "Invalid Cross-Lingual speaking rate",
+        ));
+    }
+    if reference_samples == 0 {
+        return Err(F5Error::InvalidShape(
+            "Empty Cross-Lingual reference waveform",
+        ));
+    }
+    let reference_frames = reference_samples / HOP_LENGTH as usize;
+    let max_units = available_units(reference_samples, predicted_speed)?;
+    let chunks = chunk_text(text, max_units, english)?;
+    chunks
+        .into_iter()
+        .map(|chunk| {
+            let units = count_units(&chunk, english)?;
+            let extra_frames = generated_frames(units, predicted_speed, user_speed, None)?;
+            let requested_frames = match fixed_seconds {
+                Some(seconds) => {
+                    if !seconds.is_finite() || seconds <= 0.0 {
+                        return Err(F5Error::InvalidConfiguration(
+                            "Invalid fixed Cross-Lingual duration",
+                        ));
+                    }
+                    (seconds * SAMPLE_RATE / HOP_LENGTH).floor() as usize
+                }
+                None => reference_frames
+                    .checked_add(extra_frames)
+                    .ok_or(F5Error::InvalidShape("Cross-Lingual duration overflow"))?,
+            };
+            let minimum = reference_frames
+                .checked_add(1)
+                .ok_or(F5Error::InvalidShape(
+                    "Cross-Lingual reference duration overflow",
+                ))?;
+            if requested_frames < minimum || requested_frames > 65_536 {
+                return Err(F5Error::InvalidShape(
+                    "Cross-Lingual target duration must exceed reference duration",
+                ));
+            }
+            Ok(CrossLingualChunk {
+                text: chunk,
+                syllable_units: units,
+                total_frames: requested_frames,
+            })
+        })
+        .collect()
+}
+
+pub fn cross_fade_waves(waves: &[Vec<f32>], fade_seconds: f32) -> Result<Vec<f32>> {
+    if !fade_seconds.is_finite() || fade_seconds < 0.0 {
+        return Err(F5Error::InvalidConfiguration(
+            "Cross-fade duration must be nonnegative and finite",
+        ));
+    }
+    let Some(first) = waves.first() else {
+        return Err(F5Error::InvalidShape(
+            "Cannot cross-fade an empty waveform list",
+        ));
+    };
+    if waves
+        .iter()
+        .any(|wave| wave.is_empty() || wave.iter().any(|sample| !sample.is_finite()))
+    {
+        return Err(F5Error::InvalidShape(
+            "Cross-fade needs nonempty finite waveforms",
+        ));
+    }
+    let mut joined = first.clone();
+    let overlap_samples = (fade_seconds * SAMPLE_RATE).floor() as usize;
+    for next_wave in &waves[1..] {
+        let overlap = overlap_samples.min(joined.len()).min(next_wave.len());
+        if overlap == 0 {
+            joined.extend_from_slice(next_wave);
+            continue;
+        }
+        let start = joined.len() - overlap;
+        for i in 0..overlap {
+            let alpha = if overlap == 1 {
+                0.0
+            } else {
+                i as f32 / (overlap - 1) as f32
+            };
+            joined[start + i] = joined[start + i] * (1.0 - alpha) + next_wave[i] * alpha;
+        }
+        joined.extend_from_slice(&next_wave[overlap..]);
+    }
+    Ok(joined)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,6 +277,30 @@ mod tests {
         fn count_syllables(&self, english_word: &str) -> Result<usize> {
             Ok(if english_word == "hello" { 2 } else { 1 })
         }
+    }
+
+    #[test]
+    fn linear_cross_fade_matches_numpy_linspace_endpoints() {
+        let waves = vec![vec![1.0; 6], vec![3.0; 5]];
+        let result = cross_fade_waves(&waves, 3.0 / SAMPLE_RATE).unwrap();
+        assert_eq!(result, vec![1.0, 1.0, 1.0, 1.0, 2.0, 3.0, 3.0, 3.0]);
+        assert_eq!(cross_fade_waves(&waves, 0.0).unwrap().len(), 11);
+        assert!(cross_fade_waves(&[], 0.0).is_err());
+    }
+
+    #[test]
+    fn cross_lingual_duration_counts_reference_frames_and_fixed_seconds_are_total() {
+        let chunks = plan_cross_lingual_chunks("Hello!", 24_000, 2.0, 1.0, None, &English).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].syllable_units, 4);
+        assert_eq!(chunks[0].total_frames, 93 + 187);
+
+        let fixed =
+            plan_cross_lingual_chunks("Hello!", 24_000, 2.0, 1.0, Some(4.0), &English).unwrap();
+        assert_eq!(fixed[0].total_frames, 375);
+        assert!(
+            plan_cross_lingual_chunks("Hello!", 24_000, 2.0, 1.0, Some(0.5), &English).is_err()
+        );
     }
 
     #[test]
