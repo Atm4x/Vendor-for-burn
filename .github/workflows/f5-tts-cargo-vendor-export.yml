@@ -1,0 +1,44 @@
+name: F5 TTS Cargo Vendor Offline Export
+on:
+  push:
+    branches:
+      - codex/f5-tts-cargo-vendor-export-20261120
+    paths:
+      - .github/workflows/f5-tts-cargo-vendor-export.yml
+permissions:
+  contents: read
+jobs:
+  vendor:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact F5 TTS CONT08 source
+        uses: actions/checkout@v4
+        with:
+          ref: 4bf0a7cc4fb4609cf145b8be1f57fb0b0184b961
+          persist-credentials: false
+      - name: Generate reproducible Cargo vendor pack
+        shell: bash
+        working-directory: models/f5_tts
+        run: |
+          set -euo pipefail
+          echo "CARGO_VERSION=$(cargo --version)"
+          cargo generate-lockfile
+          mkdir -p .cargo
+          cargo vendor --locked --versioned-dirs vendor > .cargo/config.toml
+          cargo metadata --offline --locked --format-version=1 --no-deps > /dev/null
+          tar -I 'zstd -T0 -1' -cf "${RUNNER_TEMP}/f5-tts-cargo-vendor.tar.zst" vendor Cargo.lock .cargo/config.toml
+          printf '%s\n' "4bf0a7cc4fb4609cf145b8be1f57fb0b0184b961" > "${RUNNER_TEMP}/source-commit.txt"
+          (cd "${RUNNER_TEMP}" && sha256sum f5-tts-cargo-vendor.tar.zst > f5-tts-cargo-vendor.sha256)
+          ls -lh "${RUNNER_TEMP}/f5-tts-cargo-vendor.tar.zst"
+      - name: Upload Cargo vendor artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: f5-tts-cargo-vendor-cont08
+          path: |
+            ${{ runner.temp }}/f5-tts-cargo-vendor.tar.zst
+            ${{ runner.temp }}/f5-tts-cargo-vendor.sha256
+            ${{ runner.temp }}/source-commit.txt
+          retention-days: 4
+          if-no-files-found: error
+          compression-level: 0
