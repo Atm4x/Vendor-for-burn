@@ -1,0 +1,12 @@
+[package]
+name = "silero-package"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+publish = false
+
+[dependencies]
+anyhow = "1"
+pytorch-reader = { path = "../../../vendor/pytorch-reader-0.22.1" }
+
+[workspace]

@@ -1,0 +1,33 @@
+[package]
+name = "ruaccent_rs"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.100"
+publish = false
+
+[features]
+default = []
+onnx = ["dep:flate2", "dep:fst", "dep:memmap2", "dep:ort", "dep:sha2", "dep:tokenizers"]
+
+[dependencies]
+regex = "=1.13.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+flate2 = { version = "=1.1.11", optional = true }
+fst = { version = "0.4", optional = true }
+memmap2 = { version = "=0.9.12", optional = true }
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic", "ndarray"], optional = true }
+sha2 = { version = "=0.10.9", optional = true }
+tokenizers = { version = "0.22", default-features = false, features = ["onig"], optional = true }
+
+[[bin]]
+name = "ruaccent-pack"
+path = "src/bin/pack.rs"
+required-features = ["onnx"]
+
+[[bin]]
+name = "ruaccent-worker"
+path = "src/bin/worker.rs"
+required-features = ["onnx"]
+
+[workspace]

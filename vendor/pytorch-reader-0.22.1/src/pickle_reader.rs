@@ -328,6 +328,7 @@ pub(crate) enum PersistentIds {
     Unavailable,
     /// `('storage', type, key, location, numel[, view])` tuples, backed by a source.
     Storages(Arc<StorageSource>),
+    Package(Arc<StorageSource>),
     /// Ids naming tensors built ahead of time (the TAR container).
     Tensors(HashMap<String, Tensor>),
 }
@@ -489,6 +490,23 @@ fn resolve_storage_id(pid: &[Object], source: &Arc<StorageSource>) -> Result<Sto
 fn resolve_persistent_id(pid: Object, ids: &PersistentIds) -> Result<Object> {
     match ids {
         PersistentIds::Unavailable => Err(PickleError::NoDataSource),
+        PersistentIds::Package(source) => match pid {
+            Object::Tuple(fields) if matches!(fields.first(), Some(Object::String(tag)) if tag == "reduce_package") => {
+                match fields.as_slice() {
+                    [_, _, Object::Class { module_name, name }, Object::Tuple(args)] if module_name == "torch.jit._script" && name == "unpackage_script_module" => match args.as_slice() {
+                        [Object::String(id)] if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) => Ok(Object::Opaque(format!("torchpackage.script:{id}"))),
+                        _ => Err(PickleError::InvalidData("invalid script module id".into())),
+                    },
+                    _ => Err(PickleError::UnsupportedType("package persistent reduction".into())),
+                }
+            }
+            Object::Tuple(fields) => {
+                let storage = resolve_storage_id(&fields, source)?;
+                if let StorageSource::Zip(zip) = &**source { zip.validate_package_storage(&storage.key, storage.reachable_bytes)?; }
+                Ok(Object::Storage(storage))
+            }
+            _ => Err(PickleError::InvalidData("invalid package persistent id".into())),
+        },
         PersistentIds::Storages(source) => match pid {
             Object::Tuple(fields) => Ok(Object::Storage(resolve_storage_id(&fields, source)?)),
             other => Err(PickleError::InvalidData(format!(
@@ -1130,9 +1148,16 @@ impl<'a> Unpickler<'a> {
     fn charge_copy(&mut self, object: &Object) -> Result<()> {
         self.copied_nodes += object.node_count();
         self.copied_bytes += object.payload_bytes();
-        if self.copied_nodes > MAX_COPIED_NODES || self.copied_bytes > MAX_COPIED_BYTES {
+        // Silero v5 embeds two substantial natural-language dictionaries, unlike ordinary
+        // tensor checkpoints. Keep the larger allowance isolated to package parsing.
+        let (nodes, bytes) = if matches!(self.ids, PersistentIds::Package(_)) {
+            (8_000_000, 256 << 20)
+        } else {
+            (MAX_COPIED_NODES, MAX_COPIED_BYTES)
+        };
+        if self.copied_nodes > nodes || self.copied_bytes > bytes {
             return Err(PickleError::InvalidData(format!(
-                "Pickle memo bomb detected: copies exceeded {MAX_COPIED_NODES} nodes or {MAX_COPIED_BYTES} bytes"
+                "Pickle memo bomb detected: copies exceeded {nodes} nodes or {bytes} bytes"
             )));
         }
         Ok(())
@@ -1439,7 +1464,13 @@ impl<'a> Unpickler<'a> {
                     let args = self.pop()?;
                     let callable = self.pop_object()?;
                     // A call's result nests no deeper than its arguments did.
-                    let obj = reduce(callable, args.object)?;
+                    let obj = if matches!(self.ids, PersistentIds::Package(_)) {
+                        match (&callable, &args.object) {
+                            (Object::Class { module_name, name }, Object::Tuple(fields)) if module_name == "torch.jit._pickle" && name == "restore_type_tag" && fields.len() == 2 => fields[0].clone(),
+                            (Object::Class { module_name, name }, Object::Tuple(fields)) if module_name == "torch.jit._pickle" && matches!(name.as_str(), "build_intlist" | "build_doublelist" | "build_boollist" | "build_tensorlist") && fields.len() == 1 => fields[0].clone(),
+                            _ => reduce(callable, args.object)?,
+                        }
+                    } else { reduce(callable, args.object)? };
                     self.push(obj, args.depth)?;
                 }
                 OpCode::NewObj => {
@@ -1477,6 +1508,7 @@ impl<'a> Unpickler<'a> {
                         }
                         // A module instance (a full-model save) becomes its state_dict,
                         // which nests no deeper than the attributes it came from.
+                        (Object::Opaque(_), Object::Dict(attrs)) if matches!(self.ids, PersistentIds::Package(_)) => (Object::Dict(attrs), state.depth),
                         (Object::Opaque(_), Object::Dict(attrs)) if is_module_state(&attrs) => {
                             (module_state_dict(attrs)?, state.depth)
                         }
