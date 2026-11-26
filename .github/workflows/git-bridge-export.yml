@@ -1,30 +1,53 @@
-name: Git Bridge - publish Silero PQMF and FFN candidate
+name: Git Bridge - official Silero model matrix
 on:
   push:
     branches: [git-bridge/export-silero-ab4d79c7]
     paths: [.github/workflows/git-bridge-export.yml]
 permissions:
-  contents: write
+  contents: read
 jobs:
-  import:
+  models:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [v3, v4, v5]
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Verify and import exact optimization commit
-        shell: bash
+      - name: Download official catalogue and checkpoints
+        env:
+          GROUP: ${{ matrix.group }}
         run: |
           set -euo pipefail
-          git fetch origin main feat/silero-tts-native-import
-          test "$(git rev-parse origin/main)" = f3618c635442334f02c47384c01dd13fed1891f7
-          test "$(git rev-parse origin/feat/silero-tts-native-import)" = 6a64a705eaf739616b31dc88899ecb8e01ce5f25
-          base64 -d .git-bridge/silero-7f71da6a.b64 > "$RUNNER_TEMP/silero.bundle"
-          echo "62a666e183624f4592bb1f97c9df1f2871874212ac29772a20370fc295b203b1  $RUNNER_TEMP/silero.bundle" | sha256sum -c -
-          git bundle verify "$RUNNER_TEMP/silero.bundle"
-          git fetch "$RUNNER_TEMP/silero.bundle" refs/heads/feat/silero-tts-native-import:refs/heads/silero-candidate
-          test "$(git rev-parse silero-candidate)" = 7f71da6abe4f869381efb3d992982b5f0fcccda5
-          test "$(git rev-parse silero-candidate^{tree})" = 4566f06893921e50582e7ace601fa4ef3153a793
-          git merge-base --is-ancestor origin/feat/silero-tts-native-import silero-candidate
-          git push origin refs/heads/silero-candidate:refs/heads/git-bridge/candidate-silero-7f71da6a
+          python -m pip install pyyaml -q
+          python - <<'PY'
+          import urllib.request, yaml, pathlib, os, hashlib, json
+          from concurrent.futures import ThreadPoolExecutor
+          url="https://raw.githubusercontent.com/snakers4/silero-models/master/models.yml"
+          raw=urllib.request.urlopen(url).read()
+          out=pathlib.Path(os.environ["RUNNER_TEMP"])/"models"
+          out.mkdir()
+          (out/"models.yml").write_bytes(raw)
+          records={}
+          for lang, models in yaml.safe_load(raw)["tts_models"].items():
+              for name,item in models.items():
+                  info=item.get("latest",{}) if isinstance(item,dict) else {}
+                  if "package" in info: records[name]=(lang,info["package"])
+          (out/"catalogue.json").write_text(json.dumps(records,ensure_ascii=False,indent=2))
+          group=os.environ["GROUP"]
+          choices={"v3":["v3_de","v3_es","v3_fr","v3_en_indic","v3_indic"],"v4":["v4_ua","v4_uz","v4_indic","v4_cyrillic","v4_ru"],"v5":["v5_6_ru","v5_cis_base","v5_cis_base_nostress","v5_turkic"]}[group]
+          def download(name):
+              try:
+                  lang,url=records[name]
+                  file=out/(name+".pt")
+                  urllib.request.urlretrieve(url,file)
+                  print(name,file.stat().st_size,hashlib.file_digest(open(file,"rb"),"sha256").hexdigest(),flush=True)
+              except Exception as e: print(name,"ERROR",str(e),flush=True)
+          with ThreadPoolExecutor(max_workers=4) as pool: list(pool.map(download,choices))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: silero-matrix-${{ matrix.group }}
+          path: ${{ runner.temp }}/models/
+          retention-days: 1
+          compression-level: 0
