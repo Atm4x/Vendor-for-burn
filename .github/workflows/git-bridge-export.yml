@@ -1,34 +1,30 @@
-name: Git Bridge - export current Silero
+name: Git Bridge - publish Silero PQMF and FFN candidate
 on:
   push:
     branches: [git-bridge/export-silero-ab4d79c7]
     paths: [.github/workflows/git-bridge-export.yml]
 permissions:
-  contents: read
+  contents: write
 jobs:
-  export:
+  import:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: feat/silero-tts-native-import
           fetch-depth: 0
-      - name: Export exact target
+      - name: Verify and import exact optimization commit
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = 6a64a705eaf739616b31dc88899ecb8e01ce5f25
-          git update-ref refs/heads/feat/silero-tts-native-import 6a64a705eaf739616b31dc88899ecb8e01ce5f25
-          git bundle create "$RUNNER_TEMP/repository.bundle" refs/heads/feat/silero-tts-native-import
-          git bundle verify "$RUNNER_TEMP/repository.bundle"
-          cd "$RUNNER_TEMP"
-          sha256sum repository.bundle > repository.bundle.sha256
-      - uses: actions/upload-artifact@v4
-        with:
-          name: silero-cycle5-source
-          path: |
-            ${{ runner.temp }}/repository.bundle
-            ${{ runner.temp }}/repository.bundle.sha256
-          compression-level: 0
-          retention-days: 1
+          git fetch origin main feat/silero-tts-native-import
+          test "$(git rev-parse origin/main)" = f3618c635442334f02c47384c01dd13fed1891f7
+          test "$(git rev-parse origin/feat/silero-tts-native-import)" = 6a64a705eaf739616b31dc88899ecb8e01ce5f25
+          base64 -d .git-bridge/silero-7f71da6a.b64 > "$RUNNER_TEMP/silero.bundle"
+          echo "62a666e183624f4592bb1f97c9df1f2871874212ac29772a20370fc295b203b1  $RUNNER_TEMP/silero.bundle" | sha256sum -c -
+          git bundle verify "$RUNNER_TEMP/silero.bundle"
+          git fetch "$RUNNER_TEMP/silero.bundle" refs/heads/feat/silero-tts-native-import:refs/heads/silero-candidate
+          test "$(git rev-parse silero-candidate)" = 7f71da6abe4f869381efb3d992982b5f0fcccda5
+          test "$(git rev-parse silero-candidate^{tree})" = 4566f06893921e50582e7ace601fa4ef3153a793
+          git merge-base --is-ancestor origin/feat/silero-tts-native-import silero-candidate
+          git push origin refs/heads/silero-candidate:refs/heads/git-bridge/candidate-silero-7f71da6a
