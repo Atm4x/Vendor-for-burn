@@ -20,6 +20,10 @@ mod english;
 mod english_vocoder;
 #[cfg(feature = "reference-flex")]
 mod flex_english_conv;
+#[cfg(feature = "reference-flex")]
+mod flex_english_pqmf;
+#[cfg(feature = "reference-flex")]
+mod flex_transformer_ffn;
 
 pub mod accentor;
 pub mod homosolver;

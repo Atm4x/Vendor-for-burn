@@ -43,14 +43,43 @@ impl MultiHeadAttention {
     }
 }
 
+enum FeedForward {
+    Burn { first: Tensor<3>, first_bias: Tensor<1>, second: Tensor<3>, second_bias: Tensor<1> },
+    #[cfg(feature = "reference-flex")]
+    Flex(crate::flex_transformer_ffn::FlexTransformerFfn),
+}
+
+impl FeedForward {
+    fn load(weights: &TensorStore, prefix: &str, device: &Device) -> Result<Self> {
+        let first = weights.float::<3>(&format!("{prefix}.conv1.weight"), device)?;
+        let first_bias = weights.float::<1>(&format!("{prefix}.conv1.bias"), device)?;
+        let second = weights.float::<3>(&format!("{prefix}.conv2.weight"), device)?;
+        let second_bias = weights.float::<1>(&format!("{prefix}.conv2.bias"), device)?;
+        #[cfg(feature = "reference-flex")]
+        if device == &Device::flex() && std::env::var_os("SILERO_BASELINE_TRANSFORMER_FFN").is_none() {
+            return Ok(Self::Flex(crate::flex_transformer_ffn::FlexTransformerFfn::new(first, first_bias, second, second_bias)?));
+        }
+        Ok(Self::Burn { first, first_bias, second, second_bias })
+    }
+
+    fn forward(&self, x: Tensor<3>) -> Tensor<3> {
+        match self {
+            Self::Burn { first, first_bias, second, second_bias } => {
+                let conv = conv1d(x.clone().swap_dims(1, 2), first.clone(), Some(first_bias.clone()), ConvOptions::new([1], [4], [1], 1));
+                let conv = conv1d(relu(conv), second.clone(), Some(second_bias.clone()), ConvOptions::new([1], [0], [1], 1)).swap_dims(1, 2);
+                x + conv
+            }
+            #[cfg(feature = "reference-flex")]
+            Self::Flex(ffn) => ffn.forward(x),
+        }
+    }
+}
+
 pub struct TransformerBlock {
     attention: MultiHeadAttention,
     norm1_weight: Tensor<1>,
     norm1_bias: Tensor<1>,
-    conv1_weight: Tensor<3>,
-    conv1_bias: Tensor<1>,
-    conv2_weight: Tensor<3>,
-    conv2_bias: Tensor<1>,
+    feed_forward: FeedForward,
     norm2_weight: Tensor<1>,
     norm2_bias: Tensor<1>,
 }
@@ -62,10 +91,7 @@ impl TransformerBlock {
             attention: MultiHeadAttention::load(weights, &attn, 2, device)?,
             norm1_weight: weights.float(&format!("{prefix}.norm1.weight"), device)?,
             norm1_bias: weights.float(&format!("{prefix}.norm1.bias"), device)?,
-            conv1_weight: weights.float(&format!("{prefix}.conv1.weight"), device)?,
-            conv1_bias: weights.float(&format!("{prefix}.conv1.bias"), device)?,
-            conv2_weight: weights.float(&format!("{prefix}.conv2.weight"), device)?,
-            conv2_bias: weights.float(&format!("{prefix}.conv2.bias"), device)?,
+            feed_forward: FeedForward::load(weights, prefix, device)?,
             norm2_weight: weights.float(&format!("{prefix}.norm2.weight"), device)?,
             norm2_bias: weights.float(&format!("{prefix}.norm2.bias"), device)?,
         })
@@ -74,11 +100,7 @@ impl TransformerBlock {
     pub fn forward(&self, input: Tensor<3>, mask: Option<Tensor<2>>) -> Tensor<3> {
         let attended = self.attention.forward(input.clone(), mask);
         let x = layer_norm(input + attended, self.norm1_weight.clone(), Some(self.norm1_bias.clone()), 1e-5);
-        let conv = conv1d(x.clone().swap_dims(1, 2), self.conv1_weight.clone(), Some(self.conv1_bias.clone()),
-            ConvOptions::new([1], [4], [1], 1));
-        let conv = conv1d(relu(conv), self.conv2_weight.clone(), Some(self.conv2_bias.clone()),
-            ConvOptions::new([1], [0], [1], 1)).swap_dims(1, 2);
-        layer_norm(x + conv, self.norm2_weight.clone(), Some(self.norm2_bias.clone()), 1e-5)
+        layer_norm(self.feed_forward.forward(x), self.norm2_weight.clone(), Some(self.norm2_bias.clone()), 1e-5)
     }
 }
 

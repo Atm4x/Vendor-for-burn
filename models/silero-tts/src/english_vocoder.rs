@@ -1,6 +1,13 @@
 use anyhow::{Result, ensure};
 use burn::tensor::{Device, Tensor, activation::leaky_relu, module::{conv1d, conv_transpose1d}, ops::{ConvOptions, ConvTransposeOptions}};
 use crate::store::TensorStore;
+use std::time::Instant;
+
+fn phase_end(start: Option<Instant>, stage: &str, index: Option<usize>) {
+    if let Some(start) = start {
+        eprintln!("silero_en_profile stage={stage} index={} ms={:.6}", index.map_or_else(|| "-".to_owned(), |i| i.to_string()), start.elapsed().as_secs_f64() * 1000.0);
+    }
+}
 
 struct Conv {
     weight: Tensor<3>,
@@ -85,10 +92,15 @@ impl Stage {
         let blocks = ResidualStage::Burn(blocks);
         Ok(Self { weight, bias, stride, padding: stride.div_ceil(2), output_padding: stride % 2, blocks })
     }
-    fn forward(&self, x: Tensor<3>) -> Tensor<3> {
+    fn forward(&self, x: Tensor<3>, profile: bool, index: usize) -> Tensor<3> {
+        let start = profile.then(Instant::now);
         let x = conv_transpose1d(leaky_relu(x, 0.1), self.weight.clone(), Some(self.bias.clone()),
             ConvTransposeOptions::new([self.stride], [self.padding], [self.output_padding], [1], 1));
-        self.blocks.forward(x)
+        phase_end(start, "upsample", Some(index));
+        let start = profile.then(Instant::now);
+        let x = self.blocks.forward(x);
+        phase_end(start, "residual", Some(index));
+        x
     }
 }
 
@@ -106,10 +118,15 @@ impl RateGraph {
         let post = Conv::load(store, &format!("vocoder.{post}"), [64, 4], 7, 1, device)?;
         Ok(Self { pre, stages, post })
     }
-    fn forward(&self, mel: Tensor<3>) -> Tensor<3> {
+    fn forward(&self, mel: Tensor<3>, profile: bool) -> Tensor<3> {
+        let start = profile.then(Instant::now);
         let mut x = self.pre.forward(mel);
-        for stage in &self.stages { x = stage.forward(x); }
-        self.post.forward(leaky_relu(x, 0.01))
+        phase_end(start, "pre", None);
+        for (index, stage) in self.stages.iter().enumerate() { x = stage.forward(x, profile, index); }
+        let start = profile.then(Instant::now);
+        let x = self.post.forward(leaky_relu(x, 0.01));
+        phase_end(start, "post", None);
+        x
     }
 }
 
@@ -117,26 +134,52 @@ pub struct EnglishVocoder {
     rates: [RateGraph; 3],
     synthesis: Tensor<3>,
     updown: Tensor<3>,
+    #[cfg(feature = "reference-flex")]
+    flex_pqmf: Option<crate::flex_english_pqmf::FlexEnglishPqmf>,
+    profile: bool,
 }
 impl EnglishVocoder {
     pub fn load(store: &TensorStore, device: &Device) -> Result<Self> {
         let synthesis = store.float::<3>("vocoder.pqmf_layer.G", device)?;
         let updown = store.float::<3>("vocoder.pqmf_layer.updown_filter", device)?;
         ensure!(synthesis.dims() == [1, 4, 63] && updown.dims() == [4, 4, 4], "Invalid English PQMF shapes");
-        Ok(Self { rates: [RateGraph::load(store, 8000, device)?, RateGraph::load(store, 24000, device)?, RateGraph::load(store, 48000, device)?], synthesis, updown: updown * 4.0 })
+        let updown = updown * 4.0;
+        #[cfg(feature = "reference-flex")]
+        let flex_pqmf = if device == &Device::flex() && std::env::var_os("SILERO_EN_BASELINE_PQMF").is_none() {
+            Some(crate::flex_english_pqmf::FlexEnglishPqmf::new(synthesis.clone(), updown.clone())?)
+        } else { None };
+        #[cfg(feature = "reference-flex")]
+        let profile = device == &Device::flex() && std::env::var_os("SILERO_EN_PROFILE").is_some();
+        #[cfg(not(feature = "reference-flex"))]
+        let profile = false;
+        Ok(Self { rates: [RateGraph::load(store, 8000, device)?, RateGraph::load(store, 24000, device)?, RateGraph::load(store, 48000, device)?], synthesis, updown, #[cfg(feature = "reference-flex")] flex_pqmf, profile })
     }
+    pub(crate) fn profile_enabled(&self) -> bool { self.profile }
+
+    fn burn_pqmf(&self, x: Tensor<3>) -> Tensor<3> {
+        let x = conv_transpose1d(x, self.updown.clone(), None, ConvTransposeOptions::new([4], [0], [0], [1], 1));
+        conv1d(x, self.synthesis.clone(), None, ConvOptions::new([1], [31], [1], 1))
+    }
+
     pub fn forward(&self, mel: Tensor<3>, rate: u32) -> Result<Tensor<2>> {
         let [batch, channels, frames] = mel.dims();
         ensure!(channels == 128 && frames > 0, "English vocoder expects [batch, 128, frames]");
         let index = match rate { 8000 => 0, 24000 => 1, 48000 => 2, _ => anyhow::bail!("Unsupported English sample rate: {rate}") };
-        let x = self.rates[index].forward(mel);
-        let x = conv_transpose1d(x, self.updown.clone(), None, ConvTransposeOptions::new([4], [0], [0], [1], 1));
-        let pcm = conv1d(x, self.synthesis.clone(), None, ConvOptions::new([1], [31], [1], 1));
+        if self.profile { eprintln!("silero_en_profile rate={rate} frames={frames} batch={batch}"); }
+        let x = self.rates[index].forward(mel, self.profile);
+        let start = self.profile.then(Instant::now);
+        #[cfg(feature = "reference-flex")]
+        let pcm = match &self.flex_pqmf { Some(fused) => fused.forward(x), None => self.burn_pqmf(x) };
+        #[cfg(not(feature = "reference-flex"))]
+        let pcm = self.burn_pqmf(x);
+        phase_end(start, "pqmf", None);
+        let start = self.profile.then(Instant::now);
         let limit: f32 = pcm.clone().abs().max().into_scalar();
         ensure!(limit.is_finite(), "Non-finite English PCM");
         let pcm = if limit > 1.0 { pcm.tanh() } else { pcm };
         let length = frames * (rate as usize / 80);
         ensure!(pcm.dims() == [batch, 1, length], "Invalid English PCM length");
+        phase_end(start, "limit", None);
         Ok(pcm.reshape([batch, length]))
     }
 }

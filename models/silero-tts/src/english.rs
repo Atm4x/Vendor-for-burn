@@ -35,7 +35,9 @@ impl EnglishTts {
     pub(crate) fn infer_token_ids(&self, tokens: &[i64], speaker: i64, rate: u32) -> Result<Tensor<2>> {
         self.config.validate_sample_rate(rate)?;
         ensure!(self.config.speakers.values().any(|&id| id as i64 == speaker), "Unknown English speaker ID");
+        let start = self.vocoder.profile_enabled().then(std::time::Instant::now);
         let (mel, _) = self.acoustic.infer_english(tokens, speaker)?;
+        if let Some(start) = start { eprintln!("silero_en_profile stage=acoustic index=- ms={:.6}", start.elapsed().as_secs_f64() * 1000.0); }
         self.vocoder.forward(mel, rate)
     }
 }
