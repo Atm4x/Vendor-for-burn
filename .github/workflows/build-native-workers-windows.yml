@@ -5,6 +5,9 @@ on:
     branches: [main]
     paths:
       - 'models/**'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - 'vendor/**'
       - 'tools/restore_vendor_checksums.py'
       - '.github/workflows/build-native-workers-windows.yml'
@@ -29,6 +32,9 @@ jobs:
             compact: true
           - package: gigaam-v3
             script: models/gigaam/package_windows.ps1
+            compact: false
+          - package: rvc-v2
+            script: models/tts-with-rvc-rs/build_windows.ps1
             compact: false
     steps:
       - uses: actions/checkout@v4

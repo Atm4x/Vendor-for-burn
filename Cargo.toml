@@ -66,3 +66,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [build-dependencies]
 burn-onnx = "=0.22.0"
+
+[workspace]
+members = [".", "models/tts-with-rvc-rs", "crates/gpu-device-resolver"]
+resolver = "3"
+
+[patch.crates-io]
+burn-cubecl = { path = "vendor/burn-cubecl-0.22.1" }

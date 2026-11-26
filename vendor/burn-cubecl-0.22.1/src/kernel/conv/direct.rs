@@ -5,6 +5,9 @@ use burn_backend::cubecl::dtype_to_storage_type;
 use burn_backend::ops::{ConvOptions, conv::calculate_conv_output_sizes};
 use cubek::convolution::{
     ConvolutionArgs, DirectTensors, components::ConvSetupError, launch_direct,
+    forward::{launch_spatial_quad, launch_spatial_reuse, launch_spatial_pair},
+    forward::{launch_prepacked_temporal_pair, launch_prepacked_temporal_quad,
+        launch_prepacked_temporal_quad_interior},
 };
 
 /// Perform a convolution using the direct convolution algorithm.
@@ -14,10 +17,45 @@ use cubek::convolution::{
 /// * `bias` - The bias added to each channel
 /// * `options` - The options to use for the convolution
 pub fn conv_direct<const N: usize>(
+    input: CubeTensor,
+    weight: CubeTensor,
+    bias: Option<CubeTensor>,
+    options: ConvOptions<N>,
+) -> Result<CubeTensor, ConvSetupError> {
+    conv_direct_impl(input, weight, bias, options, false, false, false)
+}
+
+pub fn conv_spatial_reuse(
+    input: CubeTensor, weight: CubeTensor, bias: Option<CubeTensor>,
+    options: ConvOptions<2>,
+) -> Result<CubeTensor, ConvSetupError> {
+    conv_direct_impl(input, weight, bias, options, false, true, false)
+}
+
+pub fn conv_spatial_pair(
+    input: CubeTensor, weight: CubeTensor, bias: Option<CubeTensor>,
+    options: ConvOptions<2>,
+) -> Result<CubeTensor, ConvSetupError> {
+    conv_direct_impl(input, weight, bias, options, false, false, true)
+}
+
+pub fn conv_spatial_quad(
+    input: CubeTensor,
+    weight: CubeTensor,
+    bias: Option<CubeTensor>,
+    options: ConvOptions<2>,
+) -> Result<CubeTensor, ConvSetupError> {
+    conv_direct_impl(input, weight, bias, options, true, false, false)
+}
+
+fn conv_direct_impl<const N: usize>(
     mut input: CubeTensor,
     mut weight: CubeTensor,
     bias: Option<CubeTensor>,
     options: ConvOptions<N>,
+    spatial_quad: bool,
+    spatial_reuse: bool,
+    spatial_pair: bool,
 ) -> Result<CubeTensor, ConvSetupError> {
     let out_dtype = input.dtype;
     let rank = input.meta.shape().num_dims();
@@ -27,7 +65,17 @@ pub fn conv_direct<const N: usize>(
     if input.meta.strides()[dim_c] != 1 {
         input = into_contiguous_aligned(input);
     }
-    if weight.meta.strides()[dim_c] != 1 {
+    let selected = std::env::var("RVC_NSF_CONV_KERNEL").unwrap_or_default();
+    let is_temporal = N == 1
+        && options.groups == 1
+        && matches!(selected.as_str(), "packed" | "quad" | "quad_interior")
+        && weight.meta.shape().len() == 3
+        && weight.meta.strides()[0] == 1
+        && weight.meta.strides()[2] == weight.meta.shape()[0]
+        && weight.meta.strides()[1]
+            == weight.meta.shape()[0] * weight.meta.shape()[2]
+        && weight.meta.shape().iter().all(|&dim| dim > 0);
+    if !is_temporal && weight.meta.strides()[dim_c] != 1 {
         weight = into_contiguous_aligned(weight);
     }
 
@@ -65,14 +113,53 @@ pub fn conv_direct<const N: usize>(
     let client = input.client.clone();
     let dtype = dtype_to_storage_type(out_dtype);
 
-    let tensors = DirectTensors {
-        input: input.binding(),
-        weight: weight.binding(),
-        bias: bias.map(|bias| bias.binding()),
-        out: out.clone().binding(),
-    };
+    if !is_temporal && !spatial_pair && !spatial_quad && !spatial_reuse
+        && super::tiled_dense::try_launch(&input, &weight, bias.as_ref(), &out, &options)
+    {
+        return Ok(out);
+    }
 
-    launch_direct::<N>(&client, tensors, args, options.groups, dtype)?;
+    if is_temporal {
+        let cout = weight.meta.shape()[0];
+        let kernel = weight.meta.shape()[1];
+        let cin = weight.meta.shape()[2];
+        let mut weight_binding = weight.binding();
+        weight_binding.shape = vec![1, kernel, cin, cout].into();
+        weight_binding.strides = vec![kernel * cin * cout, cin * cout, cout, 1].into();
+        let tensors = DirectTensors {
+            input: input.binding(),
+            weight: weight_binding,
+            bias: bias.map(|bias| bias.binding()),
+            out: out.clone().binding(),
+        };
+        let temporal_args = ConvolutionArgs::<1> {
+            stride: [args.stride[0]],
+            dilation: [args.dilation[0]],
+            padding: [args.padding[0]],
+        };
+        match selected.as_str() {
+            "packed" => launch_prepacked_temporal_pair(&client, tensors, temporal_args, 1, dtype)?,
+            "quad" => launch_prepacked_temporal_quad(&client, tensors, temporal_args, 1, dtype)?,
+            "quad_interior" => launch_prepacked_temporal_quad_interior(&client, tensors, temporal_args, 1, dtype)?,
+            _ => unreachable!(),
+        }
+    } else {
+        let tensors = DirectTensors {
+            input: input.binding(),
+            weight: weight.binding(),
+            bias: bias.map(|bias| bias.binding()),
+            out: out.clone().binding(),
+        };
+        if spatial_pair {
+            launch_spatial_pair::<N>(&client, tensors, args, options.groups, dtype)?;
+        } else if spatial_reuse {
+            launch_spatial_reuse::<N>(&client, tensors, args, options.groups, dtype)?;
+        } else if spatial_quad {
+            launch_spatial_quad::<N>(&client, tensors, args, options.groups, dtype)?;
+        } else {
+            launch_direct::<N>(&client, tensors, args, options.groups, dtype)?;
+        }
+    }
 
     Ok(out)
 }

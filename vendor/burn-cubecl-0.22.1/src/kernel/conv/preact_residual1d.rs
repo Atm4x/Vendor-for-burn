@@ -1,0 +1,124 @@
+use crate::{kernel::into_contiguous, ops::numeric::empty_device_dtype, tensor::CubeTensor};
+use burn_backend::{DType, cubecl::dtype_to_storage_type};
+use cubek::convolution::{components::ConvSetupError, forward::launch_preact_residual_temporal};
+
+use crate::ops::{permute_nchw_to_nhwc, permute_nhwc_to_nchw};
+
+pub fn prepare_resblock_input_ntc(input: CubeTensor) -> CubeTensor {
+    let input = permute_nchw_to_nhwc(input);
+    let input = into_contiguous(input);
+    permute_nhwc_to_nchw(input)
+}
+
+pub fn conv1d_preact_residual_temporal(
+    input: CubeTensor,
+    weight: CubeTensor,
+    bias: Option<CubeTensor>,
+    residual: Option<CubeTensor>,
+    dilation: usize,
+    padding: usize,
+) -> Result<CubeTensor, ConvSetupError> {
+    conv1d_preact_residual_temporal_activation_plan(
+        input, weight, bias, residual, dilation, padding, false, false,
+    )
+}
+
+pub fn conv1d_preact_residual_temporal_activation_plan(
+    input: CubeTensor,
+    weight: CubeTensor,
+    bias: Option<CubeTensor>,
+    residual: Option<CubeTensor>,
+    dilation: usize,
+    padding: usize,
+    input_activated: bool,
+    output_activated: bool,
+) -> Result<CubeTensor, ConvSetupError> {
+    if input.dtype != DType::F32
+        || weight.dtype != DType::F32
+        || bias.as_ref().is_some_and(|b| b.dtype != DType::F32)
+        || residual.as_ref().is_some_and(|r| r.dtype != DType::F32)
+    {
+        return Err(ConvSetupError::Unknown);
+    }
+    let input = permute_nchw_to_nhwc(input);
+    let weight = permute_nchw_to_nhwc(weight);
+    let [batch, time, cin]: [usize; 3] = input.meta.shape().dims();
+    let [cout, kernel, weight_cin]: [usize; 3] = weight.meta.shape().dims();
+    if batch == 0
+        || time == 0
+        || cin == 0
+        || cout == 0
+        || kernel == 0
+        || cin != weight_cin
+        || kernel % 2 == 0
+        || padding != ((kernel - 1) / 2) * dilation
+        || dilation == 0
+        || weight.meta.strides()[0] != 1
+        || weight.meta.strides()[2] != cout
+        || weight.meta.strides()[1] != cin * cout
+        || bias.as_ref().is_some_and(|b| b.meta.shape()[0] != cout)
+    {
+        return Err(ConvSetupError::Unknown);
+    }
+    let residual = residual.map(|r| {
+        let r = permute_nchw_to_nhwc(r);
+        if r.meta.strides()[2] == 1
+            && r.meta.strides()[1] == cout
+            && r.meta.strides()[0] == time * cout
+        {
+            r
+        } else {
+            into_contiguous(r)
+        }
+    });
+    if residual
+        .as_ref()
+        .is_some_and(|r| r.meta.shape().as_slice() != [batch, time, cout])
+    {
+        return Err(ConvSetupError::Unknown);
+    }
+    let out = empty_device_dtype(
+        input.client.clone(),
+        input.device.clone(),
+        [batch, time, cout].into(),
+        DType::F32,
+    );
+    let mut packed = weight.binding();
+    packed.shape = vec![1, kernel, cin, cout].into();
+    packed.strides = vec![kernel * cin * cout, cin * cout, cout, 1].into();
+    let client = input.client.clone();
+    let temporal_tile = if cout == 128 && kernel == 11
+        && std::env::var("RVC_NSF_RESBLOCK_TEMPORAL_TILE").as_deref() == Ok("4")
+    {
+        4
+    } else {
+        2
+    };
+    let broadcast_inputs = cout == 128 && kernel == 11 && temporal_tile == 4
+        && std::env::var("RVC_NSF_RESBLOCK_PLANE_BROADCAST").as_deref() == Ok("1");
+    let fast_interior_linear = cout == 128 && kernel == 11 && temporal_tile == 4
+        && std::env::var("RVC_NSF_RESBLOCK_LINEAR_INTERIOR").as_deref() == Ok("1")
+        && input.meta.strides()[2] == 1;
+    let residue_time_order = cout == 128 && kernel == 11 && temporal_tile == 4
+        && dilation > 1 && output_activated && !input_activated
+        && std::env::var("RVC_NSF_RESBLOCK_RESIDUE_ORDER").as_deref() == Ok("1");
+    launch_preact_residual_temporal(
+        &client,
+        input.binding(),
+        packed,
+        bias.map(|b| b.binding()),
+        residual.map(|r| r.binding()),
+        out.clone().binding(),
+        1,
+        dilation,
+        padding,
+        temporal_tile,
+        broadcast_inputs,
+        input_activated,
+        output_activated,
+        fast_interior_linear,
+        residue_time_order,
+        dtype_to_storage_type(DType::F32),
+    )?;
+    Ok(permute_nhwc_to_nchw(out))
+}
