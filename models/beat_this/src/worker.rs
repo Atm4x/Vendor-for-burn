@@ -10,10 +10,33 @@ use std::{
 };
 use uuid::Uuid;
 
-const MODEL_ID: &str = "beat_this_small1";
 const VERSION: u32 = 1;
 const MAX_FRAME: usize = 1024 * 1024;
 const MAX_SOURCE: u64 = 64 * 1024 * 1024;
+
+#[derive(Default)]
+enum Model {
+    #[default]
+    Small1,
+    Final1,
+}
+
+impl Model {
+    fn parse(id: &str) -> Result<Self, String> {
+        match id {
+            "beat_this_small1" => Ok(Self::Small1),
+            "beat_this_final1" => Ok(Self::Final1),
+            _ => Err(format!("unsupported Beat This model: {id}")),
+        }
+    }
+
+    fn definition(&self) -> (&'static str, &'static str, usize) {
+        match self {
+            Self::Small1 => ("beat_this_small1", "small1.ckpt", 128),
+            Self::Final1 => ("beat_this_final1", "final1.ckpt", 512),
+        }
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -47,6 +70,7 @@ struct Track {
 }
 
 struct Worker {
+    selection: Model,
     model_dir: PathBuf,
     soxr: PathBuf,
     input_dir: Option<PathBuf>,
@@ -56,27 +80,28 @@ struct Worker {
 
 impl Worker {
     fn command(&mut self, name: &str, payload: Value) -> Result<Value, String> {
+        let (model_id, checkpoint_name, width) = self.selection.definition();
         if !matches!(name, "load" | "infer") && payload != json!({}) {
             return Err("unexpected command payload".into());
         }
         match name {
             "capabilities" => Ok(json!({
-                "model_id": MODEL_ID,
+                "model_id": model_id,
                 "backends": ["cpu"],
                 "beats_contract_version": VERSION,
                 "beats_capability": {"formats":["wav", "flac"], "max_source_bytes":MAX_SOURCE}
             })),
             "load" => {
                 let load: Load = serde_json::from_value(payload).map_err(|e| e.to_string())?;
-                if self.model.is_some() || load.model_id != MODEL_ID {
+                if self.model.is_some() || load.model_id != model_id {
                     return Err("model does not match the package or is already loaded".into());
                 }
-                let weights = self.model_dir.join("small1.ckpt");
+                let weights = self.model_dir.join(checkpoint_name);
                 require_file(&weights)?;
                 let checkpoint = Checkpoint::open(weights)?;
                 let model = BeatThisModel::from_checkpoint(&checkpoint, &Device::flex())?;
-                if model.transformer_dim != 128 {
-                    return Err("expected the small1 model architecture".into());
+                if model.transformer_dim != width {
+                    return Err(format!("checkpoint architecture does not match {model_id}"));
                 }
                 self.model = Some(model);
                 Ok(json!({"loaded":true}))
@@ -102,7 +127,7 @@ impl Worker {
             }
             "status" => Ok(json!({
                 "phase": if self.warm { "ready" } else if self.model.is_some() { "loaded" } else { "started" },
-                "model_id": MODEL_ID,
+                "model_id": model_id,
                 "backend": "cpu",
                 "variant": "burn_flex_cpu_fp32"
             })),
@@ -220,6 +245,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let mut runtime_dir = None;
     let mut input_dir = None;
     let mut backend = None;
+    let mut selection = None;
     while let Some(flag) = args.next() {
         let value = args.next().ok_or("missing worker launch argument")?;
         match flag.as_str() {
@@ -229,6 +255,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             }
             "--input-dir" if input_dir.is_none() => input_dir = Some(absolute_directory(value)?),
             "--backend" if backend.is_none() => backend = Some(value),
+            "--model-id" if selection.is_none() => selection = Some(Model::parse(&value)?),
             _ => return Err("unknown or duplicate worker launch argument".into()),
         }
     }
@@ -242,6 +269,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     let soxr_name = "libsoxr.so.0";
     let mut worker = Worker {
+        selection: selection.unwrap_or_default(),
         model_dir: model_dir.ok_or("missing --model-dir")?,
         soxr: runtime_dir
             .ok_or("missing --runtime-dir")?

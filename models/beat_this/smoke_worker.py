@@ -35,6 +35,7 @@ def main():
     parser.add_argument("--exe", required=True, type=Path)
     parser.add_argument("--model-dir", required=True, type=Path)
     parser.add_argument("--runtime-dir", required=True, type=Path)
+    parser.add_argument("--model-id", default="beat_this_small1", choices=("beat_this_small1", "beat_this_final1"))
     parser.add_argument("--flac", type=Path)
     options = parser.parse_args()
     exe = options.exe.resolve(strict=True)
@@ -45,8 +46,10 @@ def main():
         str(options.model_dir.resolve(strict=True)),
         "--runtime-dir",
         str(options.runtime_dir.resolve(strict=True)),
-        "--backend",
     ]
+    if options.model_id != "beat_this_small1":
+        base += ["--model-id", options.model_id]
+    base.append("--backend")
     unsupported = subprocess.run(base + ["cuda"], input="", text=True, capture_output=True, timeout=10)
     assert unsupported.returncode != 0 and not unsupported.stdout, unsupported
     with tempfile.TemporaryDirectory(prefix="beat-this-contract-") as directory:
@@ -66,7 +69,7 @@ def main():
             ("capabilities", {}, True),
             ("infer", {"beats_version": 1, "kind": "beats", "input": good}, False),
             ("load", {"model_id": "wrong"}, False),
-            ("load", {"model_id": "beat_this_small1"}, True),
+            ("load", {"model_id": options.model_id}, True),
             ("status", {}, True),
             ("warmup", {}, True),
             ("status", {}, True),

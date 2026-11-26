@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory)][ValidatePattern('^\d+\.\d+\.\d+$')][string]$Version,
-    [Parameter(Mandatory)][string]$OutputRoot
+    [Parameter(Mandatory)][string]$OutputRoot,
+    [switch]$Compact
 )
 
 $ErrorActionPreference = 'Stop'
@@ -9,7 +10,7 @@ $modelRoot = $PSScriptRoot
 $repositoryRoot = (Resolve-Path (Join-Path $modelRoot '../..')).Path
 $definition = Get-Content -Raw (Join-Path $modelRoot 'distribution.json') | ConvertFrom-Json
 $versionMatch = Select-String -Path (Join-Path $modelRoot 'Cargo.toml') -Pattern '^version = "([0-9.]+)"$' | Select-Object -First 1
-if ($versionMatch.Matches[0].Groups[1].Value -ne $Version) {
+if (!$Compact -and $versionMatch.Matches[0].Groups[1].Value -ne $Version) {
     throw 'Release version must match Cargo.toml'
 }
 
@@ -66,6 +67,50 @@ try {
 
 $exe = Join-Path $modelFiles 'beat-this-rs.exe'
 Copy-Item -LiteralPath (Join-Path $modelRoot 'target/release/beat-this-rs.exe') -Destination $exe
+
+if ($Compact) {
+    $models = @($definition) + @($definition.additional_models)
+    $modelEntries = foreach ($model in $models) {
+        $weights = $model.weights
+        $checkpoint = Join-Path $modelFiles $weights.name
+        curl.exe --fail --location --silent --show-error --max-time 180 $weights.url --output $checkpoint
+        Test-FileDigest $checkpoint $weights.sha256
+        if ((Get-Item -LiteralPath $checkpoint).Length -ne $weights.size_bytes) {
+            throw "Checkpoint size does not match for $($model.model_id)"
+        }
+        python (Join-Path $modelRoot 'smoke_worker.py') --exe $exe --model-dir $modelFiles --runtime-dir $runtimeFiles --model-id $model.model_id
+        $entry = [ordered]@{
+            model_id = $model.model_id
+            display_name = $model.display_name
+            arguments = @('--model-id', $model.model_id)
+            weights = @{
+                role = 'checkpoint'
+                file = ConvertTo-FileReference $checkpoint $weights.name
+                url = $weights.url
+            }
+        }
+        Remove-Item -LiteralPath $checkpoint
+        $entry
+    }
+    [ordered]@{
+        schema_version = 1
+        package_id = 'beat-this'
+        package_version = $Version
+        source_revision = git -C $repositoryRoot rev-parse HEAD
+        os = 'windows'
+        arch = 'x86_64'
+        execution_variant = $definition.execution_variant
+        worker_protocol = $definition.worker_protocol
+        beats_contract_version = $definition.beats_contract_version
+        executable = ConvertTo-FileReference $exe 'model/beat-this-rs.exe'
+        runtime_files = @(ConvertTo-FileReference $runtimeFile "runtime/$($definition.soxr.path)")
+        models = @($modelEntries)
+    } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $package 'worker-package.json') -Encoding utf8NoBOM
+    $zip = Join-Path $assets "beat-this_v${Version}_win_x86_64.zip"
+    Compress-Archive -Path (Join-Path $package '*') -DestinationPath $zip -CompressionLevel Optimal
+    return
+}
+
 $checkpoint = Join-Path $modelFiles $definition.weights.name
 curl.exe --fail --location --silent --show-error --max-time 180 $definition.weights.url --output $checkpoint
 Test-FileDigest $checkpoint $definition.weights.sha256

@@ -11,6 +11,18 @@
     "size_bytes": 8451101,
     "sha256": "edb4830efe6b93aed7266be5d7853242bada0b482614891c00e1ddc103f85360"
   },
+  "additional_models": [
+    {
+      "model_id": "beat_this_final1",
+      "display_name": "Beat This! Final1",
+      "weights": {
+        "name": "final1.ckpt",
+        "url": "https://cloud.cp.jku.at/public.php/dav/files/7ik4RrBKTS273gp/final1.ckpt",
+        "size_bytes": 81058141,
+        "sha256": "365b553f43750717c907f32fbc42910f3b264d616654583df6e44472c93ead80"
+      }
+    }
+  ],
   "soxr": {
     "path": "soxr/0.1.3/soxr.dll",
     "source_url": "https://codeload.github.com/chirlu/soxr/zip/945b592b70470e29f917f4de89b4281fbbd540c0",

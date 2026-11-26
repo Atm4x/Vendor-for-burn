@@ -1,0 +1,45 @@
+name: Build native workers for Windows x64
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'models/**'
+      - 'vendor/**'
+      - 'tools/restore_vendor_checksums.py'
+      - '.github/workflows/build-native-workers-windows.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  WORKER_VERSION: '1.0.0'
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: beat-this
+            script: models/beat_this/package_windows.ps1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build, smoke-test and stage the package
+        shell: pwsh
+        env:
+          PACKAGE_SCRIPT: ${{ matrix.script }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & $env:PACKAGE_SCRIPT -Version $env:WORKER_VERSION -OutputRoot (Join-Path $env:RUNNER_TEMP 'native-worker') -Compact
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.package }}_v${{ env.WORKER_VERSION }}_win_x86_64
+          path: ${{ runner.temp }}/native-worker/assets/${{ matrix.package }}_v${{ env.WORKER_VERSION }}_win_x86_64.zip
+          if-no-files-found: error
+          retention-days: 14
