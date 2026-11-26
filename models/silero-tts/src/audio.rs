@@ -1,18 +1,31 @@
 //! Mono PCM16 WAV output compatible with the Silero package's save_wav interface.
 
 use anyhow::{Result, ensure};
-use std::path::Path;
+use std::{io::{Cursor, Seek, Write}, path::Path};
 
 pub fn write_wav_pcm16(path: &Path, samples: &[f32], sample_rate: u32) -> Result<()> {
     ensure!(sample_rate > 0, "WAV sample rate must be positive");
     ensure!(samples.iter().all(|s| s.is_finite()), "WAV contains non-finite PCM samples");
+    let writer = std::io::BufWriter::new(std::fs::File::create(path)?);
+    write_pcm16(writer, samples, sample_rate)
+}
+
+pub fn wav_pcm16(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
+    ensure!(sample_rate > 0, "WAV sample rate must be positive");
+    ensure!(samples.iter().all(|s| s.is_finite()), "WAV contains non-finite PCM samples");
+    let mut cursor = Cursor::new(Vec::new());
+    write_pcm16(&mut cursor, samples, sample_rate)?;
+    Ok(cursor.into_inner())
+}
+
+fn write_pcm16<W: Write + Seek>(writer: W, samples: &[f32], sample_rate: u32) -> Result<()> {
     let spec = hound::WavSpec {
         channels: 1,
         sample_rate,
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-    let mut writer = hound::WavWriter::create(path, spec)?;
+    let mut writer = hound::WavWriter::new(writer, spec)?;
     for sample in samples {
         writer.write_sample(((*sample * 32767.0).trunc() as i32) as i16)?;
     }

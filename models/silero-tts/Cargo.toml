@@ -8,12 +8,14 @@ publish = false
 [features]
 default = ["cubecl-cpu"]
 cubecl-cpu = ["burn/cpu", "burn/cubecl"]
-cubecl-cuda = ["burn/cuda", "burn/cubecl"]
-cubecl-wgpu = ["burn/wgpu", "burn/cubecl"]
+cubecl-cuda = ["burn/cuda", "burn/cubecl", "gpu-device-resolver/cuda"]
+cubecl-wgpu = ["burn/wgpu", "burn/cubecl", "gpu-device-resolver/wgpu"]
 reference-flex = ["burn/flex", "dep:burn-flex", "dep:rustfft", "dep:rayon", "dep:gemm"]
 ruaccent = ["dep:ruaccent_rs", "ruaccent_rs/onnx"]
 
 [dependencies]
+native-worker-ipc = { path = "../../crates/native-worker-ipc" }
+gpu-device-resolver = { path = "../../crates/gpu-device-resolver", default-features = false, optional = true }
 silero-package = { path = "native-import" }
 burn = { version = "=0.22.1", default-features = false, features = ["std"] }
 burn-flex = { version = "=0.22.1", default-features = false, features = ["std", "simd", "rayon"], optional = true }

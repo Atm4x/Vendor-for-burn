@@ -6,7 +6,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$families = @('beat-this', 'dettato', 'f5-tts', 'fish-speech-1.5', 'gigaam-v3', 'rvc-v2')
+$families = @('beat-this', 'dettato', 'f5-tts', 'fish-speech-1.5', 'gigaam-v3', 'rvc-v2', 'silero-tts')
 if (Test-Path -LiteralPath $OutputRoot) { throw 'Use a new release staging directory' }
 $packages = @(Get-ChildItem -LiteralPath $InputRoot -File -Filter '*.zip' -Recurse)
 if ($packages.Count -ne $families.Count) {

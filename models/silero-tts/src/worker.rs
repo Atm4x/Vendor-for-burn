@@ -25,7 +25,7 @@ pub enum BackendName {
 }
 
 impl BackendName {
-    fn device(&self, index: usize) -> Result<Device> {
+    pub(crate) fn device(&self, index: usize) -> Result<Device> {
         match self {
             Self::Cpu => {
                 #[cfg(feature = "cubecl-cpu")]
