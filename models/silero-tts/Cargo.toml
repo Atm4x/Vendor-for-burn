@@ -10,7 +10,7 @@ default = ["cubecl-cpu"]
 cubecl-cpu = ["burn/cpu", "burn/cubecl"]
 cubecl-cuda = ["burn/cuda", "burn/cubecl", "gpu-device-resolver/cuda"]
 cubecl-wgpu = ["burn/wgpu", "burn/cubecl", "gpu-device-resolver/wgpu"]
-reference-flex = ["burn/flex", "dep:burn-flex", "dep:rustfft", "dep:rayon", "dep:gemm"]
+reference-flex = ["burn/flex", "dep:burn-flex", "dep:rustfft", "dep:rayon", "dep:gemm", "gemm/x86-v4"]
 ruaccent = ["dep:ruaccent_rs", "ruaccent_rs/onnx"]
 
 [dependencies]

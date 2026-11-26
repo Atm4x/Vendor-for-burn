@@ -18,6 +18,8 @@ pub mod acoustic;
 pub mod runtime;
 mod english;
 mod english_vocoder;
+#[cfg(feature = "reference-flex")]
+mod flex_english_conv;
 
 pub mod accentor;
 pub mod homosolver;

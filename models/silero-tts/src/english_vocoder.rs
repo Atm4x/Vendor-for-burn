@@ -33,13 +33,28 @@ impl ResidualBlock {
     }
 }
 
+enum ResidualStage {
+    Burn([ResidualBlock; 3]),
+    #[cfg(feature = "reference-flex")]
+    Flex(crate::flex_english_conv::FlexEnglishResidualStage),
+}
+impl ResidualStage {
+    fn forward(&self, x: Tensor<3>) -> Tensor<3> {
+        match self {
+            Self::Burn([a, b, c]) => (a.forward(x.clone()) + b.forward(x.clone()) + c.forward(x)) / 3.0,
+            #[cfg(feature = "reference-flex")]
+            Self::Flex(stage) => stage.forward(x),
+        }
+    }
+}
+
 struct Stage {
     weight: Tensor<3>,
     bias: Tensor<1>,
     stride: usize,
     padding: usize,
     output_padding: usize,
-    blocks: [ResidualBlock; 3],
+    blocks: ResidualStage,
 }
 
 impl Stage {
@@ -49,14 +64,31 @@ impl Stage {
         let bias = store.float::<1>(&format!("{name}.bias"), device)?;
         ensure!(weight.dims() == [input, output, 2 * stride] && bias.dims() == [output], "Invalid upsampling shape: {name}");
         let block = |j, k| ResidualBlock::load(store, &format!("vocoder.resblocks{suffix}.{}", index * 3 + j), output, k, device);
-        Ok(Self { weight, bias, stride, padding: stride.div_ceil(2), output_padding: stride % 2,
-            blocks: [block(0, 3)?, block(1, 7)?, block(2, 11)?] })
+        let blocks = [block(0, 3)?, block(1, 7)?, block(2, 11)?];
+        #[cfg(feature = "reference-flex")]
+        let blocks = if device == &Device::flex() && std::env::var_os("SILERO_EN_BASELINE_CONV").is_none() {
+            let convert = |ResidualBlock([a, b]): ResidualBlock| -> Result<_> {
+                use crate::flex_english_conv::FlexEnglishConv;
+                Ok([
+                    FlexEnglishConv::new(a.weight, a.bias, a.dilation)?,
+                    FlexEnglishConv::new(b.weight, b.bias, b.dilation)?,
+                ])
+            };
+            let [a, b, c] = blocks;
+            ResidualStage::Flex(crate::flex_english_conv::FlexEnglishResidualStage([
+                convert(a)?, convert(b)?, convert(c)?,
+            ]))
+        } else {
+            ResidualStage::Burn(blocks)
+        };
+        #[cfg(not(feature = "reference-flex"))]
+        let blocks = ResidualStage::Burn(blocks);
+        Ok(Self { weight, bias, stride, padding: stride.div_ceil(2), output_padding: stride % 2, blocks })
     }
     fn forward(&self, x: Tensor<3>) -> Tensor<3> {
         let x = conv_transpose1d(leaky_relu(x, 0.1), self.weight.clone(), Some(self.bias.clone()),
             ConvTransposeOptions::new([self.stride], [self.padding], [self.output_padding], [1], 1));
-        let [a, b, c] = &self.blocks;
-        (a.forward(x.clone()) + b.forward(x.clone()) + c.forward(x)) / 3.0
+        self.blocks.forward(x)
     }
 }
 
