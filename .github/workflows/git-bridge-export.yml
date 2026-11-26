@@ -20,11 +20,11 @@ jobs:
           git fetch origin main feat/silero-tts-native-import
           test "$(git rev-parse origin/main)" = f3618c635442334f02c47384c01dd13fed1891f7
           test "$(git rev-parse origin/feat/silero-tts-native-import)" = fc82af0c33b967472284e382bd28c2bccc32898f
-          base64 -d .git-bridge/silero-d224143c.b64 > "$RUNNER_TEMP/silero.bundle"
-          echo "0e39319b5ddba85be2243ef5848ee0d6a83541c2890a7957a92ebfddde64cc3a  $RUNNER_TEMP/silero.bundle" | sha256sum -c -
+          base64 -d .git-bridge/silero-810af7f2.b64 > "$RUNNER_TEMP/silero.bundle"
+          echo "a2c28acbdc80f1da5e68e50bd6f83806d12a7e18f6e28ba5d91a70b67a239af2  $RUNNER_TEMP/silero.bundle" | sha256sum -c -
           git bundle verify "$RUNNER_TEMP/silero.bundle"
           git fetch "$RUNNER_TEMP/silero.bundle" refs/heads/feat/silero-tts-native-import:refs/heads/silero-candidate
-          test "$(git rev-parse silero-candidate)" = d224143c018068d2f33d1d7bac36564b097d4dc7
-          test "$(git rev-parse silero-candidate^{tree})" = 6c91c1a61f5915c82bfeacf283222159924f1d9a
+          test "$(git rev-parse silero-candidate)" = 810af7f205e80d45b0e9d3733dcb16c1d8afa6dd
+          test "$(git rev-parse silero-candidate^{tree})" = 19dd13f924d102e79d502d6e4725f6551870b1fc
           git merge-base --is-ancestor origin/feat/silero-tts-native-import silero-candidate
-          git push origin refs/heads/silero-candidate:refs/heads/git-bridge/candidate-silero-d224143c
+          git push origin refs/heads/silero-candidate:refs/heads/git-bridge/candidate-silero-810af7f2
