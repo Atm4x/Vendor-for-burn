@@ -73,6 +73,11 @@ pub fn capabilities() -> Value {
     json!({
         "protocol_version": PROTOCOL_VERSION,
         "model": "silero-v5-ru",
+        "model_family": "silero-tts",
+        "model_variants": [
+            {"id": "v5_ru", "sample_rates": [8000, 24000, 48000], "inference_inputs": ["text", "ssml", "accented", "symbol_durations"]},
+            {"id": "v3_en", "sample_rates": [8000, 24000, 48000], "inference_inputs": ["text"]}
+        ],
         "available_backends": compiled_backends(),
         "preferred_backend": if cfg!(feature = "cubecl-cpu") { Some("cpu") } else if cfg!(feature = "cubecl-wgpu") { Some("wgpu") } else if cfg!(feature = "cubecl-cuda") { Some("cuda") } else { None },
         "diagnostic_backend": if cfg!(feature = "reference-flex") { Some("flex") } else { None },
@@ -139,8 +144,8 @@ pub enum Request {
     },
     Warmup {
         request_id: String,
-        #[serde(default = "default_warmup_text")] text: String,
-        #[serde(default = "default_warmup_speaker")] speaker: String,
+        #[serde(default)] text: Option<String>,
+        #[serde(default)] speaker: Option<String>,
         #[serde(default = "default_sample_rate")] sample_rate: u32,
     },
     Infer {
@@ -157,8 +162,6 @@ pub enum Request {
 }
 
 fn default_sample_rate() -> u32 { 8000 }
-fn default_warmup_text() -> String { "На двери замок.".into() }
-fn default_warmup_speaker() -> String { "aidar".into() }
 
 impl Request {
     fn id(&self) -> &str {
@@ -220,6 +223,8 @@ impl Worker {
                 "backend": l.backend,
                 "device_index": l.device_index,
                 "model_dir": l.model_dir,
+                "model_variant": l.model.variant(),
+                "speaker_names": l.model.speakers().collect::<Vec<_>>(),
                 "successful_inferences": l.successful_inferences,
                 "protocol_version": PROTOCOL_VERSION,
             }),
@@ -272,7 +277,11 @@ impl Worker {
             Request::Warmup { text, speaker, sample_rate, .. } => {
                 let loaded = self.loaded.as_mut().context("Model is not loaded")?;
                 let start = Instant::now();
-                let samples = loaded.model.infer_text(&text, &speaker, sample_rate)?;
+                let (default_text, default_speaker) = match loaded.model.variant() {
+                    "v3_en" => ("Hello, world!", "en_0"),
+                    _ => ("На двери замок.", "aidar"),
+                };
+                let samples = loaded.model.infer_text(text.as_deref().unwrap_or(default_text), speaker.as_deref().unwrap_or(default_speaker), sample_rate)?;
                 loaded.warmed = true;
                 Ok((json!({
                     "state": "ready", "sample_count": samples.len(),

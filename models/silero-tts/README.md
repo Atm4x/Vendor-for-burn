@@ -1,9 +1,16 @@
-# Silero V5 RU — native Burn/CubeCL port
+# Silero TTS — native Burn worker
 
-Native model implementation lives in `models/silero-tts`. Burn 0.22.1 uses
-CubeCL; the default CPU backend is `burn/cpu` (CubeCL/LLVM), not Flex. CUDA
-and WGPU are optional features. The model data and `v5_ru.pt` are not stored
-in the Git repository.
+The same worker reads official `v5_ru.pt` and `v3_en.pt` TorchPackage files directly, with variant detection based on metadata rather than filename. No runtime Python, PyTorch, LibTorch, or mandatory conversion is required. The prepared Russian SafeTensors directory remains supported for parity and existing installations. English supports plain text with the checkpoint's speaker table and 8/24/48 kHz; Russian retains its existing frontend and controls. English SSML and explicit symbol durations are not implemented yet.
+
+Current verification (Rust 1.100.0, Linux, Burn Flex): two English phrases and two speakers, at all three sample rates, using direct `.pt` loading. Duration frames match the original exactly; max mel error `7.63e-6`, full PCM max error `2.38e-4`, isolated vocoder max error `2.70e-5`. The PyTorch fixture tool below is a developer-only independent oracle. Windows release packaging and migration to the shared `native-worker-ipc` transport remain open. Historical cycle notes below describe previous intermediate states, not the current acceptance status.
+
+```bash
+python tools/create_english_parity_fixture.py /path/to/v3_en.pt /tmp/silero-en-oracle
+SILERO_V3_EN_CHECKPOINT=/path/to/v3_en.pt \
+SILERO_EN_PARITY_DIR=/tmp/silero-en-oracle \
+SILERO_V5_RU_CHECKPOINT=/path/to/v5_ru.pt \
+cargo test --offline --no-default-features --features reference-flex -- --include-ignored --nocapture
+```
 
 ## Status at cycle 1
 

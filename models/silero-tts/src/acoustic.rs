@@ -101,8 +101,7 @@ pub struct AcousticModel {
     encoder: TransformerStack,
     pitch_proj_weight: Tensor<3>,
     pitch_proj_bias: Tensor<1>,
-    energy_proj_weight: Tensor<3>,
-    energy_proj_bias: Tensor<1>,
+    energy_projection: Option<(Tensor<3>, Tensor<1>)>,
     regulator: LengthRegulator,
     decoder: FastPitchDecoder,
     mel_weight: Tensor<2>,
@@ -111,14 +110,17 @@ pub struct AcousticModel {
 
 impl AcousticModel {
     pub fn load(weights: &TensorStore, device: &Device) -> Result<Self> {
+        Self::load_variant(weights, device, true)
+    }
+
+    pub(crate) fn load_variant(weights: &TensorStore, device: &Device, energy: bool) -> Result<Self> {
         Ok(Self {
             embedding: weights.float("tacotron.embedding.weight", device)?,
             speaker_embedding: weights.float("tacotron.speaker_embedding.weight", device)?,
             encoder: TransformerStack::load(weights, "tacotron.encoder", 4, device)?,
             pitch_proj_weight: weights.float("tacotron.pitch_proj.weight", device)?,
             pitch_proj_bias: weights.float("tacotron.pitch_proj.bias", device)?,
-            energy_proj_weight: weights.float("tacotron.energy_proj.weight", device)?,
-            energy_proj_bias: weights.float("tacotron.energy_proj.bias", device)?,
+            energy_projection: if energy { Some((weights.float("tacotron.energy_proj.weight", device)?, weights.float("tacotron.energy_proj.bias", device)?)) } else { None },
             regulator: LengthRegulator::new(device),
             decoder: FastPitchDecoder::load(weights, device)?,
             mel_weight: weights.float::<2>("tacotron.lin.weight", device)?.transpose(),
@@ -143,7 +145,8 @@ impl AcousticModel {
         encoded = encoded + pitch_projection;
         if let Some(energy) = energy {
             if energy.dims() != [batch, 1, len] { bail!("Expected energy [batch, 1, symbols]"); }
-            encoded = encoded + conv1d(energy, self.energy_proj_weight.clone(), Some(self.energy_proj_bias.clone()),
+            let (weight, bias) = self.energy_projection.as_ref().ok_or_else(|| anyhow::anyhow!("This Silero variant does not support energy projection"))?;
+            encoded = encoded + conv1d(energy, weight.clone(), Some(bias.clone()),
                 ConvOptions::new([1], [1], [1], 1)).swap_dims(1, 2);
         }
         let expanded = self.regulator.expand(encoded, durations)?;
@@ -174,10 +177,14 @@ pub struct TextToMel {
 
 impl TextToMel {
     pub fn load(weights: &TensorStore, device: &Device) -> Result<Self> {
+        Self::load_variant(weights, device, true)
+    }
+
+    pub(crate) fn load_variant(weights: &TensorStore, device: &Device, energy: bool) -> Result<Self> {
         Ok(Self {
             duration: ScalarPredictor::duration(weights, device)?,
             pitch: ScalarPredictor::pitch(weights, device)?,
-            acoustic: AcousticModel::load(weights, device)?,
+            acoustic: AcousticModel::load_variant(weights, device, energy)?,
             device: device.clone(),
         })
     }
@@ -267,6 +274,23 @@ impl TextToMel {
             cursor += frames_for_symbol;
         }
         Ok((mel, durations))
+    }
+
+    pub(crate) fn infer_english(&self, symbols: &[i64], speaker_id: i64) -> Result<(Tensor<3>, Vec<f32>)> {
+        let len = symbols.len();
+        ensure!(len > 0 && len <= 5000, "Silero input exceeds positional encoding limit");
+        ensure!(symbols.iter().all(|&x| (1..39).contains(&x)), "Invalid English token ID");
+        ensure!((0..119).contains(&speaker_id), "Invalid English speaker ID");
+        let input = Tensor::<2, Int>::from_data(TensorData::new(symbols.to_vec(), [1, len]), &self.device);
+        let speaker = Tensor::<2, Int>::from_data(TensorData::new(vec![speaker_id], [1, 1]), &self.device);
+        let duration: Vec<f32> = (self.duration.forward(input.clone(), speaker.clone(), None, 1.0).exp() - 1.0)
+            .clamp_min(0.0).round().into_data().try_to_vec()?;
+        ensure!(duration.iter().all(|x| x.is_finite()), "Non-finite English duration");
+        ensure!(duration.iter().sum::<f32>() <= self.acoustic.decoder.pos_encoding.dims()[0] as f32,
+            "Expanded Silero utterance exceeds acoustic positional encoding limit");
+        let pitch = self.pitch.forward(input.clone(), speaker.clone(), None, 1.0).reshape([1, 1, len]);
+        let durations = Tensor::<2>::from_data(TensorData::new(duration.clone(), [1, len]), &self.device);
+        Ok((self.acoustic.forward(input, speaker, None, durations, pitch, None)?, duration))
     }
 
     /// Implements the default one-speaker acoustic inference without optional

@@ -27,9 +27,80 @@ impl Default for TextOptions {
     }
 }
 
+enum Session {
+    Russian(Box<RussianTts>),
+    English(Box<crate::english::EnglishTts>),
+}
+
+/// One loaded checkpoint, with a model-specific frontend and synthesis graph.
+pub struct SileroTts(Session);
+
+impl SileroTts {
+    pub fn load(path: &Path, device: &Device) -> Result<Self> {
+        use silero_package::OfficialCheckpoint;
+        let session = if path.is_file() {
+            match OfficialCheckpoint::open(path)? {
+                OfficialCheckpoint::Russian(checkpoint) => Session::Russian(Box::new(RussianTts::from_official(checkpoint, device)?)),
+                OfficialCheckpoint::English(checkpoint) => Session::English(Box::new(crate::english::EnglishTts::load(checkpoint, device)?)),
+            }
+        } else {
+            Session::Russian(Box::new(RussianTts::load(path, device)?))
+        };
+        Ok(Self(session))
+    }
+
+    pub fn variant(&self) -> &'static str {
+        match self.0 { Session::Russian(_) => "v5_ru", Session::English(_) => "v3_en" }
+    }
+
+    fn russian(&self) -> Result<&RussianTts> {
+        match &self.0 { Session::Russian(model) => Ok(model), Session::English(_) => anyhow::bail!("Operation is not supported for v3_en") }
+    }
+
+    pub fn speakers(&self) -> impl Iterator<Item = &str> {
+        let config = match &self.0 { Session::Russian(model) => &model.config, Session::English(model) => &model.config };
+        config.speakers.keys().map(String::as_str)
+    }
+
+    pub fn infer_text(&self, text: &str, speaker: &str, sample_rate: u32) -> Result<Vec<f32>> {
+        self.infer_text_with_options(text, speaker, sample_rate, &TextOptions::default())
+    }
+
+    pub fn infer_text_with_options(&self, text: &str, speaker: &str, sample_rate: u32, flags: &TextOptions) -> Result<Vec<f32>> {
+        match &self.0 {
+            Session::Russian(model) => model.infer_text_with_options(text, speaker, sample_rate, flags),
+            Session::English(model) => model.infer_text(text, speaker, sample_rate),
+        }
+    }
+
+    pub fn infer_token_ids(&self, symbols: &[i64], speaker: i64, sample_rate: u32) -> Result<Tensor<2>> {
+        match &self.0 {
+            Session::Russian(model) => model.infer_token_ids(symbols, speaker, sample_rate),
+            Session::English(model) => model.infer_token_ids(symbols, speaker, sample_rate),
+        }
+    }
+
+    pub fn accentuate_with_options(&self, text: &str, flags: &TextOptions) -> Result<String> { self.russian()?.accentuate_with_options(text, flags) }
+    pub fn accentuate(&self, text: &str) -> Result<String> { self.russian()?.accentuate(text) }
+    pub fn accentuate_unambiguous(&self, text: &str) -> Result<String> { self.russian()?.accentuate_unambiguous(text) }
+    pub fn infer_text_unambiguous(&self, text: &str, speaker: &str, rate: u32) -> Result<Vec<f32>> { self.russian()?.infer_text_unambiguous(text, speaker, rate) }
+    pub fn infer_accented(&self, text: &str, speaker: &str, rate: u32) -> Result<Vec<f32>> { self.russian()?.infer_accented(text, speaker, rate) }
+    pub fn infer_ssml(&self, ssml: &str, speaker: &str, rate: u32) -> Result<Vec<f32>> { self.russian()?.infer_ssml(ssml, speaker, rate) }
+    pub fn infer_ssml_with_options(&self, ssml: &str, speaker: &str, rate: u32, flags: &TextOptions) -> Result<Vec<f32>> { self.russian()?.infer_ssml_with_options(ssml, speaker, rate, flags) }
+    pub fn infer_text_with_symbol_durations(&self, text: &str, speaker: &str, rate: u32, durations: &[(String, u32)], flags: &TextOptions) -> Result<Vec<f32>> { self.russian()?.infer_text_with_symbol_durations(text, speaker, rate, durations, flags) }
+    #[cfg(feature = "ruaccent")]
+    pub fn infer_text_with_ruaccent(&self, text: &str, speaker: &str, rate: u32, ruaccent: &mut ruaccent_rs::RuAccent) -> Result<Vec<f32>> { self.russian()?.infer_text_with_ruaccent(text, speaker, rate, ruaccent) }
+    pub fn save_wav(&self, text: &str, path: &Path, speaker: &str, rate: u32, flags: &TextOptions) -> Result<()> {
+        crate::audio::write_wav_pcm16(path, &self.infer_text_with_options(text, speaker, rate, flags)?, rate)
+    }
+    pub fn save_ssml_wav(&self, ssml: &str, path: &Path, speaker: &str, rate: u32, flags: &TextOptions) -> Result<()> {
+        crate::audio::write_wav_pcm16(path, &self.infer_ssml_with_options(ssml, speaker, rate, flags)?, rate)
+    }
+}
+
 /// An independently loaded, persistent Silero TTS inference session.
 /// Accepts either an official Russian package or the legacy prepared directory.
-pub struct SileroTts {
+struct RussianTts {
     config: ModelConfig,
     acoustic: TextToMel,
     accentor: Accentor,
@@ -39,14 +110,8 @@ pub struct SileroTts {
     control_constants: Option<SileroControlConstants>,
 }
 
-impl SileroTts {
+impl RussianTts {
     pub fn load(model_dir: &Path, device: &Device) -> Result<Self> {
-        if model_dir.is_file() {
-            return match silero_package::OfficialCheckpoint::open(model_dir)? {
-                silero_package::OfficialCheckpoint::Russian(checkpoint) => Self::from_official(checkpoint, device),
-                silero_package::OfficialCheckpoint::English(_) => anyhow::bail!("English v3 acoustic runtime is not implemented yet"),
-            };
-        }
         let config: ModelConfig = serde_json::from_slice(&fs::read(model_dir.join("config.json"))?)
             .context("Invalid Silero checkpoint configuration")?;
         let tts = TensorStore::open(&model_dir.join("tts.safetensors"))?;
@@ -128,11 +193,6 @@ impl SileroTts {
     /// Full default SileroStress frontend: contextual BERT homographs followed by Accentor.
     pub fn accentuate(&self, text: &str) -> Result<String> {
         self.accentuate_with_options(text, &TextOptions::default())
-    }
-
-    /// Default non-SSML text-to-PCM synthesis with automatic stress and homograph resolution.
-    pub fn infer_text(&self, text: &str, speaker: &str, sample_rate: u32) -> Result<Vec<f32>> {
-        self.infer_text_with_options(text, speaker, sample_rate, &TextOptions::default())
     }
 
     pub fn infer_text_with_options(&self, text: &str, speaker: &str, sample_rate: u32,
@@ -291,22 +351,7 @@ impl SileroTts {
         self.synthesizer.forward(mel, sample_rate)
     }
 
-    /// Produce Silero's 16-bit mono WAV representation from the native text pipeline.
-    pub fn save_wav(&self, text: &str, path: &Path, speaker: &str,
-        sample_rate: u32, flags: &TextOptions) -> Result<()> {
-        let pcm = self.infer_text_with_options(text, speaker, sample_rate, flags)?;
-        crate::audio::write_wav_pcm16(path, &pcm, sample_rate)
-    }
 
-    pub fn save_ssml_wav(&self, ssml: &str, path: &Path, speaker: &str,
-        sample_rate: u32, flags: &TextOptions) -> Result<()> {
-        let pcm = self.infer_ssml_with_options(ssml, speaker, sample_rate, flags)?;
-        crate::audio::write_wav_pcm16(path, &pcm, sample_rate)
-    }
-
-    pub fn speakers(&self) -> impl Iterator<Item = &str> {
-        self.config.speakers.keys().map(String::as_str)
-    }
 }
 
 #[cfg(all(test, feature = "reference-flex"))]
@@ -319,7 +364,7 @@ mod tests {
         let Ok(dir) = std::env::var("SILERO_PARITY_DIR") else { return };
         let dir = Path::new(&dir);
         let device = Device::flex();
-        let model = SileroTts::load(dir, &device).unwrap();
+        let model = RussianTts::load(dir, &device).unwrap();
         let input: serde_json::Value = serde_json::from_slice(&fs::read(dir.join("acoustic-input.json")).unwrap()).unwrap();
         let ids: Vec<i64> = serde_json::from_value(input["tokens"].clone()).unwrap();
         let prediction = model.infer_token_ids(&ids, 0, 8000).unwrap().into_data().try_to_vec::<f32>().unwrap();
@@ -352,11 +397,11 @@ mod text_parity {
         let dir = Path::new(&dir);
         let cases: Vec<Reference> = serde_json::from_slice(&fs::read(dir.join("full-text-parity.json")).unwrap()).unwrap();
         let references = TensorStore::open(&dir.join("full-text-parity.safetensors")).unwrap();
-        let model = SileroTts::load(dir, &Device::flex()).unwrap();
+        let model = RussianTts::load(dir, &Device::flex()).unwrap();
         for sample in cases {
             let accented = model.accentuate(&sample.text).unwrap();
             assert_eq!(accented, sample.accented, "Text frontend mismatch");
-            let pcm = model.infer_text(&sample.text, &sample.speaker, sample.sample_rate).unwrap();
+            let pcm = model.infer_text_with_options(&sample.text, &sample.speaker, sample.sample_rate, &TextOptions::default()).unwrap();
             let expected = references.float_data(&sample.key).unwrap();
             assert_eq!(pcm.len(), expected.len(), "Audio duration differs for {:?}", sample.text);
             let error = pcm.iter().zip(&expected).map(|(a,b)| (a-b).abs()).fold(0.0f32, f32::max);
@@ -383,7 +428,7 @@ mod flags_parity {
         let Ok(dir) = std::env::var("SILERO_PARITY_DIR") else { return };
         let dir = Path::new(&dir);
         let cases: Vec<Case> = serde_json::from_slice(&fs::read(dir.join("stress-flags-parity.json")).unwrap()).unwrap();
-        let model = SileroTts::load(dir, &Device::flex()).unwrap();
+        let model = RussianTts::load(dir, &Device::flex()).unwrap();
         for case in cases {
             let mut flags = TextOptions::default();
             for (key, value) in &case.options {
@@ -421,7 +466,7 @@ mod ssml_parity {
         let dir = std::path::Path::new(&dir);
         let cases: Vec<Case> = serde_json::from_slice(&fs::read(dir.join("ssml-audio-parity.json")).unwrap()).unwrap();
         let mel_reference = TensorStore::open(&dir.join("ssml-mel-parity.safetensors")).unwrap();
-        let model = SileroTts::load(dir, &Device::flex()).unwrap();
+        let model = RussianTts::load(dir, &Device::flex()).unwrap();
         let constants = model.control_constants.as_ref().unwrap();
         for case in cases {
             let segments = ssml::process_ssml(&model.config, &case.ssml).unwrap();
@@ -461,7 +506,7 @@ mod ssml_pcm_parity {
         let case = references.iter().find(|case| case["key"] == "pcm_12").unwrap();
         let audio = TensorStore::open(&dir.join("ssml-audio-parity.safetensors")).unwrap();
         let expected = audio.float_data("pcm_12").unwrap();
-        let model = SileroTts::load(dir, &Device::flex()).unwrap();
+        let model = RussianTts::load(dir, &Device::flex()).unwrap();
         let got = model.infer_ssml(case["ssml"].as_str().unwrap(), "aidar", 8000).unwrap();
         assert_eq!(got.len(), expected.len());
         let error = got.iter().zip(&expected).map(|(a,b)| (a-b).abs()).fold(0.0f32, f32::max);
@@ -479,7 +524,7 @@ mod symbol_duration_pcm_parity {
         let Ok(dir) = std::env::var("SILERO_PARITY_DIR") else { return };
         let dir = std::path::Path::new(&dir);
         let expected = TensorStore::open(&dir.join("symbol-durations-audio.safetensors")).unwrap();
-        let model = SileroTts::load(dir, &Device::flex()).unwrap();
+        let model = RussianTts::load(dir, &Device::flex()).unwrap();
         let controls = [("а".to_string(), 75)];
         for sample_rate in [8000, 24000, 48000] {
             let actual = model.infer_text_with_symbol_durations(
@@ -515,7 +560,7 @@ mod multispeaker_ssml_parity {
         let reference = TensorStore::open(&dir.join("multispeaker-ssml-parity.safetensors")).unwrap();
         let manifest: Vec<serde_json::Value> = serde_json::from_slice(
             &fs::read(dir.join("multispeaker-ssml-parity.json")).unwrap()).unwrap();
-        let model = SileroTts::load(dir, &Device::flex()).unwrap();
+        let model = RussianTts::load(dir, &Device::flex()).unwrap();
         let constants = model.control_constants.as_ref().unwrap();
         for voice in manifest {
             let name = voice["speaker"].as_str().unwrap();

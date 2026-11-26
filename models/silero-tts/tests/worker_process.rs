@@ -86,3 +86,32 @@ fn official_russian_checkpoint_worker_pcm() {
     assert_eq!(audio, &result[2]["data"]["audio"]["data_base64"]);
     assert_eq!(result[3]["data"]["state"], "unloaded");
 }
+
+#[cfg(feature = "reference-flex")]
+#[test]
+#[ignore = "requires original v3_en.pt; set SILERO_V3_EN_CHECKPOINT"]
+fn official_english_checkpoint_worker_lifecycle() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let checkpoint = std::env::var("SILERO_V3_EN_CHECKPOINT").expect("checkpoint path");
+    let result = run_process(&[
+        json!({"command": "capabilities", "request_id": "cap"}),
+        json!({"command": "load", "request_id": "load", "checkpoint": checkpoint, "backend": "flex"}),
+        json!({"command": "warmup", "request_id": "warm"}),
+        json!({"command": "status", "request_id": "ready"}),
+        json!({"command": "infer", "request_id": "first", "speaker": "en_0", "sample_rate": 8000, "input": {"kind": "text", "text": "Hello, world!"}}),
+        json!({"command": "infer", "request_id": "second", "speaker": "en_0", "sample_rate": 8000, "input": {"kind": "text", "text": "Hello, world!"}}),
+        json!({"command": "infer", "request_id": "wrong", "speaker": "aidar", "sample_rate": 8000, "input": {"kind": "text", "text": "Hello, world!"}}),
+        json!({"command": "unload", "request_id": "unload"}),
+        json!({"command": "shutdown", "request_id": "bye"}),
+    ]);
+    for (i, response) in result.iter().enumerate() { assert_eq!(response["ok"], i != 6, "{response}"); }
+    assert_eq!(result[1]["data"]["model_variant"], "v3_en");
+    assert_eq!(result[3]["data"]["state"], "ready");
+    assert_eq!(result[4]["data"]["sample_count"], 7800);
+    let audio = result[4]["data"]["audio"]["data_base64"].as_str().unwrap();
+    assert_eq!(audio, result[5]["data"]["audio"]["data_base64"].as_str().unwrap());
+    let bytes = STANDARD.decode(audio).unwrap();
+    let values = bytes.chunks_exact(4).map(|x| f32::from_le_bytes(x.try_into().unwrap())).collect::<Vec<_>>();
+    assert!(values.iter().all(|x| x.is_finite()) && values.iter().any(|x| x.abs() > 0.01));
+    assert_eq!(result[7]["data"]["state"], "unloaded");
+}

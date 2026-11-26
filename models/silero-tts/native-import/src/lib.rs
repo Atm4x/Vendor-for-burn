@@ -4,6 +4,7 @@ use pytorch_reader::TorchPackageReader;
 use std::{collections::{BTreeMap, HashMap, HashSet}, path::Path};
 
 mod russian;
+mod english_schema;
 pub use russian::{RussianCheckpoint, RussianConfig, RussianTokenizer, RussianControls};
 
 pub enum OfficialCheckpoint { English(EnglishCheckpoint), Russian(RussianCheckpoint) }
@@ -85,17 +86,7 @@ impl EnglishCheckpoint {
         let id = reference.strip_prefix("torchpackage.script:").context("unsupported model reference")?;
         ensure!(package.module_ids().len() == 1, "v3_en requires exactly one script module");
         let (module_metadata, tensors) = package.module(id).context("reading v3_en script tensors")?;
-        for (name, shape) in [
-            ("tts_model.tacotron.embedding.weight", &[39,128][..]),
-            ("tts_model.tacotron.speaker_embedding.weight", &[119,128]),
-            ("tts_model.dur_predictor.dur_pred.embedding.weight", &[39,64]),
-            ("tts_model.pitch_predictor.pitch_pred.embedding.weight", &[39,64]),
-            ("tts_model.vocoder.ups.0.weight", &[512,256,6]),
-            ("tts_model.vocoder.pqmf_layer.H", &[4,1,63]),
-        ] {
-            let tensor = tensors.get(name).with_context(|| format!("missing v3_en tensor {name}"))?;
-            ensure!(tensor.dtype() == DType::F32 && tensor.shape() == shape, "unexpected v3_en tensor {name}: {:?} {:?}", tensor.dtype(), tensor.shape());
-        }
+        english_schema::validate(&tensors, &module_metadata)?;
         let total = tensors.values().try_fold(0usize, |sum, tensor| sum.checked_add(tensor.byte_len())).context("tensor byte count overflow")?;
         ensure!(total <= 256 * 1024 * 1024, "v3_en tensor byte budget exceeded");
         let script = dictionary(&module_metadata, "script metadata")?;
@@ -117,16 +108,25 @@ impl EnglishCheckpoint {
     }
 
     pub fn encode(&self, text: &str) -> Result<Vec<i64>> {
-        let text = text.to_lowercase().replace('—', "–").replace('‑', "-");
-        let allowed: HashSet<char> = self.symbols.chars().skip(3).collect();
-        let filtered: String = text.chars().filter(|c| allowed.contains(c)).collect();
-        let normalized = filtered.split_whitespace().collect::<Vec<_>>().join(" ");
-        let sentence: String = normalized.chars().map(|ch| self.ascii_symbols.get(&ch).cloned().unwrap_or_else(|| ch.to_string())).collect();
-        ensure!(sentence.chars().any(|ch| ch.is_ascii_lowercase() || ('1'..='9').contains(&ch) || ch == '-'), "text empty after English normalization");
-        std::iter::once('|').chain(sentence.chars()).chain(std::iter::once('~')).map(|ch| {
-            self.symbols.chars().position(|symbol| symbol == ch).map(|i| i as i64).with_context(|| format!("unknown English symbol {ch:?}"))
-        }).collect()
+        let sentence = normalize_english(&self.symbols, &self.ascii_symbols, text)?;
+        encode_english(&self.symbols, &sentence)
     }
+}
+
+pub fn normalize_english(symbols: &str, ascii_symbols: &BTreeMap<char, String>, text: &str) -> Result<String> {
+    let text = text.to_lowercase().replace('—', "–").replace('‑', "-");
+    let allowed: HashSet<char> = symbols.chars().skip(3).collect();
+    let filtered: String = text.chars().filter(|c| allowed.contains(c)).collect();
+    let normalized = filtered.split_whitespace().collect::<Vec<_>>().join(" ");
+    let sentence: String = normalized.chars().map(|ch| ascii_symbols.get(&ch).cloned().unwrap_or_else(|| ch.to_string())).collect();
+    ensure!(sentence.chars().any(|ch| ch.is_ascii_lowercase() || ('1'..='9').contains(&ch) || ch == '-'), "text empty after English normalization");
+    Ok(sentence)
+}
+
+pub fn encode_english(symbols: &str, sentence: &str) -> Result<Vec<i64>> {
+    std::iter::once('|').chain(sentence.chars()).chain(std::iter::once('~')).map(|ch| {
+        symbols.chars().position(|symbol| symbol == ch).map(|i| i as i64).with_context(|| format!("unknown English symbol {ch:?}"))
+    }).collect()
 }
 
 fn dictionary<'a>(value: &'a PickleValue, field: &str) -> Result<&'a HashMap<String, PickleValue>> {

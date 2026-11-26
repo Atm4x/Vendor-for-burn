@@ -1,6 +1,6 @@
-//! Native Silero v5 Russian TTS components based on Burn/CubeCL.
+//! Native Silero v5 Russian and v3 English TTS components based on Burn.
 //!
-//! Runtime loading accepts official Russian TorchPackage checkpoints directly.
+//! Runtime loading accepts official TorchPackage checkpoints directly.
 //! Prepared safetensors remain supported; neither path requires Python or PyTorch.
 
 pub mod frontend;
@@ -16,6 +16,8 @@ pub mod transformer;
 pub mod predictors;
 pub mod acoustic;
 pub mod runtime;
+mod english;
+mod english_vocoder;
 
 pub mod accentor;
 pub mod homosolver;

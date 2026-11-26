@@ -41,3 +41,24 @@ fn official_v5_ru_all_components() {
     assert_eq!(values.len(),83830*312);
     assert!(values.iter().all(|v|v.is_finite()));
 }
+
+#[test]
+#[ignore = "requires official v3_en.pt; set SILERO_V3_EN_CHECKPOINT"]
+fn detects_renamed_checkpoint_and_rejects_truncation() {
+    use silero_package::OfficialCheckpoint;
+    let original = PathBuf::from(std::env::var_os("SILERO_V3_EN_CHECKPOINT").expect("checkpoint path"));
+    let root = std::env::temp_dir().join(format!("silero-checkpoint-test-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+    let _cleanup = Cleanup(root.clone());
+    let renamed = root.join("model.bin");
+    if std::fs::hard_link(&original, &renamed).is_err() { std::fs::copy(&original, &renamed).unwrap(); }
+    assert!(matches!(OfficialCheckpoint::open(&renamed).unwrap(), OfficialCheckpoint::English(_)));
+    let truncated = root.join("truncated.bin");
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(original).unwrap().take(2048).read_to_end(&mut bytes).unwrap();
+    std::fs::write(&truncated, bytes).unwrap();
+    assert!(OfficialCheckpoint::open(&truncated).is_err());
+}
