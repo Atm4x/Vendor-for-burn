@@ -1,0 +1,326 @@
+use crate::{checkpoint::Checkpoint, hcqt::Features};
+use burn::tensor::{Device, Tensor, TensorData, activation, module, ops::ConvOptions};
+
+pub(crate) struct BatchNorm {
+    scale: Tensor<1>,
+    shift: Tensor<1>,
+}
+
+impl BatchNorm {
+    pub(crate) fn load(ckpt: &Checkpoint, prefix: &str, device: &Device) -> Result<Self, String> {
+        let (_, weights) = ckpt.values(&format!("{prefix}.weight"))?;
+        let (_, biases) = ckpt.values(&format!("{prefix}.bias"))?;
+        let (_, means) = ckpt.values(&format!("{prefix}.running_mean"))?;
+        let (_, variances) = ckpt.values(&format!("{prefix}.running_var"))?;
+        let len = weights.len();
+        if biases.len() != len || means.len() != len || variances.len() != len {
+            return Err(format!("{prefix}: inconsistent batch norm channel counts"));
+        }
+        let mut scale = Vec::with_capacity(len);
+        let mut shift = Vec::with_capacity(len);
+        for i in 0..len {
+            let s = weights[i] / (variances[i] + 1e-5).sqrt();
+            scale.push(s);
+            shift.push(biases[i] - means[i] * s);
+        }
+        Ok(Self {
+            scale: Tensor::from_data(TensorData::new(scale, [len]), device),
+            shift: Tensor::from_data(TensorData::new(shift, [len]), device),
+        })
+    }
+
+    pub(crate) fn forward(&self, input: Tensor<4>) -> Tensor<4> {
+        let n = self.scale.dims()[0];
+        input * self.scale.clone().reshape([1, n, 1, 1])
+            + self.shift.clone().reshape([1, n, 1, 1])
+    }
+}
+
+enum ConvWeight {
+    Pointwise(Tensor<2>),
+    Spatial {
+        weight: Tensor<4>,
+        #[cfg(feature = "dynamic-conv")]
+        matrix: Option<Tensor<2>>,
+    },
+}
+
+pub(crate) struct Conv2d {
+    weight: ConvWeight,
+    bias: Option<Tensor<1>>,
+    stride: [usize; 2],
+    padding: [usize; 2],
+    dilation: [usize; 2],
+    groups: usize,
+}
+
+impl Conv2d {
+    pub(crate) fn load(
+        ckpt: &Checkpoint,
+        key: &str,
+        device: &Device,
+        stride: [usize; 2],
+        padding: [usize; 2],
+        dilation: [usize; 2],
+        groups: usize,
+    ) -> Result<Self, String> {
+        let weight = ckpt.tensor::<4>(&format!("{key}.weight"), device)?;
+        let bias = ckpt.has(&format!("{key}.bias"))
+            .then(|| ckpt.tensor::<1>(&format!("{key}.bias"), device))
+            .transpose()?;
+        let [out, input, kh, kw] = weight.dims();
+        if groups == 0 || out % groups != 0 || input == 0 {
+            return Err(format!("{key}: invalid grouped convolution"));
+        }
+        if bias.as_ref().is_some_and(|b| b.dims()[0] != out) {
+            return Err(format!("{key}: invalid bias dimension"));
+        }
+        let weight = if [kh, kw] == [1, 1] && groups == 1
+            && stride == [1, 1] && padding == [0, 0] {
+            ConvWeight::Pointwise(weight.reshape([out, input]).transpose())
+        } else {
+            ConvWeight::Spatial {
+                #[cfg(feature = "dynamic-conv")]
+                matrix: (groups == 1).then(|| weight.clone().permute([2, 3, 1, 0])
+                    .reshape([kh * kw * input, out])),
+                weight,
+            }
+        };
+        Ok(Self { weight, bias, stride, padding, dilation, groups })
+    }
+
+    pub(crate) fn forward(&self, x: Tensor<4>) -> Tensor<4> {
+        match &self.weight {
+            ConvWeight::Pointwise(weight) => {
+                let [batch, channels, height, width] = x.dims();
+                let out = weight.dims()[1];
+                let pixels = x.permute([0, 2, 3, 1])
+                    .reshape([batch * height * width, channels]);
+                let output = pixels.matmul(weight.clone());
+                let output = if let Some(bias) = &self.bias {
+                    output + bias.clone().reshape([1, out])
+                } else {
+                    output
+                };
+                output.reshape([batch, height, width, out]).permute([0, 3, 1, 2])
+            }
+            ConvWeight::Spatial {
+                weight,
+                #[cfg(feature = "dynamic-conv")]
+                matrix,
+            } => {
+                #[cfg(feature = "dynamic-conv")]
+                if let Some(matrix) = matrix {
+                    let [_, _, kh, kw] = weight.dims();
+                    let geometry = super::dynamic_conv::Geometry {
+                        kernel: [kh, kw],
+                        stride: self.stride,
+                        padding: self.padding,
+                        dilation: self.dilation,
+                    };
+                    if let Some(output) = super::dynamic_conv::forward(x.clone(), matrix, self.bias.as_ref(), &geometry) {
+                        return output;
+                    }
+                }
+                module::conv2d(
+                    x, weight.clone(), self.bias.clone(),
+                    ConvOptions::new(self.stride, self.padding, self.dilation, self.groups),
+                )
+            }
+        }
+    }
+}
+
+pub struct Stem {
+    input_norm: BatchNorm,
+    first: Conv2d,
+    first_norm: BatchNorm,
+    second: Conv2d,
+    second_norm: BatchNorm,
+    down: Conv2d,
+    output_norm: BatchNorm,
+}
+
+impl Stem {
+    pub fn load(ckpt: &Checkpoint, device: &Device, time_stride: usize) -> Result<Self, String> {
+        if time_stride == 0 { return Err("invalid stem time stride".into()); }
+        let kt = if time_stride == 2 { 3 } else { 1 };
+        Ok(Self {
+            input_norm: BatchNorm::load(ckpt, "stem.inorm", device)?,
+            first: Conv2d::load(ckpt, "stem.c1", device, [1, 1], [1, 1], [1, 1], 1)?,
+            first_norm: BatchNorm::load(ckpt, "stem.n1", device)?,
+            second: Conv2d::load(ckpt, "stem.c2", device, [1, 1], [1, 1], [1, 1], 1)?,
+            second_norm: BatchNorm::load(ckpt, "stem.n2", device)?,
+            down: Conv2d::load(ckpt, "stem.down", device, [time_stride, 3], [kt / 2, 1], [1, 1], 1)?,
+            output_norm: BatchNorm::load(ckpt, "stem.n3", device)?,
+        })
+    }
+
+    pub fn forward(&self, x: Tensor<4>) -> Tensor<4> {
+        let x = self.input_norm.forward(x);
+        let x = activation::gelu(self.first_norm.forward(self.first.forward(x)));
+        let x = activation::gelu(self.second_norm.forward(self.second.forward(x)));
+        self.output_norm.forward(self.down.forward(x))
+    }
+
+    pub fn features(&self, features: &Features, device: &Device) -> Result<Tensor<4>, String> {
+        if features.frames == 0 { return Err("empty HCQT frames".into()); }
+        let input = Tensor::from_data(
+            TensorData::new(features.data.clone(), [1, features.channels, features.frames, features.bins]),
+            device,
+        );
+        Ok(self.forward(input))
+    }
+}
+
+/// Pitch offsets are encoded as a depthwise 2D convolution in the pitch axis.
+/// This replaces one slice/concat/multiply/add chain per offset with a single
+/// CubeCL-compatible convolution on CUDA, WGPU and CubeCL CPU runtimes.
+pub struct PitchMix {
+    kernel: Tensor<4>,
+    padding: usize,
+    channels: usize,
+}
+
+impl PitchMix {
+    pub fn load(
+        ckpt: &Checkpoint,
+        key: &str,
+        device: &Device,
+        offsets: Vec<isize>,
+    ) -> Result<Self, String> {
+        let (shape, taps) = ckpt.values(&format!("{key}.taps"))?;
+        if shape.len() != 2 || shape[1] != offsets.len() || shape[0] == 0 || offsets.is_empty() {
+            return Err(format!("{key}: number of offsets differs from taps"));
+        }
+        let channels = shape[0];
+        let padding = offsets.iter().map(|offset| offset.unsigned_abs()).max().unwrap_or(0);
+        let width = padding.checked_mul(2).and_then(|n| n.checked_add(1))
+            .ok_or_else(|| format!("{key}: pitch kernel width overflow"))?;
+        let count = channels.checked_mul(width)
+            .ok_or_else(|| format!("{key}: pitch kernel size overflow"))?;
+        let mut kernel = vec![0.0f32; count];
+        for channel in 0..channels {
+            for (index, &offset) in offsets.iter().enumerate() {
+                let position = (padding as isize).checked_add(offset)
+                    .ok_or_else(|| format!("{key}: invalid pitch offset"))? as usize;
+                kernel[channel * width + position] += taps[channel * offsets.len() + index];
+            }
+        }
+        Ok(Self {
+            kernel: Tensor::from_data(TensorData::new(kernel, [channels, 1, 1, width]), device),
+            padding,
+            channels,
+        })
+    }
+
+    pub fn forward(&self, x: Tensor<4>) -> Tensor<4> {
+        assert_eq!(x.dims()[1], self.channels, "PitchMix channel mismatch");
+        module::conv2d(
+            x,
+            self.kernel.clone(),
+            None,
+            ConvOptions::new([1, 1], [0, self.padding], [1, 1], self.channels),
+        )
+    }
+}
+
+#[cfg(test)]
+mod pitch_mix_tests {
+    use super::*;
+
+    #[test]
+    fn grouped_pitch_convolution_matches_sparse_shift_sum() {
+        let device = Device::default();
+        let channels = 3;
+        let pitches = 7;
+        let frames = 5;
+        let offsets = [-3isize, -1, 0, 2, 2, 4];
+        let taps = [
+            [0.3f32, -0.4, 0.5, 0.6, -0.2, 0.7],
+            [0.1, 0.25, -0.3, 0.2, 0.9, -0.8],
+            [-0.5, 0.4, 0.0, 0.3, -0.4, 0.2],
+        ];
+        let width = 9;
+        let padding = 4;
+        let mut weights = vec![0.0; channels * width];
+        for ch in 0..channels {
+            for (k, &offset) in offsets.iter().enumerate() {
+                weights[ch * width + (padding as isize + offset) as usize] += taps[ch][k];
+            }
+        }
+        let input = (0..channels * frames * pitches)
+            .map(|i| (i as f32 * 0.19).sin()).collect::<Vec<_>>();
+        let pitch_mix = PitchMix {
+            kernel: Tensor::from_data(TensorData::new(weights, [channels, 1, 1, width]), &device),
+            padding,
+            channels,
+        };
+        let output = pitch_mix.forward(Tensor::from_data(
+            TensorData::new(input.clone(), [1, channels, frames, pitches]), &device,
+        )).into_data().try_to_vec::<f32>().unwrap();
+        for ch in 0..channels {
+            for frame in 0..frames {
+                for pitch in 0..pitches {
+                    let expected = offsets.iter().enumerate().filter_map(|(k, offset)| {
+                        let source = pitch as isize + *offset;
+                        (source >= 0 && source < pitches as isize).then(|| {
+                            input[(ch * frames + frame) * pitches + source as usize] * taps[ch][k]
+                        })
+                    }).sum::<f32>();
+                    let actual = output[(ch * frames + frame) * pitches + pitch];
+                    assert!((actual - expected).abs() < 1e-5,
+                        "channel {ch} frame {frame} pitch {pitch}: {actual} != {expected}");
+                }
+            }
+        }
+    }
+}
+
+pub struct LaneBlock {
+    pitch_mix: PitchMix,
+    depthwise: Conv2d,
+    norm: BatchNorm,
+    expand: Conv2d,
+    project: Conv2d,
+    gamma: Tensor<1>,
+}
+
+impl LaneBlock {
+    pub fn load(
+        ckpt: &Checkpoint,
+        key: &str,
+        device: &Device,
+        dilation: usize,
+        offsets: Vec<isize>,
+    ) -> Result<Self, String> {
+        if dilation == 0 { return Err("invalid lane block dilation".into()); }
+        let gamma = ckpt.tensor::<1>(&format!("{key}.gamma"), device)?;
+        let channels = gamma.dims()[0];
+        let depthwise_weight = ckpt.tensor::<4>(&format!("{key}.dw_t.weight"), device)?;
+        let [output, input, kernel_t, kernel_p] = depthwise_weight.dims();
+        if output != channels || input != 1 || kernel_p != 1 || kernel_t % 2 == 0 {
+            return Err(format!("{key}: invalid depthwise kernel"));
+        }
+        Ok(Self {
+            pitch_mix: PitchMix::load(ckpt, &format!("{key}.pmix"), device, offsets)?,
+            depthwise: Conv2d::load(
+                ckpt, &format!("{key}.dw_t"), device,
+                [1, 1], [(kernel_t / 2) * dilation, 0], [dilation, 1], channels,
+            )?,
+            norm: BatchNorm::load(ckpt, &format!("{key}.norm"), device)?,
+            expand: Conv2d::load(ckpt, &format!("{key}.pw1"), device, [1, 1], [0, 0], [1, 1], 1)?,
+            project: Conv2d::load(ckpt, &format!("{key}.pw2"), device, [1, 1], [0, 0], [1, 1], 1)?,
+            gamma,
+        })
+    }
+
+    pub fn forward(&self, x: Tensor<4>) -> Tensor<4> {
+        let t = self.depthwise.forward(x.clone());
+        let t = t.clone() + self.pitch_mix.forward(t);
+        let t = self.norm.forward(t);
+        let t = self.project.forward(activation::gelu(self.expand.forward(t)));
+        let c = self.gamma.dims()[0];
+        x + t * self.gamma.clone().reshape([1, c, 1, 1])
+    }
+}

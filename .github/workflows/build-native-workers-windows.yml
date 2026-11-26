@@ -36,6 +36,9 @@ jobs:
           - package: rvc-v2
             script: models/tts-with-rvc-rs/build_windows.ps1
             compact: false
+          - package: dettato
+            script: models/dettato/package_windows.ps1
+            compact: false
     steps:
       - uses: actions/checkout@v4
         with:

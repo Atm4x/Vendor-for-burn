@@ -1,0 +1,36 @@
+[package]
+name = "dettato-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "Apache-2.0"
+description = "Native Rust and Burn implementation of the Dettato multi-instrument transcription pipeline"
+
+[features]
+default = ["flex", "extended-audio"]
+autotune = ["burn/autotune"]
+extended-audio = ["symphonia/mp3", "symphonia/aac", "symphonia/isomp4", "symphonia/alac"]
+flex = ["burn/flex"]
+cuda = ["burn/cuda", "burn/fusion", "gpu-device-resolver/cuda"]
+cpu = ["burn/cpu", "burn/fusion", "burn/autotune"]
+wgpu = ["burn/wgpu", "burn/fusion", "gpu-device-resolver/wgpu"]
+dynamic-conv = ["burn/fusion", "dep:burn-cubecl", "dep:burn-fusion"]
+persistent-gru = ["burn/fusion", "dep:burn-cubecl", "dep:burn-fusion"]
+
+[dependencies]
+burn = { version = "=0.22.1", default-features = false, features = ["std", "cubecl"] }
+burn-cubecl = { version = "=0.22.1", optional = true, default-features = false }
+burn-fusion = { version = "=0.22.1", optional = true, default-features = false }
+rustfft = "=6.4.1"
+symphonia = { version = "=0.6.1", default-features = false, features = ["wav", "pcm", "flac", "ogg", "vorbis", "aiff"] }
+safetensors = "=0.8.0"
+half = "=2.7.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+native-worker-ipc = { path = "../../crates/native-worker-ipc" }
+gpu-device-resolver = { path = "../../crates/gpu-device-resolver", default-features = false }
+
+[workspace]
+
+[profile.test]
+debug = 0
