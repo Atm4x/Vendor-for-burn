@@ -1,46 +1,68 @@
-name: Git Bridge - Silero existing optional dependency vendor
+name: Git Bridge - publish Silero candidate
 on:
   push:
     branches: [git-bridge/export-silero-ab4d79c7]
     paths: [.github/workflows/git-bridge-export.yml]
 permissions:
-  contents: read
+  contents: write
 jobs:
-  vendor:
+  import:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Acquire only missing locked RUAccent sources
+      - name: Verify and import native Silero code
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = f3618c635442334f02c47384c01dd13fed1891f7
+          base64 -d .git-bridge/silero-72eed1e.b64 > "$RUNNER_TEMP/silero.bundle"
+          echo "f848db7aea8d9499665bd5be14bffbd5a001df2286002bd6a46ee07451a88dab  $RUNNER_TEMP/silero.bundle" | sha256sum -c -
+          git bundle verify "$RUNNER_TEMP/silero.bundle"
+          git fetch "$RUNNER_TEMP/silero.bundle" refs/heads/feat/silero-tts-native-import:refs/heads/silero-candidate
+          test "$(git rev-parse silero-candidate)" = 72eed1e04975027d82055d7b1fc596e505997cfa
+          git merge-base --is-ancestor origin/main silero-candidate
+          git switch silero-candidate
+          git push origin HEAD:refs/heads/git-bridge/candidate-silero-72eed1e
+      - name: Reconstruct optional vendor commit exactly
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
-          import pathlib, tomllib, hashlib, json, tarfile, urllib.request, os
+          import pathlib, tomllib, hashlib, json, tarfile, urllib.request, io, shutil, subprocess
           root=pathlib.Path("vendor")
-          out=pathlib.Path(os.environ["RUNNER_TEMP"])/"silero-extra-vendor"
-          out.mkdir()
-          lock=tomllib.loads(pathlib.Path("models/ruaccent/Cargo.lock").read_text())
+          lock=tomllib.loads(pathlib.Path("models/ruaccent/Cargo.lock").read_text()) if pathlib.Path("models/ruaccent/Cargo.lock").exists() else None
+          if lock is None:
+              data=subprocess.check_output(["git","show","ab4d79c710d64fe9eea70f31cfb8ce2cb9f0e994:models/ruaccent/Cargo.lock"])
+              lock=tomllib.loads(data.decode())
           for p in lock["package"]:
               if not p.get("source","").startswith("registry+"): continue
-              n,v=p["name"],p["version"]
-              name=f"{n}-{v}"
+              n,v=p["name"],p["version"]; name=f"{n}-{v}"
               if (root/name).is_dir(): continue
               data=urllib.request.urlopen(f"https://static.crates.io/crates/{n}/{name}.crate",timeout=45).read()
               assert hashlib.sha256(data).hexdigest()==p["checksum"],name
-              import io
               with tarfile.open(fileobj=io.BytesIO(data)) as archive:
-                  archive.extractall(out,filter="data")
-              dst=out/name
-              files={str(f.relative_to(dst)):hashlib.sha256(f.read_bytes()).hexdigest() for f in dst.rglob("*") if f.is_file() and f.name!=".cargo-checksum.json"}
+                  archive.extractall(root,filter="data")
+              dst=root/name
+              for f in sorted(dst.rglob("*"),key=lambda x:len(x.parts),reverse=True):
+                  if any(x.startswith(".") for x in f.relative_to(dst).parts):
+                      if f.is_dir(): shutil.rmtree(f)
+                      elif f.exists(): f.unlink()
+              files=dict(sorted((str(f.relative_to(dst)),hashlib.sha256(f.read_bytes()).hexdigest()) for f in dst.rglob("*") if f.is_file() and f.name!=".cargo-checksum.json"))
               (dst/".cargo-checksum.json").write_text(json.dumps({"files":files,"package":p["checksum"]},separators=(",",":")))
-              print(name)
+              for f in dst.rglob("*"):
+                  if f.is_file(): f.chmod(0o644)
+              subprocess.run(["git","add","-f",str(dst)],check=True)
           PY
-      - uses: actions/upload-artifact@v4
-        with:
-          name: silero-extra-vendor
-          path: ${{ runner.temp }}/silero-extra-vendor/
-          retention-days: 1
-          compression-level: 6
+          tree="$(git write-tree)"
+          echo "vendor tree=$tree"
+          test "$tree" = 11f60afd433e193df34a31df32dd01f7fed3a824
+          export GIT_AUTHOR_NAME=ChatGPT GIT_COMMITTER_NAME=ChatGPT
+          export GIT_AUTHOR_EMAIL=41898282+github-actions[bot]@users.noreply.github.com GIT_COMMITTER_EMAIL=41898282+github-actions[bot]@users.noreply.github.com
+          export GIT_AUTHOR_DATE=2026-11-26T19:59:29Z GIT_COMMITTER_DATE=2026-11-26T19:59:29Z
+          git -c commit.gpgsign=false commit -m 'build(silero): restore locked optional RUAccent vendor sources'
+          test "$(git rev-parse HEAD)" = 15b1a861be28cc4f9fed776cecd03058aab5fddc
+          git push origin HEAD:refs/heads/git-bridge/candidate-silero-15b1a86
