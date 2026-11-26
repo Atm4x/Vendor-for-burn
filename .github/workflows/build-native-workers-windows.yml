@@ -12,6 +12,7 @@ on:
       - 'tools/restore_vendor_checksums.py'
       - 'tools/package_tts_windows.ps1'
       - 'tools/smoke_tts_worker.py'
+      - 'tools/stage_native_workers_release.ps1'
       - '.github/workflows/build-native-workers-windows.yml'
   workflow_dispatch:
 
@@ -72,5 +73,28 @@ jobs:
         with:
           name: ${{ matrix.package }}_v${{ env.WORKER_VERSION }}_win_x86_64
           path: ${{ runner.temp }}/native-worker/assets/${{ matrix.package }}_v${{ env.WORKER_VERSION }}_win_x86_64.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  stage-release:
+    needs: build
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*_v${{ env.WORKER_VERSION }}_win_x86_64'
+          path: ${{ runner.temp }}/native-worker-inputs
+      - name: Verify and stage the complete Windows release
+        shell: pwsh
+        run: |
+          ./tools/stage_native_workers_release.ps1 -Version $env:WORKER_VERSION -Revision $env:GITHUB_SHA -InputRoot (Join-Path $env:RUNNER_TEMP 'native-worker-inputs') -OutputRoot (Join-Path $env:RUNNER_TEMP 'native-worker-release')
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-workers_v${{ env.WORKER_VERSION }}_win_x86_64
+          path: ${{ runner.temp }}/native-worker-release/
           if-no-files-found: error
           retention-days: 14
