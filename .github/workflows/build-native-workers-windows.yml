@@ -10,6 +10,8 @@ on:
       - 'Cargo.lock'
       - 'vendor/**'
       - 'tools/restore_vendor_checksums.py'
+      - 'tools/package_tts_windows.ps1'
+      - 'tools/smoke_tts_worker.py'
       - '.github/workflows/build-native-workers-windows.yml'
   workflow_dispatch:
 
@@ -39,6 +41,10 @@ jobs:
           - package: dettato
             script: models/dettato/package_windows.ps1
             compact: false
+          - package: f5-tts
+            script: tools/package_tts_windows.ps1
+            family: f5-tts
+            compact: false
     steps:
       - uses: actions/checkout@v4
         with:
@@ -48,6 +54,7 @@ jobs:
         env:
           PACKAGE_SCRIPT: ${{ matrix.script }}
           PACKAGE_COMPACT: ${{ matrix.compact }}
+          PACKAGE_FAMILY: ${{ matrix.family }}
         run: |
           $ErrorActionPreference = 'Stop'
           $arguments = @{
@@ -55,6 +62,7 @@ jobs:
             OutputRoot = (Join-Path $env:RUNNER_TEMP 'native-worker')
           }
           if ($env:PACKAGE_COMPACT -eq 'true') { $arguments.Compact = $true }
+          if ($env:PACKAGE_FAMILY) { $arguments.Family = $env:PACKAGE_FAMILY }
           & $env:PACKAGE_SCRIPT @arguments
       - uses: actions/upload-artifact@v4
         with:
