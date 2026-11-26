@@ -1,4 +1,4 @@
-name: Git Bridge - Silero official checkpoint
+name: Git Bridge - Silero existing optional dependency vendor
 on:
   push:
     branches: [git-bridge/export-silero-ab4d79c7]
@@ -6,19 +6,41 @@ on:
 permissions:
   contents: read
 jobs:
-  checkpoint:
+  vendor:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Download and verify official v5_ru
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Acquire only missing locked RUAccent sources
+        shell: bash
         run: |
           set -euo pipefail
-          curl -fL --retry 3 https://models.silero.ai/models/tts/ru/v5_ru.pt -o "$RUNNER_TEMP/v5_ru.pt"
-          cd "$RUNNER_TEMP"
-          echo "7ba04d42340fe0398042eed2e0d12d62e23096d626b1b9feff4dcb1309197ab4  v5_ru.pt" | sha256sum -c -
+          python - <<'PY'
+          import pathlib, tomllib, hashlib, json, tarfile, urllib.request, os
+          root=pathlib.Path("vendor")
+          out=pathlib.Path(os.environ["RUNNER_TEMP"])/"silero-extra-vendor"
+          out.mkdir()
+          lock=tomllib.loads(pathlib.Path("models/ruaccent/Cargo.lock").read_text())
+          for p in lock["package"]:
+              if not p.get("source","").startswith("registry+"): continue
+              n,v=p["name"],p["version"]
+              name=f"{n}-{v}"
+              if (root/name).is_dir(): continue
+              data=urllib.request.urlopen(f"https://static.crates.io/crates/{n}/{name}.crate",timeout=45).read()
+              assert hashlib.sha256(data).hexdigest()==p["checksum"],name
+              import io
+              with tarfile.open(fileobj=io.BytesIO(data)) as archive:
+                  archive.extractall(out,filter="data")
+              dst=out/name
+              files={str(f.relative_to(dst)):hashlib.sha256(f.read_bytes()).hexdigest() for f in dst.rglob("*") if f.is_file() and f.name!=".cargo-checksum.json"}
+              (dst/".cargo-checksum.json").write_text(json.dumps({"files":files,"package":p["checksum"]},separators=(",",":")))
+              print(name)
+          PY
       - uses: actions/upload-artifact@v4
         with:
-          name: silero-v5-ru-official
-          path: ${{ runner.temp }}/v5_ru.pt
+          name: silero-extra-vendor
+          path: ${{ runner.temp }}/silero-extra-vendor/
           retention-days: 1
-          compression-level: 0
+          compression-level: 6
