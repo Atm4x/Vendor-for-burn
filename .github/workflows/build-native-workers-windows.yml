@@ -45,6 +45,10 @@ jobs:
             script: tools/package_tts_windows.ps1
             family: f5-tts
             compact: false
+          - package: fish-speech-1.5
+            script: tools/package_tts_windows.ps1
+            family: fish-speech-1.5
+            compact: false
     steps:
       - uses: actions/checkout@v4
         with:

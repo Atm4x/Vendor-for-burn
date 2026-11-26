@@ -1,0 +1,11 @@
+# Fish Speech 1.5 Rust — CONT8 → next
+
+Start from the CONT8 full source-only archive. Verify `docs/CONT8_REPORT.md` and original user-supplied `Fish-speech-pipeline-main(1).zip` before writing code. Keep the verified Git Bridge artifact local and do not issue repetitive GitHub GET requests. The Git Bridge commit is older than CONT7; don't reset source to it. Use Rust 1.100.0 and offline Cargo vendor; no real SDK/GPU is currently available. No legacy script changes or fake mock inference.
+
+Current truth: **155 Core PASS, 3 outer PASS, 7 mock PASS, 5 Python exporter PASS, `cargo check --features tensorrt-api` PASS**. Firefly structural lowering covers 416/420 op/IO nodes; decoder has a full connected graph from external codes, but GPU execution and actual checkpoint parity are not validated. Overall engineering completion estimate ~39%, 61% left.
+
+Next priority: implement **reference encoder `LogMel`/FSQ encode** with exact original preprocessing/FSQ double-bound semantics, and connect the upper-level Rust pipeline to both encoder/decoder. Avoid making another generic ML framework. Add torch-equation fixtures as done for decoder. Ensure dynamic per-batch mask semantics are not silently lost; current static masks assume uniform valid length. Then implement complete Slow/Fast AR lowering with active-prefix Slow/Fast KV and GPU sampling. For full parity, need actual pretrained weights and Windows SDK/GPU. Before any claim of readiness, run SDK engine build→execute, numeric outputs and full original Fish Speech 1.5 TTS/voice clone. Benchmark warmed TorchInductor `reduce-overhead`, and report GPU timings only from real profiling.
+
+Pay attention to the new FSQ LUT: 8 × 1001 × 64 rows/features, including -1 sentinel; output numerically matches the Rust reference on synthetic weights. LUT/gather/transpose/assertion acceptance and performance are NOT_TESTED_GPU and cannot be inferred from compilation.
+
+At each step update the **global remaining-work progress**, not merely the CONT number. Deliver one full source-only ZIP, one small delta ZIP, and a report. Do not push to GitHub until ready and requested/compatible with repo policy; any GitHub interactions through the connector only.
