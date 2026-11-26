@@ -19,13 +19,17 @@ env:
 jobs:
   build:
     runs-on: windows-2022
-    timeout-minutes: 45
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         include:
           - package: beat-this
             script: models/beat_this/package_windows.ps1
+            compact: true
+          - package: gigaam-v3
+            script: models/gigaam/package_windows.ps1
+            compact: false
     steps:
       - uses: actions/checkout@v4
         with:
@@ -34,9 +38,15 @@ jobs:
         shell: pwsh
         env:
           PACKAGE_SCRIPT: ${{ matrix.script }}
+          PACKAGE_COMPACT: ${{ matrix.compact }}
         run: |
           $ErrorActionPreference = 'Stop'
-          & $env:PACKAGE_SCRIPT -Version $env:WORKER_VERSION -OutputRoot (Join-Path $env:RUNNER_TEMP 'native-worker') -Compact
+          $arguments = @{
+            Version = $env:WORKER_VERSION
+            OutputRoot = (Join-Path $env:RUNNER_TEMP 'native-worker')
+          }
+          if ($env:PACKAGE_COMPACT -eq 'true') { $arguments.Compact = $true }
+          & $env:PACKAGE_SCRIPT @arguments
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.package }}_v${{ env.WORKER_VERSION }}_win_x86_64

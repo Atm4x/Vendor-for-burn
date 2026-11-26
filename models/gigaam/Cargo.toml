@@ -1,0 +1,35 @@
+[package]
+name = "gigaam-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "MIT"
+
+[features]
+default = ["cuda"]
+cpu = ["burn/cpu"]
+flex = ["burn/flex"]
+cuda = ["burn/cuda"]
+wgpu = ["burn/wgpu"]
+model-download = ["dep:ureq"]
+
+[dependencies]
+burn = { version = "=0.22.1", default-features = false, features = ["std"] }
+burn-store = { version = "=0.22.1", default-features = false, features = ["std", "pytorch"] }
+burn-pack = "=0.22.1"
+safetensors = "0.8"
+half = "=2.7.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "=0.10.9"
+uuid = { version = "=1.29.1", features = ["serde"] }
+anyhow = "1"
+hound = "3.5"
+symphonia = { version = "=0.6.1", default-features = false, features = ["flac", "ogg", "vorbis", "wav", "pcm"] }
+rustfft = "6.4.1"
+prost = "=0.14.4"
+pytorch-reader = "=0.22.1"
+zip = { version = "=9.4.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+ureq = { version = "=2.12.1", default-features = false, features = ["tls"], optional = true }
+
+[workspace]
