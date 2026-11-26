@@ -1,49 +1,24 @@
-name: Git Bridge - Export Bundle
-
+name: Git Bridge - Silero official checkpoint
 on:
-  workflow_dispatch:
   push:
-    branches:
-      - git-bridge/export-silero-ab4d79c7
-    paths:
-      - .github/workflows/git-bridge-export.yml
-
+    branches: [git-bridge/export-silero-ab4d79c7]
+    paths: [.github/workflows/git-bridge-export.yml]
 permissions:
   contents: read
-
 jobs:
-  export-bundle:
+  checkpoint:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
     steps:
-      - name: Checkout complete main history
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Create and verify self-contained Git bundle
-        shell: bash
+      - name: Download and verify official v5_ru
         run: |
           set -euo pipefail
-          git update-ref refs/heads/silero-source "ab4d79c710d64fe9eea70f31cfb8ce2cb9f0e994"
-          git bundle create "${RUNNER_TEMP}/repository.bundle" refs/heads/silero-source
-          git bundle verify "${RUNNER_TEMP}/repository.bundle"
-          git bundle list-heads "${RUNNER_TEMP}/repository.bundle"
-          (
-            cd "${RUNNER_TEMP}"
-            sha256sum repository.bundle > repository.bundle.sha256
-            printf '%s\n' "ab4d79c710d64fe9eea70f31cfb8ce2cb9f0e994" > source-head.txt
-          )
-
-      - name: Upload Git Bridge artifact
-        uses: actions/upload-artifact@v4
+          curl -fL --retry 3 https://models.silero.ai/models/tts/ru/v5_ru.pt -o "$RUNNER_TEMP/v5_ru.pt"
+          cd "$RUNNER_TEMP"
+          echo "7ba04d42340fe0398042eed2e0d12d62e23096d626b1b9feff4dcb1309197ab4  v5_ru.pt" | sha256sum -c -
+      - uses: actions/upload-artifact@v4
         with:
-          name: vendor-for-burn-git-bundle
-          path: |
-            ${{ runner.temp }}/repository.bundle
-            ${{ runner.temp }}/repository.bundle.sha256
-            ${{ runner.temp }}/source-head.txt
-          if-no-files-found: error
+          name: silero-v5-ru-official
+          path: ${{ runner.temp }}/v5_ru.pt
+          retention-days: 1
           compression-level: 0
-          retention-days: 3
