@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - main
+      - git-bridge/export-silero-ab4d79c7
     paths:
       - .github/workflows/git-bridge-export.yml
 
@@ -26,14 +26,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git update-ref refs/heads/main "${GITHUB_SHA}"
-          git bundle create "${RUNNER_TEMP}/repository.bundle" HEAD refs/heads/main
+          git update-ref refs/heads/silero-source "ab4d79c710d64fe9eea70f31cfb8ce2cb9f0e994"
+          git bundle create "${RUNNER_TEMP}/repository.bundle" refs/heads/silero-source
           git bundle verify "${RUNNER_TEMP}/repository.bundle"
           git bundle list-heads "${RUNNER_TEMP}/repository.bundle"
           (
             cd "${RUNNER_TEMP}"
             sha256sum repository.bundle > repository.bundle.sha256
-            printf '%s\n' "${GITHUB_SHA}" > source-head.txt
+            printf '%s\n' "ab4d79c710d64fe9eea70f31cfb8ce2cb9f0e994" > source-head.txt
           )
 
       - name: Upload Git Bridge artifact
