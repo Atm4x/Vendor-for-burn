@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        group: [0,1,2,3,4,5,6]
+        group: [0,1,2,3,4,5,6,7,8,9]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -28,8 +28,7 @@ jobs:
           c=json.loads(pathlib.Path("models/silero-tts/official_catalogue.json").read_text())["models"]
           items=[x for x in c if x["declared_format"]=="jit"]
           group=int(os.environ["GROUP"])
-          wanted=items[group*4:group*4+4] if group<5 else [x for x in c if x["model_id"]=="v5_cis_base_nostress_jit"] if group==5 else []
-          if group==6: wanted=[x for x in items if x["model_id"]=="lj_8khz"]
+          wanted=items[group*2:group*2+2]
           for x in wanted:
               name=x["model_id"]; p=out/(name+".jit")
               urllib.request.urlretrieve(x["url"],p)
