@@ -1,0 +1,56 @@
+name: GigaAM - Streaming IPC regression
+on:
+  workflow_dispatch:
+  push:
+    branches: [git-bridge/gigaam-official-weights-20261127]
+    paths: [.github/workflows/gigaam-streaming-regression.yml]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  flex-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 0916a5946511795ab053c032689d6d02a075b8b1
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: gigaam-v4_ctc-official
+          path: ${{ runner.temp }}/gigaam-official/v4_ctc
+          run-id: 46012580905
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: gigaam-multilingual_v2_rnnt-official
+          path: ${{ runner.temp }}/gigaam-official/multilingual_v2_rnnt
+          run-id: 46012580905
+          github-token: ${{ github.token }}
+      - name: Verify checkpoint integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd "$RUNNER_TEMP/gigaam-official/v4_ctc"; sha256sum --check SHA256SUMS; echo '7f81bb7c82588bf3f6956e9ca6ce9451  v4_ctc.ckpt' | md5sum --check)
+          (cd "$RUNNER_TEMP/gigaam-official/multilingual_v2_rnnt"; sha256sum --check SHA256SUMS; echo '4c24acddcf2f81d512563067b40ca36d  multilingual_v2_rnnt.ckpt' | md5sum --check)
+      - name: Flex regression and official IPC
+        shell: bash
+        env:
+          GIGAAM_OFFICIAL_DIR: ${{ runner.temp }}/gigaam-official
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.100.0 --profile minimal
+          cd models/gigaam
+          (
+            cargo +1.100.0 test --locked --offline --release --no-default-features --features flex --test zapformer_service --test zapformer_parity --test ipc_worker_contract --test official_stream_ipc -- --test-threads=1
+            cargo +1.100.0 test --locked --offline --release --no-default-features --features flex --test official_stream_ipc -- --ignored --nocapture --test-threads=1
+          ) 2>&1 | tee "$RUNNER_TEMP/gigaam-streaming-regression.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gigaam-streaming-regression-log
+          path: ${{ runner.temp }}/gigaam-streaming-regression.log
+          if-no-files-found: warn
+          retention-days: 3
