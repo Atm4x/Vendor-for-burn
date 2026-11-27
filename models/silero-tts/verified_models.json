@@ -446,5 +446,53 @@
       "speaker": "aidar",
       "variant": "v5_ru_conditioned"
     }
+  },
+  {
+    "model_id": "lj_v2",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/en/v2_lj.pt",
+      "size_bytes": 136019894,
+      "sha256": "e3202323a4edfa6ba6bd90ac92d0beab9041afe3cd99bbef15d036feadb49fa5"
+    },
+    "smoke": {
+      "text": "Hello world.",
+      "speaker": "default",
+      "variant": "v2_tacotron2"
+    }
+  },
+  {
+    "model_id": "mykyta_v2",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/ua/v22_mykyta_48k.pt",
+      "size_bytes": 138963646,
+      "sha256": "75d7428b8f355412aa1b6811f4e9d866022208347cbddf0f12659f8c158e3c50"
+    },
+    "smoke": {
+      "text": "Привіт, світе!",
+      "speaker": "default",
+      "variant": "v2_tacotron2"
+    }
+  },
+  {
+    "model_id": "multi_v2",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/multi/v2_multi.pt",
+      "size_bytes": 136099826,
+      "sha256": "b535773eda9c0176166e6fc5b43aa302333dfeba7a836e70487d8dcffe59a0d0"
+    },
+    "smoke": {
+      "text": "Hello world.",
+      "speaker": "lj",
+      "variant": "v2_tacotron2"
+    }
   }
 ]

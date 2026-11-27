@@ -28,6 +28,7 @@ impl Default for TextOptions {
 }
 
 enum Session {
+    V2(Box<crate::v2::V2Tts>),
     Russian(Box<RussianTts>),
     V3(Box<crate::v3::V3Tts>),
     V4(Box<crate::v4::V4Tts>),
@@ -42,6 +43,7 @@ impl SileroTts {
         use silero_package::OfficialCheckpoint;
         let session = if path.is_file() {
             match OfficialCheckpoint::open(path)? {
+                OfficialCheckpoint::V2(checkpoint) => Session::V2(Box::new(crate::v2::V2Tts::load(checkpoint, device)?)),
                 OfficialCheckpoint::Russian(checkpoint) => Session::Russian(Box::new(RussianTts::from_official(checkpoint, device)?)),
                 OfficialCheckpoint::V5Plain(checkpoint) => Session::V5Plain(Box::new(crate::v5_plain::V5PlainTts::load(checkpoint, device)?)),
                 OfficialCheckpoint::V4(checkpoint) => Session::V4(Box::new(crate::v4::V4Tts::load(checkpoint, device)?)),
@@ -54,11 +56,12 @@ impl SileroTts {
     }
 
     pub fn variant(&self) -> &'static str {
-        match self.0 { Session::Russian(ref model) => if model.prosody != silero_package::RussianProsody::Legacy { "v5_ru_conditioned" } else { "v5_ru" }, Session::V3(_) => "v3_hifigan", Session::V4(_) => "v4_hifigan", Session::V5Plain(_) => "v5_convnext_plain" }
+        match self.0 { Session::V2(_) => "v2_tacotron2", Session::Russian(ref model) => if model.prosody != silero_package::RussianProsody::Legacy { "v5_ru_conditioned" } else { "v5_ru" }, Session::V3(_) => "v3_hifigan", Session::V4(_) => "v4_hifigan", Session::V5Plain(_) => "v5_convnext_plain" }
     }
 
     pub fn warmup_input(&self) -> Result<(String, String)> {
         match &self.0 {
+            Session::V2(model) => model.warmup_input(),
             Session::Russian(model) => {
                 let speaker = model.config.speakers.keys().next().context("no Russian warmup speaker")?;
                 Ok(("На двери замок.".into(), speaker.clone()))
@@ -77,8 +80,10 @@ impl SileroTts {
         match &self.0 { Session::Russian(model) => Ok(model), _ => anyhow::bail!("Operation requires the neural stress frontend") }
     }
 
+    pub fn sample_rates(&self) -> &[u32] { match &self.0 { Session::V2(model) => &model.rates, _ => &[8000,24000,48000] } }
+
     pub fn speakers(&self) -> impl Iterator<Item = &str> {
-        let speakers = match &self.0 { Session::Russian(model) => &model.config.speakers, Session::V3(model) => &model.config.speakers, Session::V4(model) => &model.speakers, Session::V5Plain(model) => &model.speakers };
+        let speakers = match &self.0 { Session::V2(model) => &model.speakers, Session::Russian(model) => &model.config.speakers, Session::V3(model) => &model.config.speakers, Session::V4(model) => &model.speakers, Session::V5Plain(model) => &model.speakers };
         speakers.keys().map(String::as_str).filter(|name| *name != "random")
     }
 
@@ -88,6 +93,7 @@ impl SileroTts {
 
     pub fn infer_text_with_options(&self, text: &str, speaker: &str, sample_rate: u32, flags: &TextOptions) -> Result<Vec<f32>> {
         match &self.0 {
+            Session::V2(model) => model.infer_text(text, speaker, sample_rate),
             Session::Russian(model) => model.infer_text_with_options(text, speaker, sample_rate, flags),
             Session::V3(model) => model.infer_text(text, speaker, sample_rate, flags),
             Session::V4(model) => model.infer_text(text, speaker, sample_rate, flags),
@@ -97,6 +103,7 @@ impl SileroTts {
 
     pub fn infer_token_ids(&self, symbols: &[i64], speaker: i64, sample_rate: u32) -> Result<Tensor<2>> {
         match &self.0 {
+            Session::V2(model) => model.infer_token_ids(symbols, speaker, sample_rate),
             Session::Russian(model) => model.infer_token_ids(symbols, speaker, sample_rate),
             Session::V3(model) => model.infer_token_ids(symbols, speaker, sample_rate),
             Session::V4(model) => model.infer_token_ids(symbols, speaker, sample_rate),

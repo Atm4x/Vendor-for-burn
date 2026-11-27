@@ -216,3 +216,45 @@ impl EnglishVocoder {
         Ok(pcm.reshape([batch, length]))
     }
 }
+
+/// Tacotron2 checkpoints use the same residual family, but a strided pre-convolution
+/// instead of V3's separate low-rate branch. Crop to the original mel-derived length.
+pub(crate) struct V2Vocoder {
+    pre: Conv,
+    low_weight: Tensor<3>,
+    low_bias: Tensor<1>,
+    stages: Vec<Stage>,
+    post: Conv,
+    high: Option<RateGraph>,
+    synthesis: Tensor<3>,
+    updown: Tensor<3>,
+    stride: usize,
+}
+impl V2Vocoder {
+    pub(crate) fn load(store:&TensorStore,rates:&[u32],device:&Device)->Result<Self>{
+        let stride=if rates.contains(&16000){2}else{3};
+        let pre=Conv::load(store,"vocoder.conv_pre.1",[128,512],7,1,device)?;
+        let low=Conv::load(store,"vocoder.conv_pre.0",[128,512],7,1,device)?;
+        let channels=[512,256,128,64];
+        let stages=[stride,5,5].into_iter().enumerate().map(|(i,s)|Stage::load(store,"",i,channels[i],channels[i+1],s,Activation::Leaky(0.1),device)).collect::<Result<_>>()?;
+        let post=Conv::load(store,"vocoder.conv_post",[64,4],7,1,device)?;
+        let high=if stride==3{Some(RateGraph::load(store,48000,false,device)?)}else{None};
+        let synthesis=store.float::<3>("vocoder.pqmf_layer.G",device)?;let updown=store.float::<3>("vocoder.pqmf_layer.updown_filter",device)?;
+        ensure!(synthesis.dims()==[1,4,63]&&updown.dims()==[4,4,4],"invalid V2 PQMF");
+        Ok(Self{pre,low_weight:low.weight,low_bias:low.bias,stages,post,high,synthesis,updown:updown*4.0,stride})
+    }
+    pub(crate) fn forward(&self,mel:Tensor<3>,rate:u32)->Result<Tensor<2>>{
+        let [batch,channels,frames]=mel.dims();ensure!(channels==128&&frames>0,"invalid V2 mel");
+        let x=if rate==48000{self.high.as_ref().ok_or_else(||anyhow::anyhow!("unsupported V2 rate"))?.forward(mel,false)}else{
+            let mut x=if rate==8000{conv1d(mel,self.low_weight.clone(),Some(self.low_bias.clone()),ConvOptions::new([self.stride],[3],[1],1))}else{self.pre.forward(mel)};
+            for (i,stage) in self.stages.iter().enumerate(){x=stage.forward(x,false,i);}
+            self.post.forward(leaky_relu(x,0.01))
+        };
+        let pcm=conv_transpose1d(x,self.updown.clone(),None,ConvTransposeOptions::new([4],[0],[0],[1],1));
+        let pcm=conv1d(pcm,self.synthesis.clone(),None,ConvOptions::new([1],[31],[1],1));
+        let peak:f32=pcm.clone().abs().max().into_scalar();ensure!(peak.is_finite(),"non-finite V2 PCM");
+        let pcm=if peak>1.0{pcm.tanh()}else{pcm};let target=frames*(rate as usize/80);
+        ensure!(pcm.dims()[2]>=target,"V2 vocoder output too short");
+        Ok(pcm.slice([0..batch,0..1,0..target]).reshape([batch,target]))
+    }
+}

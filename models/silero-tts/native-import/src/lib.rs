@@ -9,13 +9,15 @@ pub use layout::ArchiveLayout;
 mod v3_schema;
 mod v5_plain;
 mod v4;
+mod v2;
+pub use v2::{V2Checkpoint, encode_v2};
 mod ascii_accent;
 pub use ascii_accent::AsciiAccentCheckpoint;
 pub use v4::V4Checkpoint;
 pub use v5_plain::V5PlainCheckpoint;
 pub use russian::{RussianCheckpoint, RussianConfig, RussianTokenizer, RussianControls, RussianProsody};
 
-pub enum OfficialCheckpoint { V4(V4Checkpoint), V3(V3Checkpoint), Russian(RussianCheckpoint), V5Plain(V5PlainCheckpoint) }
+pub enum OfficialCheckpoint { V2(V2Checkpoint), V4(V4Checkpoint), V3(V3Checkpoint), Russian(RussianCheckpoint), V5Plain(V5PlainCheckpoint) }
 impl OfficialCheckpoint {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -25,8 +27,7 @@ impl OfficialCheckpoint {
         }
         let package = TorchPackageReader::open(path)?;
         let metadata = dictionary(package.metadata(), "model metadata")?;
-        if metadata.contains_key("speaker_to_id") { Ok(Self::V3(V3Checkpoint::from_package(package)?)) }
-        else if let Some(PickleValue::List(parts)) = metadata.get("packages") {
+        if let Some(PickleValue::List(parts)) = metadata.get("packages") {
             let part = parts.first().context("empty Silero V5 package")?;
             let fields = dictionary(part, "V5 package metadata")?;
             if matches!(fields.get("accentor"), Some(PickleValue::None)) {
@@ -36,6 +37,8 @@ impl OfficialCheckpoint {
             }
         }
         else if metadata.contains_key("speaker_to_ids") { Ok(Self::V4(V4Checkpoint::from_package(package)?)) }
+        else if matches!(metadata.get("symbols"), Some(PickleValue::String(s)) if s.starts_with("_~") && !s.starts_with("_~|")) { Ok(Self::V2(V2Checkpoint::from_package(package)?)) }
+        else if metadata.contains_key("speaker_to_id") { Ok(Self::V3(V3Checkpoint::from_package(package)?)) }
         else { bail!("unsupported Silero package architecture") }
     }
 }

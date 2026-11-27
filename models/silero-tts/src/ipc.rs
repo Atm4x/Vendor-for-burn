@@ -38,6 +38,7 @@ impl Worker {
         };
         json!({"phase": phase, "backend": self.backend, "gpu_id": self.gpu_id,
             "model_variant": self.session.as_ref().map(|s| s.model.variant()),
+            "sample_rates": self.session.as_ref().map(|s| s.model.sample_rates()),
             "speaker_names": self.session.as_ref().map(|s| s.model.speakers().collect::<Vec<_>>()),
             "successful_inferences": self.session.as_ref().map_or(0, |s| s.successful_inferences)})
     }
@@ -53,11 +54,12 @@ impl Worker {
                 "model_variants": [
                     {"id":"v5_ru", "inputs":["text","ssml","accented","symbol_durations"]},
                     {"id":"v5_ru_conditioned", "inputs":["text","accented"]},
+                    {"id":"v2_tacotron2", "inputs":["text"], "sample_rates":[8000,16000,24000,48000]},
                     {"id":"v3_hifigan", "inputs":["text"]},
                     {"id":"v4_hifigan", "inputs":["text"]},
                     {"id":"v5_convnext_plain", "inputs":["text"]}
                 ],
-                "sample_rates": [8000,24000,48000], "outputs": ["wav_pcm16"],
+                "sample_rates": [8000,16000,24000,48000], "outputs": ["wav_pcm16"],
                 "maximum_input_characters": crate::longform::MAX_INPUT_CHARS,
                 "maximum_output_seconds": crate::longform::MAX_AUDIO_SECONDS,
                 "cancel_supported": false,

@@ -17,6 +17,8 @@ pub mod transformer;
 pub mod predictors;
 pub mod acoustic;
 pub mod runtime;
+mod v2;
+mod tacotron;
 mod v3;
 mod v4;
 mod v5_plain;

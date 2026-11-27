@@ -8,7 +8,7 @@ pub enum ArchiveLayout { TtsPackage, TorchScript }
 impl ArchiveLayout {
     pub fn inspect(path: impl AsRef<Path>) -> Result<Self> {
         let file = File::open(path.as_ref()).context("open Silero checkpoint")?;
-        let archive = zip::ZipArchive::new(BufReader::new(file)).context("invalid Silero ZIP container")?;
+        let archive = zip::ZipArchive::with_config(zip::read::Config { archive_offset: zip::read::ArchiveOffset::Known(0) }, BufReader::new(file)).context("invalid Silero ZIP container")?;
         let names = archive.file_names().collect::<zip::result::ZipResult<Vec<_>>>()?;
         let packages: Vec<_> = names.iter().filter_map(|n| n.strip_suffix("tts_models/model"))
             .filter(|root| root.is_empty() || root.ends_with('/')).collect();

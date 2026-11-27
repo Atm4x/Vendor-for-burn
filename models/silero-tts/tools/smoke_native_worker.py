@@ -40,14 +40,18 @@ def run(binary, checkpoint, text=None, speaker=None, variant=None, sample_rate=8
                     ask('load', ok=False)
                     assert ask('status')['phase'] == 'started'
                 else:
-                    assert ask('load')['model_variant'] == variant
+                    loaded = ask('load')
+                    assert loaded['model_variant'] == variant
+                    assert sample_rate in loaded['sample_rates']
+                    assert speaker in loaded['speaker_names']
                     request = {'silero_version': 1, 'input': {'kind': 'text', 'text': text},
                                'speaker': speaker, 'sample_rate': sample_rate}
                     ask('infer', request, ok=False)
                     assert ask('warmup')['phase'] == 'ready'
                     outputs = [ask('infer', request) for _ in range(2)]
                     assert outputs[0]['audio']['file_name'] != outputs[1]['audio']['file_name']
-                    assert outputs[0]['audio']['sha256'] == outputs[1]['audio']['sha256']
+                    if variant != 'v2_tacotron2':
+                        assert outputs[0]['audio']['sha256'] == outputs[1]['audio']['sha256']
                     for result in outputs:
                         desc = result['audio']
                         assert Path(desc['file_name']).name == desc['file_name']

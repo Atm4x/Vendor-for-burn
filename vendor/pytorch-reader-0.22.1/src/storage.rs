@@ -137,7 +137,12 @@ impl ZipSource {
         // The stream gets a duplicate of the handle rather than an open of its own, so a
         // replacement of `path` cannot slip in between two opens. The duplicate shares the
         // cursor, which is why `file` is only ever read at explicit offsets.
-        let archive = ZipArchive::new(BufReader::new(file.try_clone()?))?;
+        let reader = BufReader::new(file.try_clone()?);
+        let archive = if package {
+            ZipArchive::with_config(zip::read::Config { archive_offset: zip::read::ArchiveOffset::Known(0) }, reader)?
+        } else {
+            ZipArchive::new(reader)?
+        };
 
         let root = archive
             .file_names()
