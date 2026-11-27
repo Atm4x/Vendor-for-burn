@@ -59,8 +59,7 @@ struct LstmLayer {
     bias: Tensor<1>,
 }
 impl LstmLayer {
-    fn load(w: &mut Weights, index: usize, device: &Device, hidden: usize) -> Result<Self> {
-        let base = "head.decoder.lstm";
+    fn load(w: &mut Weights, base: &str, index: usize, device: &Device, hidden: usize) -> Result<Self> {
         let weight_ih = w.tensor(&format!("{base}.weight_ih_l{index}"), device)?;
         let weight_hh = w.tensor(&format!("{base}.weight_hh_l{index}"), device)?;
         let b_ih: Tensor<1> = w.tensor(&format!("{base}.bias_ih_l{index}"), device)?;
@@ -102,14 +101,14 @@ struct PredictorState {
     c: Vec<Tensor<2>>,
 }
 impl Predictor {
-    fn load(w: &mut Weights, config: &RnntConfig, classes: usize, device: &Device) -> Result<Self> {
-        let embeddings = w.tensor("head.decoder.embed.weight", device)?;
+    fn load(w: &mut Weights, prefix: &str, config: &RnntConfig, classes: usize, device: &Device) -> Result<Self> {
+        let embeddings = w.checked_tensor(&format!("{prefix}.embed.weight"), [classes,config.pred_hidden], device)?;
         ensure!(
             embeddings.dims() == [classes, config.pred_hidden],
             "RNN-T embedding tensor mismatch"
         );
         let layers = (0..config.pred_rnn_layers)
-            .map(|idx| LstmLayer::load(w, idx, device, config.pred_hidden))
+            .map(|idx| LstmLayer::load(w, &format!("{prefix}.lstm"), idx, device, config.pred_hidden))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             embeddings,
@@ -157,12 +156,12 @@ struct Joint {
     output: Projection,
 }
 impl Joint {
-    fn load(w: &mut Weights, config: &Config, rnnt: &RnntConfig, device: &Device) -> Result<Self> {
-        let enc = Projection::load(w, "head.joint.enc", device)?;
-        let pred = Projection::load(w, "head.joint.pred", device)?;
-        let output = Projection::load(w, "head.joint.joint_net.1", device)?;
+    fn load(w: &mut Weights, prefix: &str, width: usize, classes: usize, rnnt: &RnntConfig, device: &Device) -> Result<Self> {
+        let enc = Projection::load(w, &format!("{prefix}.enc"), device)?;
+        let pred = Projection::load(w, &format!("{prefix}.pred"), device)?;
+        let output = Projection::load(w, &format!("{prefix}.joint_net.1"), device)?;
         ensure!(
-            enc.input_dim() == config.d_model && enc.output_dim() == rnnt.joint_hidden,
+            enc.input_dim() == width && enc.output_dim() == rnnt.joint_hidden,
             "RNN-T encoder projection mismatch"
         );
         ensure!(
@@ -170,7 +169,7 @@ impl Joint {
             "RNN-T predictor projection mismatch"
         );
         ensure!(
-            output.input_dim() == rnnt.joint_hidden && output.output_dim() == config.num_classes,
+            output.input_dim() == rnnt.joint_hidden && output.output_dim() == classes,
             "RNN-T joint classifier mismatch"
         );
         Ok(Self { enc, pred, output })
@@ -181,32 +180,81 @@ impl Joint {
     }
 }
 
-pub struct RnntModel {
-    encoder: EncoderModel,
+/// Encoder-independent RNN-T head; every decode owns its predictor state.
+pub struct RnntHead {
     predictor: Predictor,
     joint: Joint,
     classes: usize,
     max_symbols_per_step: usize,
 }
-impl RnntModel {
-    pub fn load(
-        w: &mut Weights,
-        config: Config,
-        rnnt: RnntConfig,
-        device: &Device,
-    ) -> Result<Self> {
-        config.validate()?;
+impl RnntHead {
+    pub fn load(w: &mut Weights, prefix: &str, width: usize, classes: usize, rnnt: &RnntConfig, device: &Device) -> Result<Self> {
         rnnt.validate()?;
-        let predictor = Predictor::load(w, &rnnt, config.num_classes, device)?;
-        let joint = Joint::load(w, &config, &rnnt, device)?;
-        let encoder = EncoderModel::load(w, config.clone(), device)?;
-        Ok(Self {
-            encoder,
-            predictor,
-            joint,
-            classes: config.num_classes,
-            max_symbols_per_step: rnnt.max_symbols_per_step,
-        })
+        ensure!(width > 0 && classes > 1, "invalid RNN-T head geometry");
+        let predictor = Predictor::load(w, &format!("{prefix}.decoder"), rnnt, classes, device)?;
+        let joint = Joint::load(w, &format!("{prefix}.joint"), width, classes, rnnt, device)?;
+        Ok(Self { predictor, joint, classes, max_symbols_per_step: rnnt.max_symbols_per_step })
+    }
+
+    pub fn decode_encoded(
+        &self,
+        encoded: Tensor<3>,
+        device: &Device,
+    ) -> Result<(Vec<usize>, Vec<usize>, usize)> {
+        let [batch, frames, dim] = encoded.dims();
+        ensure!(batch == 1, "RNN-T decoding expects one encoder sequence");
+        ensure!(dim == self.joint.enc.input_dim(), "RNN-T encoder width mismatch");
+        if frames == 0 { return Ok((Vec::new(), Vec::new(), 0)); }
+        let enc_proj = self.joint.enc.apply(encoded.reshape([frames, dim]));
+        let mut ids = Vec::new();
+        let mut token_frames = Vec::new();
+        let mut last_label = None;
+        let mut state: Option<PredictorState> = None;
+        let blank = self.classes - 1;
+        let mut prediction = None;
+        for frame in 0..frames {
+            let enc_frame = enc_proj
+                .clone()
+                .slice([frame..frame + 1, 0..self.joint.enc.output_dim()]);
+            for _ in 0..self.max_symbols_per_step {
+                if prediction.is_none() {
+                    prediction = Some(self.predictor.predict(last_label, state.as_ref(), device)?);
+                }
+                let (pred, _) = prediction.as_ref().unwrap();
+                let logits = self.joint.scores(enc_frame.clone(), pred.clone());
+                let values = logits
+                    .into_data()
+                    .try_to_vec::<f32>()
+                    .context("reading RNN-T probabilities")?;
+                let best = values
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1).then_with(|| b.0.cmp(&a.0)))
+                    .context("empty RNN-T joint output")?
+                    .0;
+                if best == blank {
+                    break;
+                }
+                ids.push(best);
+                token_frames.push(frame);
+                last_label = Some(best);
+                state = prediction.take().map(|(_, next)| next);
+            }
+        }
+        Ok((ids, token_frames, frames))
+    }
+}
+
+pub struct RnntModel {
+    encoder: EncoderModel,
+    head: RnntHead,
+}
+impl RnntModel {
+    pub fn load(w: &mut Weights, config: Config, rnnt: RnntConfig, device: &Device) -> Result<Self> {
+        config.validate()?;
+        let head = RnntHead::load(w, "head", config.d_model, config.num_classes, &rnnt, device)?;
+        let encoder = EncoderModel::load(w, config, device)?;
+        Ok(Self { encoder, head })
     }
 
     pub fn n_mels(&self) -> usize {
@@ -239,7 +287,7 @@ impl RnntModel {
         device: &Device,
     ) -> Result<(Vec<usize>, Vec<usize>, usize)> {
         let encoded = self.encoder.encode(features, device)?;
-        self.decode_encoded(encoded, device)
+        self.head.decode_encoded(encoded, device)
     }
 
     pub fn infer_ids_padded(
@@ -252,53 +300,12 @@ impl RnntModel {
         let mut results = Vec::with_capacity(batch);
         for (index, &frames) in lengths.iter().enumerate() {
             let sample = encoded.clone().slice([index..index + 1, 0..frames, 0..dim]);
-            results.push(self.decode_encoded(sample, device)?);
+            results.push(self.head.decode_encoded(sample, device)?);
         }
         Ok(results)
     }
 
-    fn decode_encoded(
-        &self,
-        encoded: Tensor<3>,
-        device: &Device,
-    ) -> Result<(Vec<usize>, Vec<usize>, usize)> {
-        let [batch, frames, dim] = encoded.dims();
-        ensure!(batch == 1, "RNN-T decoding expects one encoder sequence");
-        let enc_proj = self.joint.enc.apply(encoded.reshape([frames, dim]));
-        let mut ids = Vec::new();
-        let mut token_frames = Vec::new();
-        let mut last_label = None;
-        let mut state: Option<PredictorState> = None;
-        let blank = self.classes - 1;
-        for frame in 0..frames {
-            let enc_frame = enc_proj
-                .clone()
-                .slice([frame..frame + 1, 0..self.joint.enc.output_dim()]);
-            for _ in 0..self.max_symbols_per_step {
-                let (pred, proposed_state) =
-                    self.predictor.predict(last_label, state.as_ref(), device)?;
-                let logits = self.joint.scores(enc_frame.clone(), pred);
-                let values = logits
-                    .into_data()
-                    .try_to_vec::<f32>()
-                    .context("reading RNN-T probabilities")?;
-                let best = values
-                    .iter()
-                    .enumerate()
-                    .max_by(|a, b| a.1.total_cmp(b.1).then_with(|| b.0.cmp(&a.0)))
-                    .context("empty RNN-T joint output")?
-                    .0;
-                if best == blank {
-                    break;
-                }
-                ids.push(best);
-                token_frames.push(frame);
-                last_label = Some(best);
-                state = Some(proposed_state);
-            }
-        }
-        Ok((ids, token_frames, frames))
-    }
+
 }
 
 #[cfg(all(test, any(feature = "cpu", feature = "flex")))]

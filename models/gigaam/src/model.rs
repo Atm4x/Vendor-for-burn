@@ -130,7 +130,7 @@ fn subsampled_lengths(lengths: &mut [usize], kernel: usize) {
     }
 }
 
-struct Linear {
+pub(crate) struct Linear {
     weight: Tensor<2>,
     bias: Option<Tensor<1>>,
 }
@@ -144,7 +144,13 @@ impl Linear {
         };
         Ok(Self { weight, bias })
     }
-    fn forward(&self, x: Tensor<3>) -> Tensor<3> {
+    pub(crate) fn load_checked(w: &mut Weights, key: &str, d: &Device, inputs: usize, outputs: usize) -> Result<Self> {
+        Ok(Self {
+            weight: w.checked_tensor(&format!("{key}.weight"), [outputs, inputs], d)?,
+            bias: Some(w.checked_tensor(&format!("{key}.bias"), [outputs], d)?),
+        })
+    }
+    pub(crate) fn forward(&self, x: Tensor<3>) -> Tensor<3> {
         let [batch, time, features] = x.dims();
         let [outputs, inputs] = self.weight.dims();
         assert_eq!(features, inputs);
@@ -754,23 +760,38 @@ impl EncoderModel {
     }
 }
 
+/// Encoder-independent CTC projection; the checkpoint stores a 1x1 convolution.
+pub struct CtcHead {
+    weight: Tensor<3>,
+    bias: Tensor<1>,
+    num_classes: usize,
+    width: usize,
+}
+impl CtcHead {
+    pub fn load(w: &mut Weights, prefix: &str, width: usize, num_classes: usize, device: &Device) -> Result<Self> {
+        ensure!(width > 0 && num_classes > 1,"invalid CTC head geometry");
+        let key = format!("{prefix}.decoder_layers.0");
+        Ok(Self {
+            weight: w.checked_tensor(&format!("{key}.weight"), [num_classes,width,1],device)?,
+            bias: w.checked_tensor(&format!("{key}.bias"), [num_classes],device)?,
+            num_classes, width,
+        })
+    }
+    pub fn logits(&self, encoded: Tensor<3>) -> Result<Tensor<3>> {
+        ensure!(encoded.dims()[2] == self.width,"CTC encoder width mismatch");
+        Ok(module::conv1d(encoded.swap_dims(1,2),self.weight.clone(),Some(self.bias.clone()),ConvOptions::new([1],[0],[1],1)).swap_dims(1,2))
+    }
+    pub fn num_classes(&self) -> usize {self.num_classes}
+}
+
 pub struct CtcModel {
     encoder: EncoderModel,
-    head: Conv1,
-    num_classes: usize,
+    head: CtcHead,
 }
 impl CtcModel {
     pub fn load(w: &mut Weights, config: Config, device: &Device) -> Result<Self> {
-        let head = Conv1::load(w, "head.decoder_layers.0", device, 1, 0, 1)?;
-        ensure!(
-            head.w.dims()[0] == config.num_classes,
-            "CTC head classes mismatch"
-        );
-        Ok(Self {
-            encoder: EncoderModel::load(w, config.clone(), device)?,
-            head,
-            num_classes: config.num_classes,
-        })
+        let head = CtcHead::load(w,"head",config.d_model,config.num_classes,device)?;
+        Ok(Self { encoder: EncoderModel::load(w,config,device)?, head })
     }
 
     pub fn encode(&self, features: &Features, device: &Device) -> Result<Tensor<3>> {
@@ -779,12 +800,9 @@ impl CtcModel {
 
     pub fn infer_logits(&self, features: &Features, device: &Device) -> Result<(Vec<f32>, usize)> {
         let encoded = self.encoder.encode(features, device)?;
-        let logits = self
-            .head
-            .forward(encoded.permute([0, 2, 1]))
-            .permute([0, 2, 1]);
+        let logits = self.head.logits(encoded)?;
         let [_, out_t, classes] = logits.dims();
-        ensure!(classes == self.num_classes, "CTC class mismatch");
+        ensure!(classes == self.head.num_classes(), "CTC class mismatch");
         let values = logits
             .into_data()
             .try_to_vec::<f32>()
@@ -807,13 +825,10 @@ impl CtcModel {
     ) -> Result<(Vec<Vec<f32>>, Vec<usize>)> {
         let (encoded, lengths) = self.encoder.encode_padded(features, device)?;
         let [batch, _, _] = encoded.dims();
-        let logits = self
-            .head
-            .forward(encoded.permute([0, 2, 1]))
-            .permute([0, 2, 1]);
+        let logits = self.head.logits(encoded)?;
         let [_, time, classes] = logits.dims();
         ensure!(
-            batch == features.len() && classes == self.num_classes,
+            batch == features.len() && classes == self.head.num_classes(),
             "batched CTC tensor dimensions mismatch"
         );
         let values = logits.into_data().try_to_vec::<f32>()?;

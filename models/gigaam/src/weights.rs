@@ -97,6 +97,14 @@ impl Weights {
         }
     }
 
+    pub(crate) fn checked_tensor<const D: usize>(
+        &mut self, name: &str, expected: [usize; D], device: &Device,
+    ) -> Result<Tensor<D>> {
+        let (shape, values) = self.values(name)?;
+        ensure!(shape == expected, "{name}: expected shape {expected:?}, got {shape:?}");
+        Ok(Tensor::from_data(TensorData::new(values, expected), device))
+    }
+
     pub fn tensor<const D: usize>(&mut self, name: &str, device: &Device) -> Result<Tensor<D>> {
         let (shape, values) = self.values(name)?;
         ensure!(

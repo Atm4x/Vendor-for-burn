@@ -9,7 +9,7 @@ pub const FFT_SIZE: usize = 400;
 pub const HOP: usize = 160;
 
 /// Reference-compatible audio decoder: matches Python `load_audio` by asking
-/// FFmpeg for mono 16-kHz signed PCM16, then scaling samples by 32768.0.
+/// FFmpeg for mono 16-kHz float32 PCM, preserving sub-PCM16 precision.
 /// FFmpeg must be installed and discoverable in PATH.
 pub fn load_audio_ffmpeg_16k(path: &Path) -> Result<Vec<f32>> {
     let output = std::process::Command::new("ffmpeg")
@@ -17,11 +17,11 @@ pub fn load_audio_ffmpeg_16k(path: &Path) -> Result<Vec<f32>> {
         .arg(path)
         .args([
             "-f",
-            "s16le",
+            "f32le",
             "-ac",
             "1",
             "-acodec",
-            "pcm_s16le",
+            "pcm_f32le",
             "-ar",
             "16000",
             "-",
@@ -35,14 +35,14 @@ pub fn load_audio_ffmpeg_16k(path: &Path) -> Result<Vec<f32>> {
         String::from_utf8_lossy(&output.stderr).trim()
     );
     ensure!(
-        !output.stdout.is_empty() && output.stdout.len() % 2 == 0,
-        "FFmpeg returned empty or truncated PCM16 audio"
+        !output.stdout.is_empty() && output.stdout.len() % 4 == 0,
+        "FFmpeg returned empty or truncated Float32 audio"
     );
-    Ok(output
-        .stdout
-        .chunks_exact(2)
-        .map(|pair| i16::from_le_bytes([pair[0], pair[1]]) as f32 / 32768.0)
-        .collect())
+    let samples = output.stdout.chunks_exact(4)
+        .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    ensure!(samples.iter().all(|x| x.is_finite()), "FFmpeg returned non-finite PCM");
+    Ok(samples)
 }
 
 pub fn load_wav_16k(path: &Path) -> Result<Vec<f32>> {
@@ -249,13 +249,31 @@ fn htk_mel_to_hz(mel: f32) -> f32 {
     700.0 * (10f32.powf(mel / 2595.0) - 1.0)
 }
 
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MelScale {
+    #[default]
+    Htk,
+    Slaney,
+}
+
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MelNorm {
+    Slaney,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(default)]
 pub struct MelConfig {
     pub n_fft: usize,
     pub win_length: usize,
     pub hop_length: usize,
     pub center: bool,
+    pub lowfreq: f32,
+    pub highfreq: Option<f32>,
+    pub mel_scale: MelScale,
+    pub mel_norm: Option<MelNorm>,
 }
 
 impl Default for MelConfig {
@@ -265,11 +283,35 @@ impl Default for MelConfig {
             win_length: FFT_SIZE,
             hop_length: HOP,
             center: true,
+            lowfreq: 0.0,
+            highfreq: None,
+            mel_scale: MelScale::Htk,
+            mel_norm: None,
         }
     }
 }
 
 impl MelConfig {
+    pub fn from_upstream(pre: &serde_json::Value) -> Result<Self> {
+        ensure!(pre.is_object(), "preprocessor must be an object");
+        let rate = pre.get("sample_rate").map_or(Ok(SAMPLE_RATE as u64), |v| {
+            v.as_u64().context("invalid preprocessor.sample_rate")
+        })?;
+        ensure!(rate == SAMPLE_RATE as u64, "only 16000 Hz is supported");
+        if let Some(target) = pre.get("_target_") {
+            ensure!(target.as_str() == Some("gigaam.preprocess.FeatureExtractor"), "unsupported preprocessor target: {target}");
+        }
+        for (name, expected) in [("pad", 0.0), ("power", 2.0), ("f_min", 0.0), ("f_max", 8000.0)] {
+            if let Some(v) = pre.get(name) {
+                ensure!((name == "f_max" && v.is_null()) || v.as_f64() == Some(expected), "unsupported preprocessor.{name}; use upstream lowfreq/highfreq fields");
+            }
+        }
+        ensure!(pre.get("norm").is_none_or(serde_json::Value::is_null), "use upstream mel_norm, not norm");
+        let config: Self = serde_json::from_value(pre.clone()).context("invalid log-mel configuration")?;
+        config.validate()?;
+        Ok(config)
+    }
+
     pub fn validate(&self) -> Result<()> {
         ensure!(
             self.n_fft >= 2 && self.n_fft <= 8192,
@@ -283,24 +325,57 @@ impl MelConfig {
             self.hop_length >= 1 && self.hop_length <= 8192,
             "invalid hop_length"
         );
+        let high = self.highfreq.unwrap_or(SAMPLE_RATE as f32 / 2.0);
+        ensure!(self.lowfreq.is_finite() && high.is_finite() && self.lowfreq >= 0.0 && high > self.lowfreq && high <= SAMPLE_RATE as f32 / 2.0, "invalid mel frequency range");
         Ok(())
+    }
+
+    /// Physical STFT width, which can differ from upstream FeatureExtractor.out_len.
+    pub fn stft_frames(&self, samples: usize) -> usize {
+        let padding = if self.center { 2 * (self.n_fft / 2) } else { 0 };
+        samples.saturating_add(padding).checked_sub(self.n_fft).map_or(0, |n| n / self.hop_length + 1)
+    }
+
+    /// Upstream uses win_length, not n_fft, for uncentered reported lengths.
+    pub fn reported_frames(&self, samples: usize) -> usize {
+        if self.center { samples / self.hop_length + 1 }
+        else { samples.checked_sub(self.win_length).map_or(0, |n| n / self.hop_length + 1) }
     }
 }
 
-fn mel_weights(n_mels: usize, n_fft: usize) -> Vec<f32> {
+fn slaney_hz_to_mel(freq: f32) -> f32 {
+    if freq < 1000.0 { freq / (200.0 / 3.0) }
+    else { 15.0 + (freq / 1000.0).ln() / (6.4f32.ln() / 27.0) }
+}
+
+fn slaney_mel_to_hz(mel: f32) -> f32 {
+    if mel < 15.0 { mel * (200.0 / 3.0) }
+    else { 1000.0 * ((6.4f32.ln() / 27.0) * (mel - 15.0)).exp() }
+}
+
+fn mel_weights(n_mels: usize, config: MelConfig) -> Vec<f32> {
+    let n_fft = config.n_fft;
     let bins = n_fft / 2 + 1;
-    let low = htk_hz_to_mel(0.0);
-    let high = htk_hz_to_mel(SAMPLE_RATE as f32 / 2.0);
+    let (to_mel, to_hz): (fn(f32) -> f32, fn(f32) -> f32) = match config.mel_scale {
+        MelScale::Htk => (htk_hz_to_mel, htk_mel_to_hz),
+        MelScale::Slaney => (slaney_hz_to_mel, slaney_mel_to_hz),
+    };
+    let low = to_mel(config.lowfreq);
+    let high = to_mel(config.highfreq.unwrap_or(SAMPLE_RATE as f32 / 2.0));
     let mel_points: Vec<f32> = (0..(n_mels + 2))
-        .map(|i| htk_mel_to_hz(low + (high - low) * i as f32 / (n_mels + 1) as f32))
+        .map(|i| to_hz(low + (high - low) * i as f32 / (n_mels + 1) as f32))
         .collect();
     let mut weights = vec![0f32; n_mels * bins];
     for m in 0..n_mels {
+        let norm = match config.mel_norm {
+            None => 1.0,
+            Some(MelNorm::Slaney) => 2.0 / (mel_points[m + 2] - mel_points[m]),
+        };
         for k in 0..bins {
-            let f = k as f32 * SAMPLE_RATE as f32 / n_fft as f32;
+            let f = k as f32 * (SAMPLE_RATE as f32 / 2.0) / (bins - 1) as f32;
             let lo = (f - mel_points[m]) / (mel_points[m + 1] - mel_points[m]);
             let hi = (mel_points[m + 2] - f) / (mel_points[m + 2] - mel_points[m + 1]);
-            weights[m * bins + k] = lo.min(hi).max(0.0);
+            weights[m * bins + k] = lo.min(hi).max(0.0) * norm;
         }
     }
     weights
@@ -339,13 +414,9 @@ pub fn log_mel_with_config(samples: &[f32], n_mels: usize, config: MelConfig) ->
         "audio contains non-finite PCM samples"
     );
     ensure!((1..=256).contains(&n_mels), "n_mels outside 1..=256");
-    let frames = if config.center {
-        samples.len() / hop + 1
-    } else {
-        (samples.len() - n_fft) / hop + 1
-    };
+    let frames = config.stft_frames(samples.len());
     let bins = n_fft / 2 + 1;
-    let weights = mel_weights(n_mels, n_fft);
+    let weights = mel_weights(n_mels, config);
     let mut data = vec![0f32; n_mels * frames];
     let window_start = (n_fft - config.win_length) / 2;
     let mut hann = vec![0.0f32; n_fft];
@@ -638,6 +709,7 @@ mod tests {
             win_length: 320,
             hop_length: 160,
             center: false,
+            ..MelConfig::default()
         };
         assert!(log_mel_with_config(&vec![0.0; 319], 64, config).is_err());
         assert_eq!(

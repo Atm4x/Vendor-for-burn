@@ -1,0 +1,162 @@
+[
+  {
+    "file": "causal_swish.safetensors",
+    "config": {
+      "_target_": "gigaam.encoder.ZapformerEncoder",
+      "in_channels": 8,
+      "frontend_channels": [
+        2,
+        2,
+        4
+      ],
+      "embed_dim": 8,
+      "encoder_dim": [
+        8,
+        12
+      ],
+      "downsampling_factor": [
+        1,
+        2
+      ],
+      "num_encoder_layers": [
+        1,
+        2
+      ],
+      "num_heads": [
+        2,
+        3
+      ],
+      "query_head_dim": [
+        4,
+        4
+      ],
+      "value_head_dim": [
+        3,
+        2
+      ],
+      "feedforward_multiple": 2,
+      "conv_params": [
+        3,
+        0
+      ],
+      "causal_frontend": true,
+      "dual_mode": true,
+      "chunk_size": [
+        -1,
+        4,
+        8,
+        16
+      ],
+      "window_size": [
+        [
+          -1,
+          -1
+        ],
+        [
+          32,
+          0
+        ],
+        [
+          32,
+          0
+        ],
+        [
+          32,
+          0
+        ]
+      ],
+      "max_seq_len": 32,
+      "activation": "swish"
+    },
+    "lengths": [
+      35,
+      29,
+      0
+    ],
+    "output_lengths": [
+      9,
+      8,
+      0
+    ]
+  },
+  {
+    "file": "noncausal_silu.safetensors",
+    "config": {
+      "_target_": "gigaam.encoder.ZapformerEncoder",
+      "in_channels": 8,
+      "frontend_channels": [
+        2,
+        2,
+        4
+      ],
+      "embed_dim": 8,
+      "encoder_dim": [
+        8,
+        12
+      ],
+      "downsampling_factor": [
+        1,
+        2
+      ],
+      "num_encoder_layers": [
+        1,
+        2
+      ],
+      "num_heads": [
+        2,
+        3
+      ],
+      "query_head_dim": [
+        4,
+        4
+      ],
+      "value_head_dim": [
+        3,
+        2
+      ],
+      "feedforward_multiple": 2,
+      "conv_params": [
+        3,
+        0
+      ],
+      "causal_frontend": false,
+      "dual_mode": true,
+      "chunk_size": [
+        -1,
+        4,
+        8,
+        16
+      ],
+      "window_size": [
+        [
+          -1,
+          -1
+        ],
+        [
+          32,
+          0
+        ],
+        [
+          32,
+          0
+        ],
+        [
+          32,
+          0
+        ]
+      ],
+      "max_seq_len": 32,
+      "activation": "silu"
+    },
+    "lengths": [
+      35,
+      29,
+      0
+    ],
+    "output_lengths": [
+      9,
+      8,
+      0
+    ]
+  }
+]

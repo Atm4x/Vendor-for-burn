@@ -8,6 +8,7 @@ pub mod service;
 pub mod text;
 pub mod tokenizer;
 pub mod weights;
+pub mod zapformer;
 
 use anyhow::{Context, Result, bail, ensure};
 use audio::{
@@ -158,49 +159,11 @@ impl ModelManifest {
                     .with_context(|| format!("invalid string for {key}"))
             })
         };
-        let sample_rate = field(pre, "sample_rate", 16000)?;
+        let mel = MelConfig::from_upstream(pre)?;
         ensure!(
-            sample_rate == audio::SAMPLE_RATE as usize,
-            "preprocessor sample_rate={sample_rate} not supported (only 16000 Hz)"
+            (mel.center && mel.n_fft % 2 == 0) || (!mel.center && mel.win_length == mel.n_fft),
+            "legacy encoder cannot represent differing physical and reported mel lengths"
         );
-        let mel = MelConfig {
-            n_fft: field(pre, "n_fft", 400)?,
-            hop_length: field(pre, "hop_length", 160)?,
-            win_length: field(pre, "win_length", 400)?,
-            center: pre.get("center").map_or(Ok(true), |v| {
-                v.as_bool().context("preprocessor.center must be a boolean")
-            })?,
-        };
-        mel.validate()?;
-        ensure!(
-            field(pre, "pad", 0)? == 0,
-            "preprocessor.pad is not supported"
-        );
-        for (name, expected) in [("f_min", 0.0), ("f_max", 8000.0), ("power", 2.0)] {
-            if let Some(value) = pre.get(name) {
-                ensure!(
-                    (value.is_null() && name == "f_max") || value.as_f64() == Some(expected),
-                    "preprocessor.{name} is not supported by native log-mel"
-                );
-            }
-        }
-        for name in ["norm", "mel_norm"] {
-            ensure!(
-                pre.get(name).is_none_or(serde_json::Value::is_null),
-                "preprocessor.{name} not supported by native log-mel"
-            );
-        }
-        ensure!(
-            pre.get("mel_scale")
-                .is_none_or(|v| v.as_str() == Some("htk")),
-            "preprocessor.mel_scale must be HTK"
-        );
-        if let Some(target) = pre.get("_target_").and_then(|v| v.as_str()) {
-            ensure!(
-                target == "gigaam.preprocess.FeatureExtractor",
-                "unsupported preprocessor target: {target}"
-            );
-        }
         if let Some(target) = encoder.get("_target_").and_then(|v| v.as_str()) {
             ensure!(
                 target == "gigaam.encoder.ConformerEncoder",
@@ -408,7 +371,11 @@ impl TimedTranscription {
 /// Build a native inference manifest from an original PyTorch checkpoint's
 /// OmegaConf metadata without launching Python or writing a sidecar file.
 pub fn inspect_native_manifest(path: &Path) -> Result<serde_json::Value> {
-    serde_json::to_value(ModelManifest::from_checkpoint(path)?).map_err(Into::into)
+    let metadata = checkpoint_config::read_checkpoint_metadata(path)?;
+    if metadata.config["encoder"]["_target_"].as_str() == Some("gigaam.encoder.ZapformerEncoder") {
+        return Ok(serde_json::to_value(zapformer::config::CheckpointConfig::from_upstream(&metadata.config)?)?);
+    }
+    serde_json::to_value(ModelManifest::from_upstream_values(metadata.config, path, metadata.base_model_name.as_deref())?).map_err(Into::into)
 }
 
 impl GigaAm {
@@ -1279,7 +1246,8 @@ mod tests {
                 n_fft: 320,
                 win_length: 320,
                 hop_length: 160,
-                center: false
+                center: false,
+                ..MelConfig::default()
             }
         );
         let mut bad = base.clone();

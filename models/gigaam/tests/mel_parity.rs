@@ -38,6 +38,7 @@ fn log_mel_matches_official_v3_uncentered_torchaudio() {
         win_length: 320,
         hop_length: 160,
         center: false,
+        ..MelConfig::default()
     };
     let calculated = log_mel_with_config(&audio, 64, config).unwrap();
     assert_eq!(calculated.frames, 26);
@@ -67,6 +68,7 @@ fn log_mel_matches_torchaudio_when_window_is_shorter_than_fft() {
         win_length: 320,
         hop_length: 160,
         center: false,
+        ..MelConfig::default()
     };
     let calculated = log_mel_with_config(&audio, 64, config).unwrap();
     assert_eq!(calculated.frames, 25);
@@ -81,4 +83,31 @@ fn log_mel_matches_torchaudio_when_window_is_shorter_than_fft() {
         max_error < 0.003,
         "padded-window max log-mel error: {max_error}"
     );
+}
+
+#[test]
+fn log_mel_matches_torchaudio_slaney_odd_fft() {
+    use gigaam_rs::audio::{MelConfig, MelNorm, MelScale, log_mel_with_config};
+    let audio = floats(include_bytes!("fixtures/log_mel_input_16k.f32"));
+    let expected = floats(include_bytes!("fixtures/log_mel_slaney_odd.f32"));
+    let config = MelConfig {
+        n_fft: 321,
+        win_length: 319,
+        hop_length: 160,
+        center: true,
+        lowfreq: 80.0,
+        highfreq: Some(7200.0),
+        mel_scale: MelScale::Slaney,
+        mel_norm: Some(MelNorm::Slaney),
+    };
+    let calculated = log_mel_with_config(&audio, 16, config).unwrap();
+    assert_eq!(calculated.values.len(), expected.len());
+    let max = calculated
+        .values
+        .iter()
+        .zip(expected)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!("Slaney/odd FFT: max={max:.8e}");
+    assert!(max < 0.003);
 }
