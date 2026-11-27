@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        group: [v3, v2, v5]
+        group: [v2a, v2b, v5a, v5b, v5c]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -28,7 +28,7 @@ jobs:
           out=pathlib.Path(os.environ["RUNNER_TEMP"])/"models"
           out.mkdir()
           cat=json.loads(pathlib.Path("models/silero-tts/official_catalogue.json").read_text())
-          choices={"v3":["v3_1_ru","ru_v3","v3_xal","v3_tt","v3_uz","v3_ua"],"v2":["aidar_v2","lj_v2","mykyta_v2","multi_v2"],"v5":["v5_caucasian","v5_cis_ext","v5_1_ru","v5_2_ru","v5_3_ru","v5_4_ru","v5_5_ru"]}[os.environ["GROUP"]]
+          choices={"v2a":["aidar_v2","lj_v2"],"v2b":["mykyta_v2","multi_v2"],"v5a":["v5_caucasian","v5_cis_ext"],"v5b":["v5_1_ru","v5_2_ru","v5_3_ru"],"v5c":["v5_4_ru","v5_5_ru"]}[os.environ["GROUP"]]
           def get(x):
               name=x["model_id"]
               if name not in choices: return
