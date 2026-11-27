@@ -10,7 +10,7 @@ use burn::tensor::{
     Bool, Device, Tensor, TensorData, activation, module,
     ops::{ConvOptions, PadMode},
 };
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 struct RopeTable {
     cos: Tensor<4>,
@@ -375,7 +375,7 @@ impl Stack {
         residual: Tensor<3>,
         lengths: &[usize],
         rope: &(Tensor<4>, Tensor<4>),
-        condition: Option<&LanguageRequest<'_>>,
+        condition: Option<&LanguageRequest>,
         layer_offset: usize,
     ) -> Tensor<3> {
         let [b, t, width] = residual.dims();
@@ -409,7 +409,7 @@ impl Stack {
                 .matmul(self.proj.clone())
                 .reshape([b, t, width])
     }
-    fn stream(&self, residual: Tensor<3>, caches: &mut [LayerCache], geometry: &StreamGeometry, condition: Option<&LanguageRequest<'_>>, layer_offset: usize) -> Tensor<3> {
+    fn stream(&self, residual: Tensor<3>, caches: &mut [LayerCache], geometry: &StreamGeometry, condition: Option<&LanguageRequest>, layer_offset: usize) -> Tensor<3> {
         let [b,t,width] = residual.dims();
         let [dim,_] = self.proj.dims();
         let projected = residual.clone().reshape([b*t,width]).matmul(self.proj.clone().transpose()).reshape([b,t,dim]);
@@ -426,8 +426,8 @@ impl Stack {
 }
 
 /// Owns bounded per-layer caches and the unfinished feature packet. No model weights are copied.
-pub struct ZapformerEncoderStream<'a> {
-    encoder: &'a ZapformerEncoder,
+pub struct ZapformerEncoderStream {
+    encoder: Arc<ZapformerEncoder>,
     chunk: usize,
     left: usize,
     window: [i64;2],
@@ -438,7 +438,7 @@ pub struct ZapformerEncoderStream<'a> {
     finished: bool,
 }
 
-impl ZapformerEncoderStream<'_> {
+impl ZapformerEncoderStream {
     pub fn position(&self) -> usize { self.position }
     pub fn pending_frames(&self) -> usize { self.pending.as_ref().map_or(0, |t| t.dims()[1]) }
     pub fn finished(&self) -> bool { self.finished }
@@ -448,7 +448,7 @@ impl ZapformerEncoderStream<'_> {
         self.push_conditioned(features,final_packet,None)
     }
 
-    pub(super) fn push_conditioned(&mut self, features: Option<Tensor<3>>, final_packet: bool, condition: Option<&LanguageRequest<'_>>) -> Result<Option<Tensor<3>>> {
+    pub(super) fn push_conditioned(&mut self, features: Option<Tensor<3>>, final_packet: bool, condition: Option<&LanguageRequest>) -> Result<Option<Tensor<3>>> {
         ensure!(!self.finished, "encoder stream has already been finalized");
         if let Some(features) = features {
             let [batch,time,mel] = features.dims();
@@ -469,7 +469,8 @@ impl ZapformerEncoderStream<'_> {
         let padding = (packet_frames-count%packet_frames)%packet_frames;
         if padding>0 { input = input.pad([(0,padding),(0,0)],PadMode::Constant(0.0)); }
         let (frontend,length) = self.encoder.frontend.forward_stream(input,count,&mut self.frontend)?;
-        let encoded = self.encoder.stream_chunk(frontend,length,self,condition)?;
+        let encoder = Arc::clone(&self.encoder);
+        let encoded = encoder.stream_chunk(frontend,length,self,condition)?;
         self.position = self.position.checked_add(length).context("stream position overflow")?;
         self.finished = final_packet;
         let dim = encoded.dims()[2];
@@ -494,7 +495,7 @@ pub struct ZapformerEncoder {
     out_eps: f32,
 }
 impl ZapformerEncoder {
-    pub fn load(w: &mut Weights, key: &str, d: &Device, config: ZapformerConfig) -> Result<Self> {
+    pub fn load(w: &mut Weights, key: &str, d: &Device, config: ZapformerConfig) -> Result<Arc<Self>> {
         config.validate()?;
         ensure!(
             config.supports_full_context(),
@@ -528,24 +529,24 @@ impl ZapformerEncoder {
             out_eps != 0.0,
             "output normalization epsilon cannot be zero"
         );
-        Ok(Self {
+        Ok(Arc::new(Self {
             frontend,
             config,
             stacks,
             ropes,
             out_scale,
             out_eps,
-        })
+        }))
     }
 
-    pub fn start_stream(&self, chunk: usize, left: usize) -> Result<ZapformerEncoderStream<'_>> {
+    pub fn start_stream(self: &Arc<Self>, chunk: usize, left: usize) -> Result<ZapformerEncoderStream> {
         ensure!(self.config.causal_frontend && chunk>0, "streaming requires causal frontend and positive context");
         let window = self.config.contexts.iter().find(|m| usize::try_from(m.chunk_size).ok()==Some(chunk)).context("unsupported streaming chunk size")?.window;
         ensure!(self.stacks.iter().all(|s| chunk%s.factor==0 && left/s.factor+chunk/s.factor<=self.config.max_seq_len), "invalid streaming context geometry");
-        Ok(ZapformerEncoderStream { encoder:self,chunk,left,window,pending:None,frontend:Vec::new(),layers:(0..self.stacks.iter().map(|s|s.layers.len()).sum()).map(|_|LayerCache::default()).collect(),position:0,finished:false })
+        Ok(ZapformerEncoderStream { encoder:Arc::clone(self),chunk,left,window,pending:None,frontend:Vec::new(),layers:(0..self.stacks.iter().map(|s|s.layers.len()).sum()).map(|_|LayerCache::default()).collect(),position:0,finished:false })
     }
 
-    fn stream_chunk(&self,mut x: Tensor<3>,length: usize,state:&mut ZapformerEncoderStream<'_>,condition:Option<&LanguageRequest<'_>>) -> Result<Tensor<3>> {
+    fn stream_chunk(&self,mut x: Tensor<3>,length: usize,state:&mut ZapformerEncoderStream,condition:Option<&LanguageRequest>) -> Result<Tensor<3>> {
         let [b,original,embed] = x.dims();
         ensure!(b==1 && length<=original,"invalid stream geometry");
         let device=x.device();
@@ -591,7 +592,7 @@ impl ZapformerEncoder {
         &self,
         features: Tensor<3>,
         lengths: &[usize],
-        condition: Option<&LanguageRequest<'_>>,
+        condition: Option<&LanguageRequest>,
     ) -> Result<(Tensor<3>, Vec<usize>)> {
         let (x, lengths) = self.frontend.forward(features, lengths)?;
         Ok((
@@ -608,7 +609,7 @@ impl ZapformerEncoder {
         &self,
         mut x: Tensor<3>,
         lengths: &[usize],
-        condition: Option<&LanguageRequest<'_>>,
+        condition: Option<&LanguageRequest>,
     ) -> Result<Tensor<3>> {
         let [b, original, embed] = x.dims();
         ensure!(

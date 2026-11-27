@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail, ensure};
 use burn::tensor::{Device, Tensor, TensorData, activation};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LanguageConfig {
@@ -203,8 +203,8 @@ pub struct LanguageConditioner {
     fusion: Option<Fusion>,
 }
 
-pub struct LanguageRequest<'a> {
-    owner: &'a LanguageConditioner,
+pub struct LanguageRequest {
+    owner: Arc<LanguageConditioner>,
     embedding: Tensor<2>,
 }
 
@@ -214,7 +214,7 @@ impl LanguageConditioner {
         config: LanguageConfig,
         encoder: &ZapformerConfig,
         d: &Device,
-    ) -> Result<Self> {
+    ) -> Result<Arc<Self>> {
         let embedding = w.checked_tensor(
             "language_embedding.weight",
             [config.num_slots, config.embedding_dim],
@@ -260,19 +260,19 @@ impl LanguageConditioner {
                 })
             })
             .transpose()?;
-        Ok(Self {
+        Ok(Arc::new(Self {
             config,
             embedding,
             film,
             fusion,
-        })
+        }))
     }
 
     pub fn request(
-        &self,
+        self: &Arc<Self>,
         tags: Option<&[LanguageTag]>,
         batch: usize,
-    ) -> Result<LanguageRequest<'_>> {
+    ) -> Result<LanguageRequest> {
         ensure!(batch > 0, "empty language batch");
         let vectors = if let Some(tags) = tags {
             ensure!(tags.len() == batch, "language batch size mismatch");
@@ -292,12 +292,12 @@ impl LanguageConditioner {
             &self.embedding.device(),
         );
         Ok(LanguageRequest {
-            owner: self,
+            owner: Arc::clone(self),
             embedding: vectors.matmul(self.embedding.clone()),
         })
     }
 }
-impl LanguageRequest<'_> {
+impl LanguageRequest {
     pub fn batch_size(&self) -> usize {
         self.embedding.dims()[0]
     }

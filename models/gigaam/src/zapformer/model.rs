@@ -14,7 +14,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use burn::tensor::{Device, Tensor, TensorData};
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -35,8 +35,8 @@ enum Decoder {
 }
 enum Heads {
     EncoderOnly,
-    Single(AsrHead),
-    Dual { raw: AsrHead, e2e: AsrHead },
+    Single(Arc<AsrHead>),
+    Dual { raw: Arc<AsrHead>, e2e: Arc<AsrHead> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,9 +169,9 @@ impl AsrHead {
 /// Shared weights for full-context and stateful native packet inference.
 pub struct ZapformerModel {
     config: CheckpointConfig,
-    encoder: ZapformerEncoder,
+    encoder: Arc<ZapformerEncoder>,
     heads: Heads,
-    language: Option<LanguageConditioner>,
+    language: Option<Arc<LanguageConditioner>>,
     device: Device,
 }
 impl ZapformerModel {
@@ -197,17 +197,17 @@ impl ZapformerModel {
             .transpose()?;
         let heads = match &config.heads {
             HeadsConfig::EncoderOnly => Heads::EncoderOnly,
-            HeadsConfig::Single { head } => Heads::Single(AsrHead::load(
+            HeadsConfig::Single { head } => Heads::Single(Arc::new(AsrHead::load(
                 &mut weights,
                 "head",
                 head,
                 width,
                 directory,
                 &device,
-            )?),
+            )?)),
             HeadsConfig::Dual { raw, e2e } => Heads::Dual {
-                raw: AsrHead::load(&mut weights, "heads.raw", raw, width, directory, &device)?,
-                e2e: AsrHead::load(&mut weights, "heads.e2e", e2e, width, directory, &device)?,
+                raw: Arc::new(AsrHead::load(&mut weights, "heads.raw", raw, width, directory, &device)?),
+                e2e: Arc::new(AsrHead::load(&mut weights, "heads.e2e", e2e, width, directory, &device)?),
             },
         };
         Ok(Self {

@@ -1,7 +1,8 @@
 use super::{AsrHead, Decoder, Heads, ZapformerModel};
 use crate::{audio::{SAMPLE_RATE, StreamingMel}, decode::{Word, ctc_argmax, words_at_frame_shift}, rnnt::RnntDecodeState, zapformer::{encoder::ZapformerEncoderStream, language::{LanguageRequest, LanguageTag}}};
 use anyhow::{Context, Result, bail, ensure};
-use burn::tensor::{Tensor, TensorData};
+use burn::tensor::{Device, Tensor, TensorData};
+use std::sync::Arc;
 
 /// Text and words are publication deltas; token IDs and frames are newly decoded tokens.
 /// Frame and word coordinates are relative to the start of this utterance.
@@ -24,8 +25,8 @@ enum DecodeState {
     Rnnt(RnntDecodeState),
 }
 
-struct HeadState<'a> {
-    head: &'a AsrHead,
+struct HeadState {
+    head: Arc<AsrHead>,
     state: DecodeState,
     ids: Vec<usize>,
     frames: Vec<usize>,
@@ -33,13 +34,13 @@ struct HeadState<'a> {
     published_words: usize,
 }
 
-impl<'a> HeadState<'a> {
-    fn new(head: &'a AsrHead) -> Self {
+impl HeadState {
+    fn new(head: &Arc<AsrHead>) -> Self {
         let state = match head.decoder {
             Decoder::Ctc(_) => DecodeState::Ctc { previous: None, offset: 0 },
             Decoder::Rnnt(_) => DecodeState::Rnnt(RnntDecodeState::default()),
         };
-        Self { head, state, ids: Vec::new(), frames: Vec::new(), published: String::new(), published_words: 0 }
+        Self { head: Arc::clone(head), state, ids: Vec::new(), frames: Vec::new(), published: String::new(), published_words: 0 }
     }
 
     fn consume(&mut self, encoded: Tensor<3>) -> Result<()> {
@@ -103,18 +104,18 @@ impl<'a> HeadState<'a> {
     }
 }
 
-enum HeadStates<'a> {
-    Single(HeadState<'a>),
-    Dual { raw: HeadState<'a>, e2e: HeadState<'a> },
+enum HeadStates {
+    Single(HeadState),
+    Dual { raw: HeadState, e2e: HeadState },
 }
 
 /// One utterance owns encoder, mel and independent decoder states; weights remain shared.
-pub struct ZapformerStream<'a> {
-    model: &'a ZapformerModel,
-    encoder: ZapformerEncoderStream<'a>,
+pub struct ZapformerStream {
+    device: Device,
+    encoder: ZapformerEncoderStream,
     mel: StreamingMel,
-    language: Option<LanguageRequest<'a>>,
-    heads: HeadStates<'a>,
+    language: Option<LanguageRequest>,
+    heads: HeadStates,
     timestamps: bool,
     shift: f64,
     finished: bool,
@@ -122,7 +123,7 @@ pub struct ZapformerStream<'a> {
 }
 
 impl ZapformerModel {
-    pub fn start_stream(&self, future_context_ms: Option<usize>, tag: Option<&LanguageTag>, word_timestamps: bool) -> Result<ZapformerStream<'_>> {
+    pub fn start_stream(&self, future_context_ms: Option<usize>, tag: Option<&LanguageTag>, word_timestamps: bool) -> Result<ZapformerStream> {
         let contexts = self.config.streaming.as_ref().and_then(|v|v["contexts"].as_array()).context("checkpoint declares no streaming contexts")?;
         let mut modes = Vec::with_capacity(contexts.len());
         for mode in contexts {
@@ -145,11 +146,11 @@ impl ZapformerModel {
             Heads::Single(head) => HeadStates::Single(HeadState::new(head)),
             Heads::Dual { raw,e2e } => HeadStates::Dual { raw: HeadState::new(raw), e2e: HeadState::new(e2e) },
         };
-        Ok(ZapformerStream { model: self, encoder: self.encoder.start_stream(chunk,left)?, mel: StreamingMel::new(self.config.mel,self.config.encoder.in_channels)?, language, heads, timestamps: word_timestamps, shift: frame_samples as f64 / SAMPLE_RATE as f64, finished: false, failed: false })
+        Ok(ZapformerStream { device: self.device.clone(), encoder: self.encoder.start_stream(chunk,left)?, mel: StreamingMel::new(self.config.mel,self.config.encoder.in_channels)?, language, heads, timestamps: word_timestamps, shift: frame_samples as f64 / SAMPLE_RATE as f64, finished: false, failed: false })
     }
 }
 
-impl ZapformerStream<'_> {
+impl ZapformerStream {
     pub fn finished(&self) -> bool { self.finished }
     pub fn encoded_frames(&self) -> usize { self.encoder.position() }
     pub fn flush(&mut self) -> Result<StreamPacket> { self.push(&[],true) }
@@ -165,7 +166,7 @@ impl ZapformerStream<'_> {
     }
 
     fn push_inner(&mut self, pcm: &[f32], final_packet: bool) -> Result<StreamPacket> {
-        let features = self.mel.push(pcm)?.map(|f| Tensor::<3>::from_data(TensorData::new(f.values,[1,f.n_mels,f.frames]),&self.model.device).swap_dims(1,2));
+        let features = self.mel.push(pcm)?.map(|f| Tensor::<3>::from_data(TensorData::new(f.values,[1,f.n_mels,f.frames]),&self.device).swap_dims(1,2));
         let encoded = self.encoder.push_conditioned(features, final_packet, self.language.as_ref())?.map(|x|match &self.language { Some(l) => l.fuse(x), None => x });
         let frames = self.encoder.position();
         let result = match &mut self.heads {

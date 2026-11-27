@@ -464,7 +464,7 @@ impl GigaAm {
         }
     }
 
-    pub fn start_stream(&self, future_context_ms: Option<usize>, language: Option<&LanguageTag>, word_timestamps: bool) -> Result<zapformer::ZapformerStream<'_>> {
+    pub fn start_stream(&self, future_context_ms: Option<usize>, language: Option<&LanguageTag>, word_timestamps: bool) -> Result<zapformer::ZapformerStream> {
         match &self.network {
             Network::Zapformer(model) => model.start_stream(future_context_ms,language,word_timestamps),
             _ => bail!("stateful streaming requires a Zapformer ASR checkpoint"),

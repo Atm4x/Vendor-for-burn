@@ -1,7 +1,7 @@
 use burn::tensor::Device;
 use gigaam_rs::{
     AsrOptions, ModelKind,
-    zapformer::{HeadSelection, language::LanguageTag},
+    zapformer::{HeadSelection, StreamPacket, StreamTranscription, ZapformerStream, language::LanguageTag},
     audio::{self, SpeechRegionSeconds},
     model_registry::{known_models, is_zapformer_model},
     service::{GigaAmService, Segmentation, TranscribeOptions},
@@ -19,6 +19,8 @@ use uuid::Uuid;
 const PROTOCOL_VERSION: u32 = 1;
 const MAX_FRAME: usize = 1024 * 1024;
 const MAX_SOURCE: u64 = 64 * 1024 * 1024;
+const MAX_STREAM_PACKET: u64 = 4 * 16000 * 10;
+const MAX_STREAM_SAMPLES: usize = 16000 * 60 * 5;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -65,6 +67,59 @@ struct Snapshot {
     sha256: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StreamStart {
+    gigaam_version: u32,
+    future_context_ms: Option<usize>,
+    #[serde(default)]
+    language: Option<LanguageTag>,
+    #[serde(default)]
+    word_timestamps: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StreamPush {
+    stream_id: Uuid,
+    packet_index: u64,
+    input: Snapshot,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StreamFinish {
+    stream_id: Uuid,
+    packet_index: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StreamCancel {
+    stream_id: Uuid,
+}
+
+struct ActiveStream {
+    id: Uuid,
+    next_packet: u64,
+    samples: usize,
+    state: ZapformerStream,
+}
+
+fn stream_transcription(value: StreamTranscription) -> Value {
+    json!({"text":value.text,"token_ids":value.token_ids,"frames":value.frames,
+        "words":value.words.map(|words| words.into_iter().map(gigaam_rs::service::WordResult::from).collect::<Vec<_>>())})
+}
+
+fn stream_reply(id: Uuid, index: u64, samples: usize, frames: usize, finished: bool, packet: StreamPacket) -> Value {
+    let heads = match packet {
+        StreamPacket::Single(value) => json!({"single":stream_transcription(value)}),
+        StreamPacket::Dual { raw,e2e } => json!({"raw":stream_transcription(raw),"e2e":stream_transcription(e2e)}),
+    };
+    json!({"gigaam_version":PROTOCOL_VERSION,"stream_id":id,"packet_index":index,
+        "accepted_samples":samples,"encoded_frames":frames,"finished":finished,"heads":heads})
+}
+
 struct Worker {
     model_id: String,
     model_name: String,
@@ -77,11 +132,12 @@ struct Worker {
     device: Device,
     model: Option<GigaAmService>,
     warm: bool,
+    stream: Option<ActiveStream>,
 }
 
 impl Worker {
     fn command(&mut self, request: &Request) -> Result<Value, String> {
-        if !matches!(request.command.as_str(), "load" | "infer") && request.payload != json!({}) {
+        if !matches!(request.command.as_str(), "load" | "infer" | "stream_start" | "stream_push" | "stream_finish" | "stream_cancel") && request.payload != json!({}) {
             return Err("unexpected command payload".into());
         }
         match request.command.as_str() {
@@ -94,6 +150,7 @@ impl Worker {
                     "max_source_bytes": MAX_SOURCE,
                     "kind": self.infer_kind(),
                     "external_vad": true,
+                    "streaming": if self.stream_supported() { json!({"pcm_format":"f32le", "sample_rate_hz":16000, "channels":1, "max_packet_bytes":MAX_STREAM_PACKET, "max_utterance_samples":MAX_STREAM_SAMPLES, "max_active_streams":1}) } else { Value::Null },
                 },
             })),
             "load" => {
@@ -142,15 +199,76 @@ impl Worker {
                 "model_id": self.model_id,
                 "backend": self.backend,
                 "variant": self.variant,
+                "active_stream": self.stream.as_ref().map(|s| s.id),
             })),
             "infer" => self.infer(request),
+            "stream_start" => self.stream_start(request),
+            "stream_push" => self.stream_push(request),
+            "stream_finish" => self.stream_finish(request),
+            "stream_cancel" => {
+                let payload: StreamCancel = serde_json::from_value(request.payload.clone()).map_err(|e|e.to_string())?;
+                self.require_stream(payload.stream_id, None)?;
+                self.stream = None;
+                Ok(json!({"cancelled":true}))
+            },
             "unload" | "shutdown" => {
+                self.stream = None;
                 self.model = None;
                 self.warm = false;
                 Ok(json!({}))
             }
             _ => Err("unknown worker command".into()),
         }
+    }
+
+    fn stream_supported(&self) -> bool {
+        is_zapformer_model(&self.model_name) && (self.model_kind.is_ctc() || self.model_kind.is_rnnt())
+    }
+
+    fn stream_start(&mut self, request: &Request) -> Result<Value, String> {
+        let payload: StreamStart = serde_json::from_value(request.payload.clone()).map_err(|e|e.to_string())?;
+        if payload.gigaam_version != PROTOCOL_VERSION || !self.stream_supported() {
+            return Err("unsupported GigaAM streaming version or model".into());
+        }
+        if self.stream.is_some() { return Err("an utterance stream is already active".into()); }
+        let service = self.model.as_ref().filter(|_|self.warm).ok_or("model is not ready")?;
+        let state = service.start_stream(payload.future_context_ms,payload.language.as_ref(),payload.word_timestamps).map_err(|e|format!("{e:#}"))?;
+        self.stream = Some(ActiveStream { id:request.id,next_packet:0,samples:0,state });
+        Ok(json!({"stream_id":request.id,"next_packet_index":0}))
+    }
+
+    fn require_stream(&self, id: Uuid, index: Option<u64>) -> Result<&ActiveStream, String> {
+        let state = self.stream.as_ref().filter(|s|s.id==id).ok_or("unknown or inactive stream")?;
+        if index.is_some_and(|i|i!=state.next_packet) { return Err("unexpected stream packet index".into()); }
+        Ok(state)
+    }
+
+    fn stream_push(&mut self, request: &Request) -> Result<Value, String> {
+        let payload: StreamPush = serde_json::from_value(request.payload.clone()).map_err(|e|e.to_string())?;
+        let previous = self.require_stream(payload.stream_id,Some(payload.packet_index))?.samples;
+        let (bytes,_) = read_snapshot_format(&self.input_dir,&payload.input,&["f32"],MAX_STREAM_PACKET)?;
+        if bytes.len()%4 != 0 { return Err("PCM snapshot is not aligned to float32".into()); }
+        let pcm: Vec<f32> = bytes.chunks_exact(4).map(|b|f32::from_le_bytes(b.try_into().unwrap())).collect();
+        if pcm.iter().any(|v| !v.is_finite()) { return Err("PCM snapshot contains nonfinite samples".into()); }
+        let samples = previous.checked_add(pcm.len()).filter(|&n|n<=MAX_STREAM_SAMPLES).ok_or("utterance sample limit exceeded")?;
+        let state = self.stream.as_mut().unwrap();
+        let result = state.state.push(&pcm,false);
+        match result {
+            Ok(packet) => {
+                state.samples=samples;
+                state.next_packet+=1;
+                Ok(stream_reply(state.id,payload.packet_index,samples,state.state.encoded_frames(),false,packet))
+            }
+            Err(error) => { self.stream=None; Err(format!("stream discarded after inference error: {error:#}")) }
+        }
+    }
+
+    fn stream_finish(&mut self, request: &Request) -> Result<Value, String> {
+        let payload: StreamFinish = serde_json::from_value(request.payload.clone()).map_err(|e|e.to_string())?;
+        self.require_stream(payload.stream_id,Some(payload.packet_index))?;
+        let mut state=self.stream.take().unwrap();
+        let packet=state.state.flush().map_err(|e|format!("stream discarded after finalization error: {e:#}"))?;
+        Ok(stream_reply(state.id,payload.packet_index,state.samples,state.state.encoded_frames(),true,packet))
     }
 
     fn infer_kind(&self) -> &'static str {
@@ -282,13 +400,17 @@ fn require_regular_file(path: &Path) -> Result<(), String> {
 }
 
 fn read_snapshot<'a>(root: &Path, snapshot: &'a Snapshot) -> Result<(Vec<u8>, &'a str), String> {
+    read_snapshot_format(root,snapshot,&["wav","flac"],MAX_SOURCE)
+}
+
+fn read_snapshot_format<'a>(root: &Path, snapshot: &'a Snapshot, formats: &[&str], max_bytes: u64) -> Result<(Vec<u8>, &'a str), String> {
     let name = &snapshot.file_name;
     let ext = name.rsplit_once('.').map(|(_, ext)| ext)
-        .filter(|ext| matches!(*ext, "wav" | "flac"))
+        .filter(|ext| formats.contains(ext))
         .ok_or("unsupported audio snapshot format")?;
     if name.len() > 128 || name.starts_with('.') ||
        !name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')) ||
-       !(1..=MAX_SOURCE).contains(&snapshot.size_bytes) ||
+       !(1..=max_bytes).contains(&snapshot.size_bytes) ||
        snapshot.sha256.len() != 64 || !snapshot.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("invalid audio snapshot".into());
     }
@@ -375,6 +497,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
         device,
         model: None,
         warm: false,
+        stream: None,
     };
     let mut input = io::stdin().lock();
     let mut output = io::stdout().lock();

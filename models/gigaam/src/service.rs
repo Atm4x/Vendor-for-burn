@@ -141,7 +141,7 @@ impl GigaAmService {
     }
 
     /// Start a native utterance stream. The caller decides utterance boundaries (external VAD).
-    pub fn start_stream(&self, future_context_ms: Option<usize>, language: Option<&crate::zapformer::language::LanguageTag>, word_timestamps: bool) -> Result<crate::zapformer::ZapformerStream<'_>> {
+    pub fn start_stream(&self, future_context_ms: Option<usize>, language: Option<&crate::zapformer::language::LanguageTag>, word_timestamps: bool) -> Result<crate::zapformer::ZapformerStream> {
         self.model.start_stream(future_context_ms, language, word_timestamps)
     }
 
