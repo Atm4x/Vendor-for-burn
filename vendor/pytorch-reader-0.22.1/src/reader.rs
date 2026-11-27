@@ -765,6 +765,7 @@ fn parse_tar_tensors(
             source: source.clone(),
             key: storage_key,
             dtype: Some(dtype),
+            quantized: false,
             // A TAR view is resolved into its own layout entry above, so `byte_len` is
             // already the view's length and nothing is reachable past it.
             reachable_bytes: byte_len,

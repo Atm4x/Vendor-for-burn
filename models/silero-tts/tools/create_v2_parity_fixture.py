@@ -9,6 +9,14 @@ from safetensors.torch import save_file
 from torch.package import PackageImporter
 
 CASES = {
+    **{f'{name}_v2': [('Привет, мир!', 'default', 0)] for name in ('aidar','baya','irina','kseniya','natasha','ruslan')},
+    'thorsten_v2': [('Guten Tag!', 'default', 0)],
+    'tux_v2': [('Buenos días.', 'default', 0)],
+    'gilles_v2': [('Bonjour.', 'default', 0)],
+    'aigul_v2': [('Һаумы.', 'default', 0)],
+    'erdni_v2': [('Мендвт.', 'default', 0)],
+    'dilyara_v2': [('Исәнмесез.', 'default', 0)],
+    'dilnavoz_v2': [('Salom.', 'default', 0)],
     'lj_v2': [('Hello, world!', 'default', 0)],
     'multi_v2': [('Hello, world!', 'lj', 9), ('Guten Tag!', 'thorsten', 6), ('Прив+ет.', 'aidar', 0)],
     'mykyta_v2': [('Привіт, світе!', 'default', 0)],
@@ -24,7 +32,15 @@ def create(path, output):
     tensors = {}
     for index, (text, speaker, sid) in enumerate(CASES[path.stem]):
         torch.manual_seed(1847 + index)
-        ids = p.prepare_text_input(text, p.symbols).unsqueeze(0)
+        prepared = p.prepare_text_input(text, p.symbols)
+        if hasattr(m, 'accentor'):
+            sentence, clean = prepared
+            graphemes, lengths, boundaries = m.preprocess_batch_accentor([clean])
+            predictions = m.get_accentor_preds(graphemes, lengths)
+            accented = m.postprocess_batch_accentor([sentence], *predictions, boundaries)[0]
+            ids = m.preprocess_tacotron(accented).unsqueeze(0)
+        else:
+            ids = prepared.unsqueeze(0)
         tac = m.tacotron
         x = tac.embedding(ids)
         if multi:

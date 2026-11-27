@@ -3,6 +3,7 @@
 //! Runtime loading accepts official TorchPackage checkpoints directly.
 //! Prepared safetensors remain supported; neither path requires Python or PyTorch.
 
+mod recurrent_accent;
 pub mod frontend;
 pub mod catalogue;
 pub mod vocoder;

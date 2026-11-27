@@ -10,6 +10,7 @@ pub(crate) struct V3Tts {
     ascii_symbols: BTreeMap<char, String>,
     encoded_symbols: String,
     accent: Option<(Accentor, String, HashSet<String>)>,
+    recurrent_accent: Option<crate::recurrent_accent::RecurrentAccent>,
     acoustic: TextToMel,
     vocoder: EnglishVocoder,
 }
@@ -22,10 +23,11 @@ impl V3Tts {
         let ascii_symbols = std::mem::take(&mut checkpoint.ascii_symbols);
         let encoded_symbols = std::mem::take(&mut checkpoint.encoded_symbols);
         let accent = checkpoint.accent.take().map(|a| -> Result<_> { Ok((Accentor::from_parts(&TensorStore::native(a.weights), a.ngrams, a.exceptions, device)?, a.vowels, a.stop_words)) }).transpose()?;
+        let recurrent_accent = checkpoint.recurrent_accent.take().map(crate::recurrent_accent::RecurrentAccent::load).transpose()?;
         let weights = TensorStore::native(checkpoint.into_weights()?);
         let acoustic = TextToMel::load_variant(&weights, device, false)?;
         let vocoder = EnglishVocoder::load(&weights, device)?;
-        Ok(Self { config, ascii_symbols, encoded_symbols, accent, acoustic, vocoder })
+        Ok(Self { config, ascii_symbols, encoded_symbols, accent, recurrent_accent, acoustic, vocoder })
     }
 
     pub(crate) fn infer_text(&self, text: &str, speaker: &str, rate: u32, options: &TextOptions) -> Result<Vec<f32>> {
@@ -37,6 +39,7 @@ impl V3Tts {
             if let Some((accent, vowels, stop)) = &self.accent {
                 if options.put_accent { normalized = accent.accentuate_ascii(&normalized, vowels, stop, options.put_yo)?; }
             }
+            if let Some(accent) = &self.recurrent_accent { if options.put_accent { normalized = accent.accentuate(&normalized, options.put_yo)?; } }
             let tokens = encode_v3(&self.encoded_symbols, &normalized)?;
             self.infer_token_ids(&tokens, speaker_id, rate)?.into_data().try_to_vec::<f32>().map_err(Into::into)
         })

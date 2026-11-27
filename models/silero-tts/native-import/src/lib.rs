@@ -12,6 +12,8 @@ mod v4;
 mod v2;
 pub use v2::{V2Checkpoint, encode_v2};
 mod ascii_accent;
+mod recurrent_accent;
+pub use recurrent_accent::{RecurrentAccentCheckpoint, QuantizedProjection};
 pub use ascii_accent::AsciiAccentCheckpoint;
 pub use v4::V4Checkpoint;
 pub use v5_plain::V5PlainCheckpoint;
@@ -84,6 +86,7 @@ pub struct V3Checkpoint {
     pub encoded_symbols: String,
     tensors: HashMap<String, Tensor>,
     pub accent: Option<AsciiAccentCheckpoint>,
+    pub recurrent_accent: Option<RecurrentAccentCheckpoint>,
 }
 
 impl V3Checkpoint {
@@ -102,7 +105,7 @@ impl V3Checkpoint {
         ensure!(!speakers.is_empty() && speakers.len() <= 4096, "invalid V3 speaker table");
         ensure!(speakers.values().copied().collect::<HashSet<_>>().len() == speakers.len() && speakers.values().all(|&id| id < speakers.len()), "noncontiguous V3 speaker IDs");
         let mut ascii_symbols = BTreeMap::new();
-        if let Some(value) = metadata.get("symb_ascii_dict") {
+        if let Some(value) = metadata.get("symb_ascii_dict").or_else(|| metadata.get("ru_ascii_dict")) {
             for (key, value) in dictionary(value, "symb_ascii_dict")? {
                 let mut chars = key.chars();
                 let ch = chars.next().context("empty symbol mapping key")?;
@@ -115,6 +118,8 @@ impl V3Checkpoint {
         ensure!(package.module_ids().len() == 1, "V3 requires exactly one script module");
         let (module_metadata, mut tensors) = package.module(id).context("reading V3 script tensors")?;
         let script = dictionary(&module_metadata, "script metadata")?;
+        let recurrent_accent = if script.contains_key("grapheme2idx") { Some(recurrent_accent::load_recurrent_accent(script, &tensors)?) } else { None };
+        if recurrent_accent.is_some() { tensors.retain(|name,_| !name.starts_with("accentor.")); }
         let accent = match script.get("set_accent") {
             Some(PickleValue::Bool(true)) => {
                 let accent = ascii_accent::load_ascii_accent(script, &tensors)?;
@@ -122,6 +127,7 @@ impl V3Checkpoint {
                 Some(accent)
             }
             Some(PickleValue::Bool(false)) => None,
+            None if recurrent_accent.is_some() => None,
             _ => bail!("unsupported V3 accentor topology"),
         };
         v3_schema::validate(&tensors, &module_metadata, symbol_count, speakers.len())?;
@@ -134,7 +140,7 @@ impl V3Checkpoint {
         for (idx, ch) in encoded_symbols.chars().enumerate() {
             ensure!(symbol_to_id.get(&ch.to_string()) == Some(&idx), "inconsistent encoded symbol id for {ch:?}");
         }
-        Ok(Self { symbols, speakers, ascii_symbols, module_metadata, encoded_symbols, tensors, accent })
+        Ok(Self { symbols, speakers, ascii_symbols, module_metadata, encoded_symbols, tensors, accent, recurrent_accent })
     }
 
     pub fn tensors(&self) -> &HashMap<String, Tensor> { &self.tensors }

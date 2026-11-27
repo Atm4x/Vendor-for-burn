@@ -494,5 +494,229 @@
       "speaker": "lj",
       "variant": "v2_tacotron2"
     }
+  },
+  {
+    "model_id": "aidar_v2",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/ru/v2_aidar.pt",
+      "size_bytes": 138196310,
+      "sha256": "88d1fc7a639e232c48a23f055c608d6028c63d28561cee7ee9390c0554f6960b"
+    },
+    "smoke": {
+      "text": "Привет, мир!",
+      "speaker": "default",
+      "variant": "v2_tacotron2"
+    }
+  },
+  {
+    "model_id": "baya_v2",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/ru/v2_baya.pt",
+      "size_bytes": 138195922,
+      "sha256": "6c77410d7c4274c88dd327b97e1242f8e35ab0211a6f5e1ed539364039352137"
+    },
+    "smoke": {
+      "text": "Привет, мир!",
+      "speaker": "default",
+      "variant": "v2_tacotron2"
+    }
+  },
+  {
+    "model_id": "irina_v2",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/ru/v2_irina.pt",
+      "size_bytes": 138196310,
+      "sha256": "2b5c0fc5841909143cbf4b4c28401321ae66d2b99c2e2b7398f9dee81e973a0d"
+    },
+    "smoke": {
+      "text": "Привет, мир!",
+      "speaker": "default",
+      "variant": "v2_tacotron2"
+    }
+  },
+  {
+    "model_id": "kseniya_v2",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/ru/v2_kseniya.pt",
+      "size_bytes": 138254238,
+      "sha256": "5b1440d2623b6dab1f3f3d6fd323626a92857667f0a47e1571e5b48fcb02bd29"
+    },
+    "smoke": {
+      "text": "Привет, мир!",
+      "speaker": "default",
+      "variant": "v2_tacotron2"
+    }
+  },
+  {
+    "model_id": "natasha_v2",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/ru/v2_natasha.pt",
+      "size_bytes": 138197278,
+      "sha256": "9bedcb5480a7c83a0a9362a21d81aaa5ea6a7fb1c8b62253035bdbf60089b924"
+    },
+    "smoke": {
+      "text": "Привет, мир!",
+      "speaker": "default",
+      "variant": "v2_tacotron2"
+    }
+  },
+  {
+    "model_id": "ruslan_v2",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/ru/v2_ruslan.pt",
+      "size_bytes": 138196762,
+      "sha256": "967f994a2872190a0469b3f3415851da5651fce6b568c7ef786299926483379b"
+    },
+    "smoke": {
+      "text": "Привет, мир!",
+      "speaker": "default",
+      "variant": "v2_tacotron2"
+    }
+  },
+  {
+    "model_id": "thorsten_v2",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/de/v2_thorsten.pt",
+      "size_bytes": 136030620,
+      "sha256": "b7821e2e5bae0c0fef0fccd2ef41f39ce5b759327f076aff6cfde94f67f7dbf7"
+    },
+    "smoke": {
+      "text": "Guten Tag!",
+      "speaker": "default",
+      "variant": "v2_tacotron2"
+    }
+  },
+  {
+    "model_id": "tux_v2",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/es/v2_tux.pt",
+      "size_bytes": 136035594,
+      "sha256": "15bfd7b6a3d21ca835022527c96606bb488692d05dd392c510ee7cced0a59563"
+    },
+    "smoke": {
+      "text": "Buenos días.",
+      "speaker": "default",
+      "variant": "v2_tacotron2"
+    }
+  },
+  {
+    "model_id": "gilles_v2",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/fr/v2_gilles.pt",
+      "size_bytes": 136042076,
+      "sha256": "578469d6ac1b0de96221ef67a920b6106e29c8e2c1f0ed9f5afe27a472c4a365"
+    },
+    "smoke": {
+      "text": "Bonjour.",
+      "speaker": "default",
+      "variant": "v2_tacotron2"
+    }
+  },
+  {
+    "model_id": "aigul_v2",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/ba/v2_aigul.pt",
+      "size_bytes": 136051918,
+      "sha256": "c4a7a6edc089ee29595245bbb68ed7ed9d634376058e69bdb322b34e1119d3df"
+    },
+    "smoke": {
+      "text": "Һаумы.",
+      "speaker": "default",
+      "variant": "v2_tacotron2"
+    }
+  },
+  {
+    "model_id": "erdni_v2",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/xal/v2_erdni.pt",
+      "size_bytes": 136048718,
+      "sha256": "beaffe0dae5504d027c3597fa35d37ee5713a17e9eda0692d9f5a62d8949060b"
+    },
+    "smoke": {
+      "text": "Мендвт.",
+      "speaker": "default",
+      "variant": "v2_tacotron2"
+    }
+  },
+  {
+    "model_id": "dilyara_v2",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/tt/v2_dilyara.pt",
+      "size_bytes": 136048398,
+      "sha256": "13370badf67c5eb3105976a13d0d6d90a1c9f66d39e93287526a43c963e7603a"
+    },
+    "smoke": {
+      "text": "Исәнмесез.",
+      "speaker": "default",
+      "variant": "v2_tacotron2"
+    }
+  },
+  {
+    "model_id": "dilnavoz_v2",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/uz/v2_dilnavoz.pt",
+      "size_bytes": 136017234,
+      "sha256": "b2ac6dff53b3596609523eb742cceeb84e7d2177b44d348ae910c81750a02064"
+    },
+    "smoke": {
+      "text": "Salom.",
+      "speaker": "default",
+      "variant": "v2_tacotron2"
+    }
+  },
+  {
+    "model_id": "ru_v3",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/ru/ru_v3.pt",
+      "size_bytes": 59199351,
+      "sha256": "bf2bcab8e814edb17569503b23bd74e8cc8f584b0d2f7c7e08e2720cc48dc08c"
+    },
+    "smoke": {
+      "text": "Привет, мир!",
+      "speaker": "aidar",
+      "variant": "v3_hifigan"
+    }
   }
 ]

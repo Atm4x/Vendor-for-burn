@@ -7,6 +7,9 @@ use std::{
 };
 
 pub struct V2Checkpoint {
+    pub encoded_symbols: String,
+    pub ascii_symbols: BTreeMap<char, String>,
+    pub recurrent_accent: Option<crate::RecurrentAccentCheckpoint>,
     pub symbols: String,
     pub speakers: BTreeMap<String, usize>,
     pub multi: bool,
@@ -31,10 +34,16 @@ impl V2Checkpoint {
                 && symbols.chars().collect::<HashSet<_>>().len() == n,
             "invalid V2 alphabet"
         );
-        ensure!(
-            !meta.contains_key("ru_ascii_dict"),
-            "V2 recurrent accentor is not supported yet"
-        );
+        let mut ascii_symbols = BTreeMap::new();
+        if let Some(value) = meta.get("ru_ascii_dict") {
+            for (k,v) in dictionary(value,"V2 ASCII map")? {
+                let mut chars = k.chars(); let ch = chars.next().context("empty V2 mapping key")?;
+                ensure!(chars.next().is_none(), "invalid V2 mapping key");
+                ascii_symbols.insert(ch,string(Some(v),"V2 ASCII value")?.to_owned());
+            }
+        }
+        let encoded_symbols: String = symbols.chars().map(|c| ascii_symbols.get(&c).cloned().unwrap_or_else(||c.to_string())).collect();
+        ensure!(encoded_symbols.chars().count()==n && encoded_symbols.chars().collect::<HashSet<_>>().len()==n,"invalid V2 encoded symbols");
         let multi = meta.contains_key("speaker_to_id");
         let speakers = if multi {
             ids(meta.get("speaker_to_id"), "V2 speakers")?
@@ -53,10 +62,11 @@ impl V2Checkpoint {
         );
         let (root, mut tensors) = package.module(id)?;
         let root = dictionary(&root, "V2 script")?;
-        ensure!(
-            !root.contains_key("accentor"),
-            "V2 recurrent accentor not supported"
-        );
+        let recurrent_accent = if root.contains_key("accentor") { Some(crate::recurrent_accent::load_recurrent_accent(root,&tensors)?) } else { None };
+        if recurrent_accent.is_some() {
+            let table = ids(root.get("symbol_to_id"),"V2 script symbols")?;
+            ensure!(encoded_symbols.chars().enumerate().all(|(i,c)| table.get(&c.to_string())==Some(&i)),"inconsistent V2 encoded alphabet");
+        }
         let tac = dictionary(
             root.get("tacotron").context("missing V2 Tacotron2")?,
             "Tacotron2",
@@ -146,6 +156,7 @@ impl V2Checkpoint {
                         ))
         });
         Ok(Self {
+            encoded_symbols, ascii_symbols, recurrent_accent,
             symbols,
             speakers,
             multi,

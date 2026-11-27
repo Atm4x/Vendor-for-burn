@@ -20,6 +20,7 @@ V3_CASES = {
     'v3_es': ('¡Buenos días! ¿Cómo estás?', 'es_0'),
     'v3_fr': ('Bonjour, ça va très bien.', 'fr_0'),
     'v3_indic': ('namastē duniyā.', 'hindi_female'),
+    'ru_v3': ('Привет, мир!', 'aidar'),
     'v3_1_ru': ('Привет, мир!', 'aidar'),
     'v3_xal': ('Мендвт.', 'erdni'),
     'v3_tt': ('Исәнмесез.', 'dilyara'),
@@ -78,7 +79,6 @@ if __name__ == '__main__':
     parser.add_argument('binary', type=Path)
     parser.add_argument('checkpoints', type=Path)
     parser.add_argument('--model', choices=(*V3_CASES, *V4_CASES, *V5_CASES, *V5_RU_CASES), action='append')
-    parser.add_argument('--reject-unimplemented', action='store_true', help='Check the unsupported recurrent-stress V3 graph')
     args = parser.parse_args()
     torch.set_num_threads(4)
     for model in args.model or (*V3_CASES, *V4_CASES, *V5_CASES, *V5_RU_CASES):
@@ -95,13 +95,3 @@ if __name__ == '__main__':
         else:
             for text, speaker in V5_CASES[model]:
                 compare(args.binary, path, text, speaker, 'v5_convnext_plain')
-
-    if args.reject_unimplemented:
-        for model in ('ru_v3',):
-            requests = [dict(command='load', request_id='unsupported', checkpoint=str((args.checkpoints / (model + '.pt')).resolve()), backend='flex'), dict(command='shutdown', request_id='shutdown')]
-            process = subprocess.run([str(args.binary.resolve()), '--stdio'], input=''.join(json.dumps(x)+'\n' for x in requests), capture_output=True, text=True, check=True, timeout=120)
-            replies = [json.loads(line) for line in process.stdout.splitlines()]
-            assert len(replies) == 2 and not replies[0]['ok'] and replies[1]['ok'], replies
-            expected = 'unsupported V3 accentor topology'
-            assert expected in str(replies[0]['error']), replies[0]
-            print(json.dumps(dict(model=model, expected_rejection=True)), flush=True)

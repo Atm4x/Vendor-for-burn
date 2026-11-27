@@ -454,7 +454,7 @@ mod tests {
     use super::*;
     use crate::english_vocoder::V2Vocoder;
     use serde::Deserialize;
-    use silero_package::{V2Checkpoint, encode_v2};
+    use silero_package::V2Checkpoint;
     use std::{fs, path::Path};
 
     #[derive(Deserialize)]
@@ -497,6 +497,7 @@ mod tests {
         for name in names.split(',') {
             let cp = V2Checkpoint::open(Path::new(&root).join(format!("{name}.pt"))).unwrap();
             let model_rates = cp.sample_rates.clone();
+            let accent = cp.recurrent_accent.map(crate::recurrent_accent::RecurrentAccent::load).transpose().unwrap();
             let store = TensorStore::native(cp.weights);
             let acoustic =
                 Tacotron2::load(&store, cp.multi, cp.max_steps, cp.gate_threshold, &device)
@@ -513,7 +514,7 @@ mod tests {
                 let k = &case.key;
                 let label = format!("{name}/{k}");
                 assert_eq!(cp.speakers[&case.speaker] as i64, case.speaker_id);
-                assert_eq!(encode_v2(&cp.symbols, &case.text).unwrap(), case.ids);
+                assert_eq!(crate::v2::prepare_tokens(&cp.symbols, &cp.encoded_symbols, &cp.ascii_symbols, accent.as_ref(), &case.text).unwrap(), case.ids);
                 compare(
                     &format!("{label}/memory"),
                     acoustic

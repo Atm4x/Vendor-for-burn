@@ -6,6 +6,9 @@ use std::collections::BTreeMap;
 
 pub(crate) struct V2Tts {
     symbols: String,
+    encoded_symbols: String,
+    ascii_symbols: BTreeMap<char, String>,
+    recurrent_accent: Option<crate::recurrent_accent::RecurrentAccent>,
     pub(crate) speakers: BTreeMap<String, usize>,
     pub(crate) rates: Vec<u32>,
     acoustic: Tacotron2,
@@ -13,9 +16,13 @@ pub(crate) struct V2Tts {
 }
 impl V2Tts {
     pub(crate) fn load(checkpoint: V2Checkpoint, device: &Device) -> Result<Self> {
+        let recurrent_accent = checkpoint.recurrent_accent.map(crate::recurrent_accent::RecurrentAccent::load).transpose()?;
         let weights = TensorStore::native(checkpoint.weights);
         Ok(Self {
             symbols: checkpoint.symbols,
+            encoded_symbols: checkpoint.encoded_symbols,
+            ascii_symbols: checkpoint.ascii_symbols,
+            recurrent_accent,
             speakers: checkpoint.speakers,
             rates: checkpoint.sample_rates.clone(),
             acoustic: Tacotron2::load(
@@ -48,7 +55,7 @@ impl V2Tts {
         ensure!(self.rates.contains(&rate), "unsupported V2 sample rate");
         let mut output = Vec::new();
         for part in longform::split_text(text, 140)? {
-            let ids = encode_v2(&self.symbols, &part)?;
+            let ids = prepare_tokens(&self.symbols, &self.encoded_symbols, &self.ascii_symbols, self.recurrent_accent.as_ref(), &part)?;
             let pcm = self
                 .infer_token_ids(&ids, id, rate)?
                 .into_data()
@@ -70,4 +77,16 @@ impl V2Tts {
         self.vocoder
             .forward(self.acoustic.infer(tokens, speaker)?, rate)
     }
+}
+
+
+pub(crate) fn prepare_tokens(symbols: &str, encoded_symbols: &str, ascii_symbols: &BTreeMap<char,String>, accent: Option<&crate::recurrent_accent::RecurrentAccent>, text: &str) -> Result<Vec<i64>> {
+    if let Some(accent) = accent {
+        let mut normalized = text.to_lowercase().chars().filter(|c| symbols.chars().skip(2).any(|s|s==*c)).collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ");
+        ensure!(!normalized.is_empty(), "empty V2 text after normalization");
+        if !normalized.ends_with(['.', '!', '?']) { normalized.push('.'); }
+        let ascii: String = normalized.chars().map(|c| ascii_symbols.get(&c).cloned().unwrap_or_else(||c.to_string())).collect();
+        let accented = accent.accentuate(&ascii, true)?;
+        encode_v2(encoded_symbols, &accented)
+    } else { encode_v2(symbols, text) }
 }
