@@ -276,16 +276,16 @@ impl TextToMel {
         Ok((mel, durations))
     }
 
-    pub(crate) fn infer_english(&self, symbols: &[i64], speaker_id: i64) -> Result<(Tensor<3>, Vec<f32>)> {
+    pub(crate) fn infer_v3(&self, symbols: &[i64], speaker_id: i64) -> Result<(Tensor<3>, Vec<f32>)> {
         let len = symbols.len();
         ensure!(len > 0 && len <= 5000, "Silero input exceeds positional encoding limit");
-        ensure!(symbols.iter().all(|&x| (1..39).contains(&x)), "Invalid English token ID");
-        ensure!((0..119).contains(&speaker_id), "Invalid English speaker ID");
+        ensure!(symbols.iter().all(|&x| (1..self.acoustic.embedding.dims()[0] as i64).contains(&x)), "Invalid V3 token ID");
+        ensure!((0..self.acoustic.speaker_embedding.dims()[0] as i64).contains(&speaker_id), "Invalid V3 speaker ID");
         let input = Tensor::<2, Int>::from_data(TensorData::new(symbols.to_vec(), [1, len]), &self.device);
         let speaker = Tensor::<2, Int>::from_data(TensorData::new(vec![speaker_id], [1, 1]), &self.device);
         let duration: Vec<f32> = (self.duration.forward(input.clone(), speaker.clone(), None, 1.0).exp() - 1.0)
             .clamp_min(0.0).round().into_data().try_to_vec()?;
-        ensure!(duration.iter().all(|x| x.is_finite()), "Non-finite English duration");
+        ensure!(duration.iter().all(|x| x.is_finite()), "Non-finite V3 duration");
         ensure!(duration.iter().sum::<f32>() <= self.acoustic.decoder.pos_encoding.dims()[0] as f32,
             "Expanded Silero utterance exceeds acoustic positional encoding limit");
         let pitch = self.pitch.forward(input.clone(), speaker.clone(), None, 1.0).reshape([1, 1, len]);

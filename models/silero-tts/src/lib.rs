@@ -1,4 +1,4 @@
-//! Native Silero v5 Russian and v3 English TTS components based on Burn.
+//! Native Silero V5 Russian and multilingual V3 HiFi-GAN TTS components based on Burn.
 //!
 //! Runtime loading accepts official TorchPackage checkpoints directly.
 //! Prepared safetensors remain supported; neither path requires Python or PyTorch.
@@ -16,7 +16,8 @@ pub mod transformer;
 pub mod predictors;
 pub mod acoustic;
 pub mod runtime;
-mod english;
+mod v3;
+mod v5_plain;
 mod english_vocoder;
 #[cfg(feature = "reference-flex")]
 mod flex_english_conv;

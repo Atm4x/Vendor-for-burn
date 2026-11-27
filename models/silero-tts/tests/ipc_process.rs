@@ -63,7 +63,7 @@ fn shared_transport_rejects_invalid_state_payload_and_corrupt_model() {
 #[ignore = "requires official checkpoints; set SILERO_V3_EN_CHECKPOINT and SILERO_V5_RU_CHECKPOINT"]
 fn shared_transport_real_checkpoint_lifecycle() {
     for (key, variant, text, speaker, count) in [
-        ("SILERO_V3_EN_CHECKPOINT", "v3_en", "Hello, world!", "en_0", 7800),
+        ("SILERO_V3_EN_CHECKPOINT", "v3_hifigan", "Hello, world!", "en_0", 7800),
         ("SILERO_V5_RU_CHECKPOINT", "v5_ru", "Привет.", "aidar", 5800),
     ] {
         let path = std::env::var(key).expect(key);

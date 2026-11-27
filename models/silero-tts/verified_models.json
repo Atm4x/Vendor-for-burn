@@ -1,0 +1,162 @@
+[
+  {
+    "model_id": "v3_en",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/en/v3_en.pt",
+      "size_bytes": 57194546,
+      "sha256": "02b71034d9f13bc4001195017bac9db1c6bb6115e03fea52983e8abcff13b665"
+    },
+    "smoke": {
+      "text": "Hello, world!",
+      "speaker": "en_0",
+      "variant": "v3_hifigan"
+    }
+  },
+  {
+    "model_id": "v3_en_indic",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/en/v3_en_indic.pt",
+      "size_bytes": 57089310,
+      "sha256": "8ebf6b8bc4a762117e5f8d9a6ba30ffcbb65eb669f57cecd6954b0f563095429"
+    },
+    "smoke": {
+      "text": "This is a voice.",
+      "speaker": "tamil_female",
+      "variant": "v3_hifigan"
+    }
+  },
+  {
+    "model_id": "v3_de",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/de/v3_de.pt",
+      "size_bytes": 57076082,
+      "sha256": "2e22f38619e1d1da96d963bda5fab6d53843e8837438cb5a45dc376882b0354b"
+    },
+    "smoke": {
+      "text": "Fröhliche Grüße, schön!",
+      "speaker": "eva_k",
+      "variant": "v3_hifigan"
+    }
+  },
+  {
+    "model_id": "v3_es",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/es/v3_es.pt",
+      "size_bytes": 57079302,
+      "sha256": "36206add75fb89d0be16d5ce306ba7a896c6fa88bab7e3247403f4f4a520eced"
+    },
+    "smoke": {
+      "text": "¡Buenos días! ¿Cómo estás?",
+      "speaker": "es_0",
+      "variant": "v3_hifigan"
+    }
+  },
+  {
+    "model_id": "v3_fr",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/fr/v3_fr.pt",
+      "size_bytes": 57085158,
+      "sha256": "02ed062cfff1c7097324929ca05c455a25d4f610fd14d51b89483126e50f15cb"
+    },
+    "smoke": {
+      "text": "Bonjour, ça va très bien.",
+      "speaker": "fr_0",
+      "variant": "v3_hifigan"
+    }
+  },
+  {
+    "model_id": "v3_indic",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/indic/v3_indic.pt",
+      "size_bytes": 57109001,
+      "sha256": "f82129e01d4ccdfb6044ad642224be756c754dd0d82056971ff140ff7f60f87f"
+    },
+    "smoke": {
+      "text": "namastē duniyā.",
+      "speaker": "hindi_female",
+      "variant": "v3_hifigan"
+    }
+  },
+  {
+    "model_id": "v5_ru",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/ru/v5_ru.pt",
+      "size_bytes": 145382211,
+      "sha256": "7ba04d42340fe0398042eed2e0d12d62e23096d626b1b9feff4dcb1309197ab4"
+    },
+    "smoke": {
+      "text": "Привет.",
+      "speaker": "aidar",
+      "variant": "v5_ru"
+    }
+  },
+  {
+    "model_id": "v5_cis_base",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/ru/v5_cis_base.pt",
+      "size_bytes": 91680514,
+      "sha256": "ba41b18f6a707ad93605a162998865e7c087153d2e010a26dd02229dab0e672a"
+    },
+    "smoke": {
+      "text": "Прив+ет.",
+      "speaker": "ru_aigul",
+      "variant": "v5_convnext_plain"
+    }
+  },
+  {
+    "model_id": "v5_cis_base_nostress",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/ru/v5_cis_base_nostress.pt",
+      "size_bytes": 91685438,
+      "sha256": "0405777e332906f0644e08a680f7cfdc2137ea864090079c1fdd30a43c1b8761"
+    },
+    "smoke": {
+      "text": "Привет.",
+      "speaker": "ru_aigul",
+      "variant": "v5_convnext_plain"
+    }
+  },
+  {
+    "model_id": "v5_turkic",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/ru/v5_turkic.pt",
+      "size_bytes": 91645586,
+      "sha256": "891b83d0e0952a72595df3719b76deff9461df2528a8bd226b14ba9da070315a"
+    },
+    "smoke": {
+      "text": "Исәнмесез.",
+      "speaker": "tat_0",
+      "variant": "v5_convnext_plain"
+    }
+  }
+]

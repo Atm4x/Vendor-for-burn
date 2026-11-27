@@ -105,7 +105,7 @@ fn official_english_checkpoint_worker_lifecycle() {
         json!({"command": "shutdown", "request_id": "bye"}),
     ]);
     for (i, response) in result.iter().enumerate() { assert_eq!(response["ok"], i != 6, "{response}"); }
-    assert_eq!(result[1]["data"]["model_variant"], "v3_en");
+    assert_eq!(result[1]["data"]["model_variant"], "v3_hifigan");
     assert_eq!(result[3]["data"]["state"], "ready");
     assert_eq!(result[4]["data"]["sample_count"], 7800);
     let audio = result[4]["data"]["audio"]["data_base64"].as_str().unwrap();

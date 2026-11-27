@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the shared IPC executable, including both original checkpoints when supplied."""
+"""Exercise the shared IPC executable, including all verified original checkpoints when supplied."""
 import argparse
 import hashlib
 import json
@@ -75,10 +75,15 @@ def main():
     parser.add_argument('binary', type=Path)
     parser.add_argument('--en', type=Path)
     parser.add_argument('--ru', type=Path)
+    parser.add_argument('--matrix-dir', type=Path)
     args = parser.parse_args()
     run(args.binary, None)
+    if args.matrix_dir:
+        catalogue = json.loads((Path(__file__).resolve().parent.parent / 'verified_models.json').read_text(encoding='utf-8'))
+        for model in catalogue:
+            run(args.binary, args.matrix_dir / (model['model_id'] + '-renamed.pt'), **model['smoke'])
     if args.en:
-        run(args.binary, args.en, 'Hello, world!', 'en_0', 'v3_en')
+        run(args.binary, args.en, 'Hello, world!', 'en_0', 'v3_hifigan')
     if args.ru:
         run(args.binary, args.ru, 'Привет.', 'aidar', 'v5_ru')
 

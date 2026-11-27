@@ -78,6 +78,7 @@ impl RussianCheckpoint {
         let (accent_meta, accent_tensors) = package.module(accent_id)?;
         let (homo_meta, homo_tensors) = package.module(homo_id)?;
         let (tts_meta, tts_tensors) = package.module(tts_id)?;
+        ensure!(tts_tensors.len() == 311, "unsupported neural-stress V5 graph: expected 311 tensors, got {}", tts_tensors.len());
         let _ = homo_meta;
         require_tensor(&accent_tensors, "embedding.weight", DType::F32, &[126523,16])?;
         require_tensor(&homo_tensors, "bert.embeddings.word_embeddings.weight", DType::I8, &[83830,312])?;

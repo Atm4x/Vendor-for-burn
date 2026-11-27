@@ -26,11 +26,11 @@ fn validate_position(tensors: &HashMap<String, Tensor>, prefix: &str, width: usi
     Ok(())
 }
 
-pub(crate) fn validate(tensors: &HashMap<String, Tensor>, metadata: &PickleValue) -> Result<()> {
-    ensure!(tensors.len() == 363, "Unsupported v3_en tensor count: {}", tensors.len());
+pub(crate) fn validate(tensors: &HashMap<String, Tensor>, metadata: &PickleValue, symbols: usize, speakers: usize) -> Result<()> {
+    ensure!(tensors.len() == 363, "Unsupported V3 tensor count: {}", tensors.len());
     let required = |name: &str, dims: &[usize]| require_tensor(tensors, &format!("tts_model.{name}"), DType::F32, dims);
     for prefix in ["dur_predictor.dur_pred", "pitch_predictor.pitch_pred"] {
-        for (suffix, dims) in [("embedding.weight", vec![39, 64]), ("speaker_embedding.weight", vec![119, 64]),
+        for (suffix, dims) in [("embedding.weight", vec![symbols, 64]), ("speaker_embedding.weight", vec![speakers, 64]),
             ("lin.weight", vec![1, 64]), ("lin.bias", vec![1])] {
             required(&format!("{prefix}.{suffix}"), &dims)?;
         }
@@ -39,7 +39,7 @@ pub(crate) fn validate(tensors: &HashMap<String, Tensor>, metadata: &PickleValue
         for i in 0..4 { validate_block(tensors, &format!("{stack}.layers.{i}"), 64, 64)?; }
     }
     for (name, dims) in [
-        ("tacotron.embedding.weight", vec![39, 128]), ("tacotron.speaker_embedding.weight", vec![119, 128]),
+        ("tacotron.embedding.weight", vec![symbols, 128]), ("tacotron.speaker_embedding.weight", vec![speakers, 128]),
         ("tacotron.pitch_proj.weight", vec![128, 1, 3]), ("tacotron.pitch_proj.bias", vec![128]),
         ("tacotron.lin.weight", vec![128, 128]), ("tacotron.lin.bias", vec![128]),
         ("tacotron.decoder.upsample.proj.weight", vec![384, 128]), ("tacotron.decoder.upsample.proj.bias", vec![384]),
@@ -74,7 +74,7 @@ pub(crate) fn validate(tensors: &HashMap<String, Tensor>, metadata: &PickleValue
     let get_dict = |key: &str| -> Result<&HashMap<String, PickleValue>> {
         let mut node = script;
         for segment in key.split('.') {
-            let value = node.get(segment).ok_or_else(|| anyhow::anyhow!("Missing v3_en metadata: {key}"))?;
+            let value = node.get(segment).ok_or_else(|| anyhow::anyhow!("Missing V3 metadata: {key}"))?;
             node = dictionary(value, key)?;
         }
         Ok(node)
@@ -83,9 +83,9 @@ pub(crate) fn validate(tensors: &HashMap<String, Tensor>, metadata: &PickleValue
     let decoder = get_dict("tts_model.tacotron.decoder")?;
     let vocoder = get_dict("tts_model.vocoder")?;
     let pqmf = get_dict("tts_model.vocoder.pqmf_layer")?;
-    ensure!(matches!(tacotron.get("pitch_strength"), Some(PickleValue::Float(v)) if *v == 1.0), "Unsupported English pitch strength");
-    ensure!(matches!(decoder.get("shorten_factor"), Some(PickleValue::Int(3))), "Unsupported English HourGlass factor");
-    ensure!(matches!(vocoder.get("num_kernels"), Some(PickleValue::Int(3))) && matches!(vocoder.get("multiband"), Some(PickleValue::Bool(true))) && matches!(vocoder.get("resample"), Some(PickleValue::Int(1))), "Unsupported English vocoder metadata");
-    ensure!(matches!(pqmf.get("N"), Some(PickleValue::Int(4))) && matches!(pqmf.get("taps"), Some(PickleValue::Int(62))), "Unsupported English PQMF metadata");
+    ensure!(matches!(tacotron.get("pitch_strength"), Some(PickleValue::Float(v)) if *v == 1.0), "Unsupported V3 pitch strength");
+    ensure!(matches!(decoder.get("shorten_factor"), Some(PickleValue::Int(3))), "Unsupported V3 HourGlass factor");
+    ensure!(matches!(vocoder.get("num_kernels"), Some(PickleValue::Int(3))) && matches!(vocoder.get("multiband"), Some(PickleValue::Bool(true))) && matches!(vocoder.get("resample"), Some(PickleValue::Int(1))), "Unsupported V3 vocoder metadata");
+    ensure!(matches!(pqmf.get("N"), Some(PickleValue::Int(4))) && matches!(pqmf.get("taps"), Some(PickleValue::Int(62))), "Unsupported V3 PQMF metadata");
     Ok(())
 }

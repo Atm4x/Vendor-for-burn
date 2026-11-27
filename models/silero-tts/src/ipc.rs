@@ -52,7 +52,8 @@ impl Worker {
                 "backend": self.backend, "gpu_id": self.gpu_id,
                 "model_variants": [
                     {"id":"v5_ru", "inputs":["text","ssml","accented","symbol_durations"]},
-                    {"id":"v3_en", "inputs":["text"]}
+                    {"id":"v3_hifigan", "inputs":["text"]},
+                    {"id":"v5_convnext_plain", "inputs":["text"]}
                 ],
                 "sample_rates": [8000,24000,48000], "outputs": ["wav_pcm16"],
                 "maximum_input_characters": crate::longform::MAX_INPUT_CHARS,
@@ -69,11 +70,8 @@ impl Worker {
             "warmup" => {
                 let session = self.session.as_mut().ok_or("model is not loaded")?;
                 if session.ready { return Err("model is already ready".into()); }
-                let (text, speaker) = match session.model.variant() {
-                    "v3_en" => ("Hello, world!", "en_0"),
-                    _ => ("На двери замок.", "aidar"),
-                };
-                session.model.infer_text(text, speaker, 8000).map_err(|e| format!("{e:#}"))?;
+                let (text, speaker) = session.model.warmup_input().map_err(|e| format!("{e:#}"))?;
+                session.model.infer_text(&text, &speaker, 8000).map_err(|e| format!("{e:#}"))?;
                 self.device.sync().map_err(|e| e.to_string())?;
                 session.ready = true;
                 Ok(self.status())

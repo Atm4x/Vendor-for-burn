@@ -38,16 +38,9 @@ Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'IPC_STDIO_WORKER.md') -Destinat
         size_bytes = (Get-Item -LiteralPath $exe).Length
         sha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
     }
-    models = @(
-        @{ model_id = 'v3_en'; artifact_arguments = @('--checkpoint'); checkpoint = @{
-            url = 'https://models.silero.ai/models/tts/en/v3_en.pt'; size_bytes = 57194546
-            sha256 = '02b71034d9f13bc4001195017bac9db1c6bb6115e03fea52983e8abcff13b665'
-        } },
-        @{ model_id = 'v5_ru'; artifact_arguments = @('--checkpoint'); checkpoint = @{
-            url = 'https://models.silero.ai/models/tts/ru/v5_ru.pt'; size_bytes = 145382211
-            sha256 = '7ba04d42340fe0398042eed2e0d12d62e23096d626b1b9feff4dcb1309197ab4'
-        } }
-    )
+    models = @(Get-Content -LiteralPath (Join-Path $PSScriptRoot 'verified_models.json') -Raw -Encoding utf8 | ConvertFrom-Json | ForEach-Object {
+        @{ model_id = $_.model_id; artifact_arguments = @($_.artifact_arguments); checkpoint = $_.checkpoint }
+    })
 } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $package 'worker-package.json') -Encoding utf8NoBOM
 $zip = Join-Path $assets "silero-tts_v${Version}_win_x86_64.zip"
 Compress-Archive -Path (Join-Path $package '*') -DestinationPath $zip -CompressionLevel Optimal
@@ -56,12 +49,10 @@ Expand-Archive -LiteralPath $zip -DestinationPath $installed
 $manifest = Get-Content -LiteralPath (Join-Path $installed 'worker-package.json') -Raw | ConvertFrom-Json
 $installedExe = Join-Path $installed $manifest.executable.path
 if ((Get-FileHash -LiteralPath $installedExe -Algorithm SHA256).Hash.ToLowerInvariant() -cne $manifest.executable.sha256) { throw 'Invalid executable hash' }
-$weights = @{}
 foreach ($model in $manifest.models) {
     $path = Join-Path $OutputRoot ($model.model_id + '-renamed.pt')
     curl.exe --fail --location --retry 3 $model.checkpoint.url --output $path
     if ((Get-Item -LiteralPath $path).Length -ne $model.checkpoint.size_bytes -or (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $model.checkpoint.sha256) { throw 'Invalid checkpoint' }
-    $weights[$model.model_id] = $path
 }
 $env:RAYON_NUM_THREADS = '4'
-python (Join-Path $PSScriptRoot 'tools/smoke_native_worker.py') $installedExe --en $weights['v3_en'] --ru $weights['v5_ru']
+python (Join-Path $PSScriptRoot 'tools/smoke_native_worker.py') $installedExe --matrix-dir $OutputRoot

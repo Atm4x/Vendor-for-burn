@@ -1,4 +1,4 @@
-use silero_package::EnglishCheckpoint;
+use silero_package::V3Checkpoint;
 use pytorch_reader::DType;
 use std::path::PathBuf;
 
@@ -6,7 +6,7 @@ use std::path::PathBuf;
 #[ignore = "requires official v3_en.pt; set SILERO_V3_EN_CHECKPOINT"]
 fn official_v3_en_all_tensors() {
     let path = PathBuf::from(std::env::var_os("SILERO_V3_EN_CHECKPOINT").expect("checkpoint path"));
-    let package = EnglishCheckpoint::open(&path).unwrap();
+    let package = V3Checkpoint::open(&path).unwrap();
     assert_eq!(package.tensors().len(), 363);
     assert_eq!(package.symbols.chars().count(), 39);
     assert_eq!(package.speakers["en_0"], 0);
@@ -54,7 +54,7 @@ fn detects_renamed_checkpoint_and_rejects_truncation() {
     let _cleanup = Cleanup(root.clone());
     let renamed = root.join("model.bin");
     if std::fs::hard_link(&original, &renamed).is_err() { std::fs::copy(&original, &renamed).unwrap(); }
-    assert!(matches!(OfficialCheckpoint::open(&renamed).unwrap(), OfficialCheckpoint::English(_)));
+    assert!(matches!(OfficialCheckpoint::open(&renamed).unwrap(), OfficialCheckpoint::V3(_)));
     let truncated = root.join("truncated.bin");
     use std::io::Read;
     let mut bytes = Vec::new();

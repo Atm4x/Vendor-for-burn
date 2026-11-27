@@ -29,7 +29,8 @@ impl Default for TextOptions {
 
 enum Session {
     Russian(Box<RussianTts>),
-    English(Box<crate::english::EnglishTts>),
+    V3(Box<crate::v3::V3Tts>),
+    V5Plain(Box<crate::v5_plain::V5PlainTts>),
 }
 
 /// One loaded checkpoint, with a model-specific frontend and synthesis graph.
@@ -41,7 +42,8 @@ impl SileroTts {
         let session = if path.is_file() {
             match OfficialCheckpoint::open(path)? {
                 OfficialCheckpoint::Russian(checkpoint) => Session::Russian(Box::new(RussianTts::from_official(checkpoint, device)?)),
-                OfficialCheckpoint::English(checkpoint) => Session::English(Box::new(crate::english::EnglishTts::load(checkpoint, device)?)),
+                OfficialCheckpoint::V5Plain(checkpoint) => Session::V5Plain(Box::new(crate::v5_plain::V5PlainTts::load(checkpoint, device)?)),
+                OfficialCheckpoint::V3(checkpoint) => Session::V3(Box::new(crate::v3::V3Tts::load(checkpoint, device)?)),
             }
         } else {
             Session::Russian(Box::new(RussianTts::load(path, device)?))
@@ -50,16 +52,28 @@ impl SileroTts {
     }
 
     pub fn variant(&self) -> &'static str {
-        match self.0 { Session::Russian(_) => "v5_ru", Session::English(_) => "v3_en" }
+        match self.0 { Session::Russian(_) => "v5_ru", Session::V3(_) => "v3_hifigan", Session::V5Plain(_) => "v5_convnext_plain" }
+    }
+
+    pub fn warmup_input(&self) -> Result<(String, String)> {
+        match &self.0 {
+            Session::Russian(_) => Ok(("На двери замок.".into(), "aidar".into())),
+            Session::V5Plain(model) => model.warmup_input(),
+            Session::V3(model) => {
+                let letter = model.config.symbols.chars().find(|c| c.is_ascii_lowercase()).context("V3 vocabulary has no warmup letter")?;
+                let speaker = model.config.speakers.keys().find(|s| s.as_str() != "random").context("V3 has no concrete warmup speaker")?;
+                Ok((letter.to_string().repeat(3), speaker.clone()))
+            }
+        }
     }
 
     fn russian(&self) -> Result<&RussianTts> {
-        match &self.0 { Session::Russian(model) => Ok(model), Session::English(_) => anyhow::bail!("Operation is not supported for v3_en") }
+        match &self.0 { Session::Russian(model) => Ok(model), _ => anyhow::bail!("Operation requires the neural stress frontend") }
     }
 
     pub fn speakers(&self) -> impl Iterator<Item = &str> {
-        let config = match &self.0 { Session::Russian(model) => &model.config, Session::English(model) => &model.config };
-        config.speakers.keys().map(String::as_str)
+        let speakers = match &self.0 { Session::Russian(model) => &model.config.speakers, Session::V3(model) => &model.config.speakers, Session::V5Plain(model) => &model.speakers };
+        speakers.keys().map(String::as_str).filter(|name| *name != "random")
     }
 
     pub fn infer_text(&self, text: &str, speaker: &str, sample_rate: u32) -> Result<Vec<f32>> {
@@ -69,14 +83,16 @@ impl SileroTts {
     pub fn infer_text_with_options(&self, text: &str, speaker: &str, sample_rate: u32, flags: &TextOptions) -> Result<Vec<f32>> {
         match &self.0 {
             Session::Russian(model) => model.infer_text_with_options(text, speaker, sample_rate, flags),
-            Session::English(model) => model.infer_text(text, speaker, sample_rate),
+            Session::V3(model) => model.infer_text(text, speaker, sample_rate),
+            Session::V5Plain(model) => model.infer_text(text, speaker, sample_rate),
         }
     }
 
     pub fn infer_token_ids(&self, symbols: &[i64], speaker: i64, sample_rate: u32) -> Result<Tensor<2>> {
         match &self.0 {
             Session::Russian(model) => model.infer_token_ids(symbols, speaker, sample_rate),
-            Session::English(model) => model.infer_token_ids(symbols, speaker, sample_rate),
+            Session::V3(model) => model.infer_token_ids(symbols, speaker, sample_rate),
+            Session::V5Plain(model) => model.infer_token_ids(symbols, speaker, sample_rate),
         }
     }
 

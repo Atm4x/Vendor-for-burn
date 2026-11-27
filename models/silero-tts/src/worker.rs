@@ -72,16 +72,16 @@ fn compiled_backends() -> Vec<&'static str> {
 pub fn capabilities() -> Value {
     json!({
         "protocol_version": PROTOCOL_VERSION,
-        "model": "silero-v5-ru",
+        "model": "silero-tts",
         "model_family": "silero-tts",
         "model_variants": [
             {"id": "v5_ru", "sample_rates": [8000, 24000, 48000], "inference_inputs": ["text", "ssml", "accented", "symbol_durations"]},
-            {"id": "v3_en", "sample_rates": [8000, 24000, 48000], "inference_inputs": ["text"]}
+            {"id": "v3_hifigan", "sample_rates": [8000, 24000, 48000], "inference_inputs": ["text"]},
+            {"id": "v5_convnext_plain", "sample_rates": [8000, 24000, 48000], "inference_inputs": ["text"]}
         ],
         "available_backends": compiled_backends(),
         "preferred_backend": if cfg!(feature = "cubecl-cpu") { Some("cpu") } else if cfg!(feature = "cubecl-wgpu") { Some("wgpu") } else if cfg!(feature = "cubecl-cuda") { Some("cuda") } else { None },
         "diagnostic_backend": if cfg!(feature = "reference-flex") { Some("flex") } else { None },
-        "speaker_names": ["aidar", "baya", "kseniya", "eugene", "xenia"],
         "sample_rates": [8000, 24000, 48000],
         "inference_inputs": ["text", "ssml", "accented", "symbol_durations"],
         "optional_text_providers": if cfg!(feature = "ruaccent") { vec!["ruaccent"] } else { vec![] },
@@ -277,11 +277,8 @@ impl Worker {
             Request::Warmup { text, speaker, sample_rate, .. } => {
                 let loaded = self.loaded.as_mut().context("Model is not loaded")?;
                 let start = Instant::now();
-                let (default_text, default_speaker) = match loaded.model.variant() {
-                    "v3_en" => ("Hello, world!", "en_0"),
-                    _ => ("На двери замок.", "aidar"),
-                };
-                let samples = loaded.model.infer_text(text.as_deref().unwrap_or(default_text), speaker.as_deref().unwrap_or(default_speaker), sample_rate)?;
+                let (default_text, default_speaker) = loaded.model.warmup_input()?;
+                let samples = loaded.model.infer_text(text.as_deref().unwrap_or(&default_text), speaker.as_deref().unwrap_or(&default_speaker), sample_rate)?;
                 loaded.warmed = true;
                 Ok((json!({
                     "state": "ready", "sample_count": samples.len(),

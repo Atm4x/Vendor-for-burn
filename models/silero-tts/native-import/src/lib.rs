@@ -4,16 +4,27 @@ use pytorch_reader::TorchPackageReader;
 use std::{collections::{BTreeMap, HashMap, HashSet}, path::Path};
 
 mod russian;
-mod english_schema;
+mod v3_schema;
+mod v5_plain;
+pub use v5_plain::V5PlainCheckpoint;
 pub use russian::{RussianCheckpoint, RussianConfig, RussianTokenizer, RussianControls};
 
-pub enum OfficialCheckpoint { English(EnglishCheckpoint), Russian(RussianCheckpoint) }
+pub enum OfficialCheckpoint { V3(V3Checkpoint), Russian(RussianCheckpoint), V5Plain(V5PlainCheckpoint) }
 impl OfficialCheckpoint {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let package = TorchPackageReader::open(path)?;
         let metadata = dictionary(package.metadata(), "model metadata")?;
-        if metadata.contains_key("speaker_to_id") { Ok(Self::English(EnglishCheckpoint::from_package(package)?)) }
-        else if metadata.contains_key("packages") { Ok(Self::Russian(RussianCheckpoint::from_package(package)?)) }
+        if metadata.contains_key("speaker_to_id") { Ok(Self::V3(V3Checkpoint::from_package(package)?)) }
+        else if let Some(PickleValue::List(parts)) = metadata.get("packages") {
+            let part = parts.first().context("empty Silero V5 package")?;
+            let fields = dictionary(part, "V5 package metadata")?;
+            if matches!(fields.get("accentor"), Some(PickleValue::None)) {
+                Ok(Self::V5Plain(V5PlainCheckpoint::from_package(package)?))
+            } else {
+                Ok(Self::Russian(RussianCheckpoint::from_package(package)?))
+            }
+        }
+        else if metadata.contains_key("speaker_to_ids") { bail!("unsupported V4 graph (multi-rate vocoder and frontend not yet implemented)") }
         else { bail!("unsupported Silero package architecture") }
     }
 }
@@ -51,15 +62,16 @@ fn require_tensor(tensors: &HashMap<String, Tensor>, name: &str, dtype: DType, s
     ensure!(t.dtype()==dtype && t.shape()==shape, "unexpected tensor {name}: {:?} {:?}", t.dtype(), t.shape()); Ok(())
 }
 
-pub struct EnglishCheckpoint {
+pub struct V3Checkpoint {
     pub symbols: String,
     pub speakers: BTreeMap<String, usize>,
     pub ascii_symbols: BTreeMap<char, String>,
     pub module_metadata: PickleValue,
+    pub encoded_symbols: String,
     tensors: HashMap<String, Tensor>,
 }
 
-impl EnglishCheckpoint {
+impl V3Checkpoint {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let package = TorchPackageReader::open(path.as_ref()).context("reading Silero TorchPackage")?;
         Self::from_package(package)
@@ -69,10 +81,11 @@ impl EnglishCheckpoint {
         let metadata = dictionary(package.metadata(), "model metadata")?;
         let symbols = string(metadata.get("symbols"), "symbols")?.to_owned();
         let speakers = ids(metadata.get("speaker_to_id"), "speaker_to_id")?;
-        ensure!(symbols.chars().count() == 39 && symbols.starts_with("_~|"), "unsupported v3_en symbols");
-        ensure!(symbols.chars().collect::<HashSet<_>>().len() == 39, "duplicate v3_en symbols");
-        ensure!(speakers.get("en_0") == Some(&0), "missing v3_en speaker en_0");
-        ensure!(speakers.values().all(|&id| id < 119), "speaker id outside embedding table");
+        let symbol_count = symbols.chars().count();
+        ensure!((4..=4096).contains(&symbol_count) && symbols.starts_with("_~|"), "unsupported V3 input symbols");
+        ensure!(symbols.chars().collect::<HashSet<_>>().len() == symbol_count, "duplicate V3 input symbols");
+        ensure!(!speakers.is_empty() && speakers.len() <= 4096, "invalid V3 speaker table");
+        ensure!(speakers.values().copied().collect::<HashSet<_>>().len() == speakers.len() && speakers.values().all(|&id| id < speakers.len()), "noncontiguous V3 speaker IDs");
         let mut ascii_symbols = BTreeMap::new();
         if let Some(value) = metadata.get("symb_ascii_dict") {
             for (key, value) in dictionary(value, "symb_ascii_dict")? {
@@ -84,17 +97,19 @@ impl EnglishCheckpoint {
         }
         let Some(PickleValue::Unsupported(reference)) = metadata.get("model") else { bail!("missing script module reference"); };
         let id = reference.strip_prefix("torchpackage.script:").context("unsupported model reference")?;
-        ensure!(package.module_ids().len() == 1, "v3_en requires exactly one script module");
-        let (module_metadata, tensors) = package.module(id).context("reading v3_en script tensors")?;
-        english_schema::validate(&tensors, &module_metadata)?;
+        ensure!(package.module_ids().len() == 1, "V3 requires exactly one script module");
+        let (module_metadata, tensors) = package.module(id).context("reading V3 script tensors")?;
+        v3_schema::validate(&tensors, &module_metadata, symbol_count, speakers.len())?;
         let total = tensors.values().try_fold(0usize, |sum, tensor| sum.checked_add(tensor.byte_len())).context("tensor byte count overflow")?;
-        ensure!(total <= 256 * 1024 * 1024, "v3_en tensor byte budget exceeded");
+        ensure!(total <= 256 * 1024 * 1024, "V3 tensor byte budget exceeded");
         let script = dictionary(&module_metadata, "script metadata")?;
         let symbol_to_id = ids(script.get("symbol_to_id"), "symbol_to_id")?;
-        for (idx, ch) in symbols.chars().enumerate() {
-            ensure!(symbol_to_id.get(&ch.to_string()) == Some(&idx), "inconsistent symbol id for {ch:?}");
+        let encoded_symbols: String = symbols.chars().map(|ch| ascii_symbols.get(&ch).cloned().unwrap_or_else(|| ch.to_string())).collect();
+        ensure!(encoded_symbols.chars().count() == symbol_count && symbol_to_id.len() == symbol_count, "invalid V3 encoded alphabet size");
+        for (idx, ch) in encoded_symbols.chars().enumerate() {
+            ensure!(symbol_to_id.get(&ch.to_string()) == Some(&idx), "inconsistent encoded symbol id for {ch:?}");
         }
-        Ok(Self { symbols, speakers, ascii_symbols, module_metadata, tensors })
+        Ok(Self { symbols, speakers, ascii_symbols, module_metadata, encoded_symbols, tensors })
     }
 
     pub fn tensors(&self) -> &HashMap<String, Tensor> { &self.tensors }
@@ -108,24 +123,24 @@ impl EnglishCheckpoint {
     }
 
     pub fn encode(&self, text: &str) -> Result<Vec<i64>> {
-        let sentence = normalize_english(&self.symbols, &self.ascii_symbols, text)?;
-        encode_english(&self.symbols, &sentence)
+        let sentence = normalize_v3(&self.symbols, &self.ascii_symbols, text)?;
+        encode_v3(&self.encoded_symbols, &sentence)
     }
 }
 
-pub fn normalize_english(symbols: &str, ascii_symbols: &BTreeMap<char, String>, text: &str) -> Result<String> {
+pub fn normalize_v3(symbols: &str, ascii_symbols: &BTreeMap<char, String>, text: &str) -> Result<String> {
     let text = text.to_lowercase().replace('—', "–").replace('‑', "-");
     let allowed: HashSet<char> = symbols.chars().skip(3).collect();
     let filtered: String = text.chars().filter(|c| allowed.contains(c)).collect();
     let normalized = filtered.split_whitespace().collect::<Vec<_>>().join(" ");
     let sentence: String = normalized.chars().map(|ch| ascii_symbols.get(&ch).cloned().unwrap_or_else(|| ch.to_string())).collect();
-    ensure!(sentence.chars().any(|ch| ch.is_ascii_lowercase() || ('1'..='9').contains(&ch) || ch == '-'), "text empty after English normalization");
+    ensure!(sentence.chars().any(|ch| ch.is_ascii_lowercase() || ('1'..='9').contains(&ch) || ch == '-'), "text empty after V3 normalization");
     Ok(sentence)
 }
 
-pub fn encode_english(symbols: &str, sentence: &str) -> Result<Vec<i64>> {
+pub fn encode_v3(symbols: &str, sentence: &str) -> Result<Vec<i64>> {
     std::iter::once('|').chain(sentence.chars()).chain(std::iter::once('~')).map(|ch| {
-        symbols.chars().position(|symbol| symbol == ch).map(|i| i as i64).with_context(|| format!("unknown English symbol {ch:?}"))
+        symbols.chars().position(|symbol| symbol == ch).map(|i| i as i64).with_context(|| format!("unknown V3 symbol {ch:?}"))
     }).collect()
 }
 
