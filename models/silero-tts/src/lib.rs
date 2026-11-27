@@ -4,6 +4,7 @@
 //! Prepared safetensors remain supported; neither path requires Python or PyTorch.
 
 pub mod frontend;
+pub mod catalogue;
 pub mod vocoder;
 pub mod spectral;
 pub mod synthesis;
@@ -17,6 +18,7 @@ pub mod predictors;
 pub mod acoustic;
 pub mod runtime;
 mod v3;
+mod v4;
 mod v5_plain;
 mod english_vocoder;
 #[cfg(feature = "reference-flex")]

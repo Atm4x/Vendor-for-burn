@@ -4,14 +4,23 @@ use pytorch_reader::TorchPackageReader;
 use std::{collections::{BTreeMap, HashMap, HashSet}, path::Path};
 
 mod russian;
+mod layout;
+pub use layout::ArchiveLayout;
 mod v3_schema;
 mod v5_plain;
+mod v4;
+pub use v4::V4Checkpoint;
 pub use v5_plain::V5PlainCheckpoint;
 pub use russian::{RussianCheckpoint, RussianConfig, RussianTokenizer, RussianControls};
 
-pub enum OfficialCheckpoint { V3(V3Checkpoint), Russian(RussianCheckpoint), V5Plain(V5PlainCheckpoint) }
+pub enum OfficialCheckpoint { V4(V4Checkpoint), V3(V3Checkpoint), Russian(RussianCheckpoint), V5Plain(V5PlainCheckpoint) }
 impl OfficialCheckpoint {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        match ArchiveLayout::inspect(path)? {
+            ArchiveLayout::TtsPackage => (),
+            ArchiveLayout::TorchScript => bail!("standalone TorchScript detected; native graph lowering is not implemented for this layout"),
+        }
         let package = TorchPackageReader::open(path)?;
         let metadata = dictionary(package.metadata(), "model metadata")?;
         if metadata.contains_key("speaker_to_id") { Ok(Self::V3(V3Checkpoint::from_package(package)?)) }
@@ -24,7 +33,7 @@ impl OfficialCheckpoint {
                 Ok(Self::Russian(RussianCheckpoint::from_package(package)?))
             }
         }
-        else if metadata.contains_key("speaker_to_ids") { bail!("unsupported V4 graph (multi-rate vocoder and frontend not yet implemented)") }
+        else if metadata.contains_key("speaker_to_ids") { Ok(Self::V4(V4Checkpoint::from_package(package)?)) }
         else { bail!("unsupported Silero package architecture") }
     }
 }

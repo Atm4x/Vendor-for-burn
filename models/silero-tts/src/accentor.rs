@@ -281,6 +281,70 @@ impl Accentor {
         output.into_iter().collect()
     }
 
+    /// V4's serialized frontend classifies the ASCII-transliterated words,
+    /// rather than the Unicode strings used by the V5 stress pipeline.
+    pub(crate) fn accentuate_v4_ascii(&self, sentence: &str, vowels: &str,
+        stop_words: &std::collections::HashSet<String>, put_yo: bool) -> Result<String> {
+        let clean: String = sentence.chars().filter(|c| c.is_ascii_lowercase() || ('1'..='9').contains(c) || *c == '-' || *c == ' ').collect();
+        let mut tokens = Vec::new();
+        for (word, cleaned) in sentence.split(' ').zip(clean.split(' ')) {
+            let parts: Vec<_> = word.split('-').collect();
+            let cleaned_parts: Vec<_> = cleaned.split('-').collect();
+            for (i, (raw, clean)) in parts.iter().zip(cleaned_parts).enumerate() {
+                let last = i + 1 == parts.len();
+                let raw = if last { raw.to_string() } else { format!("{raw}-") };
+                let needs_prediction = !clean.is_empty() && (!last || parts.len() == 1 || !stop_words.contains(clean));
+                tokens.push(Token { raw, clean: clean.to_owned(), needs_prediction });
+            }
+        }
+        let inputs: Vec<_> = tokens.iter().map(|t| t.clean.clone()).collect();
+        let predictions = self.predict(&inputs)?;
+        let words: Vec<_> = tokens.iter().zip(predictions.iter()).map(|(token, pred)| {
+            if !token.needs_prediction { return token.raw.clone(); }
+            let raw = &token.raw;
+            let have_stress = raw.contains('+');
+            let have_yo = raw.contains('1');
+            if have_stress && have_yo { return raw.clone(); }
+            let mut chars: Vec<_> = raw.chars().collect();
+            if !have_stress && have_yo {
+                for i in (0..chars.len()).rev() { if chars[i] == '1' { chars.insert(i, '+'); } }
+                return chars.into_iter().collect();
+            }
+            if let Some(entry) = self.exceptions.get(&token.clean) {
+                if have_stress {
+                    let positions: Vec<_> = chars.iter().enumerate().filter_map(|(i, c)| (*c == '+').then_some(i)).collect();
+                    chars.retain(|c| *c != '+');
+                    if put_yo && entry.1 >= 0 && positions.contains(&(entry.1 as usize + 1)) && (entry.1 as usize) < chars.len() {
+                        chars[entry.1 as usize] = '1';
+                    }
+                    for i in positions { chars.insert(i.min(chars.len()), '+'); }
+                } else {
+                    if put_yo && entry.1 >= 0 && (entry.1 as usize) < chars.len() { chars[entry.1 as usize] = '1'; }
+                    chars.insert((entry.0.max(0) as usize).min(chars.len()), '+');
+                }
+                return chars.into_iter().collect();
+            }
+            let (stress_id, stress_prob) = AccentPrediction::best(&pred.stress_logits);
+            let (yo_id, yo_prob) = AccentPrediction::best(&pred.yo_logits);
+            let vowel_positions: Vec<_> = chars.iter().enumerate().filter_map(|(i,c)| vowels.contains(*c).then_some(i)).collect();
+            if vowel_positions.is_empty() { return raw.clone(); }
+            let ye_positions: Vec<_> = chars.iter().enumerate().filter_map(|(i,c)| (*c == 'e').then_some(i)).collect();
+            let mut stress_positions = if have_stress {
+                raw.split('+').filter_map(|part| vowel_positions.get(part.chars().filter(|c| vowels.contains(*c)).count()).copied()).collect::<Vec<_>>()
+            } else { vowel_positions.get(stress_id).copied().into_iter().collect() };
+            if put_yo && yo_prob > 0.5 && (stress_prob > 0.5 || have_stress) && yo_id > 0 {
+                if let Some(&i) = ye_positions.get(yo_id-1).filter(|i| stress_positions.contains(i)) { chars[i] = '1'; }
+            }
+            let single_vowel = vowel_positions.len() == 1;
+            if single_vowel { stress_positions = vec![vowel_positions[0]]; }
+            if !have_stress && (stress_prob > 0.5 || single_vowel) {
+                for (offset,i) in stress_positions.into_iter().enumerate() { chars.insert((i+offset).min(chars.len()), '+'); }
+            }
+            chars.into_iter().collect()
+        }).collect();
+        Ok(words.join(" ").replace("- ", "-"))
+    }
+
     pub fn accentuate(&self, sentence: &str, opts: &AccentOptions) -> Result<String> {
         if !(opts.put_stress || opts.put_yo) { return Ok(sentence.to_string()); }
         let tokens = Self::tokenize(sentence);

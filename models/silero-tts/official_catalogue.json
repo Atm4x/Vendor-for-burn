@@ -1,0 +1,813 @@
+{
+  "source": "latest_silero_models.yml from silero-v5-ru-offline.zip",
+  "source_sha256": "5ef48c889e47197a0dc23dc857248b239e005ce82bb52597fea6a555ac95a3b5",
+  "models": [
+    {
+      "language": "ru",
+      "model_id": "v5_turkic",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/ru/v5_turkic.pt",
+      "sample_rates": [
+        8000,
+        24000,
+        48000
+      ],
+      "example": "В н+едрах т+ундры в+ыдры в г+етрах т+ырят в в+ёдра +ядра к+едров."
+    },
+    {
+      "language": "ru",
+      "model_id": "v5_caucasian",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/ru/v5_caucasian.pt",
+      "sample_rates": [
+        8000,
+        24000,
+        48000
+      ],
+      "example": "В н+едрах т+ундры в+ыдры в г+етрах т+ырят в в+ёдра +ядра к+едров."
+    },
+    {
+      "language": "ru",
+      "model_id": "v5_cis_base",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/ru/v5_cis_base.pt",
+      "sample_rates": [
+        8000,
+        24000,
+        48000
+      ],
+      "example": "В н+едрах т+ундры в+ыдры в г+етрах т+ырят в в+ёдра +ядра к+едров."
+    },
+    {
+      "language": "ru",
+      "model_id": "v5_cis_base_nostress_jit",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/ru/v5_cis_base_nostress.jit",
+      "sample_rates": [
+        8000,
+        24000,
+        48000
+      ],
+      "example": "В н+едрах т+ундры в+ыдры в г+етрах т+ырят в в+ёдра +ядра к+едров."
+    },
+    {
+      "language": "ru",
+      "model_id": "v5_cis_base_nostress",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/ru/v5_cis_base_nostress.pt",
+      "sample_rates": [
+        8000,
+        24000,
+        48000
+      ],
+      "example": "В н+едрах т+ундры в+ыдры в г+етрах т+ырят в в+ёдра +ядра к+едров."
+    },
+    {
+      "language": "ru",
+      "model_id": "v5_cis_ext",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/ru/v5_cis_ext.pt",
+      "sample_rates": [
+        8000,
+        24000,
+        48000
+      ],
+      "example": "+Я з р+аннього дит+инства д+уже любл+ю сл+ухати цік+аві к+азки."
+    },
+    {
+      "language": "ru",
+      "model_id": "v5_6_ru",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/ru/v5_6_ru.pt",
+      "sample_rates": [
+        8000,
+        24000,
+        48000
+      ],
+      "example": "Меня зовут Лева Королев. Я из готов. И я уже готов открыть все ваши замки любой сложности!"
+    },
+    {
+      "language": "ru",
+      "model_id": "v5_5_ru",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/ru/v5_5_ru.pt",
+      "sample_rates": [
+        8000,
+        24000,
+        48000
+      ],
+      "example": "Меня зовут Лева Королев. Я из готов. И я уже готов открыть все ваши замки любой сложности!"
+    },
+    {
+      "language": "ru",
+      "model_id": "v5_4_ru",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/ru/v5_4_ru.pt",
+      "sample_rates": [
+        8000,
+        24000,
+        48000
+      ],
+      "example": "Меня зовут Лева Королев. Я из готов. И я уже готов открыть все ваши замки любой сложности!"
+    },
+    {
+      "language": "ru",
+      "model_id": "v5_3_ru",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/ru/v5_3_ru.pt",
+      "sample_rates": [
+        8000,
+        24000,
+        48000
+      ],
+      "example": "Меня зовут Лева Королев. Я из готов. И я уже готов открыть все ваши замки любой сложности!"
+    },
+    {
+      "language": "ru",
+      "model_id": "v5_2_ru",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/ru/v5_2_ru.pt",
+      "sample_rates": [
+        8000,
+        24000,
+        48000
+      ],
+      "example": "Меня зовут Лева Королев. Я из готов. И я уже готов открыть все ваши замки любой сложности!"
+    },
+    {
+      "language": "ru",
+      "model_id": "v5_1_ru",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/ru/v5_1_ru.pt",
+      "sample_rates": [
+        8000,
+        24000,
+        48000
+      ],
+      "example": "Меня зовут Лева Королев. Я из готов. И я уже готов открыть все ваши замки любой сложности!"
+    },
+    {
+      "language": "ru",
+      "model_id": "v5_ru",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/ru/v5_ru.pt",
+      "sample_rates": [
+        8000,
+        24000,
+        48000
+      ],
+      "example": "Меня зовут Лева Королев. Я из готов. И я уже готов открыть все ваши замки любой сложности!"
+    },
+    {
+      "language": "ru",
+      "model_id": "v4_ru",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/ru/v4_ru.pt",
+      "sample_rates": [
+        8000,
+        24000,
+        48000
+      ],
+      "example": "В н+едрах т+ундры в+ыдры в г+етрах т+ырят в в+ёдра +ядра к+едров."
+    },
+    {
+      "language": "ru",
+      "model_id": "v3_1_ru",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/ru/v3_1_ru.pt",
+      "sample_rates": [
+        8000,
+        24000,
+        48000
+      ],
+      "example": "В н+едрах т+ундры в+ыдры в г+етрах т+ырят в в+ёдра +ядра к+едров."
+    },
+    {
+      "language": "ru",
+      "model_id": "ru_v3",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/ru/ru_v3.pt",
+      "sample_rates": [
+        8000,
+        24000,
+        48000
+      ],
+      "example": "В н+едрах т+ундры в+ыдры в г+етрах т+ырят в в+ёдра +ядра к+едров."
+    },
+    {
+      "language": "ru",
+      "model_id": "aidar_v2",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/ru/v2_aidar.pt",
+      "sample_rates": [
+        8000,
+        16000
+      ],
+      "example": "В н+едрах т+ундры в+ыдры в г+етрах т+ырят в в+ёдра +ядра к+едров."
+    },
+    {
+      "language": "ru",
+      "model_id": "aidar_8khz",
+      "declared_format": "jit",
+      "url": "https://models.silero.ai/models/tts/ru/v1_aidar_8000.jit",
+      "sample_rates": [
+        8000
+      ],
+      "tokenset": "_~абвгдеёжзийклмнопрстуфхцчшщъыьэюя +.,!?…:;–",
+      "example": "В н+едрах т+ундры в+ыдры в г+етрах т+ырят в в+ёдра +ядра к+едров."
+    },
+    {
+      "language": "ru",
+      "model_id": "aidar_16khz",
+      "declared_format": "jit",
+      "url": "https://models.silero.ai/models/tts/ru/v1_aidar_16000.jit",
+      "sample_rates": [
+        16000
+      ],
+      "tokenset": "_~абвгдеёжзийклмнопрстуфхцчшщъыьэюя +.,!?…:;–",
+      "example": "В н+едрах т+ундры в+ыдры в г+етрах т+ырят в в+ёдра +ядра к+едров."
+    },
+    {
+      "language": "ru",
+      "model_id": "baya_v2",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/ru/v2_baya.pt",
+      "sample_rates": [
+        8000,
+        16000
+      ],
+      "example": "В н+едрах т+ундры в+ыдры в г+етрах т+ырят в в+ёдра +ядра к+едров."
+    },
+    {
+      "language": "ru",
+      "model_id": "baya_8khz",
+      "declared_format": "jit",
+      "url": "https://models.silero.ai/models/tts/ru/v1_baya_8000.jit",
+      "sample_rates": [
+        8000
+      ],
+      "tokenset": "_~абвгдеёжзийклмнопрстуфхцчшщъыьэюя +.,!?…:;–",
+      "example": "В н+едрах т+ундры в+ыдры в г+етрах т+ырят в в+ёдра +ядра к+едров."
+    },
+    {
+      "language": "ru",
+      "model_id": "baya_16khz",
+      "declared_format": "jit",
+      "url": "https://models.silero.ai/models/tts/ru/v1_baya_16000.jit",
+      "sample_rates": [
+        16000
+      ],
+      "tokenset": "_~абвгдеёжзийклмнопрстуфхцчшщъыьэюя +.,!?…:;–",
+      "example": "В н+едрах т+ундры в+ыдры в г+етрах т+ырят в в+ёдра +ядра к+едров."
+    },
+    {
+      "language": "ru",
+      "model_id": "irina_v2",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/ru/v2_irina.pt",
+      "sample_rates": [
+        8000,
+        16000
+      ],
+      "example": "В н+едрах т+ундры в+ыдры в г+етрах т+ырят в в+ёдра +ядра к+едров."
+    },
+    {
+      "language": "ru",
+      "model_id": "irina_8khz",
+      "declared_format": "jit",
+      "url": "https://models.silero.ai/models/tts/ru/v1_irina_8000.jit",
+      "sample_rates": [
+        8000
+      ],
+      "tokenset": "_~абвгдеёжзийклмнопрстуфхцчшщъыьэюя +.,!?…:;–",
+      "example": "В н+едрах т+ундры в+ыдры в г+етрах т+ырят в в+ёдра +ядра к+едров."
+    },
+    {
+      "language": "ru",
+      "model_id": "irina_16khz",
+      "declared_format": "jit",
+      "url": "https://models.silero.ai/models/tts/ru/v1_irina_16000.jit",
+      "sample_rates": [
+        16000
+      ],
+      "tokenset": "_~абвгдеёжзийклмнопрстуфхцчшщъыьэюя +.,!?…:;–",
+      "example": "В н+едрах т+ундры в+ыдры в г+етрах т+ырят в в+ёдра +ядра к+едров."
+    },
+    {
+      "language": "ru",
+      "model_id": "kseniya_v2",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/ru/v2_kseniya.pt",
+      "sample_rates": [
+        8000,
+        16000
+      ],
+      "example": "В н+едрах т+ундры в+ыдры в г+етрах т+ырят в в+ёдра +ядра к+едров."
+    },
+    {
+      "language": "ru",
+      "model_id": "kseniya_8khz",
+      "declared_format": "jit",
+      "url": "https://models.silero.ai/models/tts/ru/v1_kseniya_8000.jit",
+      "sample_rates": [
+        8000
+      ],
+      "tokenset": "_~абвгдеёжзийклмнопрстуфхцчшщъыьэюя +.,!?…:;–",
+      "example": "В н+едрах т+ундры в+ыдры в г+етрах т+ырят в в+ёдра +ядра к+едров."
+    },
+    {
+      "language": "ru",
+      "model_id": "kseniya_16khz",
+      "declared_format": "jit",
+      "url": "https://models.silero.ai/models/tts/ru/v1_kseniya_16000.jit",
+      "sample_rates": [
+        16000
+      ],
+      "tokenset": "_~абвгдеёжзийклмнопрстуфхцчшщъыьэюя +.,!?…:;–",
+      "example": "В н+едрах т+ундры в+ыдры в г+етрах т+ырят в в+ёдра +ядра к+едров."
+    },
+    {
+      "language": "ru",
+      "model_id": "natasha_v2",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/ru/v2_natasha.pt",
+      "sample_rates": [
+        8000,
+        16000
+      ],
+      "example": "В н+едрах т+ундры в+ыдры в г+етрах т+ырят в в+ёдра +ядра к+едров."
+    },
+    {
+      "language": "ru",
+      "model_id": "natasha_8khz",
+      "declared_format": "jit",
+      "url": "https://models.silero.ai/models/tts/ru/v1_natasha_8000.jit",
+      "sample_rates": [
+        8000
+      ],
+      "tokenset": "_~абвгдеёжзийклмнопрстуфхцчшщъыьэюя +.,!?…:;–",
+      "example": "В н+едрах т+ундры в+ыдры в г+етрах т+ырят в в+ёдра +ядра к+едров."
+    },
+    {
+      "language": "ru",
+      "model_id": "natasha_16khz",
+      "declared_format": "jit",
+      "url": "https://models.silero.ai/models/tts/ru/v1_natasha_16000.jit",
+      "sample_rates": [
+        16000
+      ],
+      "tokenset": "_~абвгдеёжзийклмнопрстуфхцчшщъыьэюя +.,!?…:;–",
+      "example": "В н+едрах т+ундры в+ыдры в г+етрах т+ырят в в+ёдра +ядра к+едров."
+    },
+    {
+      "language": "ru",
+      "model_id": "ruslan_v2",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/ru/v2_ruslan.pt",
+      "sample_rates": [
+        8000,
+        16000
+      ],
+      "example": "В н+едрах т+ундры в+ыдры в г+етрах т+ырят в в+ёдра +ядра к+едров."
+    },
+    {
+      "language": "ru",
+      "model_id": "ruslan_8khz",
+      "declared_format": "jit",
+      "url": "https://models.silero.ai/models/tts/ru/v1_ruslan_8000.jit",
+      "sample_rates": [
+        8000
+      ],
+      "tokenset": "_~абвгдеёжзийклмнопрстуфхцчшщъыьэюя +.,!?…:;–",
+      "example": "В н+едрах т+ундры в+ыдры в г+етрах т+ырят в в+ёдра +ядра к+едров."
+    },
+    {
+      "language": "ru",
+      "model_id": "ruslan_16khz",
+      "declared_format": "jit",
+      "url": "https://models.silero.ai/models/tts/ru/v1_ruslan_16000.jit",
+      "sample_rates": [
+        16000
+      ],
+      "tokenset": "_~абвгдеёжзийклмнопрстуфхцчшщъыьэюя +.,!?…:;–",
+      "example": "В н+едрах т+ундры в+ыдры в г+етрах т+ырят в в+ёдра +ядра к+едров."
+    },
+    {
+      "language": "en",
+      "model_id": "v3_en",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/en/v3_en.pt",
+      "sample_rates": [
+        8000,
+        24000,
+        48000
+      ],
+      "example": "Can you can a canned can into an un-canned can like a canner can can a canned can into an un-canned can?"
+    },
+    {
+      "language": "en",
+      "model_id": "v3_en_indic",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/en/v3_en_indic.pt",
+      "sample_rates": [
+        8000,
+        24000,
+        48000
+      ],
+      "example": "Can you can a canned can into an un-canned can like a canner can can a canned can into an un-canned can?"
+    },
+    {
+      "language": "en",
+      "model_id": "lj_v2",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/en/v2_lj.pt",
+      "sample_rates": [
+        8000,
+        16000
+      ],
+      "example": "Can you can a canned can into an un-canned can like a canner can can a canned can into an un-canned can?"
+    },
+    {
+      "language": "en",
+      "model_id": "lj_8khz",
+      "declared_format": "jit",
+      "url": "https://models.silero.ai/models/tts/en/v1_lj_8000.jit",
+      "sample_rates": [
+        8000
+      ],
+      "tokenset": "_~abcdefghijklmnopqrstuvwxyz .,!?…:;–",
+      "example": "Can you can a canned can into an un-canned can like a canner can can a canned can into an un-canned can?"
+    },
+    {
+      "language": "en",
+      "model_id": "lj_16khz",
+      "declared_format": "jit",
+      "url": "https://models.silero.ai/models/tts/en/v1_lj_16000.jit",
+      "sample_rates": [
+        16000
+      ],
+      "tokenset": "_~abcdefghijklmnopqrstuvwxyz .,!?…:;–",
+      "example": "Can you can a canned can into an un-canned can like a canner can can a canned can into an un-canned can?"
+    },
+    {
+      "language": "de",
+      "model_id": "v3_de",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/de/v3_de.pt",
+      "sample_rates": [
+        8000,
+        24000,
+        48000
+      ],
+      "example": "Fischers Fritze fischt frische Fische, Frische Fische fischt Fischers Fritze."
+    },
+    {
+      "language": "de",
+      "model_id": "thorsten_v2",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/de/v2_thorsten.pt",
+      "sample_rates": [
+        8000,
+        16000
+      ],
+      "example": "Fischers Fritze fischt frische Fische, Frische Fische fischt Fischers Fritze."
+    },
+    {
+      "language": "de",
+      "model_id": "thorsten_8khz",
+      "declared_format": "jit",
+      "url": "https://models.silero.ai/models/tts/de/v1_thorsten_8000.jit",
+      "sample_rates": [
+        8000
+      ],
+      "tokenset": "_~abcdefghijklmnopqrstuvwxyzäöüß .,!?…:;–",
+      "example": "Fischers Fritze fischt frische Fische, Frische Fische fischt Fischers Fritze."
+    },
+    {
+      "language": "de",
+      "model_id": "thorsten_16khz",
+      "declared_format": "jit",
+      "url": "https://models.silero.ai/models/tts/de/v1_thorsten_16000.jit",
+      "sample_rates": [
+        16000
+      ],
+      "tokenset": "_~abcdefghijklmnopqrstuvwxyzäöüß .,!?…:;–",
+      "example": "Fischers Fritze fischt frische Fische, Frische Fische fischt Fischers Fritze."
+    },
+    {
+      "language": "es",
+      "model_id": "v3_es",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/es/v3_es.pt",
+      "sample_rates": [
+        8000,
+        24000,
+        48000
+      ],
+      "example": "Hoy ya es ayer y ayer ya es hoy, ya llegó el día, y hoy es hoy."
+    },
+    {
+      "language": "es",
+      "model_id": "tux_v2",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/es/v2_tux.pt",
+      "sample_rates": [
+        8000,
+        16000
+      ],
+      "example": "Hoy ya es ayer y ayer ya es hoy, ya llegó el día, y hoy es hoy."
+    },
+    {
+      "language": "es",
+      "model_id": "tux_8khz",
+      "declared_format": "jit",
+      "url": "https://models.silero.ai/models/tts/es/v1_tux_8000.jit",
+      "sample_rates": [
+        8000
+      ],
+      "tokenset": "_~abcdefghijklmnopqrstuvwxyzáéíñóú .,!?…:;–¡¿",
+      "example": "Hoy ya es ayer y ayer ya es hoy, ya llegó el día, y hoy es hoy."
+    },
+    {
+      "language": "es",
+      "model_id": "tux_16khz",
+      "declared_format": "jit",
+      "url": "https://models.silero.ai/models/tts/es/v1_tux_16000.jit",
+      "sample_rates": [
+        16000
+      ],
+      "tokenset": "_~abcdefghijklmnopqrstuvwxyzáéíñóú .,!?…:;–¡¿",
+      "example": "Hoy ya es ayer y ayer ya es hoy, ya llegó el día, y hoy es hoy."
+    },
+    {
+      "language": "fr",
+      "model_id": "v3_fr",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/fr/v3_fr.pt",
+      "sample_rates": [
+        8000,
+        24000,
+        48000
+      ],
+      "example": "Je suis ce que je suis, et si je suis ce que je suis, qu’est ce que je suis."
+    },
+    {
+      "language": "fr",
+      "model_id": "gilles_v2",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/fr/v2_gilles.pt",
+      "sample_rates": [
+        8000,
+        16000
+      ],
+      "example": "Je suis ce que je suis, et si je suis ce que je suis, qu’est ce que je suis."
+    },
+    {
+      "language": "fr",
+      "model_id": "gilles_8khz",
+      "declared_format": "jit",
+      "url": "https://models.silero.ai/models/tts/fr/v1_gilles_8000.jit",
+      "sample_rates": [
+        8000
+      ],
+      "tokenset": "_~abcdefghijklmnopqrstuvwxyzéàèùâêîôûç .,!?…:;–",
+      "example": "Je suis ce que je suis, et si je suis ce que je suis, qu’est ce que je suis."
+    },
+    {
+      "language": "fr",
+      "model_id": "gilles_16khz",
+      "declared_format": "jit",
+      "url": "https://models.silero.ai/models/tts/fr/v1_gilles_16000.jit",
+      "sample_rates": [
+        16000
+      ],
+      "tokenset": "_~abcdefghijklmnopqrstuvwxyzéàèùâêîôûç .,!?…:;–",
+      "example": "Je suis ce que je suis, et si je suis ce que je suis, qu’est ce que je suis."
+    },
+    {
+      "language": "ba",
+      "model_id": "aigul_v2",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/ba/v2_aigul.pt",
+      "sample_rates": [
+        8000,
+        16000
+      ],
+      "example": "Салауат Юлаевтың тормошо һәм яҙмышы хаҡындағы документтарҙың һәм шиғри әҫәрҙәренең бик аҙ өлөшө генә һаҡланған.",
+      "language_name": "bashkir"
+    },
+    {
+      "language": "xal",
+      "model_id": "v3_xal",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/xal/v3_xal.pt",
+      "sample_rates": [
+        8000,
+        24000,
+        48000
+      ],
+      "example": "Һорвн, дөрвн күн ирәд, һазань чиңгнв. Байн Цецн хаана һорвн көвүн күүндҗәнә."
+    },
+    {
+      "language": "xal",
+      "model_id": "erdni_v2",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/xal/v2_erdni.pt",
+      "sample_rates": [
+        8000,
+        16000
+      ],
+      "example": "Һорвн, дөрвн күн ирәд, һазань чиңгнв. Байн Цецн хаана һорвн көвүн күүндҗәнә.",
+      "language_name": "kalmyk"
+    },
+    {
+      "language": "tt",
+      "model_id": "v3_tt",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/tt/v3_tt.pt",
+      "sample_rates": [
+        8000,
+        24000,
+        48000
+      ],
+      "example": "Исәнмесез, саумысез, нишләп кәҗәгезне саумыйсыз, әтәчегез күкәй салган, нишләп чыгып алмыйсыз."
+    },
+    {
+      "language": "tt",
+      "model_id": "dilyara_v2",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/tt/v2_dilyara.pt",
+      "sample_rates": [
+        8000,
+        16000
+      ],
+      "example": "Ис+әнмесез, с+аумысез, нишл+әп кәҗәгезн+е с+аумыйсыз, әтәчег+ез күк+әй салг+ан, нишл+әп чыг+ып +алмыйсыз.",
+      "language_name": "tatar"
+    },
+    {
+      "language": "uz",
+      "model_id": "v4_uz",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/uz/v4_uz.pt",
+      "sample_rates": [
+        8000,
+        24000,
+        48000
+      ],
+      "example": "Tanishganimdan xursandman."
+    },
+    {
+      "language": "uz",
+      "model_id": "v3_uz",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/uz/v3_uz.pt",
+      "sample_rates": [
+        8000,
+        24000,
+        48000
+      ],
+      "example": "Tanishganimdan xursandman."
+    },
+    {
+      "language": "uz",
+      "model_id": "dilnavoz_v2",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/uz/v2_dilnavoz.pt",
+      "sample_rates": [
+        8000,
+        16000
+      ],
+      "example": "Tanishganimdan xursandman.",
+      "language_name": "uzbek"
+    },
+    {
+      "language": "ua",
+      "model_id": "v4_ua",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/ua/v4_ua.pt",
+      "sample_rates": [
+        8000,
+        24000,
+        48000
+      ],
+      "example": "К+отики - пухн+асті жив+отики."
+    },
+    {
+      "language": "ua",
+      "model_id": "v3_ua",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/ua/v3_ua.pt",
+      "sample_rates": [
+        8000,
+        24000,
+        48000
+      ],
+      "example": "К+отики - пухн+асті жив+отики."
+    },
+    {
+      "language": "ua",
+      "model_id": "mykyta_v2",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/ua/v22_mykyta_48k.pt",
+      "sample_rates": [
+        8000,
+        24000,
+        48000
+      ],
+      "example": "К+отики - пухн+асті жив+отики.",
+      "language_name": "ukrainian"
+    },
+    {
+      "language": "indic",
+      "model_id": "v4_indic",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/indic/v4_indic.pt",
+      "sample_rates": [
+        8000,
+        24000,
+        48000
+      ],
+      "example": "prasidda kabīra adhyētā, puruṣōttama agravāla kā yaha śōdha ālēkha, usa rāmānaṁda kī khōja karatā hai"
+    },
+    {
+      "language": "indic",
+      "model_id": "v3_indic",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/indic/v3_indic.pt",
+      "sample_rates": [
+        8000,
+        24000,
+        48000
+      ],
+      "example": "prasidda kabīra adhyētā, puruṣōttama agravāla kā yaha śōdha ālēkha, usa rāmānaṁda kī khōja karatā hai"
+    },
+    {
+      "language": "cyrillic",
+      "model_id": "v4_cyrillic",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/cyr/v4_cyrillic.pt",
+      "sample_rates": [
+        8000,
+        24000,
+        48000
+      ],
+      "example": "Волк слабее льва и тигра, но в цирке он не выступает."
+    },
+    {
+      "language": "multi",
+      "model_id": "multi_v2",
+      "declared_format": "package",
+      "url": "https://models.silero.ai/models/tts/multi/v2_multi.pt",
+      "sample_rates": [
+        8000,
+        16000
+      ],
+      "speakers": {
+        "aidar": {
+          "lang": "ru",
+          "example": "Съ+ешьте ещ+ё +этих м+ягких франц+узских б+улочек, д+а в+ыпейте ч+аю."
+        },
+        "baya": {
+          "lang": "ru",
+          "example": "Съ+ешьте ещ+ё +этих м+ягких франц+узских б+улочек, д+а в+ыпейте ч+аю."
+        },
+        "kseniya": {
+          "lang": "ru",
+          "example": "Съ+ешьте ещ+ё +этих м+ягких франц+узских б+улочек, д+а в+ыпейте ч+аю."
+        },
+        "irina": {
+          "lang": "ru",
+          "example": "Съ+ешьте ещ+ё +этих м+ягких франц+узских б+улочек, д+а в+ыпейте ч+аю."
+        },
+        "ruslan": {
+          "lang": "ru",
+          "example": "Съ+ешьте ещ+ё +этих м+ягких франц+узских б+улочек, д+а в+ыпейте ч+аю."
+        },
+        "natasha": {
+          "lang": "ru",
+          "example": "Съ+ешьте ещ+ё +этих м+ягких франц+узских б+улочек, д+а в+ыпейте ч+аю."
+        },
+        "thorsten": {
+          "lang": "de",
+          "example": "Fischers Fritze fischt frische Fische, Frische Fische fischt Fischers Fritze."
+        },
+        "tux": {
+          "lang": "es",
+          "example": "Hoy ya es ayer y ayer ya es hoy, ya llegó el día, y hoy es hoy."
+        },
+        "gilles": {
+          "lang": "fr",
+          "example": "Je suis ce que je suis, et si je suis ce que je suis, qu’est ce que je suis."
+        },
+        "lj": {
+          "lang": "en",
+          "example": "Can you can a canned can into an un-canned can like a canner can can a canned can into an un-canned can?"
+        },
+        "dilyara": {
+          "lang": "tt",
+          "example": "Пес+и пес+и песик+әй, борыннар+ы бәләк+әй."
+        }
+      }
+    }
+  ]
+}

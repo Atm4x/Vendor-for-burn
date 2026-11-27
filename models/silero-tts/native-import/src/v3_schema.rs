@@ -26,8 +26,7 @@ fn validate_position(tensors: &HashMap<String, Tensor>, prefix: &str, width: usi
     Ok(())
 }
 
-pub(crate) fn validate(tensors: &HashMap<String, Tensor>, metadata: &PickleValue, symbols: usize, speakers: usize) -> Result<()> {
-    ensure!(tensors.len() == 363, "Unsupported V3 tensor count: {}", tensors.len());
+pub(crate) fn validate_acoustic(tensors: &HashMap<String, Tensor>, symbols: usize, speakers: usize) -> Result<()> {
     let required = |name: &str, dims: &[usize]| require_tensor(tensors, &format!("tts_model.{name}"), DType::F32, dims);
     for prefix in ["dur_predictor.dur_pred", "pitch_predictor.pitch_pred"] {
         for (suffix, dims) in [("embedding.weight", vec![symbols, 64]), ("speaker_embedding.weight", vec![speakers, 64]),
@@ -44,14 +43,20 @@ pub(crate) fn validate(tensors: &HashMap<String, Tensor>, metadata: &PickleValue
         ("tacotron.lin.weight", vec![128, 128]), ("tacotron.lin.bias", vec![128]),
         ("tacotron.decoder.upsample.proj.weight", vec![384, 128]), ("tacotron.decoder.upsample.proj.bias", vec![384]),
         ("pitch_predictor.pitch_proj.weight", vec![256, 1, 3]), ("pitch_predictor.pitch_proj.bias", vec![256]),
-        ("vocoder.pqmf_layer.H", vec![4, 1, 63]), ("vocoder.pqmf_layer.G", vec![1, 4, 63]),
-        ("vocoder.pqmf_layer.updown_filter", vec![4, 4, 4]),
     ] { required(name, &dims)?; }
     for prefix in ["tts_model.tacotron.encoder", "tts_model.tacotron.decoder"] { validate_position(tensors, prefix, 128)?; }
     for i in 0..4 { validate_block(tensors, &format!("tts_model.tacotron.encoder.layers.{i}"), 128, 512)?; }
     for layer in ["pre_vanilla_layers.0", "shorten_layers.0", "shorten_layers.1", "post_vanilla_layers.0"] {
         validate_block(tensors, &format!("tts_model.tacotron.decoder.{layer}"), 128, 512)?;
     }
+    Ok(())
+}
+
+pub(crate) fn validate(tensors: &HashMap<String, Tensor>, metadata: &PickleValue, symbols: usize, speakers: usize) -> Result<()> {
+    ensure!(tensors.len() == 363, "Unsupported V3 tensor count: {}", tensors.len());
+    validate_acoustic(tensors, symbols, speakers)?;
+    let required = |name: &str, dims: &[usize]| require_tensor(tensors, &format!("tts_model.{name}"), DType::F32, dims);
+    for (name,dims) in [("vocoder.pqmf_layer.H", &[4,1,63][..]), ("vocoder.pqmf_layer.G", &[1,4,63]), ("vocoder.pqmf_layer.updown_filter", &[4,4,4])] { required(name,dims)?; }
     for (name, input, output) in [("conv_pre.0", 128, 256), ("conv_pre.1", 128, 512), ("conv_post", 64, 4), ("conv_post_u", 64, 4)] {
         required(&format!("vocoder.{name}.weight"), &[output, input, 7])?;
         required(&format!("vocoder.{name}.bias"), &[output])?;

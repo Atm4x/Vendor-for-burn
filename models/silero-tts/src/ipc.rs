@@ -53,6 +53,7 @@ impl Worker {
                 "model_variants": [
                     {"id":"v5_ru", "inputs":["text","ssml","accented","symbol_durations"]},
                     {"id":"v3_hifigan", "inputs":["text"]},
+                    {"id":"v4_hifigan", "inputs":["text"]},
                     {"id":"v5_convnext_plain", "inputs":["text"]}
                 ],
                 "sample_rates": [8000,24000,48000], "outputs": ["wav_pcm16"],

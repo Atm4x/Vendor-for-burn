@@ -158,5 +158,85 @@
       "speaker": "tat_0",
       "variant": "v5_convnext_plain"
     }
+  },
+  {
+    "model_id": "v4_ru",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/ru/v4_ru.pt",
+      "size_bytes": 40107184,
+      "sha256": "896ab96347d5bd781ab97959d4fd6885620e5aab52405d3445626eb7c1414b00"
+    },
+    "smoke": {
+      "text": "Привет, мир!",
+      "speaker": "aidar",
+      "variant": "v4_hifigan"
+    }
+  },
+  {
+    "model_id": "v4_ua",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/ua/v4_ua.pt",
+      "size_bytes": 35354913,
+      "sha256": "ee14ace1b9ef79ab6af53cf14fdba17d80de209ee6c34dc69efc65a5a5458165"
+    },
+    "smoke": {
+      "text": "Привіт, світе!",
+      "speaker": "mykyta",
+      "variant": "v4_hifigan"
+    }
+  },
+  {
+    "model_id": "v4_uz",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/uz/v4_uz.pt",
+      "size_bytes": 35337035,
+      "sha256": "46c7977beccf2f3c9f730de281f8efefe60ee8f293a2047e89aebe567b3ed4d7"
+    },
+    "smoke": {
+      "text": "Salom dunyo!",
+      "speaker": "dilnavoz",
+      "variant": "v4_hifigan"
+    }
+  },
+  {
+    "model_id": "v4_indic",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/indic/v4_indic.pt",
+      "size_bytes": 35379600,
+      "sha256": "8c0d0055340a9789a7ff8e5f7610bbc8d82355e577e483acb8a1fe4f2df0caa6"
+    },
+    "smoke": {
+      "text": "namastē duniyā.",
+      "speaker": "hindi_female",
+      "variant": "v4_hifigan"
+    }
+  },
+  {
+    "model_id": "v4_cyrillic",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/cyr/v4_cyrillic.pt",
+      "size_bytes": 35431527,
+      "sha256": "5e3862319e13883ea105cd4db835273c7febde62ff82d98d1ccf596607f8673f"
+    },
+    "smoke": {
+      "text": "Исәнмесез.",
+      "speaker": "b_tat",
+      "variant": "v4_hifigan"
+    }
   }
 ]
