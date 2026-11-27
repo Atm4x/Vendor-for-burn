@@ -1,0 +1,48 @@
+name: GigaAM - Export official checkpoint
+on:
+  workflow_dispatch:
+  push:
+    branches: [git-bridge/gigaam-official-weights-20261127]
+    paths: [.github/workflows/gigaam-official-weights.yml]
+permissions:
+  contents: read
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - model: v4_ctc
+            md5: 7f81bb7c82588bf3f6956e9ca6ce9451
+          - model: multilingual_v2_rnnt
+            md5: 4c24acddcf2f81d512563067b40ca36d
+    env:
+      MODEL: ${{ matrix.model }}
+      EXPECTED: ${{ matrix.md5 }}
+      ROOT_URL: https://cdn.chatwm.opensmodel.sberdevices.ru/GigaAM
+    steps:
+      - name: Fetch official assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/weights"
+          cd "$RUNNER_TEMP/weights"
+          fetch() { curl --fail --location --retry 3 --connect-timeout 20 --max-time 600 --output "$1.part" "$ROOT_URL/$1"; mv "$1.part" "$1"; }
+          fetch "$MODEL.ckpt"
+          printf '%s  %s\n' "$EXPECTED" "$MODEL.ckpt" | md5sum --check
+          if [[ "$MODEL" == multilingual_v2_rnnt ]]; then
+            fetch "${MODEL}_raw_tokenizer.model"
+            fetch "${MODEL}_e2e_tokenizer.model"
+          fi
+          sha256sum *.ckpt *.model 2>/dev/null > SHA256SUMS || test "$MODEL" = v4_ctc
+          sha256sum --check SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gigaam-${{ matrix.model }}-official
+          path: ${{ runner.temp }}/weights/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
