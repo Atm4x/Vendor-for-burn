@@ -4,7 +4,7 @@ use super::{
     language::{LanguageConditioner, LanguageTag},
 };
 use crate::{
-    audio::log_mel_with_config,
+    audio::{Features, log_mel_with_config},
     checkpoint_config::read_checkpoint_metadata,
     decode::{Transcription, ctc_argmax},
     model::CtcHead,
@@ -15,6 +15,15 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use burn::tensor::{Device, Tensor, TensorData};
 use std::path::Path;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeadSelection {
+    Raw,
+    #[default]
+    E2e,
+}
 
 struct AsrHead {
     tokenizer: Tokenizer,
@@ -157,7 +166,7 @@ impl AsrHead {
     }
 }
 
-/// Native full-context model. Streaming and the existing worker have separate contracts.
+/// Shared weights for full-context and stateful native packet inference.
 pub struct ZapformerModel {
     config: CheckpointConfig,
     encoder: ZapformerEncoder,
@@ -238,6 +247,66 @@ impl ZapformerModel {
             lengths,
         ))
     }
+    pub fn has_dual_heads(&self) -> bool {
+        matches!(self.heads, Heads::Dual { .. })
+    }
+
+    pub fn validate_language(&self, language: Option<&LanguageTag>) -> Result<()> {
+        if let Some(tag) = language {
+            self.config.language_conditioning.as_ref().context("checkpoint has no language conditioning")?.vector(tag)?;
+        }
+        Ok(())
+    }
+
+    fn selected_head(&self, selection: HeadSelection) -> Result<&AsrHead> {
+        match &self.heads {
+            Heads::EncoderOnly => bail!("encoder-only checkpoint does not support ASR"),
+            Heads::Single(head) => Ok(head),
+            Heads::Dual { raw, e2e } => Ok(match selection {
+                HeadSelection::Raw => raw,
+                HeadSelection::E2e => e2e,
+            }),
+        }
+    }
+
+    pub fn tokenizer(&self, selection: HeadSelection) -> Result<&Tokenizer> {
+        Ok(&self.selected_head(selection)?.tokenizer)
+    }
+
+    pub fn decode_selected(&self, encoded: Tensor<3>, lengths: &[usize], selection: HeadSelection) -> Result<Vec<Transcription>> {
+        self.selected_head(selection)?.decode(encoded, lengths)
+    }
+
+    pub fn selected_ctc_logits(&self, encoded: Tensor<3>, selection: HeadSelection) -> Result<Tensor<3>> {
+        match &self.selected_head(selection)?.decoder {
+            Decoder::Ctc(head) => head.logits(encoded),
+            Decoder::Rnnt(_) => bail!("CTC logits require a CTC head"),
+        }
+    }
+
+    pub(crate) fn encode_padded(&self, features: &[Features], tags: Option<&[LanguageTag]>) -> Result<(Tensor<3>, Vec<usize>)> {
+        ensure!(!features.is_empty(), "empty feature batch");
+        let mel = self.config.encoder.in_channels;
+        ensure!(features.iter().all(|f| f.n_mels == mel && f.frames > 0 && f.values.len() == mel * f.frames), "invalid mel batch dimensions");
+        let batch = features.len();
+        let time = features.iter().map(|f| f.frames).max().unwrap();
+        let lengths: Vec<_> = features.iter().map(|f| f.frames).collect();
+        let mut values = vec![0.0; batch * time * mel];
+        for (i, f) in features.iter().enumerate() {
+            for m in 0..mel {
+                let offset = (i * mel + m) * time;
+                values[offset..offset + f.frames].copy_from_slice(&f.values[m * f.frames..(m+1) * f.frames]);
+            }
+        }
+        self.encode_features(Tensor::<3>::from_data(TensorData::new(values, [batch, mel, time]), &self.device).swap_dims(1, 2), &lengths, tags)
+    }
+
+    pub(crate) fn pcm_features(&self, pcm: &[f32]) -> Result<Features> {
+        let features = log_mel_with_config(pcm, self.config.encoder.in_channels, self.config.mel)?;
+        ensure!(features.frames == self.config.mel.reported_frames(pcm.len()), "STFT/reported length mismatch");
+        Ok(features)
+    }
+
     pub fn decode_encoded(
         &self,
         encoded: Tensor<3>,
@@ -257,22 +326,8 @@ impl ZapformerModel {
         pcm: &[f32],
         tag: Option<&LanguageTag>,
     ) -> Result<(Tensor<3>, Vec<usize>)> {
-        ensure!(pcm.iter().all(|x| x.is_finite()), "non-finite PCM");
-        let features = log_mel_with_config(
-            pcm,
-            self.config.encoder.in_channels,
-            self.config.mel.clone(),
-        )?;
-        ensure!(
-            features.frames == self.config.mel.reported_frames(pcm.len()),
-            "STFT/reported length mismatch"
-        );
-        let input = Tensor::<3>::from_data(
-            TensorData::new(features.values, [1, features.n_mels, features.frames]),
-            &self.device,
-        )
-        .swap_dims(1, 2);
-        self.encode_features(input, &[features.frames], tag.map(std::slice::from_ref))
+        let features = self.pcm_features(pcm)?;
+        self.encode_padded(&[features], tag.map(std::slice::from_ref))
     }
     pub fn transcribe_pcm_16k(
         &self,
@@ -283,3 +338,6 @@ impl ZapformerModel {
         self.decode_encoded(encoded, &lengths)
     }
 }
+
+mod stream;
+pub use stream::{StreamPacket, StreamTranscription, ZapformerStream};

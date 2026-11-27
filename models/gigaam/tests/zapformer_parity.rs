@@ -174,3 +174,50 @@ fn flex_loads_native_dual_heads_and_language_conditioning() -> Result<()> {
 fn cubecl_cpu_loads_native_dual_heads_and_language_conditioning() -> Result<()> {
     run_dual(Device::cpu())
 }
+
+#[derive(Deserialize)]
+struct StreamReference {
+    packets: Vec<usize>,
+    cases: Vec<StreamCase>,
+}
+#[derive(Deserialize)]
+struct StreamCase {
+    chunk: usize,
+    left: usize,
+    counts: Vec<usize>,
+    output: Vec<f32>,
+}
+
+#[cfg(feature = "flex")]
+#[test]
+fn flex_matches_upstream_streaming_encoder_all_contexts() -> Result<()> {
+    use burn::tensor::TensorData;
+    let device = Device::flex();
+    let cases: Vec<Case> = serde_json::from_str(include_str!("fixtures/zapformer/cases.json"))?;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/zapformer");
+    let mut weights = Weights::open(&root.join(&cases[0].file))?;
+    let model = ZapformerEncoder::load(&mut weights, "encoder", &device, ZapformerConfig::from_upstream(&cases[0].config)?)?;
+    let base: Tensor<3> = weights.tensor("reference.input", &device)?;
+    let base = base.slice([0..1,0..35,0..8]).into_data().try_to_vec::<f32>()?;
+    let x = base.iter().cycle().take(145*8).copied().collect::<Vec<_>>();
+    let input = Tensor::<3>::from_data(TensorData::new(x,[1,145,8]),&device);
+    let reference: StreamReference = serde_json::from_str(include_str!("fixtures/zapformer/stream_reference.json"))?;
+    for case in reference.cases {
+        let mut stream = model.start_stream(case.chunk,case.left)?;
+        let mut offset = 0;
+        let mut frames = Vec::new();
+        for (i,count) in reference.packets.iter().copied().chain([0]).enumerate() {
+            let packet = (count>0).then(||input.clone().slice([0..1,offset..offset+count,0..8]));
+            offset+=count;
+            let output = stream.push(packet,count==0)?;
+            assert_eq!(output.as_ref().map_or(0,|x|x.dims()[1]),case.counts[i],"chunk {} left {} packet {i}",case.chunk,case.left);
+            if let Some(output) = output {frames.extend(output.into_data().try_to_vec::<f32>()?);}
+            assert!(stream.pending_frames()<case.chunk*4);
+        }
+        assert_eq!(stream.position(),37);
+        assert!(stream.finished());
+        assert!(stream.push(None,true).is_err());
+        compare(&format!("stream/chunk{}/left{}",case.chunk,case.left),Tensor::from_data(TensorData::new(frames,[1,37,8]),&device),Tensor::from_data(TensorData::new(case.output,[1,37,8]),&device))?;
+    }
+    Ok(())
+}

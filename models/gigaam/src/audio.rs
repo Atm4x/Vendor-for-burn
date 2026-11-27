@@ -456,6 +456,37 @@ pub fn log_mel_with_config(samples: &[f32], n_mels: usize, config: MelConfig) ->
     })
 }
 
+/// Uncentered STFT packetization. Only the incomplete window tail is retained.
+pub(crate) struct StreamingMel {
+    config: MelConfig,
+    n_mels: usize,
+    pending: Vec<f32>,
+    samples: usize,
+}
+
+impl StreamingMel {
+    pub(crate) fn new(config: MelConfig, n_mels: usize) -> Result<Self> {
+        config.validate()?;
+        ensure!(!config.center && config.hop_length <= config.n_fft, "streaming requires uncentered overlapping STFT");
+        ensure!((1..=256).contains(&n_mels), "n_mels outside 1..=256");
+        Ok(Self { config, n_mels, pending: Vec::new(), samples: 0 })
+    }
+
+    pub(crate) fn samples(&self) -> usize { self.samples }
+
+    pub(crate) fn push(&mut self, pcm: &[f32]) -> Result<Option<Features>> {
+        ensure!(pcm.iter().all(|v| v.is_finite()), "audio contains non-finite PCM samples");
+        self.samples = self.samples.checked_add(pcm.len()).context("stream sample count overflow")?;
+        self.pending.extend_from_slice(pcm);
+        let frames = self.config.stft_frames(self.pending.len());
+        if frames == 0 { return Ok(None); }
+        let count = (frames - 1) * self.config.hop_length + self.config.n_fft;
+        let features = log_mel_with_config(&self.pending[..count], self.n_mels, self.config)?;
+        self.pending.drain(..frames * self.config.hop_length);
+        Ok(Some(features))
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct AudioChunk<'a> {
     pub start_sample: usize,

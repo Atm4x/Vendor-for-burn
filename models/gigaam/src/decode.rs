@@ -93,6 +93,17 @@ pub fn words_from_frames(
     );
     let frame_shift =
         sample_count as f64 / crate::audio::SAMPLE_RATE as f64 / encoded_frames as f64;
+    words_at_frame_shift(tokenizer, token_ids, token_frames, frame_shift, encoded_frames)
+}
+
+pub(crate) fn words_at_frame_shift(
+    tokenizer: &crate::tokenizer::Tokenizer,
+    token_ids: &[usize],
+    token_frames: &[usize],
+    frame_shift: f64,
+    encoded_frames: usize,
+) -> Result<Vec<Word>> {
+    ensure!(token_ids.len() == token_frames.len(), "token/frame count mismatch");
     let mut result = Vec::new();
     let mut current_pieces = Vec::<&str>::new();
     let mut current_frames = Vec::<usize>::new();

@@ -187,6 +187,14 @@ pub struct RnntHead {
     classes: usize,
     max_symbols_per_step: usize,
 }
+#[derive(Default)]
+pub(crate) struct RnntDecodeState {
+    last_label: Option<usize>,
+    hidden: Option<PredictorState>,
+    prediction: Option<(Tensor<2>, PredictorState)>,
+    frame_offset: usize,
+}
+
 impl RnntHead {
     pub fn load(w: &mut Weights, prefix: &str, width: usize, classes: usize, rnnt: &RnntConfig, device: &Device) -> Result<Self> {
         rnnt.validate()?;
@@ -201,6 +209,12 @@ impl RnntHead {
         encoded: Tensor<3>,
         device: &Device,
     ) -> Result<(Vec<usize>, Vec<usize>, usize)> {
+        self.decode_chunk(encoded, device, &mut RnntDecodeState::default())
+    }
+
+    pub(crate) fn decode_chunk(
+        &self, encoded: Tensor<3>, device: &Device, state: &mut RnntDecodeState,
+    ) -> Result<(Vec<usize>, Vec<usize>, usize)> {
         let [batch, frames, dim] = encoded.dims();
         ensure!(batch == 1, "RNN-T decoding expects one encoder sequence");
         ensure!(dim == self.joint.enc.input_dim(), "RNN-T encoder width mismatch");
@@ -208,19 +222,17 @@ impl RnntHead {
         let enc_proj = self.joint.enc.apply(encoded.reshape([frames, dim]));
         let mut ids = Vec::new();
         let mut token_frames = Vec::new();
-        let mut last_label = None;
-        let mut state: Option<PredictorState> = None;
         let blank = self.classes - 1;
-        let mut prediction = None;
+        let end = state.frame_offset.checked_add(frames).context("RNN-T frame offset overflow")?;
         for frame in 0..frames {
             let enc_frame = enc_proj
                 .clone()
                 .slice([frame..frame + 1, 0..self.joint.enc.output_dim()]);
             for _ in 0..self.max_symbols_per_step {
-                if prediction.is_none() {
-                    prediction = Some(self.predictor.predict(last_label, state.as_ref(), device)?);
+                if state.prediction.is_none() {
+                    state.prediction = Some(self.predictor.predict(state.last_label, state.hidden.as_ref(), device)?);
                 }
-                let (pred, _) = prediction.as_ref().unwrap();
+                let (pred, _) = state.prediction.as_ref().unwrap();
                 let logits = self.joint.scores(enc_frame.clone(), pred.clone());
                 let values = logits
                     .into_data()
@@ -236,11 +248,12 @@ impl RnntHead {
                     break;
                 }
                 ids.push(best);
-                token_frames.push(frame);
-                last_label = Some(best);
-                state = prediction.take().map(|(_, next)| next);
+                token_frames.push(state.frame_offset + frame);
+                state.last_label = Some(best);
+                state.hidden = state.prediction.take().map(|(_, next)| next);
             }
         }
+        state.frame_offset = end;
         Ok((ids, token_frames, frames))
     }
 }

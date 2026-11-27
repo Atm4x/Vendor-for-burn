@@ -27,6 +27,11 @@ const MODEL_HASHES: &[(&str, &str)] = &[
     ("multilingual_ssl", "af54fed7a0337eeae7c4a25b2f8779c8"),
     ("multilingual_large_ctc", "79a9adde50dd7f35bbf70927cb6557d0"),
     ("multilingual_large_ssl", "2ef65a2ca413f6e1f99a4df0e86c1cee"),
+    ("v4_ctc", "7f81bb7c82588bf3f6956e9ca6ce9451"),
+    ("v4_rnnt", "af1027b4fa8b306c7aa1974e4b740fe0"),
+    ("v4_ssl", "22f509eba66cd723e06995e650ae99e8"),
+    ("multilingual_v2_rnnt", "4c24acddcf2f81d512563067b40ca36d"),
+    ("multilingual_v2_ssl", "ea8a54fb545b2e0f89a7f23dd9bcd807"),
 ];
 
 #[derive(Clone, Debug)]
@@ -53,6 +58,20 @@ impl Default for CacheOptions {
 
 pub fn known_models() -> &'static [(&'static str, &'static str)] {
     MODEL_HASHES
+}
+
+/// Encoder family for registered package identities. VAD is deliberately not an ASR model.
+pub fn is_zapformer_model(name: &str) -> bool {
+    matches!(name, "v4_ctc" | "v4_rnnt" | "v4_ssl" | "multilingual_v2_rnnt" | "multilingual_v2_ssl")
+}
+
+/// Official SentencePiece assets, independently owned by each decoder head.
+pub fn tokenizer_artifacts(name: &str) -> Vec<String> {
+    match name {
+        "v4_rnnt" | "multilingual_v2_rnnt" => ["raw", "e2e"].map(|head| format!("{name}_{head}_tokenizer.model")).to_vec(),
+        "v1_rnnt" | "v3_e2e_ctc" | "v3_e2e_rnnt" => vec![format!("{name}_tokenizer.model")],
+        _ => Vec::new(),
+    }
 }
 
 /// Resolve a directory, checkpoint path, or one of the Python model names.
@@ -86,8 +105,7 @@ pub fn resolve_model_path(spec: &str, options: &CacheOptions) -> Result<PathBuf>
         Some(md5),
         options,
     )?;
-    if canonical == "v1_rnnt" || canonical.contains("e2e") {
-        let filename = format!("{canonical}_tokenizer.model");
+    for filename in tokenizer_artifacts(canonical) {
         ensure_model_file(
             &options.directory.join(&filename),
             &format!("{ROOT_URL}/{filename}"),
@@ -298,6 +316,31 @@ mod tests {
             }
             assert_eq!(h.finish(), expected);
         }
+    }
+    #[test]
+    fn zapformer_registry_excludes_vad_and_resolves_both_tokenizers() -> Result<()> {
+        assert_eq!(known_models().iter().filter(|(name, _)| is_zapformer_model(name)).count(), 5);
+        assert!(!known_models().iter().any(|(name, _)| *name == "vad"));
+        assert_eq!(tokenizer_artifacts("v4_rnnt"), ["v4_rnnt_raw_tokenizer.model", "v4_rnnt_e2e_tokenizer.model"]);
+        assert_eq!(tokenizer_artifacts("multilingual_v2_rnnt"), ["multilingual_v2_rnnt_raw_tokenizer.model", "multilingual_v2_rnnt_e2e_tokenizer.model"]);
+        assert!(tokenizer_artifacts("v4_ctc").is_empty());
+        assert!(tokenizer_artifacts("v4_ssl").is_empty());
+        let root = std::env::temp_dir().join(format!("gigaam-registry-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()));
+        std::fs::create_dir(&root)?;
+        let result = (|| -> Result<()> {
+            let options = CacheOptions { directory: root.clone(), download_if_missing: false, validate_md5: false };
+            std::fs::write(root.join("v4_rnnt.ckpt"), b"synthetic cache")?;
+            assert!(resolve_model_path("v4_rnnt", &options).unwrap_err().to_string().contains("raw_tokenizer"));
+            std::fs::write(root.join("v4_rnnt_raw_tokenizer.model"), b"raw")?;
+            assert!(resolve_model_path("v4_rnnt", &options).unwrap_err().to_string().contains("e2e_tokenizer"));
+            std::fs::write(root.join("v4_rnnt_e2e_tokenizer.model"), b"e2e")?;
+            assert_eq!(resolve_model_path("v4_rnnt", &options)?, root.join("v4_rnnt.ckpt"));
+            let strict = CacheOptions { validate_md5: true, ..options };
+            assert!(resolve_model_path("v4_rnnt", &strict).unwrap_err().to_string().contains("MD5 mismatch"));
+            Ok(())
+        })();
+        std::fs::remove_dir_all(root)?;
+        result
     }
     #[test]
     fn aliases_and_cache_do_not_access_network_without_permission() -> Result<()> {

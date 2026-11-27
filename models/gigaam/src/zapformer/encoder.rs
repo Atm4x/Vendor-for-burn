@@ -78,6 +78,10 @@ impl Attention {
         rope: &(Tensor<4>, Tensor<4>),
         mask: &Tensor<2, Bool>,
     ) -> Tensor<3> {
+        self.forward_masked(qk, vg, rope, mask.clone().unsqueeze_dims::<4>(&[1, 2]), 0)
+    }
+
+    fn forward_masked(&self, qk: Tensor<3>, vg: Tensor<3>, rope: &(Tensor<4>, Tensor<4>), mask: Tensor<4, Bool>, offset: usize) -> Tensor<3> {
         let [b, t, _] = qk.dims();
         let qwidth = self.heads * self.qdim;
         let vwidth = self.heads * self.vdim;
@@ -103,14 +107,46 @@ impl Attention {
         let v = (v * activation::sigmoid(gate_in))
             .reshape([b, t, self.heads, self.vdim])
             .permute([0, 2, 1, 3]);
+        let q = if offset > 0 { q.slice([0..b,0..self.heads,offset..t,0..self.qdim]) } else { q };
+        let gate_out = if offset > 0 { gate_out.slice([0..b,offset..t,0..vwidth]) } else { gate_out };
         let scores = (q / (self.qdim as f64).sqrt()).matmul(k.transpose());
-        let scores = scores.mask_fill(mask.clone().unsqueeze_dims::<4>(&[1, 2]), -10000.0);
+        let scores = scores.mask_fill(mask, -10000.0);
         let values = activation::softmax(scores, 3)
             .matmul(v)
             .permute([0, 2, 1, 3])
-            .reshape([b, t, vwidth]);
+            .reshape([b, t-offset, vwidth]);
         self.out.forward(values * activation::sigmoid(gate_out))
     }
+}
+
+#[derive(Default)]
+struct LayerCache {
+    query: Option<Tensor<3>>,
+    value: Option<Tensor<3>>,
+    mean: Option<Tensor<3>>,
+    convolution: Option<Tensor<3>>,
+}
+
+fn with_history(previous: &Option<Tensor<3>>, current: Tensor<3>) -> Tensor<3> {
+    match previous {
+        Some(past) => Tensor::cat(vec![past.clone(),current], 1),
+        None => current,
+    }
+}
+
+fn tail(history: &Tensor<3>, limit: usize) -> Option<Tensor<3>> {
+    let [b,t,d] = history.dims();
+    (limit > 0).then(|| history.clone().slice([0..b,t.saturating_sub(limit)..t,0..d]))
+}
+
+struct StreamGeometry {
+    offset: usize,
+    valid: Tensor<2, Bool>,
+    allowed: Tensor<3, Bool>,
+    rope: (Tensor<4>,Tensor<4>),
+    keep: usize,
+    chunk: usize,
+    position: usize,
 }
 
 struct Convolution {
@@ -170,6 +206,38 @@ impl Convolution {
                 .forward((convolved + mean) * activation::sigmoid(gate), false),
         )
     }
+    fn stream(&self, x: Tensor<3>, cache: &mut LayerCache, geometry: &StreamGeometry) -> Tensor<3> {
+        let [b,t,d] = x.dims();
+        let device = x.device();
+        let projected = self.input.forward(x);
+        let values = projected.clone().slice([0..b,0..t,0..d]).mask_fill(geometry.valid.clone().bool_not().unsqueeze_dim::<3>(2),0.0);
+        let gate = projected.slice([0..b,0..t,d..2*d]);
+        let history = with_history(&cache.mean, values.clone());
+        let context = geometry.allowed.clone().float();
+        let counts = context.clone().sum_dim(2).clamp_min(1.0);
+        let mean = context.matmul(history.clone()) / counts * self.mean_weight.clone().reshape([1,1,d]);
+        cache.mean = tail(&history, geometry.keep);
+        let radius = self.kernel / 2;
+        let values = values.swap_dims(1,2);
+        let joined = if radius == 0 { values.clone() } else {
+            let past = cache.convolution.take().unwrap_or_else(|| Tensor::zeros([b,d,radius], &device));
+            let joined = Tensor::cat(vec![past,values.clone()],2);
+            cache.convolution = Some(joined.clone().slice([0..b,0..d,t..t+radius]));
+            joined
+        };
+        let mut y = module::conv1d(joined, self.weight.clone().slice([0..d,0..1,0..radius+1]), Some(self.bias.clone()), ConvOptions::new([1],[0],[1],d));
+        if radius > 0 {
+            let padded = values.pad([(0,radius)],PadMode::Constant(0.0));
+            for j in 1..=radius {
+                let visibility = (0..t).map(|i| f32::from((geometry.position+i) % geometry.chunk + j < geometry.chunk)).collect::<Vec<_>>();
+                let visibility = Tensor::<3>::from_data(TensorData::new(visibility,[1,1,t]), &device);
+                let weight = self.weight.clone().slice([0..d,0..1,radius+j..radius+j+1]).reshape([1,d,1]);
+                y = y + padded.clone().slice([0..b,0..d,j..j+t]) * weight * visibility;
+            }
+        }
+        self.output.forward(self.activation.forward((y.swap_dims(1,2)+mean)*activation::sigmoid(gate),false))
+    }
+
 }
 
 struct Layer {
@@ -240,6 +308,18 @@ impl Layer {
         }
         self.norm.forward(residual.clone() + (x - residual) * 0.25)
     }
+    fn stream(&self, residual: Tensor<3>, cache: &mut LayerCache, geometry: &StreamGeometry) -> Tensor<3> {
+        let mut x = residual.clone() + self.ff1.forward(residual.clone());
+        let history_q = with_history(&cache.query,residual.clone());
+        let history_v = with_history(&cache.value,x.clone());
+        x = x + self.attention.forward_masked(history_q.clone(),history_v.clone(),&geometry.rope,geometry.allowed.clone().bool_not().unsqueeze_dim::<4>(1),geometry.offset);
+        cache.query = tail(&history_q,geometry.keep);
+        cache.value = tail(&history_v,geometry.keep);
+        if let Some(conv) = &self.conv { x = x.clone() + conv.stream(x,cache,geometry); }
+        if let Some(ff) = &self.ff2 { x = x.clone() + ff.forward(x); }
+        self.norm.forward(residual.clone()+(x-residual)*0.25)
+    }
+
 }
 
 fn scalars(w: &mut Weights, key: &str, shape: &[usize]) -> Result<Vec<f32>> {
@@ -329,9 +409,82 @@ impl Stack {
                 .matmul(self.proj.clone())
                 .reshape([b, t, width])
     }
+    fn stream(&self, residual: Tensor<3>, caches: &mut [LayerCache], geometry: &StreamGeometry, condition: Option<&LanguageRequest<'_>>, layer_offset: usize) -> Tensor<3> {
+        let [b,t,width] = residual.dims();
+        let [dim,_] = self.proj.dims();
+        let projected = residual.clone().reshape([b*t,width]).matmul(self.proj.clone().transpose()).reshape([b,t,dim]);
+        let mut bypass = projected.clone()*self.residual_scales[0];
+        let mut x = projected*self.input_scale;
+        for (i,(layer,cache)) in self.layers.iter().zip(caches).enumerate() {
+            x = layer.stream(x,cache,geometry);
+            if let Some(condition) = condition { x = condition.apply_layer(layer_offset+i,x); }
+            bypass = bypass+x.clone()*self.residual_scales[i+1];
+        }
+        residual+bypass.reshape([b*t,dim]).matmul(self.proj.clone()).reshape([b,t,width])
+    }
+
 }
 
-/// Native offline full-context Zapformer. Context-limited and language-conditioned execution are separate gates.
+/// Owns bounded per-layer caches and the unfinished feature packet. No model weights are copied.
+pub struct ZapformerEncoderStream<'a> {
+    encoder: &'a ZapformerEncoder,
+    chunk: usize,
+    left: usize,
+    window: [i64;2],
+    pending: Option<Tensor<3>>,
+    frontend: Vec<Tensor<4>>,
+    layers: Vec<LayerCache>,
+    position: usize,
+    finished: bool,
+}
+
+impl ZapformerEncoderStream<'_> {
+    pub fn position(&self) -> usize { self.position }
+    pub fn pending_frames(&self) -> usize { self.pending.as_ref().map_or(0, |t| t.dims()[1]) }
+    pub fn finished(&self) -> bool { self.finished }
+
+    /// Accept feature packets [1, time, mel]. None flushes without additional input.
+    pub fn push(&mut self, features: Option<Tensor<3>>, final_packet: bool) -> Result<Option<Tensor<3>>> {
+        self.push_conditioned(features,final_packet,None)
+    }
+
+    pub(super) fn push_conditioned(&mut self, features: Option<Tensor<3>>, final_packet: bool, condition: Option<&LanguageRequest<'_>>) -> Result<Option<Tensor<3>>> {
+        ensure!(!self.finished, "encoder stream has already been finalized");
+        if let Some(features) = features {
+            let [batch,time,mel] = features.dims();
+            ensure!(batch==1 && mel==self.encoder.config.in_channels && time>0, "invalid streaming feature packet");
+            self.pending = Some(with_history(&self.pending,features));
+        }
+        let packet_frames = self.chunk.checked_mul(4).context("packet frame count overflow")?;
+        let available = self.pending_frames();
+        let count = if final_packet {available} else {available/packet_frames*packet_frames};
+        if count == 0 {
+            self.finished = final_packet;
+            return Ok(None);
+        }
+        let pending = self.pending.take().context("missing pending features")?;
+        let mel = pending.dims()[2];
+        let mut input = pending.clone().slice([0..1,0..count,0..mel]);
+        if count<available { self.pending = Some(pending.slice([0..1,count..available,0..mel])); }
+        let padding = (packet_frames-count%packet_frames)%packet_frames;
+        if padding>0 { input = input.pad([(0,padding),(0,0)],PadMode::Constant(0.0)); }
+        let (frontend,length) = self.encoder.frontend.forward_stream(input,count,&mut self.frontend)?;
+        let encoded = self.encoder.stream_chunk(frontend,length,self,condition)?;
+        self.position = self.position.checked_add(length).context("stream position overflow")?;
+        self.finished = final_packet;
+        let dim = encoded.dims()[2];
+        Ok(Some(encoded.slice([0..1,0..length,0..dim])))
+    }
+}
+
+fn allowed_position(q: i64,k: i64,chunk: i64,window: [i64;2],chunk_window: [i64;2]) -> bool {
+    let within = |q:i64,k:i64,[left,right]:[i64;2]| (left != -1 || right != -1) && (left<0 || k>=q-left) && (right<0 || k<=q+right);
+    let qc = q.div_euclid(chunk);
+    let kc = k.div_euclid(chunk);
+    qc==kc || within(q,k,window) || within(qc,kc,chunk_window)
+}
+
+/// Shared Zapformer weights for full-context and context-limited packet inference.
 pub struct ZapformerEncoder {
     pub frontend: ZapformerFrontend,
     config: ZapformerConfig,
@@ -383,6 +536,46 @@ impl ZapformerEncoder {
             out_scale,
             out_eps,
         })
+    }
+
+    pub fn start_stream(&self, chunk: usize, left: usize) -> Result<ZapformerEncoderStream<'_>> {
+        ensure!(self.config.causal_frontend && chunk>0, "streaming requires causal frontend and positive context");
+        let window = self.config.contexts.iter().find(|m| usize::try_from(m.chunk_size).ok()==Some(chunk)).context("unsupported streaming chunk size")?.window;
+        ensure!(self.stacks.iter().all(|s| chunk%s.factor==0 && left/s.factor+chunk/s.factor<=self.config.max_seq_len), "invalid streaming context geometry");
+        Ok(ZapformerEncoderStream { encoder:self,chunk,left,window,pending:None,frontend:Vec::new(),layers:(0..self.stacks.iter().map(|s|s.layers.len()).sum()).map(|_|LayerCache::default()).collect(),position:0,finished:false })
+    }
+
+    fn stream_chunk(&self,mut x: Tensor<3>,length: usize,state:&mut ZapformerEncoderStream<'_>,condition:Option<&LanguageRequest<'_>>) -> Result<Tensor<3>> {
+        let [b,original,embed] = x.dims();
+        ensure!(b==1 && length<=original,"invalid stream geometry");
+        let device=x.device();
+        let mask=invalid_mask(&[length],original,&device);
+        let mut layer_offset=0;
+        for stack in &self.stacks {
+            let ds=stack.factor;
+            ensure!(original%ds==0,"stream packet is not stack aligned");
+            if ds>1 {x=x.mask_fill(mask.clone().unsqueeze_dim::<3>(2),0.0);}
+            let t=original/ds;
+            let valid=length.div_ceil(ds);
+            let cache=&mut state.layers[layer_offset..layer_offset+stack.layers.len()];
+            let past=cache[0].query.as_ref().map_or(0,|x|x.dims()[1]);
+            let history=past+t;
+            ensure!(history<=self.config.max_seq_len,"stream packet exceeds RoPE table");
+            let position=i64::try_from(state.position)?;
+            let step=i64::try_from(ds)?;
+            let chunk=i64::try_from(state.chunk)?;
+            let mut values=Vec::with_capacity(t*history);
+            for q in 0..t {
+                for k in 0..history {
+                    values.push(k<past+valid && allowed_position(position+q as i64*step,position+(k as i64-past as i64)*step,chunk,state.window,self.config.chunk_window));
+                }
+            }
+            let geometry=StreamGeometry {offset:past,valid:invalid_mask(&[valid],t,&device).bool_not(),allowed:Tensor::from_data(TensorData::new(values,[1,t,history]),&device),rope:self.ropes[&stack.query_dim].positions(history),keep:state.left/ds,chunk:state.chunk/ds,position:state.position/ds};
+            x=stack.stream(x.reshape([b,t,embed*ds]),cache,&geometry,condition,layer_offset).reshape([b,original,embed]);
+            layer_offset+=stack.layers.len();
+        }
+        let variance=(x.clone()*x.clone()).mean_dim(2)+self.out_eps*self.out_eps;
+        Ok(x*(variance.sqrt().recip()*self.out_scale))
     }
 
     /// Input [batch,time,mel], output [batch,time,embed]. No decoder or mutable stream state.

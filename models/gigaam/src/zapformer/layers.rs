@@ -57,6 +57,11 @@ impl Conv2 {
             options: ConvOptions::new([stride; 2], padding, [1; 2], groups),
         })
     }
+    pub(super) fn forward_unpadded(&self, x: Tensor<4>, frequency_padding: usize) -> Tensor<4> {
+        let mut options = self.options.clone();
+        options.padding = [(0, 0), (frequency_padding, frequency_padding)];
+        module::conv2d(x, self.weight.clone(), Some(self.bias.clone()), options)
+    }
     pub(super) fn forward(&self, x: Tensor<4>) -> Tensor<4> {
         module::conv2d(
             x,

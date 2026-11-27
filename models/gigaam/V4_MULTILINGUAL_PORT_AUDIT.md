@@ -34,3 +34,17 @@ Use one loaded encoder per ASR model, with a typed encoder variant (Conformer or
 ## Evidence and limitations
 
 Git Bridge run 45884834323 artifact 15149105940: archive SHA-256 `9e89c13553e48217a00ee71ccc545a681079119a6c52108e0919900f0894dac7`; inner checksum and `git bundle verify` passed; source HEAD matches GitHub main. Static source review only: no Rust toolchain found on PATH, no official checkpoints, no CI or numerical tests run in CONT01. No runtime code or legacy files changed. Next implementation: G02 typed config/weight inventory and G03 float frontend, followed by G04/G05 offline Zapformer, before enabling new model IDs.
+
+
+## CONT03 scope correction and implementation evidence
+
+G09 is **external / out of scope**: the host owns VAD, utterance boundaries and speech regions. Upstream contains an independent `vad.ckpt`, not a required part of the ASR model. The ASR registry deliberately excludes it. The remaining target comprises ten contours and five official ASR/SSL checkpoints.
+
+- G01: explicit five new names and exact official MD5s, dual SentencePiece artifact inventory. Existing ambiguous short aliases still target v3 (legacy compatibility); explicit `multilingual_v2_ssl` selects the new checkpoint. Registry resolution is not a release support claim.
+- G02: embedded OmegaConf native checkpoints and upstream-format `config.json` + checkpoint/Safetensors load through the shared `GigaAm` encoder variant. Bare weights with sibling YAML, missing-metadata fine-tunes, and official checkpoint tensor inventories remain unverified/unsupported.
+- G03-G07: previous numerical component gates remain covered; shared encoder, independent heads, language and CTC/SSL outputs are now reachable through the main native API.
+- G08: Rust `ZapformerStream` owns uncentered PCM overlap, pending features, causal frontend and attention/convolution history, independent CTC or RNN-T predictor states, and text/word publication offsets. Context is selected from the checkpoint; default is largest declared context. Recreate the stream for changed context/language or a new utterance; failed streams are discarded. No whole-wave replay. One large packet must fit the encoder RoPE table.
+- G10: existing snapshot worker and service accept Zapformer, select a head and language per request, preserve external VAD regions/absolute offline timestamps. Native streaming available on `GigaAm`/`GigaAmService`; stdio protocol does not yet expose streaming sessions. Existing release packaging is unchanged.
+- G11: official checkpoint and GPU validation still blocked. No official weights/tokenizers present in the source archive or available library; CDN DNS resolution failed in the runtime. No CUDA or CubeCL CPU run; only Burn Flex FP32 on Rust 1.100.0.
+
+Evidence: `cargo test --offline --no-default-features --features flex` passes 69 tests (unit, integration, worker and regression). Streaming encoder: six original-PyTorch reference cases (160/320/640 ms; 0/8 left context), max absolute error 1.19209e-7, exact frame counts. End-to-end PCM: twelve original `GigaAMStreaming` cases (CTC/RNNT, three contexts, timestamps on/off), each with ten uneven packets and flush; exact text/token/frame IDs and word timestamps within 1e-9 s. Synthetic dual-head checkpoints only, not official weights. Reproduction scripts and fixtures are tracked; no new runtime dependencies.

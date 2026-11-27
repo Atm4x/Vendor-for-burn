@@ -1,4 +1,4 @@
-use crate::{GigaAm, ModelKind, audio, decode::Word};
+use crate::{AsrOptions, GigaAm, ModelKind, audio, decode::Word};
 use anyhow::{Context, Result, ensure};
 use burn::tensor::Device;
 use serde::Serialize;
@@ -140,6 +140,15 @@ impl GigaAmService {
         Ok(Self::from_loaded(GigaAm::load_with_cache(&path, device, options)?))
     }
 
+    /// Start a native utterance stream. The caller decides utterance boundaries (external VAD).
+    pub fn start_stream(&self, future_context_ms: Option<usize>, language: Option<&crate::zapformer::language::LanguageTag>, word_timestamps: bool) -> Result<crate::zapformer::ZapformerStream<'_>> {
+        self.model.start_stream(future_context_ms, language, word_timestamps)
+    }
+
+    pub fn is_zapformer(&self) -> bool {
+        self.model.is_zapformer()
+    }
+
     pub fn status(&self) -> ServiceStatus {
         ServiceStatus {
             model_kind: self.model.model_kind(),
@@ -162,10 +171,11 @@ impl GigaAmService {
         pcm: &[f32],
         options: TranscribeOptions<'_>,
     ) -> Result<TranscriptResult> {
-        ensure!(
-            self.model.model_kind().is_ctc() || self.model.model_kind().is_rnnt(),
-            "transcription requires a CTC or RNN-T model"
-        );
+        self.transcribe_16k_with_asr(pcm, options, AsrOptions::default())
+    }
+
+    pub fn transcribe_16k_with_asr(&self, pcm: &[f32], options: TranscribeOptions<'_>, asr: AsrOptions<'_>) -> Result<TranscriptResult> {
+        self.model.validate_asr_options(asr)?;
         ensure!(
             pcm.iter().all(|x| x.is_finite()),
             "PCM contains nonfinite samples"
@@ -200,7 +210,7 @@ impl GigaAmService {
                 if options.word_timestamps {
                     let results = self
                         .model
-                        .transcribe_segments_padded_with_timestamps_16k(&recordings)?;
+                        .transcribe_segments_padded_with_timestamps_16k(&recordings, asr)?;
                     for (chunk, result) in group.iter().zip(results) {
                         let offset = chunk.start_sample as f64 / audio::SAMPLE_RATE as f64;
                         segments.push(TranscriptSegment {
@@ -224,7 +234,7 @@ impl GigaAmService {
                         });
                     }
                 } else {
-                    let results = self.model.transcribe_segments_padded_16k(&recordings)?;
+                    let results = self.model.transcribe_segments_padded_16k(&recordings, asr)?;
                     for (chunk, result) in group.iter().zip(results) {
                         segments.push(TranscriptSegment {
                             text: result.text,
@@ -255,7 +265,7 @@ impl GigaAmService {
             let segment = if options.word_timestamps {
                 let result = self
                     .model
-                    .transcribe_segment_with_timestamps_16k(chunk.samples)
+                    .transcribe_segment_with_timestamps_16k(chunk.samples, asr)
                     .with_context(|| format!("transcribing segment {index}"))?;
                 let words = result
                     .words
@@ -275,7 +285,7 @@ impl GigaAmService {
             } else {
                 let result = self
                     .model
-                    .transcribe_segment_16k(chunk.samples)
+                    .transcribe_segment_16k(chunk.samples, asr)
                     .with_context(|| format!("transcribing segment {index}"))?;
                 TranscriptSegment {
                     text: result.text,

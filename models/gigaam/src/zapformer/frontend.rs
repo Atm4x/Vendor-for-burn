@@ -119,6 +119,40 @@ impl ZapformerFrontend {
         })
     }
 
+    /// One padded packet. Caches retain only the preceding convolution context, not the recording.
+    pub(super) fn forward_stream(&self, features: Tensor<3>, mut length: usize, cache: &mut Vec<Tensor<4>>) -> Result<(Tensor<3>, usize)> {
+        let [batch, time, freq] = features.dims();
+        ensure!(self.causal && batch == 1 && time > 0 && time % 4 == 0 && freq == self.in_channels && length <= time, "invalid streaming frontend geometry");
+        ensure!(cache.is_empty() || cache.len() == 4, "invalid streaming frontend cache");
+        let device = features.device();
+        let mut mask = invalid_mask(&[length], time, &device);
+        let mut x = features.mask_fill(mask.clone().unsqueeze_dim::<3>(2), 0.0).unsqueeze_dim::<4>(1);
+        let mut next = Vec::with_capacity(4);
+        let join = |x: Tensor<4>, index: usize, valid: usize, context: usize, next: &mut Vec<Tensor<4>>| {
+            let [_, channels, _, freq] = x.dims();
+            let past = cache.get(index).cloned().unwrap_or_else(|| Tensor::zeros([1, channels, context, freq], &device));
+            let joined = Tensor::cat(vec![past, x], 2);
+            next.push(joined.clone().slice([0..1, 0..channels, valid..valid+context, 0..freq]));
+            joined
+        };
+        for (i, conv) in self.convs.iter().enumerate() {
+            let joined = join(x, i, length, if i == 0 {2} else {1}, &mut next);
+            x = self.activation.forward(conv.forward_unpadded(joined, usize::from(i == 0)), false);
+            if i > 0 { length = length.div_ceil(2); }
+            mask = invalid_mask(&[length], x.dims()[2], &device);
+            x = x.mask_fill(mask.clone().unsqueeze_dims::<4>(&[1,3]), 0.0);
+        }
+        let joined = join(x.clone(), 3, length, 2, &mut next);
+        let conv = &self.convnext;
+        let y = conv.depthwise.forward_unpadded(joined, 1);
+        let y = conv.activation.forward(conv.expand.forward(y), true);
+        x = x + conv.reduce.forward(y);
+        let [b,c,t,f] = x.dims();
+        let x = self.out.forward(x.permute([0,2,1,3]).reshape([b,t,c*f]));
+        *cache = next;
+        Ok((x.mask_fill(mask.unsqueeze_dim::<3>(2), 0.0), length))
+    }
+
     /// Input and output are [batch, time, channels]; lengths are independent valid widths.
     pub fn forward(&self, x: Tensor<3>, lengths: &[usize]) -> Result<(Tensor<3>, Vec<usize>)> {
         let [batch, time, freq] = x.dims();

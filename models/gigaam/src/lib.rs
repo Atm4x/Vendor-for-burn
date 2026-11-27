@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tokenizer::Tokenizer;
 use weights::Weights;
+use zapformer::{HeadSelection, HeadTranscriptions, ZapformerModel, config::{CheckpointConfig, HeadConfig, HeadsConfig}, language::LanguageTag};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -55,6 +56,7 @@ impl ModelKind {
             "e2e_ctc" => "v3_e2e_ctc",
             "e2e_rnnt" => "v3_e2e_rnnt",
             "ssl" => "v3_ssl",
+            "multilingual_rnnt" => "multilingual_v2_rnnt",
             other => other,
         }
     }
@@ -78,6 +80,12 @@ impl ModelKind {
             ("v3_e2e_ctc", ModelKind::E2eCtc),
             ("v3_e2e_rnnt", ModelKind::E2eRnnt),
             ("v3_ssl", ModelKind::Ssl),
+            ("v4_ctc", ModelKind::Ctc),
+            ("v4_rnnt", ModelKind::Rnnt),
+            ("v4_ssl", ModelKind::Ssl),
+            ("multilingual_v2_rnnt", ModelKind::Rnnt),
+            ("multilingual_v2_ssl", ModelKind::Ssl),
+            ("multilingual_rnnt", ModelKind::Rnnt),
             ("multilingual_ctc", ModelKind::Ctc),
             ("multilingual_ssl", ModelKind::Ssl),
             ("multilingual_large_ctc", ModelKind::Ctc),
@@ -333,6 +341,7 @@ enum Network {
     Rnnt(RnntModel),
     Ssl(EncoderModel),
     Emo(EmotionModel),
+    Zapformer(Box<ZapformerModel>),
 }
 
 pub struct GigaAm {
@@ -378,6 +387,19 @@ pub fn inspect_native_manifest(path: &Path) -> Result<serde_json::Value> {
     serde_json::to_value(ModelManifest::from_upstream_values(metadata.config, path, metadata.base_model_name.as_deref())?).map_err(Into::into)
 }
 
+/// Per-request decoding policy; never changes the loaded model or its weights.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AsrOptions<'a> {
+    pub head: Option<HeadSelection>,
+    pub language: Option<&'a LanguageTag>,
+}
+
+impl AsrOptions<'_> {
+    fn selection(self) -> HeadSelection {
+        self.head.unwrap_or_default()
+    }
+}
+
 impl GigaAm {
     /// Load from a model directory or a specific checkpoint file. A sibling
     /// `config.json` supplies the architecture and tokenizer configuration.
@@ -393,6 +415,64 @@ impl GigaAm {
         cache: &model_registry::CacheOptions,
     ) -> Result<Self> {
         Self::load_internal(model_dir, device, Some(cache))
+    }
+
+    fn load_zapformer(path: &Path, config: CheckpointConfig, device: Device) -> Result<Self> {
+        let head_kind = |head: &HeadConfig| match head {
+            HeadConfig::Ctc { .. } => ModelKind::Ctc,
+            HeadConfig::Rnnt { .. } => ModelKind::Rnnt,
+        };
+        let kind = match &config.heads {
+            HeadsConfig::EncoderOnly => ModelKind::Ssl,
+            HeadsConfig::Single { head } => head_kind(head),
+            HeadsConfig::Dual { raw, e2e } => {
+                ensure!(head_kind(raw) == head_kind(e2e), "mixed CTC/RNN-T head families are not supported by the service");
+                head_kind(raw)
+            }
+        };
+        let n_mels = config.encoder.in_channels;
+        let mel = config.mel;
+        let network = Network::Zapformer(Box::new(ZapformerModel::load_with_config(path, config, device.clone())?));
+        Ok(Self { network, tokenizer: None, device, n_mels, mel, kind, emotion_names: Vec::new() })
+    }
+
+    pub fn validate_asr_options(&self, options: AsrOptions<'_>) -> Result<()> {
+        ensure!(self.kind.is_ctc() || self.kind.is_rnnt(), "ASR requires a CTC or RNN-T model");
+        match &self.network {
+            Network::Zapformer(model) => {
+                ensure!(options.head.is_none() || model.has_dual_heads(), "head selection requires a dual-head checkpoint");
+                model.validate_language(options.language)?;
+            }
+            _ => ensure!(options.head.is_none() && options.language.is_none(), "head/language selection requires a compatible Zapformer checkpoint"),
+        }
+        Ok(())
+    }
+
+    fn asr_tokenizer(&self, selection: HeadSelection) -> Result<&Tokenizer> {
+        match &self.network {
+            Network::Zapformer(model) => model.tokenizer(selection),
+            _ => self.tokenizer.as_ref().context("ASR tokenizer missing"),
+        }
+    }
+
+    /// Decode both heads using a single encoder execution. Only Zapformer checkpoints support this API.
+    pub fn transcribe_zapformer_heads_16k(&self, pcm: &[f32], language: Option<&LanguageTag>) -> Result<HeadTranscriptions> {
+        Self::check_short_transcription(pcm)?;
+        match &self.network {
+            Network::Zapformer(model) => model.transcribe_pcm_16k(pcm, language),
+            _ => bail!("explicit heads require a Zapformer checkpoint"),
+        }
+    }
+
+    pub fn start_stream(&self, future_context_ms: Option<usize>, language: Option<&LanguageTag>, word_timestamps: bool) -> Result<zapformer::ZapformerStream<'_>> {
+        match &self.network {
+            Network::Zapformer(model) => model.start_stream(future_context_ms,language,word_timestamps),
+            _ => bail!("stateful streaming requires a Zapformer ASR checkpoint"),
+        }
+    }
+
+    pub fn is_zapformer(&self) -> bool {
+        matches!(self.network, Network::Zapformer(_))
     }
 
     fn load_internal(
@@ -441,15 +521,31 @@ impl GigaAm {
         };
         let mut base_checkpoint = None;
         let manifest: ModelManifest = if cfg_path.is_file() {
-            serde_json::from_slice(
-                &std::fs::read(&cfg_path)
-                    .with_context(|| format!("reading {}", cfg_path.display()))?,
-            )?
+            let cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(&cfg_path).with_context(|| format!("reading {}", cfg_path.display()))?)?;
+            if cfg["encoder"]["_target_"].as_str() == Some("gigaam.encoder.ZapformerEncoder") {
+                let path = match direct_checkpoint {
+                    Some(path) => path.to_path_buf(),
+                    None => {
+                        let mut names = Vec::new();
+                        if let Some(name) = cfg["model_name"].as_str() {
+                            ensure!(name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'), "invalid model_name");
+                            names.extend([format!("{name}.ckpt"), format!("{name}.safetensors")]);
+                        }
+                        names.extend(["model.ckpt".into(), "model.safetensors".into()]);
+                        names.iter().map(|name| model_root.join(name)).find(|path| path.is_file()).context("Zapformer model weights not found")?
+                    }
+                };
+                return Self::load_zapformer(&path, CheckpointConfig::from_upstream(&cfg)?, device);
+            }
+            serde_json::from_value(cfg)?
         } else {
             let path = inferred_checkpoint.as_deref().context(
                 "automatic configuration requires a PyTorch checkpoint; use config.json with Safetensors",
             )?;
             let metadata = checkpoint_config::read_checkpoint_metadata(path)?;
+            if metadata.config["encoder"]["_target_"].as_str() == Some("gigaam.encoder.ZapformerEncoder") {
+                return Self::load_zapformer(path, CheckpointConfig::from_upstream(&metadata.config)?, device);
+            }
             let decoder_needs_base = metadata
                 .config
                 .pointer("/decoding/model_path")
@@ -635,7 +731,10 @@ impl GigaAm {
     }
 
     pub fn extract_features_16k(&self, pcm: &[f32]) -> Result<audio::Features> {
-        log_mel_with_config(pcm, self.n_mels, self.mel)
+        match &self.network {
+            Network::Zapformer(model) => model.pcm_features(pcm),
+            _ => log_mel_with_config(pcm, self.n_mels, self.mel),
+        }
     }
 
     pub fn mel_config(&self) -> MelConfig {
@@ -643,9 +742,15 @@ impl GigaAm {
     }
 
     pub fn infer_logits_16k(&self, pcm: &[f32]) -> Result<(Vec<f32>, usize)> {
-        let features = log_mel_with_config(pcm, self.n_mels, self.mel)?;
         match &self.network {
-            Network::Ctc(m) => m.infer_logits(&features, &self.device),
+            Network::Ctc(m) => m.infer_logits(&self.extract_features_16k(pcm)?, &self.device),
+            Network::Zapformer(model) => {
+                let (encoded, lengths) = model.encode_pcm_16k(pcm, None)?;
+                let logits = model.selected_ctc_logits(encoded, HeadSelection::default())?;
+                let [_, _, classes] = logits.dims();
+                let time = lengths[0];
+                Ok((logits.slice([0..1, 0..time, 0..classes]).into_data().try_to_vec::<f32>()?, time))
+            }
             _ => bail!("infer_logits_16k is only available for CTC variants"),
         }
     }
@@ -654,12 +759,22 @@ impl GigaAm {
     /// Output is row-major [time, channels], equivalent to Python
     /// `encoded.transpose(1, 2)[0]` (Python returns [1, channels, time]).
     pub fn infer_encoder_16k(&self, pcm: &[f32]) -> Result<(Vec<f32>, usize, usize)> {
-        let features = log_mel_with_config(pcm, self.n_mels, self.mel)?;
         let encoded = match &self.network {
-            Network::Ctc(model) => model.encode(&features, &self.device)?,
-            Network::Rnnt(model) => model.encode(&features, &self.device)?,
-            Network::Ssl(model) => model.encode(&features, &self.device)?,
-            Network::Emo(model) => model.encode(&features, &self.device)?,
+            Network::Zapformer(model) => {
+                let (encoded, lengths) = model.encode_pcm_16k(pcm, None)?;
+                let [_, _, channels] = encoded.dims();
+                encoded.slice([0..1, 0..lengths[0], 0..channels])
+            }
+            network => {
+                let features = self.extract_features_16k(pcm)?;
+                match network {
+                    Network::Ctc(model) => model.encode(&features, &self.device)?,
+                    Network::Rnnt(model) => model.encode(&features, &self.device)?,
+                    Network::Ssl(model) => model.encode(&features, &self.device)?,
+                    Network::Emo(model) => model.encode(&features, &self.device)?,
+                    Network::Zapformer(_) => unreachable!(),
+                }
+            }
         };
         let [batch, frames, channels] = encoded.dims();
         ensure!(batch == 1, "only single-sample encoder export supported");
@@ -682,7 +797,7 @@ impl GigaAm {
             .map(|(index, pcm)| {
                 let pcm = pcm.as_ref();
                 ensure!(!pcm.is_empty(), "empty recording at batch index {index}");
-                log_mel_with_config(pcm, self.n_mels, self.mel)
+                self.extract_features_16k(pcm)
             })
             .collect::<Result<Vec<_>>>()?;
         let (encoded, lengths) = match &self.network {
@@ -690,6 +805,9 @@ impl GigaAm {
             Network::Rnnt(model) => model.encode_padded(&features, &self.device)?,
             Network::Ssl(model) => model.encode_padded(&features, &self.device)?,
             Network::Emo(model) => model.encode_padded(&features, &self.device)?,
+            Network::Zapformer(model) => {
+                model.encode_padded(&features, None)?
+            }
         };
         let [_, max_time, channels] = encoded.dims();
         let values = encoded.into_data().try_to_vec::<f32>()?;
@@ -709,19 +827,21 @@ impl GigaAm {
     }
 
     pub fn infer_embeddings_16k(&self, pcm: &[f32]) -> Result<(Vec<f32>, usize, usize)> {
-        let features = log_mel_with_config(pcm, self.n_mels, self.mel)?;
-        let net = match &self.network {
-            Network::Ssl(net) => net,
-            _ => bail!("infer_embeddings_16k is only available for SSL models"),
-        };
-        let encoded = net.encode(&features, &self.device)?;
-        let [batch, frames, channels] = encoded.dims();
-        ensure!(batch == 1, "only single-sample embeddings supported");
-        let values = encoded.into_data().try_to_vec::<f32>()?;
-        Ok((values, frames, channels))
+        ensure!(self.kind.is_ssl(), "infer_embeddings_16k is only available for SSL models");
+        self.infer_encoder_16k(pcm)
     }
 
     fn decode_with_length_16k(&self, pcm: &[f32]) -> Result<(Transcription, usize)> {
+        self.decode_selected_16k(pcm, AsrOptions::default())
+    }
+
+    fn decode_selected_16k(&self, pcm: &[f32], options: AsrOptions<'_>) -> Result<(Transcription, usize)> {
+        self.validate_asr_options(options)?;
+        if let Network::Zapformer(model) = &self.network {
+            let (encoded, lengths) = model.encode_pcm_16k(pcm, options.language)?;
+            let mut result = model.decode_selected(encoded, &lengths, options.selection())?;
+            return Ok((result.pop().context("missing Zapformer transcription")?, lengths[0]));
+        }
         ensure!(!pcm.is_empty(), "transcription requires nonempty audio");
         let tokenizer = self
             .tokenizer
@@ -744,7 +864,7 @@ impl GigaAm {
                 (ids, frames, time)
             }
             Network::Rnnt(m) => m.infer_ids_with_length(&features, &self.device)?,
-            Network::Ssl(_) | Network::Emo(_) => bail!("non-ASR models do not produce transcripts"),
+            Network::Ssl(_) | Network::Emo(_) | Network::Zapformer(_) => bail!("non-ASR models do not produce transcripts"),
         };
         let text = tokenizer.decode(&ids)?;
         Ok((
@@ -762,11 +882,9 @@ impl GigaAm {
         &self,
         recordings: &[T],
         short_form: bool,
+        options: AsrOptions<'_>,
     ) -> Result<Vec<(Transcription, usize)>> {
-        let tokenizer = self
-            .tokenizer
-            .as_ref()
-            .context("batch transcription requires an ASR model")?;
+        self.validate_asr_options(options)?;
         if recordings.is_empty() {
             return Ok(Vec::new());
         }
@@ -781,10 +899,16 @@ impl GigaAm {
                 } else {
                     ensure!(!pcm.is_empty(), "longform segment {index} cannot be empty");
                 }
-                log_mel_with_config(pcm, self.n_mels, self.mel)
+                self.extract_features_16k(pcm)
                     .with_context(|| format!("preprocessing batch item {index}"))
             })
             .collect::<Result<Vec<_>>>()?;
+        if let Network::Zapformer(model) = &self.network {
+            let tags = options.language.map(|tag| vec![tag.clone(); features.len()]);
+            let (encoded, lengths) = model.encode_padded(&features, tags.as_deref())?;
+            return Ok(model.decode_selected(encoded, &lengths, options.selection())?.into_iter().zip(lengths).collect());
+        }
+        let tokenizer = self.asr_tokenizer(HeadSelection::default())?;
         let paths: Vec<(Vec<usize>, Vec<usize>, usize)> = match &self.network {
             Network::Ctc(model) => {
                 let (logits, lengths) = model.infer_logits_padded(&features, &self.device)?;
@@ -829,7 +953,7 @@ impl GigaAm {
         recordings: &[T],
     ) -> Result<Vec<Transcription>> {
         Ok(self
-            .decode_padded_batch_16k(recordings, true)?
+            .decode_padded_batch_16k(recordings, true, AsrOptions::default())?
             .into_iter()
             .map(|(result, _)| result)
             .collect())
@@ -838,9 +962,10 @@ impl GigaAm {
     pub(crate) fn transcribe_segments_padded_16k<T: AsRef<[f32]>>(
         &self,
         recordings: &[T],
+        options: AsrOptions<'_>,
     ) -> Result<Vec<Transcription>> {
         Ok(self
-            .decode_padded_batch_16k(recordings, false)?
+            .decode_padded_batch_16k(recordings, false, options)?
             .into_iter()
             .map(|(result, _)| result)
             .collect())
@@ -850,9 +975,10 @@ impl GigaAm {
         &self,
         recordings: &[T],
         short_form: bool,
+        options: AsrOptions<'_>,
     ) -> Result<Vec<TimedTranscription>> {
-        let tokenizer = self.tokenizer.as_ref().context("ASR tokenizer missing")?;
-        let decoded = self.decode_padded_batch_16k(recordings, short_form)?;
+        let tokenizer = self.asr_tokenizer(options.selection())?;
+        let decoded = self.decode_padded_batch_16k(recordings, short_form, options)?;
         decoded
             .into_iter()
             .zip(recordings)
@@ -879,14 +1005,15 @@ impl GigaAm {
         &self,
         recordings: &[T],
     ) -> Result<Vec<TimedTranscription>> {
-        self.timed_padded_batch_16k(recordings, true)
+        self.timed_padded_batch_16k(recordings, true, AsrOptions::default())
     }
 
     pub(crate) fn transcribe_segments_padded_with_timestamps_16k<T: AsRef<[f32]>>(
         &self,
         recordings: &[T],
+        options: AsrOptions<'_>,
     ) -> Result<Vec<TimedTranscription>> {
-        self.timed_padded_batch_16k(recordings, false)
+        self.timed_padded_batch_16k(recordings, false, options)
     }
 
     /// Ordered batch encoder outputs as (row-major frames, time, channels).
@@ -932,8 +1059,8 @@ impl GigaAm {
         Ok(())
     }
 
-    pub(crate) fn transcribe_segment_16k(&self, pcm: &[f32]) -> Result<Transcription> {
-        Ok(self.decode_with_length_16k(pcm)?.0)
+    pub(crate) fn transcribe_segment_16k(&self, pcm: &[f32], options: AsrOptions<'_>) -> Result<Transcription> {
+        Ok(self.decode_selected_16k(pcm, options)?.0)
     }
 
     pub fn transcribe_16k(&self, pcm: &[f32]) -> Result<Transcription> {
@@ -941,17 +1068,28 @@ impl GigaAm {
         Ok(self.decode_with_length_16k(pcm)?.0)
     }
 
+    pub fn transcribe_16k_with_options(&self, pcm: &[f32], options: AsrOptions<'_>) -> Result<Transcription> {
+        Self::check_short_transcription(pcm)?;
+        self.transcribe_segment_16k(pcm, options)
+    }
+
+    pub fn transcribe_with_timestamps_and_options_16k(&self, pcm: &[f32], options: AsrOptions<'_>) -> Result<TimedTranscription> {
+        Self::check_short_transcription(pcm)?;
+        self.transcribe_segment_with_timestamps_16k(pcm, options)
+    }
+
     pub fn transcribe_with_timestamps_16k(&self, pcm: &[f32]) -> Result<TimedTranscription> {
         Self::check_short_transcription(pcm)?;
-        self.transcribe_segment_with_timestamps_16k(pcm)
+        self.transcribe_segment_with_timestamps_16k(pcm, AsrOptions::default())
     }
 
     pub(crate) fn transcribe_segment_with_timestamps_16k(
         &self,
         pcm: &[f32],
+        options: AsrOptions<'_>,
     ) -> Result<TimedTranscription> {
-        let (transcription, encoded_len) = self.decode_with_length_16k(pcm)?;
-        let tokenizer = self.tokenizer.as_ref().context("ASR tokenizer missing")?;
+        let (transcription, encoded_len) = self.decode_selected_16k(pcm, options)?;
+        let tokenizer = self.asr_tokenizer(options.selection())?;
         let words = words_from_frames(
             tokenizer,
             &transcription.token_ids,
@@ -999,7 +1137,7 @@ impl GigaAm {
         speech_chunks_grouped_vad(samples, regions, options)?
             .iter()
             .map(|chunk| {
-                self.transcribe_segment_with_timestamps_16k(chunk.samples)
+                self.transcribe_segment_with_timestamps_16k(chunk.samples, AsrOptions::default())
                     .map(|result| result.with_sample_offset(chunk.start_sample))
             })
             .collect()

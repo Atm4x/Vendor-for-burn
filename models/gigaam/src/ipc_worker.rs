@@ -1,8 +1,9 @@
 use burn::tensor::Device;
 use gigaam_rs::{
-    ModelKind,
+    AsrOptions, ModelKind,
+    zapformer::{HeadSelection, language::LanguageTag},
     audio::{self, SpeechRegionSeconds},
-    model_registry::known_models,
+    model_registry::{known_models, is_zapformer_model},
     service::{GigaAmService, Segmentation, TranscribeOptions},
 };
 use serde::Deserialize;
@@ -46,6 +47,10 @@ struct Infer {
     segments: Option<Vec<SpeechRegionSeconds>>,
     #[serde(default = "default_group_vad")]
     group_vad: bool,
+    #[serde(default)]
+    head: Option<HeadSelection>,
+    #[serde(default)]
+    language: Option<LanguageTag>,
 }
 
 fn default_group_vad() -> bool {
@@ -102,6 +107,9 @@ impl Worker {
                     .map_err(|error| format!("{error:#}"))?;
                 if service.status().model_kind != self.model_kind {
                     return Err("checkpoint model family differs from package model_id".into());
+                }
+                if service.is_zapformer() != is_zapformer_model(&self.model_name) {
+                    return Err("checkpoint encoder architecture differs from package model_id".into());
                 }
                 self.model = Some(service);
                 self.warm = false;
@@ -201,10 +209,10 @@ impl Worker {
                     },
                     Some(regions) => Segmentation::SpeechRegions(regions),
                 };
-                let answer = model.transcribe_16k(&pcm, TranscribeOptions {
+                let answer = model.transcribe_16k_with_asr(&pcm, TranscribeOptions {
                     segmentation,
                     word_timestamps: infer.word_timestamps,
-                }).map_err(|error| format!("{error:#}"))?;
+                }, AsrOptions { head: infer.head, language: infer.language.as_ref() }).map_err(|error| format!("{error:#}"))?;
                 Ok(json!({
                     "gigaam_version": PROTOCOL_VERSION,
                     "kind": "asr",
@@ -215,7 +223,7 @@ impl Worker {
                 }))
             }
             "emotion" => {
-                if infer.word_timestamps || infer.segments.is_some() {
+                if infer.word_timestamps || infer.segments.is_some() || infer.head.is_some() || infer.language.is_some() {
                     return Err("emotion inference does not accept ASR segmentation options".into());
                 }
                 let probabilities = model.emotions_dict_16k(&pcm).map_err(|e| format!("{e:#}"))?;
@@ -228,7 +236,7 @@ impl Worker {
                 }))
             }
             "embeddings" => {
-                if infer.word_timestamps || infer.segments.is_some() {
+                if infer.word_timestamps || infer.segments.is_some() || infer.head.is_some() || infer.language.is_some() {
                     return Err("embedding inference does not accept ASR segmentation options".into());
                 }
                 let output_root = self.output_dir.as_ref().ok_or("embedding output directory was not configured")?;

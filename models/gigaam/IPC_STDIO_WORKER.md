@@ -39,6 +39,8 @@ The NeuroMita Core copies the audio to its own input directory and sends a **sin
 
 An `asr` result has `gigaam_version`, `kind`, `duration_seconds`, `sample_rate_hz` (=16000), `text`, and `segments` (each contains `text`, `start`, `end`, optional `words`). One recording without VAD intervals must be at most 25 seconds. For longform, pass `segments:[{"start":0.5,"end":2.7},...]` from the host VAD; Python-style grouping is enabled by default (`group_vad:false` disables it). The worker never detects speech intervals itself.
 
+Zapformer ASR snapshots additionally accept optional `head:"raw"` or `head:"e2e"` for dual-head checkpoints (default E2E) and `language` for conditioned checkpoints (tag, list, weighted map, or `"auto"`). These are request-scoped. Legacy models reject these explicit options. Native Rust clients can use `GigaAmService::start_stream` for packet inference; stdio remains a snapshot-only contract in this revision. The host continues to own VAD and utterance boundaries.
+
 For an SSL package, use `kind:"embeddings"` with the same version and snapshot; it returns `frames`, `channels` and `output:{file_name,size_bytes,sha256}`. Float32 little-endian output is written to the host-owned `--output-dir` under the request UUID as `<UUID>.f32`, without overwriting pre-existing files. For Emo, use `kind:"emotion"`; the response contains `probabilities` keyed by emotion name. Neither of these operations accepts ASR-only timestamps or VAD intervals.
 
 ## Windows package manifest
