@@ -1,0 +1,32 @@
+name: Build Silero Windows candidate
+
+on:
+  push:
+    branches: [feat/silero-tts-native-import]
+    paths:
+      - 'models/silero-tts/**'
+      - 'crates/native-worker-ipc/**'
+      - 'vendor/**'
+      - '.github/workflows/build-silero-windows-candidate.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build and stage the Flex worker
+        shell: pwsh
+        run: ./models/silero-tts/package_windows.ps1 -Version 1.0.0 -OutputRoot (Join-Path $env:RUNNER_TEMP 'silero-native')
+      - uses: actions/upload-artifact@v4
+        with:
+          name: silero-tts_v1.0.0_win_x86_64
+          path: ${{ runner.temp }}/silero-native/assets/silero-tts_v1.0.0_win_x86_64.zip
+          if-no-files-found: error
+          retention-days: 14

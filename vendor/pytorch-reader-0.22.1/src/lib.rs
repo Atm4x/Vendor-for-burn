@@ -52,8 +52,10 @@
 //! `state_dict()` gives them, leaving out non-persistent buffers and every other attribute.
 //! What a module computes for its state dict rather than stores, extra state
 //! (`get_extra_state()`) and the work of state dict hooks, is not in the pickle and so is
-//! not read. Checkpoints holding sparse, quantized or nested tensors are refused, since those cannot
-//! be represented. Only little-endian files are supported.
+//! not read. Ordinary checkpoints holding sparse, quantized or nested tensors are refused.
+//! The package-object reader additionally preserves signed per-tensor affine quantized weights
+//! and their scale and zero point as metadata; it does not expose them as ordinary float tensors.
+//! Only little-endian files are supported.
 //!
 //! # Safety limits
 //!
@@ -74,7 +76,7 @@ mod tests;
 
 pub use pickle_reader::{OpCode, PickleError};
 pub use reader::{
-    ByteOrder, FileFormat, PickleValue, PytorchError, PytorchMetadata, PytorchReader,
+    ByteOrder, FileFormat, PickleValue, PytorchError, PytorchMetadata, PytorchReader, TorchPackageReader, read_script_state,
 };
 pub use tensor::{DType, Tensor};
 

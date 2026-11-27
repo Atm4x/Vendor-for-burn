@@ -224,6 +224,7 @@ pub struct StorageRef {
     pub(crate) key: String,
     /// Element type of a typed storage; `None` for `torch.UntypedStorage`.
     pub(crate) dtype: Option<DType>,
+    pub(crate) quantized: bool,
     /// Bytes a tensor may reach in this storage: its declared size, or the end of the view
     /// when the pickle describes one.
     pub(crate) reachable_bytes: usize,
@@ -328,6 +329,7 @@ pub(crate) enum PersistentIds {
     Unavailable,
     /// `('storage', type, key, location, numel[, view])` tuples, backed by a source.
     Storages(Arc<StorageSource>),
+    Package(Arc<StorageSource>),
     /// Ids naming tensors built ahead of time (the TAR container).
     Tensors(HashMap<String, Tensor>),
 }
@@ -406,6 +408,10 @@ pub(crate) fn key_string(value: &Object, what: &str) -> Result<String> {
 
 /// Resolve a `('storage', storage_type, key, location, numel[, view_metadata])` tuple.
 fn resolve_storage_id(pid: &[Object], source: &Arc<StorageSource>) -> Result<StorageRef> {
+    resolve_storage_id_with_quantized(pid, source, false)
+}
+
+fn resolve_storage_id_with_quantized(pid: &[Object], source: &Arc<StorageSource>, allow_quantized: bool) -> Result<StorageRef> {
     let [tag, storage_type, key, _location, numel, view @ ..] = pid else {
         return Err(PickleError::InvalidData(format!(
             "storage persistent id has {} fields, expected at least 5",
@@ -428,8 +434,11 @@ fn resolve_storage_id(pid: &[Object], source: &Arc<StorageSource>) -> Result<Sto
             )));
         }
     };
+    let quantized = allow_quantized && matches!(storage_type, Object::Class { module_name, name } if module_name == "torch" && name == "QInt8Storage");
     let dtype = if type_name == "UntypedStorage" {
         None
+    } else if quantized {
+        Some(DType::I8)
     } else {
         Some(storage_type_to_dtype(type_name)?)
     };
@@ -480,6 +489,7 @@ fn resolve_storage_id(pid: &[Object], source: &Arc<StorageSource>) -> Result<Sto
         source: source.clone(),
         key,
         dtype,
+        quantized,
         // `reachable` never exceeds `numel`, whose byte length is checked above.
         reachable_bytes: reachable * element_size,
         view_offset,
@@ -489,6 +499,23 @@ fn resolve_storage_id(pid: &[Object], source: &Arc<StorageSource>) -> Result<Sto
 fn resolve_persistent_id(pid: Object, ids: &PersistentIds) -> Result<Object> {
     match ids {
         PersistentIds::Unavailable => Err(PickleError::NoDataSource),
+        PersistentIds::Package(source) => match pid {
+            Object::Tuple(fields) if matches!(fields.first(), Some(Object::String(tag)) if tag == "reduce_package") => {
+                match fields.as_slice() {
+                    [_, _, Object::Class { module_name, name }, Object::Tuple(args)] if module_name == "torch.jit._script" && name == "unpackage_script_module" => match args.as_slice() {
+                        [Object::String(id)] if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) => Ok(Object::Opaque(format!("torchpackage.script:{id}"))),
+                        _ => Err(PickleError::InvalidData("invalid script module id".into())),
+                    },
+                    _ => Err(PickleError::UnsupportedType("package persistent reduction".into())),
+                }
+            }
+            Object::Tuple(fields) => {
+                let storage = resolve_storage_id_with_quantized(&fields, source, true)?;
+                if let StorageSource::Zip(zip) = &**source { zip.validate_package_storage(&storage.key, storage.reachable_bytes)?; }
+                Ok(Object::Storage(storage))
+            }
+            _ => Err(PickleError::InvalidData("invalid package persistent id".into())),
+        },
         PersistentIds::Storages(source) => match pid {
             Object::Tuple(fields) => Ok(Object::Storage(resolve_storage_id(&fields, source)?)),
             other => Err(PickleError::InvalidData(format!(
@@ -759,6 +786,7 @@ fn rebuild_tensor(args: Object, kind: TensorRebuild) -> Result<Object> {
             )));
         }
     };
+    if storage.quantized { return Err(PickleError::UnsupportedType("QInt8Storage without quantizer".into())); }
     let storage_offset = non_negative(&fields[1], "storage offset")?;
     let shape = parse_dims(&fields[2], "shape")?;
     let stride = parse_dims(&fields[3], "stride")?;
@@ -790,6 +818,21 @@ fn rebuild_tensor(args: Object, kind: TensorRebuild) -> Result<Object> {
     }
 
     build_tensor(storage, dtype, storage_offset, shape, stride).map(Object::Tensor)
+}
+
+fn rebuild_package_qtensor(args: Object) -> Result<Object> {
+    let Object::Tuple(mut fields) = args else { return Err(PickleError::InvalidData("quantized tensor arguments".into())); };
+    if fields.len() != 7 { return Err(PickleError::InvalidData("quantized tensor arity".into())); }
+    let Object::Tuple(q) = &fields[4] else { return Err(PickleError::InvalidData("quantization parameters".into())); };
+    let [Object::Class { module_name, name }, Object::Float(scale), Object::Int(zero)] = q.as_slice() else { return Err(PickleError::UnsupportedType("non-per-tensor quantizer".into())); };
+    if module_name != "torch" || name != "per_tensor_affine" || !scale.is_finite() || *scale <= 0.0 || !(-128..=127).contains(zero) || !matches!(&fields[0], Object::Storage(s) if s.dtype == Some(DType::I8) && s.quantized) || fields[5..].iter().any(Object::holds_tensor_data) {
+        return Err(PickleError::InvalidData("invalid package QInt8 quantizer".into()));
+    }
+    let (scale, zero) = (*scale, *zero);
+    if let Object::Storage(storage) = &mut fields[0] { storage.quantized = false; }
+    fields.truncate(4);
+    let tensor = rebuild_tensor(Object::Tuple(fields), TensorRebuild::Legacy)?;
+    Ok(Object::Dict(HashMap::from([("weight".into(), tensor), ("scale".into(), Object::Float(scale)), ("zero_point".into(), Object::Int(zero))])))
 }
 
 fn parse_dims(value: &Object, what: &str) -> Result<Vec<usize>> {
@@ -1130,9 +1173,16 @@ impl<'a> Unpickler<'a> {
     fn charge_copy(&mut self, object: &Object) -> Result<()> {
         self.copied_nodes += object.node_count();
         self.copied_bytes += object.payload_bytes();
-        if self.copied_nodes > MAX_COPIED_NODES || self.copied_bytes > MAX_COPIED_BYTES {
+        // Silero v5 embeds two substantial natural-language dictionaries, unlike ordinary
+        // tensor checkpoints. Keep the larger allowance isolated to package parsing.
+        let (nodes, bytes) = if matches!(self.ids, PersistentIds::Package(_)) {
+            (8_000_000, 256 << 20)
+        } else {
+            (MAX_COPIED_NODES, MAX_COPIED_BYTES)
+        };
+        if self.copied_nodes > nodes || self.copied_bytes > bytes {
             return Err(PickleError::InvalidData(format!(
-                "Pickle memo bomb detected: copies exceeded {MAX_COPIED_NODES} nodes or {MAX_COPIED_BYTES} bytes"
+                "Pickle memo bomb detected: copies exceeded {nodes} nodes or {bytes} bytes"
             )));
         }
         Ok(())
@@ -1439,7 +1489,14 @@ impl<'a> Unpickler<'a> {
                     let args = self.pop()?;
                     let callable = self.pop_object()?;
                     // A call's result nests no deeper than its arguments did.
-                    let obj = reduce(callable, args.object)?;
+                    let obj = if matches!(self.ids, PersistentIds::Package(_)) {
+                        match (&callable, &args.object) {
+                            (Object::Class { module_name, name }, Object::Tuple(fields)) if module_name == "torch.jit._pickle" && name == "restore_type_tag" && fields.len() == 2 => fields[0].clone(),
+                            (Object::Class { module_name, name }, Object::Tuple(fields)) if module_name == "torch.jit._pickle" && matches!(name.as_str(), "build_intlist" | "build_doublelist" | "build_boollist" | "build_tensorlist") && fields.len() == 1 => fields[0].clone(),
+                            (Object::Class { module_name, name }, _) if module_name == "torch._utils" && name == "_rebuild_qtensor" => rebuild_package_qtensor(args.object)?,
+                            _ => reduce(callable, args.object)?,
+                        }
+                    } else { reduce(callable, args.object)? };
                     self.push(obj, args.depth)?;
                 }
                 OpCode::NewObj => {
@@ -1477,6 +1534,10 @@ impl<'a> Unpickler<'a> {
                         }
                         // A module instance (a full-model save) becomes its state_dict,
                         // which nests no deeper than the attributes it came from.
+                        (Object::Opaque(name), packed @ Object::Tuple(_)) if matches!(self.ids, PersistentIds::Package(_)) && matches!(name.as_str(), "__torch__.torch.classes.quantized.LinearPackedParamsBase" | "__torch__.torch.classes.rnn.CellParamsBase") => {
+                            (Object::Dict(HashMap::from([("class".into(), Object::String(name)), ("state".into(), packed)])), state.depth + 1)
+                        }
+                        (Object::Opaque(_), Object::Dict(attrs)) if matches!(self.ids, PersistentIds::Package(_)) => (Object::Dict(attrs), state.depth),
                         (Object::Opaque(_), Object::Dict(attrs)) if is_module_state(&attrs) => {
                             (module_state_dict(attrs)?, state.depth)
                         }
@@ -1972,6 +2033,28 @@ mod tests {
             reduce(callable, args).unwrap_err(),
             PickleError::UnsupportedType(name) if name == "torch._utils._rebuild_qtensor"
         ));
+    }
+
+    #[test]
+    fn package_qint8_preserves_quantization_without_reinterpreting_plain_tensors() {
+        let source = fixture_source();
+        let Object::Tuple(pid) = storage_pid("QInt8Storage", "0", 128) else { unreachable!() };
+        assert!(resolve_storage_id(&pid, &source).is_err());
+        let storage = resolve_storage_id_with_quantized(&pid, &source, true).unwrap();
+        let base = vec![Object::Storage(storage), Object::Int(0), Object::Tuple(vec![Object::Int(2)]), Object::Tuple(vec![Object::Int(1)])];
+        assert!(rebuild_tensor(Object::Tuple(base.clone()), TensorRebuild::Legacy).is_err());
+        let args = |name: &str, scale: f64, zero: i64| {
+            let mut fields = base.clone();
+            fields.extend([Object::Tuple(vec![Object::Class {module_name: "torch".into(), name: name.into()}, Object::Float(scale), Object::Int(zero)]), Object::Bool(false), Object::Dict(HashMap::new())]);
+            Object::Tuple(fields)
+        };
+        let Object::Dict(values) = rebuild_package_qtensor(args("per_tensor_affine", 0.25, -3)).unwrap() else {panic!("missing quantized metadata")};
+        assert!(matches!(values["scale"], Object::Float(0.25)));
+        assert!(matches!(values["zero_point"], Object::Int(-3)));
+        assert!(matches!(&values["weight"], Object::Tensor(t) if t.dtype()==DType::I8 && t.shape()==[2]));
+        for bad in [args("per_channel_affine", 0.25, 0), args("per_tensor_affine", -1.0, 0), args("per_tensor_affine", 1.0, 128)] {
+            assert!(rebuild_package_qtensor(bad).is_err());
+        }
     }
 
     #[test]

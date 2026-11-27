@@ -125,23 +125,33 @@ pub(crate) struct ZipSource {
     /// Size of the archive file. A stored storage is checked to lie within it, and it caps
     /// the up-front allocation for a deflated one, which grows as it is read.
     file_len: u64,
+    package: bool,
 }
 
 impl ZipSource {
-    pub fn open(path: &Path) -> Result<Self, PytorchError> {
+    pub fn open(path: &Path) -> Result<Self, PytorchError> { Self::open_layout(path, false, false) }
+    pub(crate) fn open_package(path: &Path) -> Result<Self, PytorchError> { Self::open_layout(path, true, false) }
+    pub(crate) fn open_script(path: &Path) -> Result<Self, PytorchError> { Self::open_layout(path, false, true) }
+    fn open_layout(path: &Path, package: bool, script: bool) -> Result<Self, PytorchError> {
         let file = File::open(path)?;
         let file_len = file.metadata()?.len();
         // The stream gets a duplicate of the handle rather than an open of its own, so a
         // replacement of `path` cannot slip in between two opens. The duplicate shares the
         // cursor, which is why `file` is only ever read at explicit offsets.
-        let archive = ZipArchive::new(BufReader::new(file.try_clone()?))?;
+        let reader = BufReader::new(file.try_clone()?);
+        let archive = if package || script {
+            ZipArchive::with_config(zip::read::Config { archive_offset: zip::read::ArchiveOffset::Known(0) }, reader)?
+        } else {
+            ZipArchive::new(reader)?
+        };
 
         let root = archive
             .file_names()
             .collect::<zip::result::ZipResult<Vec<_>>>()?
             .iter()
-            .filter_map(|name| name.strip_suffix("data.pkl"))
+            .filter_map(|name| name.strip_suffix(if package { "tts_models/model" } else { "data.pkl" }))
             .filter(|root| root.is_empty() || root.ends_with('/'))
+            .filter(|root| !script || archive.index_for_name(&format!("{root}constants.pkl")).is_some())
             .min_by_key(|root| root.len())
             .map(str::to_string)
             .ok_or_else(|| {
@@ -156,7 +166,30 @@ impl ZipSource {
             file,
             root,
             file_len,
+            package,
         })
+    }
+
+    fn storage_name(&self, key: &str) -> io::Result<String> {
+        if self.package {
+            let id = key.strip_suffix(".storage").unwrap_or(key);
+            if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) { return Err(invalid_data(format!("invalid package storage key '{key}'"))); }
+            Ok(format!("{}.data/{id}.storage", self.root))
+        } else { Ok(format!("{}data/{key}", self.root)) }
+    }
+    pub(crate) fn validate_package_storage(&self, key: &str, len: usize) -> io::Result<()> {
+        let name = self.storage_name(key)?;
+        let mut archive = lock_ignoring_poison(&self.archive);
+        let entry = open_entry(&mut archive, &name)?;
+        if entry.size() != len as u64 || len > crate::MAX_TENSOR_SIZE { return Err(invalid_data(format!("package storage '{name}' size mismatch: expected {len}, got {}", entry.size()))); }
+        Ok(())
+    }
+    pub(crate) fn package_pickle(&self, entry: &str) -> io::Result<Vec<u8>> { self.read_entry(&format!("{}{entry}", self.root), MAX_PICKLE_SIZE) }
+    pub(crate) fn package_modules(&self) -> io::Result<Vec<String>> {
+        let prefix = format!("{}.data/ts_code/", self.root);
+        let archive = lock_ignoring_poison(&self.archive);
+        let mut ids: Vec<String> = archive.file_names().collect::<zip::result::ZipResult<Vec<_>>>()?.iter().filter_map(|name| name.strip_prefix(&prefix)?.strip_suffix("/data.pkl")).filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())).map(str::to_owned).collect();
+        ids.sort(); ids.dedup(); Ok(ids)
     }
 
     /// Total uncompressed size of the storage entries.
@@ -210,7 +243,7 @@ impl ZipSource {
         start: usize,
         max_len: usize,
     ) -> io::Result<(Vec<u8>, usize)> {
-        let name = format!("{}data/{key}", self.root);
+        let name = self.storage_name(key)?;
         let mut archive = lock_ignoring_poison(&self.archive);
         let mut entry = open_entry(&mut archive, &name)?;
         let size = entry.size();

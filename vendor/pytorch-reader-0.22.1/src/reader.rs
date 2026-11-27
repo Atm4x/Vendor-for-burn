@@ -340,6 +340,85 @@ pub enum PickleValue {
     Unsupported(String),
 }
 
+/// Data-only TorchPackage reader for Silero-style packages. Script source is never evaluated.
+pub struct TorchPackageReader {
+    source: Arc<StorageSource>,
+    metadata: PickleValue,
+    tensors: HashMap<String, Tensor>,
+    module_ids: Vec<String>,
+}
+
+impl TorchPackageReader {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let zip = ZipSource::open_package(path.as_ref())?;
+        let bytes = zip.package_pickle("tts_models/model")?;
+        let module_ids = zip.package_modules()?;
+        if module_ids.is_empty() || module_ids.len() > 32 {
+            return Err(PytorchError::InvalidFormat("invalid number of package script modules".into()));
+        }
+        let source = Arc::new(StorageSource::Zip(zip));
+        let (metadata, tensors) = decode_package_pickle(bytes, &source)?;
+        Ok(Self { source, metadata, tensors, module_ids })
+    }
+
+    pub fn metadata(&self) -> &PickleValue { &self.metadata }
+    pub fn tensors(&self) -> &HashMap<String, Tensor> { &self.tensors }
+    pub fn module_ids(&self) -> &[String] { &self.module_ids }
+
+    pub fn module(&self, id: &str) -> Result<(PickleValue, HashMap<String, Tensor>)> {
+        if !self.module_ids.iter().any(|x| x == id) {
+            return Err(PytorchError::KeyNotFound(format!("script module {id}")));
+        }
+        let StorageSource::Zip(zip) = &*self.source else { unreachable!() };
+        let bytes = zip.package_pickle(&format!(".data/ts_code/{id}/data.pkl"))?;
+        decode_package_pickle(bytes, &self.source)
+    }
+}
+
+/// Read only the serialized state of a standalone TorchScript module, without executing code.
+pub fn read_script_state(path: impl AsRef<Path>) -> Result<(PickleValue, HashMap<String, Tensor>)> {
+    let zip = ZipSource::open_script(path.as_ref())?;
+    let bytes = zip.pickle()?;
+    let source = Arc::new(StorageSource::Zip(zip));
+    decode_package_pickle(bytes, &source)
+}
+
+fn decode_package_pickle(bytes: Vec<u8>, source: &Arc<StorageSource>) -> Result<(PickleValue, HashMap<String, Tensor>)> {
+    fn split(object: Object, path: &mut Vec<String>, tensors: &mut HashMap<String, Tensor>) -> Result<PickleValue> {
+        Ok(match object {
+            Object::Dict(dict) => PickleValue::Dict(dict.into_iter().map(|(key, value)| {
+                path.push(key.clone());
+                let value = split(value, path, tensors)?;
+                path.pop();
+                Ok((key, value))
+            }).collect::<Result<_>>()?),
+            Object::Tuple(items) | Object::List(items) => PickleValue::List(items.into_iter().enumerate().map(|(index, item)| {
+                path.push(index.to_string());
+                let value = split(item, path, tensors)?;
+                path.pop();
+                Ok(value)
+            }).collect::<Result<_>>()?),
+            Object::Tensor(mut tensor) => {
+                tensor.name = path.join(".");
+                let name = tensor.name.clone();
+                if tensors.insert(name.clone(), tensor).is_some() {
+                    return Err(PytorchError::InvalidFormat(format!("duplicate package tensor path {name}")));
+                }
+                PickleValue::Unsupported("torch.Tensor".into())
+            }
+            other => to_pickle_value(other),
+        })
+    }
+    let mut cursor = Cursor::new(bytes);
+    let root = read_pickle(&mut cursor, &PersistentIds::Package(source.clone()))?;
+    if cursor.position() != cursor.get_ref().len() as u64 || !matches!(root, Object::Dict(_)) {
+        return Err(PytorchError::InvalidFormat("invalid package pickle root or trailing data".into()));
+    }
+    let mut tensors = HashMap::new();
+    let metadata = split(root, &mut Vec::new(), &mut tensors)?;
+    Ok((metadata, tensors))
+}
+
 // ---------------------------------------------------------------------------------------------
 // Format detection and loading
 // ---------------------------------------------------------------------------------------------
@@ -694,6 +773,7 @@ fn parse_tar_tensors(
             source: source.clone(),
             key: storage_key,
             dtype: Some(dtype),
+            quantized: false,
             // A TAR view is resolved into its own layout entry above, so `byte_len` is
             // already the view's length and nothing is reachable past it.
             reachable_bytes: byte_len,
