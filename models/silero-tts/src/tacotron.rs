@@ -399,6 +399,14 @@ impl Tacotron2 {
         mut dropout: impl FnMut(Tensor<2>) -> Tensor<2>,
     ) -> Result<Tensor<3>> {
         let memory = self.encode(tokens, speaker)?;
+        self.rollout(memory, &mut dropout, |_, mel| mel)
+    }
+    fn rollout(
+        &self,
+        memory: Tensor<2>,
+        mut dropout: impl FnMut(Tensor<2>) -> Tensor<2>,
+        mut feedback: impl FnMut(usize, Tensor<2>) -> Tensor<2>,
+    ) -> Result<Tensor<3>> {
         let len = memory.dims()[0];
         let processed = self.attention.memory.forward(memory.clone());
         let zeros = |n| Tensor::<2>::zeros([1, n], &self.device);
@@ -406,7 +414,7 @@ impl Tacotron2 {
         let (mut previous, mut cumulative, mut context, mut input) =
             (zeros(len), zeros(len), zeros(512), zeros(128));
         let mut frames = Vec::new();
-        for _ in 0..self.max_steps {
+        for step in 0..self.max_steps {
             let x = dropout(relu(self.prenet[0].forward(input)));
             let x = dropout(relu(self.prenet[1].forward(x)));
             (ah, ac) = self
@@ -429,8 +437,9 @@ impl Tacotron2 {
             if gate as f64 > self.gate_threshold {
                 break;
             }
-            input = self.mel.forward(out);
-            frames.push(input.clone());
+            let mel = self.mel.forward(out);
+            input = feedback(step, mel.clone());
+            frames.push(mel);
         }
         ensure!(
             !frames.is_empty(),
@@ -452,7 +461,7 @@ impl Tacotron2 {
 #[cfg(all(test, feature = "reference-flex"))]
 mod tests {
     use super::*;
-    use crate::english_vocoder::{V1Vocoder,V2Vocoder};
+    use crate::english_vocoder::{V1Vocoder, V2Vocoder};
     use serde::Deserialize;
     use silero_package::V2Checkpoint;
     use std::{fs, path::Path};
@@ -485,7 +494,9 @@ mod tests {
             actual.len(),
             10.0 * (signal / error).log10()
         );
-        if max > tolerance { println!("FAIL {label} exceeds {tolerance}"); }
+        if max > tolerance {
+            println!("FAIL {label} exceeds {tolerance}");
+        }
         max <= tolerance
     }
     #[test]
@@ -493,7 +504,9 @@ mod tests {
     fn original_v2_fixed_mask_parity() {
         let root = std::env::var("SILERO_V2_CHECKPOINTS").unwrap();
         let fixtures = std::env::var("SILERO_V2_FIXTURES").unwrap();
-        let names = std::env::var("SILERO_V1_MODELS").or_else(|_| std::env::var("SILERO_V2_MODELS")).unwrap_or_else(|_| "lj_v2,multi_v2,mykyta_v2".into());
+        let names = std::env::var("SILERO_V1_MODELS")
+            .or_else(|_| std::env::var("SILERO_V2_MODELS"))
+            .unwrap_or_else(|_| "lj_v2,multi_v2,mykyta_v2".into());
         let device = Device::flex();
         let mut all_pass = true;
         for name in names.split(',') {
@@ -501,17 +514,34 @@ mod tests {
             let cp = if standalone {
                 let path = Path::new(&root).join(format!("{name}.jit"));
                 let entry = crate::catalogue::standalone_entry(&path).unwrap();
-                V2Checkpoint::open_standalone(&path,entry.tokenset.as_deref().unwrap(),entry.sample_rates[0]).unwrap()
-            } else { V2Checkpoint::open(Path::new(&root).join(format!("{name}.pt"))).unwrap() };
+                V2Checkpoint::open_standalone(
+                    &path,
+                    entry.tokenset.as_deref().unwrap(),
+                    entry.sample_rates[0],
+                )
+                .unwrap()
+            } else {
+                V2Checkpoint::open(Path::new(&root).join(format!("{name}.pt"))).unwrap()
+            };
             let model_rates = cp.sample_rates.clone();
-            let accent = cp.recurrent_accent.map(crate::recurrent_accent::RecurrentAccent::load).transpose().unwrap();
+            let accent = cp
+                .recurrent_accent
+                .map(crate::recurrent_accent::RecurrentAccent::load)
+                .transpose()
+                .unwrap();
             let store = TensorStore::native(cp.weights);
             let acoustic =
                 Tacotron2::load(&store, cp.multi, cp.max_steps, cp.gate_threshold, &device)
                     .unwrap();
-            let v1 = standalone.then(||V1Vocoder::load(&store,model_rates[0],&device).unwrap());
-            let v2 = (!standalone).then(||V2Vocoder::load(&store,&model_rates,&device).unwrap());
-            let vocoder = |mel: Tensor<3>, rate| if let Some(v)=&v1 { v.forward(mel,rate) } else { v2.as_ref().unwrap().forward(mel,rate) };
+            let v1 = standalone.then(|| V1Vocoder::load(&store, model_rates[0], &device).unwrap());
+            let v2 = (!standalone).then(|| V2Vocoder::load(&store, &model_rates, &device).unwrap());
+            let vocoder = |mel: Tensor<3>, rate| {
+                if let Some(v) = &v1 {
+                    v.forward(mel, rate)
+                } else {
+                    v2.as_ref().unwrap().forward(mel, rate)
+                }
+            };
             let reference =
                 TensorStore::open(&Path::new(&fixtures).join(format!("{name}.safetensors")))
                     .unwrap();
@@ -523,7 +553,17 @@ mod tests {
                 let k = &case.key;
                 let label = format!("{name}/{k}");
                 assert_eq!(cp.speakers[&case.speaker] as i64, case.speaker_id);
-                assert_eq!(crate::v2::prepare_tokens(&cp.symbols, &cp.encoded_symbols, &cp.ascii_symbols, accent.as_ref(), &case.text).unwrap(), case.ids);
+                assert_eq!(
+                    crate::v2::prepare_tokens(
+                        &cp.symbols,
+                        &cp.encoded_symbols,
+                        &cp.ascii_symbols,
+                        accent.as_ref(),
+                        &case.text
+                    )
+                    .unwrap(),
+                    case.ids
+                );
                 all_pass &= compare(
                     &format!("{label}/memory"),
                     acoustic
@@ -557,13 +597,13 @@ mod tests {
                 for rate in case.rates {
                     let expected = reference.float_data(&format!("{k}_pcm{rate}")).unwrap();
                     let isolated = vocoder(
-                            reference.float::<3>(&format!("{k}_mel"), &device).unwrap(),
-                            rate,
-                        )
-                        .unwrap()
-                        .into_data()
-                        .try_to_vec()
-                        .unwrap();
+                        reference.float::<3>(&format!("{k}_mel"), &device).unwrap(),
+                        rate,
+                    )
+                    .unwrap()
+                    .into_data()
+                    .try_to_vec()
+                    .unwrap();
                     all_pass &= compare(
                         &format!("{label}/vocoder{rate}"),
                         isolated,
@@ -584,5 +624,107 @@ mod tests {
             }
         }
         assert!(all_pass, "fixed-mask parity exceeds original tolerance");
+    }
+    #[test]
+    #[ignore = "requires original V1 models and raw-mel oracle fixtures"]
+    fn original_v1_error_attribution() {
+        let root = std::env::var("SILERO_V2_CHECKPOINTS").unwrap();
+        let fixtures = std::env::var("SILERO_V2_FIXTURES").unwrap();
+        let names = std::env::var("SILERO_V1_MODELS").unwrap();
+        let device = Device::flex();
+        for name in names.split(',') {
+            let path = Path::new(&root).join(format!("{name}.jit"));
+            let entry = crate::catalogue::standalone_entry(&path).unwrap();
+            let cp = V2Checkpoint::open_standalone(
+                &path,
+                entry.tokenset.as_deref().unwrap(),
+                entry.sample_rates[0],
+            )
+            .unwrap();
+            let store = TensorStore::native(cp.weights);
+            let acoustic =
+                Tacotron2::load(&store, cp.multi, cp.max_steps, cp.gate_threshold, &device)
+                    .unwrap();
+            let reference =
+                TensorStore::open(&Path::new(&fixtures).join(format!("{name}.safetensors")))
+                    .unwrap();
+            let cases: Vec<Case> = serde_json::from_slice(
+                &fs::read(Path::new(&fixtures).join(format!("{name}.json"))).unwrap(),
+            )
+            .unwrap();
+            for case in cases {
+                let key = case.key;
+                let mask = reference
+                    .float::<2>(&format!("{key}_masks"), &device)
+                    .unwrap();
+                let raw = reference
+                    .float::<2>(&format!("{key}_raw_mel"), &device)
+                    .unwrap();
+                let expected = reference.float_data(&format!("{key}_mel")).unwrap();
+                for (label, exact_memory, teacher_forced) in [
+                    ("closed", false, false),
+                    ("exact_memory", true, false),
+                    ("teacher_forced", false, true),
+                    ("exact_memory_teacher_forced", true, true),
+                ] {
+                    let memory = if exact_memory {
+                        reference
+                            .float::<2>(&format!("{key}_memory"), &device)
+                            .unwrap()
+                    } else {
+                        acoustic.encode(&case.ids, case.speaker_id).unwrap()
+                    };
+                    let mut cursor = 0;
+                    let mut first_error = None;
+                    let mut first_over_tolerance = None;
+                    let mut raw_max = 0f32;
+                    let mel = acoustic
+                        .rollout(
+                            memory,
+                            |x| {
+                                let v = x * mask.clone().slice([cursor..cursor + 1, 0..256]);
+                                cursor += 1;
+                                v
+                            },
+                            |step, frame| {
+                                let target = raw.clone().slice([step..step + 1, 0..128]);
+                                let error: f32 =
+                                    (frame.clone() - target.clone()).abs().max().into_scalar();
+                                if first_error.is_none() {
+                                    first_error = Some(error);
+                                }
+                                if error > 3e-3 && first_over_tolerance.is_none() {
+                                    first_over_tolerance = Some(step);
+                                }
+                                raw_max = raw_max.max(error);
+                                if teacher_forced { target } else { frame }
+                            },
+                        )
+                        .unwrap();
+                    assert_eq!(cursor, mask.dims()[0], "{name}/{label}: gate mismatch");
+                    println!(
+                        "{name}/{label} raw_max={raw_max:.9} first={first_error:?} first_over_3e-3={first_over_tolerance:?}"
+                    );
+                    let actual: Vec<f32> = mel.into_data().try_to_vec().unwrap();
+                    assert_eq!(actual.len(), expected.len(), "{name}/{label}: mel shape");
+                    assert!(actual.iter().all(|x| x.is_finite()));
+                    let mel_max = actual
+                        .iter()
+                        .zip(&expected)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0f32, f32::max);
+                    println!(
+                        "{name}/{label}/mel count={} max_abs={mel_max:.9}",
+                        actual.len()
+                    );
+                    if teacher_forced {
+                        assert!(
+                            mel_max <= 2e-4 && raw_max <= 2e-4,
+                            "{name}/{label}: teacher-forced numerical mismatch"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

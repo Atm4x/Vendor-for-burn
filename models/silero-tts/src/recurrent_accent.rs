@@ -43,9 +43,10 @@ impl QuantizedBatch {
         .clamp(0., 127.) as i32;
         let scale = scale64 as f32;
         let inv = 1.0 / scale;
+        // Quantized dynamic linear packs the affine transform with a single rounding.
         let values = input
             .iter()
-            .map(|&v| ((v * inv).round_ties_even() as i32 + zero).clamp(0, 255) - zero)
+            .map(|&v| (v.mul_add(inv, zero as f32).round_ties_even() as i32).clamp(0, 255) - zero)
             .collect();
         Self {
             values,
@@ -326,6 +327,12 @@ mod tests {
         assert!(z.values.iter().all(|&x| x == 0));
         assert_eq!(z.scale, 0.1);
     }
+    #[test]
+    fn affine_quantization_rounds_after_fused_zero_point() {
+        let extremum = 0.9640276f32;
+        let q = QuantizedBatch::new(&[-extremum, 0.0, extremum], 3);
+        assert_eq!(q.values, [-63, 0, 64]);
+    }
     #[derive(serde::Deserialize)]
     struct Case {
         text: String,
@@ -374,6 +381,11 @@ mod tests {
                     case.text, case.accented
                 );
                 assert_eq!(accented, case.accented, "{}", case.text);
+                assert!(
+                    max <= 1e-4,
+                    "{}: recurrent accentor logits error {max}",
+                    case.text
+                );
             }
         }
     }

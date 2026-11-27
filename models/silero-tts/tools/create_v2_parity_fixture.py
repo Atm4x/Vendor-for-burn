@@ -23,7 +23,7 @@ CASES = {
 }
 
 
-def create(path, output, standalone=None):
+def create(path, output, standalone=None, *, feedback_ulp=False):
     if standalone is not None:
         m = torch.jit.load(str(path), map_location='cpu').eval()
         multi = False
@@ -78,12 +78,16 @@ def create(path, output, standalone=None):
                 break
             frames.append(mel)
             inp = mel
+            if feedback_ulp and len(frames) == 1:
+                inp = torch.nextafter(inp, torch.full_like(inp, float("inf")))
         assert frames
-        mel = torch.cat(frames, 0).transpose(0, 1).unsqueeze(0)
+        raw_mel = torch.cat(frames, 0).contiguous()
+        mel = raw_mel.transpose(0, 1).unsqueeze(0)
         mel = mel + tac.postnet(mel)
         key = f'case{index}'
         tensors[f'{key}_memory'] = memory.squeeze(0).contiguous()
         tensors[f'{key}_masks'] = torch.cat(masks, 0).contiguous()
+        tensors[f'{key}_raw_mel'] = raw_mel
         tensors[f'{key}_mel'] = mel.contiguous()
         for rate in rates:
             wav = (m.vocoder(mel) if standalone is not None else m.vocoder(mel, rate))[:, :, :mel.shape[-1] * (rate // 80)]
@@ -100,16 +104,20 @@ if __name__ == '__main__':
     cli.add_argument('output', type=Path)
     cli.add_argument('--models', nargs='+')
     cli.add_argument('--standalone', action='store_true')
+    cli.add_argument('--disable-mkldnn', action='store_true', help='compare the original graph with an alternative CPU backend')
+    cli.add_argument('--feedback-ulp', action='store_true', help='perturb only the first decoder feedback frame by one ULP per element')
     cli.add_argument('--short', action='store_true', help='use one short test sentence per language')
     args = cli.parse_args()
     torch.set_num_threads(4)
+    if args.disable_mkldnn:
+        torch.backends.mkldnn.enabled = False
     with torch.inference_mode():
         if args.standalone:
             catalogue = json.loads((Path(__file__).resolve().parent.parent/'official_catalogue.json').read_text(encoding='utf8'))['models']
             for entry in catalogue:
                 if entry['declared_format'] == 'jit' and (not args.models or entry['model_id'] in args.models):
                     if args.short: entry["test_text"] = {"ru":"Прив+ет, мир!","en":"Hello, world!","de":"Guten Tag!","es":"Buenos días.","fr":"Je suis."}[entry["language"]]
-                    create(args.checkpoints / (entry['model_id'] + '.jit'), args.output, entry)
+                    create(args.checkpoints / (entry['model_id'] + '.jit'), args.output, entry, feedback_ulp=args.feedback_ulp)
         else:
             for name in args.models or list(CASES):
-                create(args.checkpoints / (name + '.pt'), args.output)
+                create(args.checkpoints / (name + '.pt'), args.output, feedback_ulp=args.feedback_ulp)
