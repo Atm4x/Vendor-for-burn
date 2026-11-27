@@ -1,42 +1,30 @@
-name: Git Bridge - original standalone Silero models
+name: Git Bridge - publish native standalone Silero candidate
 on:
   push:
     branches: [git-bridge/export-silero-ab4d79c7]
     paths: [.github/workflows/git-bridge-export.yml]
 permissions:
-  contents: read
+  contents: write
 jobs:
-  models:
+  import:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        group: [0,1,2,3,4,5,6,7,8,9]
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: a7bf8caa8dede56d3f10b47dece1dd80e4b08c84
-      - name: Download original checkpoints
-        env:
-          GROUP: ${{ matrix.group }}
+          fetch-depth: 0
+      - name: Verify and import exact standalone graph commit
+        shell: bash
         run: |
           set -euo pipefail
-          python - <<'PY'
-          import os,json,pathlib,urllib.request,hashlib
-          out=pathlib.Path(os.environ["RUNNER_TEMP"])/"models";out.mkdir()
-          c=json.loads(pathlib.Path("models/silero-tts/official_catalogue.json").read_text())["models"]
-          items=[x for x in c if x["declared_format"]=="jit"]
-          group=int(os.environ["GROUP"])
-          wanted=items[group*2:group*2+2]
-          for x in wanted:
-              name=x["model_id"]; p=out/(name+".jit")
-              urllib.request.urlretrieve(x["url"],p)
-              print(name,p.stat().st_size,hashlib.file_digest(open(p,"rb"),"sha256").hexdigest(),flush=True)
-          PY
-      - uses: actions/upload-artifact@v4
-        with:
-          name: silero-jit-${{ matrix.group }}
-          path: ${{ runner.temp }}/models/
-          compression-level: 0
-          retention-days: 1
+          git fetch origin main feat/silero-tts-native-import
+          test "$(git rev-parse origin/main)" = f3618c635442334f02c47384c01dd13fed1891f7
+          test "$(git rev-parse origin/feat/silero-tts-native-import)" = a7bf8caa8dede56d3f10b47dece1dd80e4b08c84
+          base64 -d .git-bridge/silero-8d8b54b5.b64 > "$RUNNER_TEMP/silero.bundle"
+          echo "35e347ea477e09419daf8ee97f094dd9b605ad117b8657c2e90791b5b30e97ff  $RUNNER_TEMP/silero.bundle" | sha256sum -c -
+          git bundle verify "$RUNNER_TEMP/silero.bundle"
+          git fetch "$RUNNER_TEMP/silero.bundle" refs/heads/feat/silero-tts-native-import:refs/heads/silero-candidate
+          test "$(git rev-parse silero-candidate)" = 8d8b54b5dbd56aacafe0f17e2b89268281eb8173
+          test "$(git rev-parse silero-candidate^{tree})" = c327d7b7935e970c7287dc14ed008c04b1437ba8
+          git merge-base --is-ancestor origin/feat/silero-tts-native-import silero-candidate
+          git push origin refs/heads/silero-candidate:refs/heads/git-bridge/candidate-silero-8d8b54b5
