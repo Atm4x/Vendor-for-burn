@@ -1,4 +1,4 @@
-name: Git Bridge - publish multilingual Silero candidate
+name: Git Bridge - publish upstream Silero loader
 on:
   push:
     branches: [git-bridge/export-silero-ab4d79c7]
@@ -13,18 +13,18 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Verify and import exact multilingual commit
+      - name: Verify and import exact upstream-loader commit
         shell: bash
         run: |
           set -euo pipefail
           git fetch origin main feat/silero-tts-native-import
           test "$(git rev-parse origin/main)" = f3618c635442334f02c47384c01dd13fed1891f7
-          test "$(git rev-parse origin/feat/silero-tts-native-import)" = 7f71da6abe4f869381efb3d992982b5f0fcccda5
-          base64 -d .git-bridge/silero-96e84eb9.b64 > "$RUNNER_TEMP/silero.bundle"
-          echo "5f7fc81a85c8053809e8a633904f4d7c6f9ba8a2ac345828bd9562d392be8690  $RUNNER_TEMP/silero.bundle" | sha256sum -c -
+          test "$(git rev-parse origin/feat/silero-tts-native-import)" = 96e84eb9e302b7e261561decfc06bab4c5ea251b
+          base64 -d .git-bridge/silero-0171c408.b64 > "$RUNNER_TEMP/silero.bundle"
+          echo "90dc887fce10bd7b04c5fb8b95baaa38af78fb2c017e26819c50d3364b34bf2f  $RUNNER_TEMP/silero.bundle" | sha256sum -c -
           git bundle verify "$RUNNER_TEMP/silero.bundle"
           git fetch "$RUNNER_TEMP/silero.bundle" refs/heads/feat/silero-tts-native-import:refs/heads/silero-candidate
-          test "$(git rev-parse silero-candidate)" = 96e84eb9e302b7e261561decfc06bab4c5ea251b
-          test "$(git rev-parse silero-candidate^{tree})" = cdb4e2c24cf8e38b4cbae46c9af83d0e21074be7
+          test "$(git rev-parse silero-candidate)" = 0171c4082656af4b689ec7be5d03202afa7129f1
+          test "$(git rev-parse silero-candidate^{tree})" = e2abc416dd6c2468525d3606425d2cb41f2f7dcc
           git merge-base --is-ancestor origin/feat/silero-tts-native-import silero-candidate
-          git push origin refs/heads/silero-candidate:refs/heads/git-bridge/candidate-silero-96e84eb9
+          git push origin refs/heads/silero-candidate:refs/heads/git-bridge/candidate-silero-0171c408
