@@ -12,6 +12,7 @@ on:
       - 'vendor/**'
       - 'tools/restore_vendor_checksums.py'
       - 'tools/package_tts_windows.ps1'
+      - 'tools/package_burn_worker_windows.ps1'
       - 'tools/smoke_tts_worker.py'
       - 'tools/stage_native_workers_release.ps1'
       - '.github/workflows/build-native-workers-windows.yml'
@@ -21,7 +22,7 @@ permissions:
   contents: read
 
 env:
-  WORKER_VERSION: '1.0.0'
+  WORKER_VERSION: '1.1.0'
 
 jobs:
   build:
@@ -53,6 +54,18 @@ jobs:
           - package: fish-speech-1.5
             script: tools/package_tts_windows.ps1
             family: fish-speech-1.5
+            compact: false
+          - package: omnivoice
+            script: tools/package_burn_worker_windows.ps1
+            family: omnivoice
+            compact: false
+          - package: whisper
+            script: tools/package_burn_worker_windows.ps1
+            family: whisper
+            compact: false
+          - package: semantic
+            script: tools/package_burn_worker_windows.ps1
+            family: semantic
             compact: false
     steps:
       - uses: actions/checkout@v4
@@ -154,5 +167,5 @@ jobs:
             }
             $file
           })
-          gh release create $tag @files --verify-tag --draft --latest=false --title "Native workers $env:WORKER_VERSION (Windows x64)" --notes "Seven version-matched Windows x64 worker packages. The checksum index records the exact build revision and SHA-256 of every ZIP. Model weights are separate. See each package manifest for launch arguments. Verify the release index with gh attestation verify staged-release-index.json --repo $env:GITHUB_REPOSITORY."
+          gh release create $tag @files --verify-tag --draft --latest=false --title "Native workers $env:WORKER_VERSION (Windows x64)" --notes "Ten version-matched Windows x64 worker packages. The checksum index records the exact build revision and SHA-256 of every ZIP. Model weights are separate. See each package manifest for launch arguments. Verify the release index with gh attestation verify staged-release-index.json --repo $env:GITHUB_REPOSITORY."
           gh release edit $tag --draft=false --latest=false

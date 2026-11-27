@@ -1,0 +1,21 @@
+[package]
+name = "semantic-worker"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[dependencies]
+anyhow = "1"
+candle-core = "=0.11.1"
+candle-nn = "=0.11.1"
+candle-transformers = "=0.11.1"
+burn = { version = "=0.22.1", default-features = false, features = ["std", "flex", "cuda", "wgpu"] }
+burn-store = { version = "=0.22.1", default-features = false, features = ["std"] }
+native-burn-qwen3 = { path = "../../crates/burn-qwen3" }
+native-worker-ipc = { path = "../../crates/native-worker-ipc" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokenizers = { version = "=0.22.2", default-features = false, features = ["onig"] }
+
+[workspace]

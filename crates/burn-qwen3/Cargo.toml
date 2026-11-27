@@ -1,0 +1,13 @@
+[package]
+name = "native-burn-qwen3"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[dependencies]
+anyhow = "1"
+burn = { version = "=0.22.1", default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+
+[workspace]

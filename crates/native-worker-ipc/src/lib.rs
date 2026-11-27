@@ -63,6 +63,20 @@ pub fn serve(mut dispatch: impl FnMut(&str, Value) -> Result<Value, String>) -> 
     }
 }
 
+pub fn validate_model_payload(
+    command: &str,
+    payload: &Value,
+    model_id: &str,
+) -> Result<(), String> {
+    match command {
+        "infer" => Ok(()),
+        "load" if payload == &json!({"model_id": model_id}) => Ok(()),
+        "load" => Err("load requires the worker's launch model_id".into()),
+        _ if payload == &json!({}) => Ok(()),
+        _ => Err("unexpected command payload".into()),
+    }
+}
+
 pub fn absolute_path(path: &Path, directory: bool) -> Result<PathBuf, String> {
     if !path.is_absolute() {
         return Err(format!("expected an absolute path: {}", path.display()));

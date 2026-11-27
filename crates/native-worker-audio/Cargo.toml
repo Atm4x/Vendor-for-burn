@@ -1,0 +1,13 @@
+[package]
+name = "native-worker-audio"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1"
+audioadapter-buffers = "5.2"
+hound = "3.5"
+rubato = "5"
+
+[workspace]

@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "models": [
+    {
+      "model_id": "whisper_large_v3_turbo",
+      "service": "asr",
+      "source_revision": "41f01f3fe87f28c78e2fbf8b568835947dd65ed9",
+      "launch_arguments": [
+        "--model-id",
+        "whisper_large_v3_turbo"
+      ],
+      "downloads": [
+        {
+          "role": "checkpoint",
+          "argument": "--checkpoint",
+          "path": "model.safetensors",
+          "url": "https://huggingface.co/openai/whisper-large-v3-turbo/resolve/41f01f3fe87f28c78e2fbf8b568835947dd65ed9/model.safetensors",
+          "size_bytes": 1617824864,
+          "sha256": "542566a422ae4f3fd23f1ba11add198fca01bbf82e66e6a2857b3f608b1eb9d1"
+        },
+        {
+          "role": "tokenizer",
+          "argument": "--tokenizer",
+          "path": "tokenizer.json",
+          "url": "https://huggingface.co/openai/whisper-large-v3-turbo/resolve/41f01f3fe87f28c78e2fbf8b568835947dd65ed9/tokenizer.json",
+          "size_bytes": 2710337,
+          "sha256": "297b13372ac43916285644fb9687add3cc62ee2a1adb60da3dc25cc94c1871fd"
+        },
+        {
+          "role": "generation-config",
+          "argument": "--generation-config",
+          "path": "generation_config.json",
+          "url": "https://huggingface.co/openai/whisper-large-v3-turbo/resolve/41f01f3fe87f28c78e2fbf8b568835947dd65ed9/generation_config.json",
+          "size_bytes": 3772,
+          "sha256": "cce11bfe3aaa6ae9e072ea2637caaec8795e68d9b67e655a5af16ee509681a4c"
+        }
+      ]
+    },
+    {
+      "model_id": "whisper_large_v3",
+      "service": "asr",
+      "source_revision": "06f233fe06e710322aca913c1bc4249a0d71fce1",
+      "launch_arguments": [
+        "--model-id",
+        "whisper_large_v3"
+      ],
+      "downloads": [
+        {
+          "role": "checkpoint",
+          "argument": "--checkpoint",
+          "path": "model.safetensors",
+          "url": "https://huggingface.co/openai/whisper-large-v3/resolve/06f233fe06e710322aca913c1bc4249a0d71fce1/model.safetensors",
+          "size_bytes": 3087130976,
+          "sha256": "a8e94b85976e5864ba3e9525c7e6c83b2a1eca42d4b797a0c7c24d778e40fd95"
+        },
+        {
+          "role": "tokenizer",
+          "argument": "--tokenizer",
+          "path": "tokenizer.json",
+          "url": "https://huggingface.co/openai/whisper-large-v3/resolve/06f233fe06e710322aca913c1bc4249a0d71fce1/tokenizer.json",
+          "size_bytes": 2480617,
+          "sha256": "6d8cbd7cd0d8d5815e478dac67b85a26bbe77c1f5e0c6d76d1ce2abc0e5f21ca"
+        },
+        {
+          "role": "generation-config",
+          "argument": "--generation-config",
+          "path": "generation_config.json",
+          "url": "https://huggingface.co/openai/whisper-large-v3/resolve/06f233fe06e710322aca913c1bc4249a0d71fce1/generation_config.json",
+          "size_bytes": 3903,
+          "sha256": "fbdfa70135de9b1d31553393f14e80aaeb1936ea36576b2ba864055943c09d23"
+        }
+      ]
+    }
+  ]
+}
