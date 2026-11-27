@@ -27,7 +27,7 @@ Send UTF-8 JSON Lines to stdin, one object per line. The frame must terminate wi
 
 Success responses have `{"version":1,"id":"<UUID>","ok":true,"result":{},"error":null}`; command errors use `ok:false`, `result:null` and `error:"..."`. Invalid request framing, envelope or protocol version is fatal, matching Beat This!. Invalid **commands and payloads** return errors but leave the process available for the next command.
 
-Commands: `capabilities`, `load`, `warmup`, `status`, `infer`, `unload`, `shutdown`. Status phases: `started` (unloaded), `loaded` (weights loaded, not warmed), `ready` (warmup complete). `infer` requires `ready`. `unload` clears the model and the warm flag; `shutdown` replies and exits; EOF also exits. Only one model is resident. To select a different checkpoint package, the supervisor launches a different worker process.
+Commands: `capabilities`, `load`, `warmup`, `status`, `infer`, `unload`, `shutdown`, plus `stream_start`, `stream_push`, `stream_finish`, `stream_cancel` on Zapformer ASR packages. Status phases: `started` (unloaded), `loaded` (weights loaded, not warmed), `ready` (warmup complete). `infer` requires `ready`. `unload` clears the model and the warm flag; `shutdown` replies and exits; EOF also exits. Only one model is resident. To select a different checkpoint package, the supervisor launches a different worker process.
 
 ## Snapshot-only inference
 
@@ -39,9 +39,24 @@ The NeuroMita Core copies the audio to its own input directory and sends a **sin
 
 An `asr` result has `gigaam_version`, `kind`, `duration_seconds`, `sample_rate_hz` (=16000), `text`, and `segments` (each contains `text`, `start`, `end`, optional `words`). One recording without VAD intervals must be at most 25 seconds. For longform, pass `segments:[{"start":0.5,"end":2.7},...]` from the host VAD; Python-style grouping is enabled by default (`group_vad:false` disables it). The worker never detects speech intervals itself.
 
-Zapformer ASR snapshots additionally accept optional `head:"raw"` or `head:"e2e"` for dual-head checkpoints (default E2E) and `language` for conditioned checkpoints (tag, list, weighted map, or `"auto"`). These are request-scoped. Legacy models reject these explicit options. Native Rust clients can use `GigaAmService::start_stream` for packet inference; stdio remains a snapshot-only contract in this revision. The host continues to own VAD and utterance boundaries.
+Zapformer ASR snapshots additionally accept optional `head:"raw"` or `head:"e2e"` for dual-head checkpoints (default E2E) and `language` for conditioned checkpoints (tag, list, weighted map, or `"auto"`). These are request-scoped. Legacy models reject these explicit options. Native Rust clients can use `GigaAmService::start_stream` for packet inference; the stdio worker exposes the same stateful engine. The host continues to own VAD and utterance boundaries.
 
 For an SSL package, use `kind:"embeddings"` with the same version and snapshot; it returns `frames`, `channels` and `output:{file_name,size_bytes,sha256}`. Float32 little-endian output is written to the host-owned `--output-dir` under the request UUID as `<UUID>.f32`, without overwriting pre-existing files. For Emo, use `kind:"emotion"`; the response contains `probabilities` keyed by emotion name. Neither of these operations accepts ASR-only timestamps or VAD intervals.
+
+## Stateful utterance streaming
+
+Streaming is advertised in `gigaam_capability.streaming` for registered Zapformer ASR packages; other families return null. A loaded checkpoint must actually declare the requested context mode. The wire envelope remains version 1. The worker owns at most one active utterance, not one model copy per stream. The host still owns VAD, PCM conversion, boundaries, and snapshot cleanup.
+
+After load and warmup:
+
+- `stream_start`: payload `{"gigaam_version":1,"future_context_ms":160,"language":"ru","word_timestamps":true}`. Language is optional and only valid for conditioned checkpoints; omit it on monolingual ones. Omit the context to select the checkpoint's largest declared context. The request UUID becomes the stream ID. Result: `{"stream_id":"<UUID>","next_packet_index":0}`.
+- `stream_push`: payload `{"stream_id":"<UUID>","packet_index":0,"input":{"file_name":"packet.f32","size_bytes":5120,"sha256":"<digest>"}}`. This snapshot contains raw little-endian float32, mono, 16000 Hz samples, no header, no resampling or VAD. It uses the same leaf-name and digest checks as file inference. Packet size is at most 640000 bytes and utterance length at most 4800000 samples (300 seconds). Every sample must be finite.
+- `stream_finish`: payload `{"stream_id":"<UUID>","packet_index":1}` for the next expected sequence number. Flushes the unfinished PCM and encoder context and releases stream state. No additional input is accepted after finish.
+- `stream_cancel`: payload `{"stream_id":"<UUID>"}`. Discards state without flushing; the warmed model remains loaded.
+
+Push and finish return `gigaam_version`, `stream_id`, `packet_index`, cumulative `accepted_samples`, cumulative `encoded_frames`, `finished`, and `heads`. Each head contains text publication delta, newly decoded token IDs, absolute utterance-relative frame indices, and optional word publication deltas (seconds relative to utterance start). Dual-head checkpoints return both `heads.raw` and `heads.e2e`; single-head checkpoints return `heads.single`. The host selects the display head; no second encoder invocation is required. A word or text fragment may only become available on a later packet or finish.
+
+Packets must be contiguous in sequence order. Incorrect stream ID, sequence, malformed or corrupt PCM, or size limit errors do not consume a packet. An inference/finalization error discards the active stream; the host can open a fresh one. Starting another stream while one is active is rejected. Status includes `active_stream` (UUID or null). Unload, shutdown, and EOF release all stream state and the model. Transport retry after a lost successful response is not idempotent: recover via status or cancel/restart rather than replaying accepted PCM.
 
 ## Windows package manifest
 
