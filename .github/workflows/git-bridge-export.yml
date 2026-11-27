@@ -1,30 +1,49 @@
-name: Git Bridge - publish upstream Silero loader
+name: Git Bridge - remaining Silero checkpoint families
 on:
   push:
     branches: [git-bridge/export-silero-ab4d79c7]
     paths: [.github/workflows/git-bridge-export.yml]
 permissions:
-  contents: write
+  contents: read
 jobs:
-  import:
+  models:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [v3, v2, v5]
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-      - name: Verify and import exact upstream-loader commit
-        shell: bash
+          ref: 0171c4082656af4b689ec7be5d03202afa7129f1
+      - name: Acquire original packages
+        env:
+          GROUP: ${{ matrix.group }}
         run: |
           set -euo pipefail
-          git fetch origin main feat/silero-tts-native-import
-          test "$(git rev-parse origin/main)" = f3618c635442334f02c47384c01dd13fed1891f7
-          test "$(git rev-parse origin/feat/silero-tts-native-import)" = 96e84eb9e302b7e261561decfc06bab4c5ea251b
-          base64 -d .git-bridge/silero-0171c408.b64 > "$RUNNER_TEMP/silero.bundle"
-          echo "90dc887fce10bd7b04c5fb8b95baaa38af78fb2c017e26819c50d3364b34bf2f  $RUNNER_TEMP/silero.bundle" | sha256sum -c -
-          git bundle verify "$RUNNER_TEMP/silero.bundle"
-          git fetch "$RUNNER_TEMP/silero.bundle" refs/heads/feat/silero-tts-native-import:refs/heads/silero-candidate
-          test "$(git rev-parse silero-candidate)" = 0171c4082656af4b689ec7be5d03202afa7129f1
-          test "$(git rev-parse silero-candidate^{tree})" = e2abc416dd6c2468525d3606425d2cb41f2f7dcc
-          git merge-base --is-ancestor origin/feat/silero-tts-native-import silero-candidate
-          git push origin refs/heads/silero-candidate:refs/heads/git-bridge/candidate-silero-0171c408
+          python - <<'PY'
+          import pathlib, urllib.request, hashlib, json, os
+          from concurrent.futures import ThreadPoolExecutor
+          out=pathlib.Path(os.environ["RUNNER_TEMP"])/"models"
+          out.mkdir()
+          cat=json.loads(pathlib.Path("models/silero-tts/official_catalogue.json").read_text())
+          choices={"v3":["v3_1_ru","ru_v3","v3_xal","v3_tt","v3_uz","v3_ua"],"v2":["aidar_v2","lj_v2","mykyta_v2","multi_v2"],"v5":["v5_caucasian","v5_cis_ext","v5_1_ru","v5_2_ru","v5_3_ru","v5_4_ru","v5_5_ru"]}[os.environ["GROUP"]]
+          def get(x):
+              name=x["model_id"]
+              if name not in choices: return
+              file=out/(name+".pt")
+              try:
+                  urllib.request.urlretrieve(x["url"],file)
+                  print(name,file.stat().st_size,hashlib.file_digest(open(file,"rb"),"sha256").hexdigest(),flush=True)
+              except Exception as e:
+                  file.unlink(missing_ok=True)
+                  print(name,"ERROR",str(e),flush=True)
+          with ThreadPoolExecutor(max_workers=4) as p: list(p.map(get,cat["models"]))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: silero-cycle8-${{ matrix.group }}
+          path: ${{ runner.temp }}/models/
+          retention-days: 1
+          compression-level: 0
