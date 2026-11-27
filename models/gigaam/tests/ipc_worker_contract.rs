@@ -110,7 +110,7 @@ fn emotion_matches_beat_worker_lifecycle() -> Result<()> { run_case("emo", "emo"
 fn worker_rejects_unsupported_backend_before_writing_stdout() -> Result<()> {
     let fixture = fixture_root();
     let output = Command::new(env!("CARGO_BIN_EXE_gigaam-rs"))
-        .args(["--ipc-stdio", "--model-id", "gigaam_v3_ctc", "--backend", "cuda", "--model-dir"])
+        .args(["--ipc-stdio", "--model-id", "gigaam_v3_ctc", "--backend", "invalid", "--model-dir"])
         .arg(fixture.join("ctc"))
         .args(["--input-dir"]).arg(&fixture)
         .output()?;
