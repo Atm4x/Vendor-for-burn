@@ -76,6 +76,7 @@ pub fn capabilities() -> Value {
         "model_family": "silero-tts",
         "model_variants": [
             {"id": "v5_ru", "sample_rates": [8000, 24000, 48000], "inference_inputs": ["text", "ssml", "accented", "symbol_durations"]},
+            {"id": "v5_ru_conditioned", "sample_rates": [8000, 24000, 48000], "inference_inputs": ["text", "accented"]},
             {"id": "v4_hifigan", "sample_rates": [8000, 24000, 48000], "inference_inputs": ["text"]},
             {"id": "v3_hifigan", "sample_rates": [8000, 24000, 48000], "inference_inputs": ["text"]},
             {"id": "v5_convnext_plain", "sample_rates": [8000, 24000, 48000], "inference_inputs": ["text"]}

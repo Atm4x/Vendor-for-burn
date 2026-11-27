@@ -1,18 +1,33 @@
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use burn::tensor::{Device, Tensor, Int, module::{embedding, linear}};
 use crate::{store::TensorStore, transformer::TransformerStack};
 
 pub struct ScalarPredictor {
     symbol_weight: Tensor<2>,
     speaker_weight: Tensor<2>,
+    conditioning: Option<SentenceConditioning>,
     stack: TransformerStack,
     lin_weight: Tensor<2>,
     lin_bias: Tensor<1>,
 }
 
+struct SentenceConditioning {
+    type_weight: Tensor<2>,
+    focus_weight: Tensor<2>,
+}
+
 impl ScalarPredictor {
     fn load(weights: &TensorStore, prefix: &str, device: &Device) -> Result<Self> {
+        let names = weights.names()?;
+        let type_name = format!("{prefix}.type_embedding.weight");
+        let conditioning = if names.contains(&type_name) {
+            Some(SentenceConditioning {
+                type_weight: weights.float(&type_name, device)?,
+                focus_weight: weights.float(&format!("{prefix}.focus_embedding.weight"), device)?,
+            })
+        } else { None };
         Ok(Self {
+            conditioning,
             symbol_weight: weights.float(&format!("{prefix}.embedding.weight"), device)?,
             speaker_weight: weights.float(&format!("{prefix}.speaker_embedding.weight"), device)?,
             stack: TransformerStack::load(weights, &format!("{prefix}.transformer"), 4, device)?,
@@ -31,11 +46,24 @@ impl ScalarPredictor {
 
     /// Computes the original logarithmic durations or pitch values as `[B, L]`.
     pub fn forward(&self, tokens: Tensor<2, Int>, speaker: Tensor<2, Int>, mask: Option<Tensor<2>>, alpha: f32) -> Tensor<2> {
+        self.forward_inner(tokens, speaker, mask, alpha, None, None)
+    }
+
+    pub(crate) fn forward_conditioned(&self, tokens: Tensor<2, Int>, speaker: Tensor<2, Int>, mask: Option<Tensor<2>>, types: Tensor<2, Int>, focus: Option<Tensor<2, Int>>) -> Result<Tensor<2>> {
+        ensure!(self.conditioning.is_some(), "predictor does not support sentence conditioning");
+        Ok(self.forward_inner(tokens, speaker, mask, 1.0, Some(types), focus))
+    }
+
+    fn forward_inner(&self, tokens: Tensor<2, Int>, speaker: Tensor<2, Int>, mask: Option<Tensor<2>>, alpha: f32, types: Option<Tensor<2, Int>>, focus: Option<Tensor<2, Int>>) -> Tensor<2> {
         let [batch, len] = tokens.dims();
         let channel = self.symbol_weight.dims()[1];
         let symbol = embedding(self.symbol_weight.clone(), tokens);
         let speaker = embedding(self.speaker_weight.clone(), speaker).reshape([batch, 1, channel]);
-        let hidden = symbol + speaker.repeat_dim(1, len);
+        let mut hidden = symbol + speaker.repeat_dim(1, len);
+        if let Some(c) = &self.conditioning {
+            if let Some(types) = types { hidden = hidden + embedding(c.type_weight.clone(), types); }
+            if let Some(focus) = focus { hidden = hidden + embedding(c.focus_weight.clone(), focus); }
+        }
         let hidden = self.stack.forward(hidden, mask);
         linear(hidden, self.lin_weight.clone(), Some(self.lin_bias.clone())).reshape([batch, len]) / alpha
     }

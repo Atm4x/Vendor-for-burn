@@ -43,7 +43,7 @@ impl V5PlainCheckpoint {
         let V::List(alphabet) = field(part, "alphabet")? else { bail!("invalid V5 alphabet") };
         let alphabet = alphabet.iter().map(|v| char_key(string(Some(v), "alphabet")?)).collect::<Result<HashSet<_>>>()?;
         let speakers = ids(Some(one(field(part, "speaker_to_ids")?, "speaker_to_ids")?), "speaker_to_ids")?;
-        ensure!(!speakers.is_empty() && speakers.len() <= 4096 && speakers.values().copied().collect::<HashSet<_>>().len() == speakers.len() && speakers.values().all(|&id| id < speakers.len()), "invalid V5 speaker IDs");
+        ensure!(!speakers.is_empty() && speakers.len() <= 4096 && speakers.values().copied().collect::<HashSet<_>>().len() == speakers.len(), "invalid V5 speaker IDs");
         for (node, name) in [(root, "speaker_to_package"), (part, "speaker_to_model")] {
             let routes = ids(node.get(name), name)?;
             ensure!(routes.len() == speakers.len() && speakers.keys().all(|key| routes.get(key) == Some(&0)), "invalid single-graph V5 routing: {name}");
@@ -72,7 +72,9 @@ impl V5PlainCheckpoint {
         let (script, mut tensors) = package.module(id)?;
         ensure!(tensors.len() == 317, "unsupported plain V5 graph: expected 317 tensors, got {}", tensors.len());
         let script = dictionary(&script, "V5 acoustic metadata")?;
-        ensure!(matches!(script.get("mean_std_coef"), Some(V::List(v)) if v.len() == speakers.len()), "invalid V5 pitch metadata");
+        let speaker_rows = tensors.get("tacotron.speaker_embedding.weight").context("missing V5 speaker embedding")?.shape().first().copied().context("invalid V5 speaker embedding")?;
+        ensure!((1..=4096).contains(&speaker_rows) && speakers.values().all(|&id| id < speaker_rows), "V5 speaker IDs out of bounds");
+        ensure!(matches!(script.get("mean_std_coef"), Some(V::List(v)) if v.len() == speaker_rows), "invalid V5 pitch metadata");
         let symbol_count = tensors.get("tacotron.embedding.weight").context("missing V5 embedding")?.shape().first().copied().context("invalid V5 embedding")?;
         ensure!((4..=4096).contains(&symbol_count) && symbol_ids.values().all(|&id| id < symbol_count), "invalid V5 symbol IDs");
         ensure!(symbol_ids.get(&sos) == Some(&2) && symbol_ids.get(&eos) == Some(&1), "unsupported V5 boundary IDs");
@@ -80,7 +82,7 @@ impl V5PlainCheckpoint {
         for prefix in ["dur_predictor.dur_pred", "pitch_predictor.pitch_pred", "tacotron"] {
             let width = if prefix == "tacotron" {128} else {64};
             require_tensor(&tensors, &format!("{prefix}.embedding.weight"), DType::F32, &[symbol_count, width])?;
-            require_tensor(&tensors, &format!("{prefix}.speaker_embedding.weight"), DType::F32, &[speakers.len(), width])?;
+            require_tensor(&tensors, &format!("{prefix}.speaker_embedding.weight"), DType::F32, &[speaker_rows, width])?;
         }
         for (name, shape) in [("tacotron.lin.weight", &[192,128][..]), ("tacotron.energy_proj.weight", &[128,1,3]), ("vocoder.head.istft.window", &[2400])] {
             require_tensor(&tensors, name, DType::F32, shape)?;

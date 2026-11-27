@@ -20,6 +20,7 @@ pub mod runtime;
 mod v3;
 mod v4;
 mod v5_plain;
+mod utterance;
 mod english_vocoder;
 #[cfg(feature = "reference-flex")]
 mod flex_english_conv;

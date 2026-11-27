@@ -1,13 +1,15 @@
 use anyhow::{Result, ensure};
 use burn::tensor::{Device, Tensor};
 use silero_package::{V3Checkpoint, encode_v3, normalize_v3};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use crate::{accentor::Accentor, runtime::TextOptions};
 use crate::{acoustic::TextToMel, english_vocoder::EnglishVocoder, frontend::ModelConfig, longform, store::TensorStore};
 
 pub(crate) struct V3Tts {
     pub(crate) config: ModelConfig,
     ascii_symbols: BTreeMap<char, String>,
     encoded_symbols: String,
+    accent: Option<(Accentor, String, HashSet<String>)>,
     acoustic: TextToMel,
     vocoder: EnglishVocoder,
 }
@@ -19,18 +21,22 @@ impl V3Tts {
             sos: "|".into(), eos: "~".into(), speakers: std::mem::take(&mut checkpoint.speakers), sample_rates: vec![8000, 24000, 48000] };
         let ascii_symbols = std::mem::take(&mut checkpoint.ascii_symbols);
         let encoded_symbols = std::mem::take(&mut checkpoint.encoded_symbols);
+        let accent = checkpoint.accent.take().map(|a| -> Result<_> { Ok((Accentor::from_parts(&TensorStore::native(a.weights), a.ngrams, a.exceptions, device)?, a.vowels, a.stop_words)) }).transpose()?;
         let weights = TensorStore::native(checkpoint.into_weights()?);
         let acoustic = TextToMel::load_variant(&weights, device, false)?;
         let vocoder = EnglishVocoder::load(&weights, device)?;
-        Ok(Self { config, ascii_symbols, encoded_symbols, acoustic, vocoder })
+        Ok(Self { config, ascii_symbols, encoded_symbols, accent, acoustic, vocoder })
     }
 
-    pub(crate) fn infer_text(&self, text: &str, speaker: &str, rate: u32) -> Result<Vec<f32>> {
+    pub(crate) fn infer_text(&self, text: &str, speaker: &str, rate: u32, options: &TextOptions) -> Result<Vec<f32>> {
         ensure!(speaker != "random", "random voice generation is not implemented");
         let speaker_id = self.config.validate_speaker(speaker)? as i64;
         self.config.validate_sample_rate(rate)?;
         longform::infer_text_chunks(text, rate, |fragment| {
-            let normalized = normalize_v3(&self.config.symbols, &self.ascii_symbols, fragment)?;
+            let mut normalized = normalize_v3(&self.config.symbols, &self.ascii_symbols, fragment)?;
+            if let Some((accent, vowels, stop)) = &self.accent {
+                if options.put_accent { normalized = accent.accentuate_ascii(&normalized, vowels, stop, options.put_yo)?; }
+            }
             let tokens = encode_v3(&self.encoded_symbols, &normalized)?;
             self.infer_token_ids(&tokens, speaker_id, rate)?.into_data().try_to_vec::<f32>().map_err(Into::into)
         })

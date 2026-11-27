@@ -54,16 +54,19 @@ impl SileroTts {
     }
 
     pub fn variant(&self) -> &'static str {
-        match self.0 { Session::Russian(_) => "v5_ru", Session::V3(_) => "v3_hifigan", Session::V4(_) => "v4_hifigan", Session::V5Plain(_) => "v5_convnext_plain" }
+        match self.0 { Session::Russian(ref model) => if model.prosody != silero_package::RussianProsody::Legacy { "v5_ru_conditioned" } else { "v5_ru" }, Session::V3(_) => "v3_hifigan", Session::V4(_) => "v4_hifigan", Session::V5Plain(_) => "v5_convnext_plain" }
     }
 
     pub fn warmup_input(&self) -> Result<(String, String)> {
         match &self.0 {
-            Session::Russian(_) => Ok(("На двери замок.".into(), "aidar".into())),
+            Session::Russian(model) => {
+                let speaker = model.config.speakers.keys().next().context("no Russian warmup speaker")?;
+                Ok(("На двери замок.".into(), speaker.clone()))
+            },
             Session::V5Plain(model) => model.warmup_input(),
             Session::V4(model) => model.warmup_input(),
             Session::V3(model) => {
-                let letter = model.config.symbols.chars().find(|c| c.is_ascii_lowercase()).context("V3 vocabulary has no warmup letter")?;
+                let letter = model.config.symbols.chars().find(|c| c.is_alphabetic()).context("V3 vocabulary has no warmup letter")?;
                 let speaker = model.config.speakers.keys().find(|s| s.as_str() != "random").context("V3 has no concrete warmup speaker")?;
                 Ok((letter.to_string().repeat(3), speaker.clone()))
             }
@@ -86,7 +89,7 @@ impl SileroTts {
     pub fn infer_text_with_options(&self, text: &str, speaker: &str, sample_rate: u32, flags: &TextOptions) -> Result<Vec<f32>> {
         match &self.0 {
             Session::Russian(model) => model.infer_text_with_options(text, speaker, sample_rate, flags),
-            Session::V3(model) => model.infer_text(text, speaker, sample_rate),
+            Session::V3(model) => model.infer_text(text, speaker, sample_rate, flags),
             Session::V4(model) => model.infer_text(text, speaker, sample_rate, flags),
             Session::V5Plain(model) => model.infer_text(text, speaker, sample_rate),
         }
@@ -122,6 +125,7 @@ impl SileroTts {
 /// An independently loaded, persistent Silero TTS inference session.
 /// Accepts either an official Russian package or the legacy prepared directory.
 struct RussianTts {
+    prosody: silero_package::RussianProsody,
     config: ModelConfig,
     acoustic: TextToMel,
     accentor: Accentor,
@@ -148,6 +152,7 @@ impl RussianTts {
             Err(e) => return Err(e.into()),
         };
         Ok(Self {
+            prosody: silero_package::RussianProsody::Legacy,
             control_constants,
             accentor: Accentor::load(model_dir, device)?,
             homosolver: HomoSolver::load(model_dir, device)?,
@@ -160,7 +165,7 @@ impl RussianTts {
 
     fn from_official(checkpoint: silero_package::RussianCheckpoint, device: &Device) -> Result<Self> {
         use crate::tokenizer::{TokenizerConfig, WordPieceTokenizer};
-        let silero_package::RussianCheckpoint { config, tokenizer, controls, ngrams, exceptions,
+        let silero_package::RussianCheckpoint { prosody, config, tokenizer, controls, ngrams, exceptions,
             homographs, acoustic, accentor, homosolver, pqmf } = checkpoint;
         let config = ModelConfig { format_version: 1, symbols: config.symbols, alphabet: config.alphabet,
             sos: config.sos, eos: config.eos, speakers: config.speakers,
@@ -179,7 +184,7 @@ impl RussianTts {
         let control_constants = Some(SileroControlConstants { point_id: controls.point_id,
             comma_ids: controls.comma_ids, punctuation_ids: controls.punctuation_ids,
             pitch_mean_shift: controls.pitch_mean_shift, sil_value: controls.sil_value });
-        Ok(Self { config, accentor, homographs: homograph_keys, homosolver,
+        Ok(Self { prosody, config, accentor, homographs: homograph_keys, homosolver,
             acoustic: TextToMel::load(&tts, device)?, synthesizer: Synthesizer::load(&tts, &filters, device)?,
             control_constants })
     }
@@ -221,8 +226,11 @@ impl RussianTts {
         let speaker_id = self.config.validate_speaker(speaker)? as i64;
         self.config.validate_sample_rate(sample_rate)?;
         longform::infer_text_chunks(text, sample_rate, |fragment| {
+            if self.prosody != silero_package::RussianProsody::Legacy {
+                anyhow::ensure!(!fragment.contains('*'), "V5 sentence-conditioned focus and emphasis controls are not yet supported");
+            }
             let accented = self.accentuate_with_options(fragment, flags)?;
-            self.infer_accented_single(&accented, speaker_id, sample_rate)
+            self.infer_accented_from_raw(fragment, &accented, speaker_id, sample_rate)
         })
     }
 
@@ -260,6 +268,7 @@ impl RussianTts {
         flags: &TextOptions) -> Result<(Vec<f32>, Vec<f32>)> {
         let speaker_id = self.config.validate_speaker(speaker)? as i64;
         self.config.validate_sample_rate(sample_rate)?;
+        anyhow::ensure!(self.prosody == silero_package::RussianProsody::Legacy, "SSML is not yet supported for sentence-conditioned V5");
         let constants = self.control_constants.as_ref()
             .ok_or_else(|| anyhow::anyhow!("Missing ssml-controls.json; export model weights again"))?;
         let segments = ssml::process_ssml(&self.config, ssml)?;
@@ -359,8 +368,17 @@ impl RussianTts {
     }
 
     fn infer_accented_single(&self, text: &str, speaker_id: i64, sample_rate: u32) -> Result<Vec<f32>> {
-        let (ids, _) = self.config.encode_accented(text)?;
-        let pcm = self.infer_token_ids(&ids, speaker_id, sample_rate)?;
+        self.infer_accented_from_raw(text, text, speaker_id, sample_rate)
+    }
+
+    fn infer_accented_from_raw(&self, raw: &str, accented: &str, speaker_id: i64, sample_rate: u32) -> Result<Vec<f32>> {
+        let (ids, _) = self.config.encode_accented(accented)?;
+        let pcm = if self.prosody != silero_package::RussianProsody::Legacy {
+            let condition_duration = self.prosody == silero_package::RussianProsody::SentenceConditioned;
+            let types = if condition_duration { crate::utterance::type_ids(raw, accented) } else { crate::utterance::legacy_type_ids(raw, ids.len()) };
+            let (mel, _) = self.acoustic.infer_conditioned(&ids, speaker_id, &types, condition_duration)?;
+            self.synthesizer.forward(mel, sample_rate)?
+        } else { self.infer_token_ids(&ids, speaker_id, sample_rate)? };
         Ok(pcm.into_data().try_to_vec::<f32>()?)
     }
 
@@ -368,7 +386,14 @@ impl RussianTts {
     /// PCM has shape `[1, samples]`. The loaded session remains reusable.
     pub fn infer_token_ids(&self, symbols: &[i64], speaker: i64, sample_rate: u32) -> Result<Tensor<2>> {
         self.config.validate_sample_rate(sample_rate)?;
-        let (mel, _) = self.acoustic.infer(symbols, speaker)?;
+        let (mel, _) = if self.prosody != silero_package::RussianProsody::Legacy {
+            anyhow::ensure!(symbols.len() >= 3, "missing sentence boundaries");
+            let alphabet: Vec<_> = self.config.symbols.chars().collect();
+            let text: String = symbols[1..symbols.len()-1].iter().map(|&id| alphabet.get(id as usize).copied().context("invalid token ID")).collect::<Result<_>>()?;
+            let condition_duration = self.prosody == silero_package::RussianProsody::SentenceConditioned;
+            let types = if condition_duration { crate::utterance::type_ids(&text,&text) } else { crate::utterance::legacy_type_ids(&text, symbols.len()) };
+            self.acoustic.infer_conditioned(symbols, speaker, &types, condition_duration)?
+        } else { self.acoustic.infer(symbols, speaker)? };
         self.synthesizer.forward(mel, sample_rate)
     }
 

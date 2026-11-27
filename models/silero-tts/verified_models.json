@@ -238,5 +238,213 @@
       "speaker": "b_tat",
       "variant": "v4_hifigan"
     }
+  },
+  {
+    "model_id": "v3_1_ru",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/ru/v3_1_ru.pt",
+      "size_bytes": 61896251,
+      "sha256": "cf60b47ec8a9c31046021d2d14b962ea56b8a5bf7061c98accaaaca428522f85"
+    },
+    "smoke": {
+      "text": "Привет, мир!",
+      "speaker": "aidar",
+      "variant": "v3_hifigan"
+    }
+  },
+  {
+    "model_id": "v3_xal",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/xal/v3_xal.pt",
+      "size_bytes": 57089610,
+      "sha256": "fcababc14c6dbbffb14d04e490e4d2d85087f4aa42b2ae9d33f147cd4b868b76"
+    },
+    "smoke": {
+      "text": "Мендвт.",
+      "speaker": "erdni",
+      "variant": "v3_hifigan"
+    }
+  },
+  {
+    "model_id": "v3_tt",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/tt/v3_tt.pt",
+      "size_bytes": 57086687,
+      "sha256": "368c8f55e6de1b54dc5a393f0f5bcd328f84b3d544ac6f8b9654fc23730e925d"
+    },
+    "smoke": {
+      "text": "Исәнмесез.",
+      "speaker": "dilyara",
+      "variant": "v3_hifigan"
+    }
+  },
+  {
+    "model_id": "v3_uz",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/uz/v3_uz.pt",
+      "size_bytes": 57070495,
+      "sha256": "cbd93dca034adb84c3f914709e7ad4f5936b3594282ea200d3dc97758f6a56ce"
+    },
+    "smoke": {
+      "text": "Salom dunyo!",
+      "speaker": "dilnavoz",
+      "variant": "v3_hifigan"
+    }
+  },
+  {
+    "model_id": "v3_ua",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/ua/v3_ua.pt",
+      "size_bytes": 57081646,
+      "sha256": "025c53797e730142816c9ce817518977c29d7a75adefece9f3c707a4f4b569cb"
+    },
+    "smoke": {
+      "text": "Привіт, світе!",
+      "speaker": "mykyta",
+      "variant": "v3_hifigan"
+    }
+  },
+  {
+    "model_id": "v5_caucasian",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/ru/v5_caucasian.pt",
+      "size_bytes": 91643410,
+      "sha256": "c4f4de6c50efc0a0fb71e317ab3a2fbe315aa7e0347410ff28ce25f02b9d3551"
+    },
+    "smoke": {
+      "text": "Салам.",
+      "speaker": "abq_0",
+      "variant": "v5_convnext_plain"
+    }
+  },
+  {
+    "model_id": "v5_cis_ext",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/ru/v5_cis_ext.pt",
+      "size_bytes": 91651972,
+      "sha256": "e8185323fc5a341c229f8a8c9928512f665bf2736021bc600512499d0506eed2"
+    },
+    "smoke": {
+      "text": "Сәлем, әлем!",
+      "speaker": "kaz_danara",
+      "variant": "v5_convnext_plain"
+    }
+  },
+  {
+    "model_id": "v5_1_ru",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/ru/v5_1_ru.pt",
+      "size_bytes": 145376593,
+      "sha256": "4046127a930478a6c353f68f029cf603d29c7535f041e8726af15e7f8b7fa61b"
+    },
+    "smoke": {
+      "text": "Привет. Ты дома?",
+      "speaker": "aidar",
+      "variant": "v5_ru"
+    }
+  },
+  {
+    "model_id": "v5_2_ru",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/ru/v5_2_ru.pt",
+      "size_bytes": 145358040,
+      "sha256": "2e637606092c9947617004a19c55782e59393a368cff52a2aec5ccdaf9810ada"
+    },
+    "smoke": {
+      "text": "Привет. Ты дома?",
+      "speaker": "aidar",
+      "variant": "v5_ru"
+    }
+  },
+  {
+    "model_id": "v5_3_ru",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/ru/v5_3_ru.pt",
+      "size_bytes": 145359640,
+      "sha256": "f036d3da1584899e5e24bdf2d5bd3bcf896e2d62505de39a02caca76014d7a1c"
+    },
+    "smoke": {
+      "text": "Привет. Ты дома?",
+      "speaker": "aidar",
+      "variant": "v5_ru"
+    }
+  },
+  {
+    "model_id": "v5_4_ru",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/ru/v5_4_ru.pt",
+      "size_bytes": 145412956,
+      "sha256": "10642dda88b3e2dd1685bf974253447bcf3c95333213d3e34f516ceab85580cc"
+    },
+    "smoke": {
+      "text": "Привет. Ты дома?",
+      "speaker": "aidar",
+      "variant": "v5_ru_conditioned"
+    }
+  },
+  {
+    "model_id": "v5_5_ru",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/ru/v5_5_ru.pt",
+      "size_bytes": 145420684,
+      "sha256": "50081637b602126ee06cb3bc8a744d25651d2da149ee8864b9a379bfdd934437"
+    },
+    "smoke": {
+      "text": "Привет. Ты дома?",
+      "speaker": "aidar",
+      "variant": "v5_ru_conditioned"
+    }
+  },
+  {
+    "model_id": "v5_6_ru",
+    "artifact_arguments": [
+      "--checkpoint"
+    ],
+    "checkpoint": {
+      "url": "https://models.silero.ai/models/tts/ru/v5_6_ru.pt",
+      "size_bytes": 147664410,
+      "sha256": "04cc9b1d08ce38bcaa9d02c488d80d3e6806d17f7eaa7c95982f36a3cbf50b2e"
+    },
+    "smoke": {
+      "text": "Привет. Ты дома?",
+      "speaker": "aidar",
+      "variant": "v5_ru_conditioned"
+    }
   }
 ]

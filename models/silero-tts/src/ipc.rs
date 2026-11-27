@@ -52,6 +52,7 @@ impl Worker {
                 "backend": self.backend, "gpu_id": self.gpu_id,
                 "model_variants": [
                     {"id":"v5_ru", "inputs":["text","ssml","accented","symbol_durations"]},
+                    {"id":"v5_ru_conditioned", "inputs":["text","accented"]},
                     {"id":"v3_hifigan", "inputs":["text"]},
                     {"id":"v4_hifigan", "inputs":["text"]},
                     {"id":"v5_convnext_plain", "inputs":["text"]}

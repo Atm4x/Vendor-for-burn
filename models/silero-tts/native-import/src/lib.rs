@@ -9,9 +9,11 @@ pub use layout::ArchiveLayout;
 mod v3_schema;
 mod v5_plain;
 mod v4;
+mod ascii_accent;
+pub use ascii_accent::AsciiAccentCheckpoint;
 pub use v4::V4Checkpoint;
 pub use v5_plain::V5PlainCheckpoint;
-pub use russian::{RussianCheckpoint, RussianConfig, RussianTokenizer, RussianControls};
+pub use russian::{RussianCheckpoint, RussianConfig, RussianTokenizer, RussianControls, RussianProsody};
 
 pub enum OfficialCheckpoint { V4(V4Checkpoint), V3(V3Checkpoint), Russian(RussianCheckpoint), V5Plain(V5PlainCheckpoint) }
 impl OfficialCheckpoint {
@@ -78,6 +80,7 @@ pub struct V3Checkpoint {
     pub module_metadata: PickleValue,
     pub encoded_symbols: String,
     tensors: HashMap<String, Tensor>,
+    pub accent: Option<AsciiAccentCheckpoint>,
 }
 
 impl V3Checkpoint {
@@ -107,7 +110,17 @@ impl V3Checkpoint {
         let Some(PickleValue::Unsupported(reference)) = metadata.get("model") else { bail!("missing script module reference"); };
         let id = reference.strip_prefix("torchpackage.script:").context("unsupported model reference")?;
         ensure!(package.module_ids().len() == 1, "V3 requires exactly one script module");
-        let (module_metadata, tensors) = package.module(id).context("reading V3 script tensors")?;
+        let (module_metadata, mut tensors) = package.module(id).context("reading V3 script tensors")?;
+        let script = dictionary(&module_metadata, "script metadata")?;
+        let accent = match script.get("set_accent") {
+            Some(PickleValue::Bool(true)) => {
+                let accent = ascii_accent::load_ascii_accent(script, &tensors)?;
+                tensors.retain(|name, _| !name.starts_with("accentor."));
+                Some(accent)
+            }
+            Some(PickleValue::Bool(false)) => None,
+            _ => bail!("unsupported V3 accentor topology"),
+        };
         v3_schema::validate(&tensors, &module_metadata, symbol_count, speakers.len())?;
         let total = tensors.values().try_fold(0usize, |sum, tensor| sum.checked_add(tensor.byte_len())).context("tensor byte count overflow")?;
         ensure!(total <= 256 * 1024 * 1024, "V3 tensor byte budget exceeded");
@@ -118,7 +131,7 @@ impl V3Checkpoint {
         for (idx, ch) in encoded_symbols.chars().enumerate() {
             ensure!(symbol_to_id.get(&ch.to_string()) == Some(&idx), "inconsistent encoded symbol id for {ch:?}");
         }
-        Ok(Self { symbols, speakers, ascii_symbols, module_metadata, encoded_symbols, tensors })
+        Ok(Self { symbols, speakers, ascii_symbols, module_metadata, encoded_symbols, tensors, accent })
     }
 
     pub fn tensors(&self) -> &HashMap<String, Tensor> { &self.tensors }

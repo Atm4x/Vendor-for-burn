@@ -20,6 +20,11 @@ V3_CASES = {
     'v3_es': ('¡Buenos días! ¿Cómo estás?', 'es_0'),
     'v3_fr': ('Bonjour, ça va très bien.', 'fr_0'),
     'v3_indic': ('namastē duniyā.', 'hindi_female'),
+    'v3_1_ru': ('Привет, мир!', 'aidar'),
+    'v3_xal': ('Мендвт.', 'erdni'),
+    'v3_tt': ('Исәнмесез.', 'dilyara'),
+    'v3_uz': ('Salom dunyo!', 'dilnavoz'),
+    'v3_ua': ('Привіт, світе!', 'mykyta'),
 }
 
 
@@ -29,7 +34,13 @@ V5_CASES = {
     'v5_cis_base': [('Прив+ет.', 'ru_aigul'), ('Բարեւ աշխարհ։', 'hye_zara'), ('Salam dünya.', 'aze_gamat')],
     'v5_cis_base_nostress': [('Привет.', 'ru_aigul')],
     'v5_turkic': [('Исәнмесез.', 'tat_0')],
+    'v5_caucasian': [('Салам.', 'abq_0')],
+    'v5_cis_ext': [('Сәлем, әлем!', 'kaz_danara')],
 }
+
+
+V5_RU_CASES = {f'v5_{i}_ru': [('Привет. Ты дома?', 'aidar')] for i in range(1,7)}
+V5_RU_CASES['v5_6_ru'] += [(text, 'aidar') for text in ['Привет, мир!', 'Куда ты идёшь?', 'Ты дома?', 'Чай или кофе?', 'Ты дома, правда?']]
 
 
 def compare(binary, path, text, speaker, variant="v3_hifigan"):
@@ -66,27 +77,31 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('binary', type=Path)
     parser.add_argument('checkpoints', type=Path)
-    parser.add_argument('--model', choices=(*V3_CASES, *V4_CASES, *V5_CASES), action='append')
-    parser.add_argument('--reject-unimplemented', action='store_true', help='Check the acquired unsupported neural-stress V5 graph')
+    parser.add_argument('--model', choices=(*V3_CASES, *V4_CASES, *V5_CASES, *V5_RU_CASES), action='append')
+    parser.add_argument('--reject-unimplemented', action='store_true', help='Check the unsupported recurrent-stress V3 graph')
     args = parser.parse_args()
     torch.set_num_threads(4)
-    for model in args.model or (*V3_CASES, *V4_CASES, *V5_CASES):
+    for model in args.model or (*V3_CASES, *V4_CASES, *V5_CASES, *V5_RU_CASES):
         path = args.checkpoints / (model + '.pt')
         if model in V3_CASES:
             compare(args.binary, path, *V3_CASES[model])
         elif model in V4_CASES:
             for text, speaker in V4_CASES[model]:
                 compare(args.binary, path, text, speaker, "v4_hifigan")
+        elif model in V5_RU_CASES:
+            variant = 'v5_ru_conditioned' if model in ('v5_4_ru', 'v5_5_ru', 'v5_6_ru') else 'v5_ru'
+            for text, speaker in V5_RU_CASES[model]:
+                compare(args.binary, path, text, speaker, variant)
         else:
             for text, speaker in V5_CASES[model]:
                 compare(args.binary, path, text, speaker, 'v5_convnext_plain')
 
     if args.reject_unimplemented:
-        for model in ('v5_6_ru',):
+        for model in ('ru_v3',):
             requests = [dict(command='load', request_id='unsupported', checkpoint=str((args.checkpoints / (model + '.pt')).resolve()), backend='flex'), dict(command='shutdown', request_id='shutdown')]
             process = subprocess.run([str(args.binary.resolve()), '--stdio'], input=''.join(json.dumps(x)+'\n' for x in requests), capture_output=True, text=True, check=True, timeout=120)
             replies = [json.loads(line) for line in process.stdout.splitlines()]
             assert len(replies) == 2 and not replies[0]['ok'] and replies[1]['ok'], replies
-            expected = 'unsupported neural-stress V5 graph' if model == 'v5_6_ru' else 'unsupported V4 graph'
+            expected = 'unsupported V3 accentor topology'
             assert expected in str(replies[0]['error']), replies[0]
             print(json.dumps(dict(model=model, expected_rejection=True)), flush=True)

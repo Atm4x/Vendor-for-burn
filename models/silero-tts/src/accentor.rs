@@ -283,7 +283,7 @@ impl Accentor {
 
     /// V4's serialized frontend classifies the ASCII-transliterated words,
     /// rather than the Unicode strings used by the V5 stress pipeline.
-    pub(crate) fn accentuate_v4_ascii(&self, sentence: &str, vowels: &str,
+    pub(crate) fn accentuate_ascii(&self, sentence: &str, vowels: &str,
         stop_words: &std::collections::HashSet<String>, put_yo: bool) -> Result<String> {
         let clean: String = sentence.chars().filter(|c| c.is_ascii_lowercase() || ('1'..='9').contains(c) || *c == '-' || *c == ' ').collect();
         let mut tokens = Vec::new();

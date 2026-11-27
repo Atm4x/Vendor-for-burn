@@ -293,6 +293,27 @@ impl TextToMel {
         Ok((self.acoustic.forward(input, speaker, None, durations, pitch, None)?, duration))
     }
 
+    pub(crate) fn infer_conditioned(&self, symbols: &[i64], speaker_id: i64, types: &[i64], condition_duration: bool) -> Result<(Tensor<3>, Vec<f32>)> {
+        let len = symbols.len();
+        ensure!((3..=5000).contains(&len) && types.len() == len && types.iter().all(|&x| (0..6).contains(&x)), "Invalid sentence-conditioned tokens");
+        let input = Tensor::<2, Int>::from_data(TensorData::new(symbols.to_vec(), [1, len]), &self.device);
+        let speaker = Tensor::<2, Int>::from_data(TensorData::new(vec![speaker_id], [1, 1]), &self.device);
+        let type_ids = Tensor::<2, Int>::from_data(TensorData::new(types.to_vec(), [1,len]), &self.device);
+        let focus = Tensor::<2, Int>::zeros([1,len], &self.device);
+        let log_duration = if condition_duration {
+            self.duration.forward_conditioned(input.clone(), speaker.clone(), None, type_ids.clone(), Some(focus.clone()))?
+        } else { self.duration.forward(input.clone(), speaker.clone(), None, 1.0) };
+        let mut duration: Vec<f32> = (log_duration.exp() - 1.0).clamp_min(0.0).round().into_data().try_to_vec()?;
+        duration[0] = duration[0].min(5.0);
+        duration[len-1] = duration[len-1].min(7.0);
+        duration[len-2] = 13.0;
+        duration[len-3] = duration[len-3].min(13.0);
+        let pitch = self.pitch.forward_conditioned(input.clone(), speaker.clone(), None, type_ids, condition_duration.then_some(focus))?.reshape([1,1,len]);
+        let pitch = silence_near_zero_pitch_tensor(pitch);
+        let durations = Tensor::<2>::from_data(TensorData::new(duration.clone(), [1,len]), &self.device);
+        Ok((self.acoustic.forward(input, speaker, None, durations, pitch, None)?, duration))
+    }
+
     /// Implements the default one-speaker acoustic inference without optional
     /// SSML, pause overrides, rate modifications, or explicit pitch coefficients.
     pub fn infer(&self, symbols: &[i64], speaker: i64) -> Result<(Tensor<3>, Vec<f32>)> {

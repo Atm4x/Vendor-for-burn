@@ -32,7 +32,11 @@ pub struct RussianControls {
     pub sil_value: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RussianProsody { Legacy, PitchConditioned, SentenceConditioned }
+
 pub struct RussianCheckpoint {
+    pub prosody: RussianProsody,
     pub config: RussianConfig,
     pub tokenizer: RussianTokenizer,
     pub controls: RussianControls,
@@ -60,7 +64,7 @@ impl RussianCheckpoint {
             ensure!(symbol_ids.get(&ch.to_string()) == Some(&idx), "inconsistent Russian symbol mapping");
         }
         let speakers = ids(Some(only(field(part, "speaker_to_ids")?, "speaker_to_ids")?), "speaker_to_ids")?;
-        ensure!(speakers.len() == 5 && speakers.values().all(|&n| n < 5), "unexpected v5_ru speakers");
+        ensure!((1..=4096).contains(&speakers.len()) && speakers.values().copied().collect::<std::collections::HashSet<_>>().len() == speakers.len() && speakers.values().all(|&n| n < speakers.len()), "invalid Russian speaker table");
         let config = RussianConfig {
             symbols,
             alphabet: strings(field(part, "alphabet")?, "alphabet")?.concat(),
@@ -77,15 +81,43 @@ impl RussianCheckpoint {
         ensure!(accent_id != homo_id && accent_id != tts_id && homo_id != tts_id && package.module_ids().len() == 3, "unexpected Russian script topology");
         let (accent_meta, accent_tensors) = package.module(accent_id)?;
         let (homo_meta, homo_tensors) = package.module(homo_id)?;
-        let (tts_meta, tts_tensors) = package.module(tts_id)?;
-        ensure!(tts_tensors.len() == 311, "unsupported neural-stress V5 graph: expected 311 tensors, got {}", tts_tensors.len());
+        let (tts_meta, mut tts_tensors) = package.module(tts_id)?;
+        let tts = dictionary(&tts_meta, "acoustic metadata")?;
+        let embedded_pqmf = tts_tensors.contains_key("vocoder.pqmf_2.H");
+        let pred_flags = |outer: &str, inner: &str| -> Result<&HashMap<String,V>> { dictionary(field(dictionary(field(tts,outer)?,outer)?,inner)?,inner) };
+        let prosody = match tts_tensors.len() {
+            311 | 317 => RussianProsody::Legacy,
+            321 if matches!(pred_flags("dur_predictor","dur_pred")?.get("utt_type_emb"), Some(V::Bool(false))) => {
+                for (prefix, type_rows, enabled) in [("dur_predictor.dur_pred", 1, false), ("pitch_predictor.pitch_pred", 6, true)] {
+                    let (outer, inner) = prefix.split_once('.').unwrap();
+                    let pred = pred_flags(outer,inner)?;
+                    ensure!(matches!(pred.get("utt_type_emb"), Some(V::Bool(b)) if *b == enabled) && matches!(pred.get("focus_emb"), Some(V::Bool(b)) if *b == enabled), "unsupported V5 pitch conditioning flags");
+                    for (name,rows) in [("type_embedding",type_rows),("focus_embedding",4),("emotion_embedding",15)] {
+                        require_tensor(&tts_tensors,&format!("{prefix}.{name}.weight"),DType::F32,&[rows,64])?;
+                    }
+                }
+                RussianProsody::PitchConditioned
+            }
+            321 => {
+                for (prefix, type_rows, emotion_rows, emphasis) in [("dur_predictor.dur_pred", 12, 0, false), ("pitch_predictor.pitch_pred", 6, 15, true)] {
+                    let (outer, inner) = prefix.split_once('.').unwrap();
+                    let pred = dictionary(field(dictionary(field(tts,outer)?,outer)?,inner)?,inner)?;
+                    ensure!(matches!(pred.get("utt_type_emb"), Some(V::Bool(true))) && matches!(pred.get("focus_emb"), Some(V::Bool(true))) && matches!(pred.get("emphasis_emb"), Some(V::Bool(b)) if *b == emphasis), "unsupported V5 prosody predictor flags");
+                    for (name,rows) in [("type_embedding",type_rows),("focus_embedding",4),("emotion_embedding",emotion_rows),("emphasis_embedding",2)] {
+                        require_tensor(&tts_tensors,&format!("{prefix}.{name}.weight"),DType::F32,&[rows,64])?;
+                    }
+                }
+                RussianProsody::SentenceConditioned
+            }
+            count => bail!("unsupported neural-stress V5 graph: got {count} tensors"),
+        };
         let _ = homo_meta;
         require_tensor(&accent_tensors, "embedding.weight", DType::F32, &[126523,16])?;
         require_tensor(&homo_tensors, "bert.embeddings.word_embeddings.weight", DType::I8, &[83830,312])?;
         require_tensor(&homo_tensors, "bert.scale", DType::F32, &[])?;
         require_tensor(&homo_tensors, "bert.zero_point", DType::F32, &[])?;
         require_tensor(&tts_tensors, "tacotron.embedding.weight", DType::F32, &[47,128])?;
-        require_tensor(&tts_tensors, "tacotron.speaker_embedding.weight", DType::F32, &[5,128])?;
+        require_tensor(&tts_tensors, "tacotron.speaker_embedding.weight", DType::F32, &[config.speakers.len(),128])?;
         require_tensor(&tts_tensors, "vocoder.head.istft.window", DType::F32, &[2400])?;
         let embedding = dictionary(field(dictionary(&accent_meta, "accent script")?, "embedding")?, "embedding")?;
         let ngrams: HashMap<_, _> = ids(embedding.get("ngram_dict"), "ngram_dict")?.into_iter().collect();
@@ -114,7 +146,6 @@ impl RussianCheckpoint {
             vocab: ids(tok.get("vocab"), "vocab")?.into_iter().collect(),
         };
         ensure!(tokenizer.vocab.len() == 83830 && tokenizer.vocab.values().all(|&v| v < 83830) && tokenizer.homo_start_id < 83830 && tokenizer.homo_end_id < 83830 && tokenizer.model_max_length <= 2048, "invalid Russian tokenizer vocabulary");
-        let tts = dictionary(&tts_meta, "acoustic metadata")?;
         let controls = RussianControls {
             point_id: integer(field(tts,"point_id")?, "point_id")?,
             comma_ids: integers(field(tts,"comma_ids")?, "comma_ids")?,
@@ -122,20 +153,29 @@ impl RussianCheckpoint {
             pitch_mean_shift: list(field(tts,"mean_std_coef")?, "mean_std_coef")?.iter().map(number).collect::<Result<_>>()?,
             sil_value: number(field(tts,"sil_value")?)?,
         };
-        ensure!(controls.pitch_mean_shift.len() == 5, "invalid Russian prosody metadata");
+        ensure!(controls.pitch_mean_shift.len() == config.speakers.len(), "invalid Russian prosody metadata");
         let mut filters = HashMap::new();
-        for (alias, path, shape) in [
-            ("analysis_2", "packages.0.wrapped_jit_v.pqmf_2._buffers.H", &[2,1,63][..]),
-            ("analysis_6", "packages.0.wrapped_jit_v.pqmf_6._buffers.H", &[6,1,63]),
-        ] {
-            require_tensor(package.tensors(), path, DType::F32, shape)?;
-            filters.insert(alias.to_owned(), package.tensors()[path].clone());
+        for bands in [2,6] {
+            let alias = format!("analysis_{bands}");
+            let shape = [bands,1,63];
+            match embedded_pqmf {
+                false => {
+                    let path = format!("packages.0.wrapped_jit_v.pqmf_{bands}._buffers.H");
+                    require_tensor(package.tensors(), &path, DType::F32, &shape)?;
+                    filters.insert(alias, package.tensors()[&path].clone());
+                }
+                true => {
+                    let path = format!("vocoder.pqmf_{bands}.H");
+                    require_tensor(&tts_tensors, &path, DType::F32, &shape)?;
+                    filters.insert(alias, tts_tensors.remove(&path).unwrap());
+                }
+            }
         }
         let mut homosolver = WeightSet::new(homo_tensors)?;
         let scale = homosolver.read_f32("bert.scale")?[0];
         let zero_point = homosolver.read_f32("bert.zero_point")?[0];
         homosolver.set_quantization("bert.embeddings.word_embeddings.weight", scale, zero_point)?;
-        Ok(Self { config, tokenizer, controls, ngrams, exceptions, homographs,
+        Ok(Self { prosody, config, tokenizer, controls, ngrams, exceptions, homographs,
             acoustic: WeightSet::new(tts_tensors)?, accentor: WeightSet::new(accent_tensors)?,
             homosolver, pqmf: WeightSet::new(filters)? })
     }

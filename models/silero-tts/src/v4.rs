@@ -27,7 +27,7 @@ impl V4Tts {
     fn encode(&self, text: &str, options: &TextOptions) -> Result<Vec<i64>> {
         let mut sentence = silero_package::normalize_v3(&self.symbols, &self.ascii_symbols, text)?;
         if let Some((accent,vowels,stop)) = &self.accent {
-            if options.put_accent { sentence = accent.accentuate_v4_ascii(&sentence, vowels, stop, options.put_yo)?; }
+            if options.put_accent { sentence = accent.accentuate_ascii(&sentence, vowels, stop, options.put_yo)?; }
         }
         std::iter::once('|').chain(sentence.chars()).chain(std::iter::once('~')).map(|ch| {
             self.symbol_ids.get(&ch.to_string()).map(|&id| id as i64).with_context(|| format!("unknown V4 symbol {ch:?}"))
