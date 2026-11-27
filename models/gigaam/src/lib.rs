@@ -400,11 +400,27 @@ impl AsrOptions<'_> {
     }
 }
 
+/// Files explicitly assigned to their checkpoint roles.
+#[derive(Default)]
+pub struct CheckpointFiles<'a> {
+    pub config: Option<&'a Path>,
+    pub model_name: Option<&'a str>,
+    pub tokenizers: TokenizerFiles<'a>,
+}
+
+/// External tokenizers for either a single decoder or separate RAW and E2E decoders.
+#[derive(Clone, Copy, Default)]
+pub struct TokenizerFiles<'a> {
+    pub single: Option<&'a Path>,
+    pub raw: Option<&'a Path>,
+    pub e2e: Option<&'a Path>,
+}
+
 impl GigaAm {
     /// Load from a model directory or a specific checkpoint file. A sibling
     /// `config.json` supplies the architecture and tokenizer configuration.
     pub fn load(model_dir: &Path, device: Device) -> Result<Self> {
-        Self::load_internal(model_dir, device, None)
+        Self::load_internal(model_dir, device, None, None)
     }
 
     /// Load fine-tuned checkpoints using the upstream base-model fallback when
@@ -414,10 +430,15 @@ impl GigaAm {
         device: Device,
         cache: &model_registry::CacheOptions,
     ) -> Result<Self> {
-        Self::load_internal(model_dir, device, Some(cache))
+        Self::load_internal(model_dir, device, Some(cache), None)
     }
 
-    fn load_zapformer(path: &Path, config: CheckpointConfig, device: Device) -> Result<Self> {
+    /// Load one checkpoint using only the explicit configuration and tokenizer paths.
+    pub fn load_files(path: &Path, device: Device, files: CheckpointFiles<'_>) -> Result<Self> {
+        Self::load_internal(path, device, None, Some(files))
+    }
+
+    fn load_zapformer(path: &Path, config: CheckpointConfig, device: Device, tokenizers: Option<TokenizerFiles<'_>>) -> Result<Self> {
         let head_kind = |head: &HeadConfig| match head {
             HeadConfig::Ctc { .. } => ModelKind::Ctc,
             HeadConfig::Rnnt { .. } => ModelKind::Rnnt,
@@ -432,7 +453,7 @@ impl GigaAm {
         };
         let n_mels = config.encoder.in_channels;
         let mel = config.mel;
-        let network = Network::Zapformer(Box::new(ZapformerModel::load_with_config(path, config, device.clone())?));
+        let network = Network::Zapformer(Box::new(ZapformerModel::load_with_tokenizers(path, config, device.clone(), tokenizers)?));
         Ok(Self { network, tokenizer: None, device, n_mels, mel, kind, emotion_names: Vec::new() })
     }
 
@@ -479,6 +500,7 @@ impl GigaAm {
         model_dir: &Path,
         device: Device,
         cache: Option<&model_registry::CacheOptions>,
+        files: Option<CheckpointFiles<'_>>,
     ) -> Result<Self> {
         let direct_checkpoint = match model_dir.extension().and_then(|ext| ext.to_str()) {
             Some("ckpt" | "pth" | "pt" | "safetensors") => {
@@ -497,8 +519,15 @@ impl GigaAm {
                 .context("checkpoint has no parent directory")?,
             None => model_dir,
         };
-        let cfg_path = model_root.join("config.json");
-        let inferred_checkpoint = if cfg_path.is_file() || direct_checkpoint.is_some() {
+        let legacy_config = model_root.join("config.json");
+        let cfg_path = if let Some(files) = &files {
+            ensure!(direct_checkpoint.is_some(), "expected an explicit .ckpt, .pt, .pth or .safetensors file");
+            files.config
+        } else {
+            legacy_config.is_file().then_some(legacy_config.as_path())
+        };
+        let tokenizers = files.as_ref().map(|files| files.tokenizers);
+        let inferred_checkpoint = if cfg_path.is_some() || direct_checkpoint.is_some() {
             direct_checkpoint.map(Path::to_path_buf)
         } else {
             let available = std::fs::read_dir(model_root)
@@ -520,8 +549,8 @@ impl GigaAm {
             available.into_iter().next()
         };
         let mut base_checkpoint = None;
-        let manifest: ModelManifest = if cfg_path.is_file() {
-            let cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(&cfg_path).with_context(|| format!("reading {}", cfg_path.display()))?)?;
+        let manifest: ModelManifest = if let Some(cfg_path) = cfg_path {
+            let cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(cfg_path).with_context(|| format!("reading {}", cfg_path.display()))?)?;
             if cfg["encoder"]["_target_"].as_str() == Some("gigaam.encoder.ZapformerEncoder") {
                 let path = match direct_checkpoint {
                     Some(path) => path.to_path_buf(),
@@ -535,7 +564,7 @@ impl GigaAm {
                         names.iter().map(|name| model_root.join(name)).find(|path| path.is_file()).context("Zapformer model weights not found")?
                     }
                 };
-                return Self::load_zapformer(&path, CheckpointConfig::from_upstream(&cfg)?, device);
+                return Self::load_zapformer(&path, CheckpointConfig::from_upstream(&cfg)?, device, tokenizers);
             }
             serde_json::from_value(cfg)?
         } else {
@@ -544,7 +573,7 @@ impl GigaAm {
             )?;
             let metadata = checkpoint_config::read_checkpoint_metadata(path)?;
             if metadata.config["encoder"]["_target_"].as_str() == Some("gigaam.encoder.ZapformerEncoder") {
-                return Self::load_zapformer(path, CheckpointConfig::from_upstream(&metadata.config)?, device);
+                return Self::load_zapformer(path, CheckpointConfig::from_upstream(&metadata.config)?, device, tokenizers);
             }
             let decoder_needs_base = metadata
                 .config
@@ -580,7 +609,7 @@ impl GigaAm {
                 ModelManifest::from_upstream_values(
                     metadata.config,
                     path,
-                    metadata.base_model_name.as_deref(),
+                    metadata.base_model_name.as_deref().or_else(|| files.as_ref().and_then(|files| files.model_name)),
                 )?
             }
         };
@@ -606,10 +635,19 @@ impl GigaAm {
             .as_deref()
             .and_then(Path::parent)
             .unwrap_or(model_root);
+        if let Some(paths) = tokenizers {
+            ensure!(paths.raw.is_none() && paths.e2e.is_none(), "legacy checkpoints use --tokenizer");
+            let requires_file = manifest.sentencepiece_model.is_some()
+                || matches!(kind, ModelKind::E2eCtc | ModelKind::E2eRnnt)
+                || canonical_name == Some("v1_rnnt");
+            ensure!(paths.single.is_some() == requires_file, "checkpoint configuration and --tokenizer do not match");
+        }
         let tokenizer = if kind.is_ssl() || kind.is_emo() {
             None
         } else {
-            let sp_path = if let Some(path) = manifest.sentencepiece_model {
+            let sp_path = if let Some(paths) = tokenizers {
+                paths.single.map(Path::to_path_buf)
+            } else if let Some(path) = manifest.sentencepiece_model {
                 ensure!(
                     !path.contains('/') && !path.contains('\\') && !path.contains(".."),
                     "sentencepiece_model must be a filename in model_dir"
@@ -653,7 +691,7 @@ impl GigaAm {
         }
         let weights_path = match direct_checkpoint {
             Some(path) => path.to_owned(),
-            None if !cfg_path.is_file() => {
+            None if cfg_path.is_none() => {
                 inferred_checkpoint.context("checkpoint required for auto configuration")?
             }
             None => weight_names

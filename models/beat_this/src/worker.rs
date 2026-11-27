@@ -71,7 +71,7 @@ struct Track {
 
 struct Worker {
     selection: Model,
-    model_dir: PathBuf,
+    checkpoint: PathBuf,
     soxr: PathBuf,
     input_dir: Option<PathBuf>,
     model: Option<BeatThisModel>,
@@ -80,7 +80,7 @@ struct Worker {
 
 impl Worker {
     fn command(&mut self, name: &str, payload: Value) -> Result<Value, String> {
-        let (model_id, checkpoint_name, width) = self.selection.definition();
+        let (model_id, _, width) = self.selection.definition();
         if !matches!(name, "load" | "infer") && payload != json!({}) {
             return Err("unexpected command payload".into());
         }
@@ -96,9 +96,8 @@ impl Worker {
                 if self.model.is_some() || load.model_id != model_id {
                     return Err("model does not match the package or is already loaded".into());
                 }
-                let weights = self.model_dir.join(checkpoint_name);
-                require_file(&weights)?;
-                let checkpoint = Checkpoint::open(weights)?;
+                require_file(&self.checkpoint)?;
+                let checkpoint = Checkpoint::open(&self.checkpoint)?;
                 let model = BeatThisModel::from_checkpoint(&checkpoint, &Device::flex())?;
                 if model.transformer_dim != width {
                     return Err(format!("checkpoint architecture does not match {model_id}"));
@@ -242,6 +241,7 @@ fn absolute_directory(value: String) -> Result<PathBuf, String> {
 
 pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let mut model_dir = None;
+    let mut checkpoint = None;
     let mut runtime_dir = None;
     let mut input_dir = None;
     let mut backend = None;
@@ -250,6 +250,14 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
         let value = args.next().ok_or("missing worker launch argument")?;
         match flag.as_str() {
             "--model-dir" if model_dir.is_none() => model_dir = Some(absolute_directory(value)?),
+            "--checkpoint" if checkpoint.is_none() => {
+                let path = PathBuf::from(value);
+                if !path.is_absolute() {
+                    return Err("checkpoint path must be absolute".into());
+                }
+                require_file(&path)?;
+                checkpoint = Some(path);
+            }
             "--runtime-dir" if runtime_dir.is_none() => {
                 runtime_dir = Some(absolute_directory(value)?)
             }
@@ -268,9 +276,16 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let soxr_name = "libsoxr.dylib";
     #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     let soxr_name = "libsoxr.so.0";
+    let selection = selection.unwrap_or_default();
+    let checkpoint = match (checkpoint, model_dir) {
+        (Some(path), None) => path,
+        (None, Some(dir)) => dir.join(selection.definition().1),
+        (Some(_), Some(_)) => return Err("pass either --checkpoint or --model-dir".into()),
+        (None, None) => return Err("missing --checkpoint".into()),
+    };
     let mut worker = Worker {
-        selection: selection.unwrap_or_default(),
-        model_dir: model_dir.ok_or("missing --model-dir")?,
+        selection,
+        checkpoint,
         soxr: runtime_dir
             .ok_or("missing --runtime-dir")?
             .join("soxr/0.1.3")

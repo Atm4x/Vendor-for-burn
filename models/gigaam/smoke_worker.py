@@ -33,9 +33,13 @@ def snapshot(path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--exe", type=Path, required=True)
-    parser.add_argument("--model-dir", type=Path, required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--model-dir", type=Path)
+    source.add_argument("--checkpoint", type=Path)
+    for arg in ("--config", "--tokenizer", "--raw-tokenizer", "--e2e-tokenizer"):
+        parser.add_argument(arg, type=Path)
     parser.add_argument("--model-id", required=True)
-    parser.add_argument("--backend", choices=["cpu", "cuda"], required=True)
+    parser.add_argument("--backend", choices=["cpu", "cuda", "wgpu"], required=True)
     options = parser.parse_args()
     kind = (
         "embeddings"
@@ -78,10 +82,12 @@ def main():
             "--ipc-stdio",
             "--backend", options.backend,
             "--model-id", options.model_id,
-            "--model-dir", str(options.model_dir.resolve(strict=True)),
             "--input-dir", str(root),
             "--output-dir", str(root),
         ]
+        for name in ("model_dir", "checkpoint", "config", "tokenizer", "raw_tokenizer", "e2e_tokenizer"):
+            if (path := getattr(options, name)) is not None:
+                command += ["--" + name.replace("_", "-"), str(path.resolve(strict=True))]
         result = subprocess.run(
             command,
             input="".join(json.dumps(request) + "\n" for request in requests),

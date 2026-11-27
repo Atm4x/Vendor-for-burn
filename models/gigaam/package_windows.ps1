@@ -19,27 +19,36 @@ rustup toolchain install 1.100.0 --profile minimal --no-self-update
 $target = Join-Path $OutputRoot 'target'
 Push-Location $PSScriptRoot
 try {
-    cargo '+1.100.0' build --release --locked --offline --no-default-features --features 'flex,cuda' --bin gigaam-rs --target-dir $target
+    cargo '+1.100.0' build --release --locked --offline --no-default-features --features 'flex,cuda,wgpu' --bin gigaam-rs --target-dir $target
 } finally {
     Pop-Location
 }
 $exe = Join-Path $target 'release/gigaam-rs.exe'
 $fixtures = Join-Path $PSScriptRoot 'tests/fixtures/backend'
-python (Join-Path $PSScriptRoot 'smoke_worker.py') --exe $exe --model-dir (Join-Path $fixtures 'ctc') --model-id gigaam_v3_ctc --backend cpu
-python (Join-Path $PSScriptRoot 'smoke_worker.py') --exe $exe --model-dir (Join-Path $fixtures 'rnnt') --model-id gigaam_v3_rnnt --backend cpu
+foreach ($kind in @('ctc', 'rnnt')) {
+    $checkpoint = Join-Path $OutputRoot "renamed-$kind.safetensors"
+    Copy-Item -LiteralPath (Join-Path $fixtures "$kind/model.safetensors") -Destination $checkpoint
+    $config = Join-Path $fixtures "$kind/config.json"
+    python (Join-Path $PSScriptRoot 'smoke_worker.py') --exe $exe --checkpoint $checkpoint --config $config --model-id "gigaam_v3_$kind" --backend cpu
+}
 
 Copy-Item -LiteralPath $exe -Destination $package
 foreach ($file in @('LICENSE', 'THIRD_PARTY_NOTICES.md', 'IPC_STDIO_WORKER.md')) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $file) -Destination $package
 }
-$models = foreach ($name in @('v3_ctc', 'v3_rnnt', 'v3_e2e_ctc', 'v3_e2e_rnnt')) {
-    $files = @(@{ role = 'checkpoint'; name = "$name.ckpt" })
+$models = foreach ($name in @('v3_ctc', 'v3_rnnt', 'v3_e2e_ctc', 'v3_e2e_rnnt', 'v4_ctc', 'v4_rnnt', 'multilingual_ctc', 'multilingual_large_ctc', 'multilingual_v2_rnnt')) {
+    $files = @(@{ role = 'checkpoint'; argument = '--checkpoint'; name = "$name.ckpt" })
     if ($name.StartsWith('v3_e2e_')) {
-        $files += @{ role = 'tokenizer'; name = "${name}_tokenizer.model" }
+        $files += @{ role = 'tokenizer'; argument = '--tokenizer'; name = "${name}_tokenizer.model" }
+    }
+    if ($name -in @('v4_rnnt', 'multilingual_v2_rnnt')) {
+        $files += @{ role = 'raw_tokenizer'; argument = '--raw-tokenizer'; name = "${name}_raw_tokenizer.model" }
+        $files += @{ role = 'e2e_tokenizer'; argument = '--e2e-tokenizer'; name = "${name}_e2e_tokenizer.model" }
     }
     @{
         model_id = "gigaam_$name"
         arguments = @('--model-id', "gigaam_$name")
+        artifact_arguments = @($files.argument)
         external_files = $files
     }
 }
@@ -52,7 +61,7 @@ $models = foreach ($name in @('v3_ctc', 'v3_rnnt', 'v3_e2e_ctc', 'v3_e2e_rnnt'))
     arch = 'x86_64'
     worker_protocol = 1
     gigaam_contract_version = 1
-    execution_variants = @('burn_flex_cpu_fp32', 'burn_cubecl_cuda_fp32')
+    execution_variants = @('burn_flex_cpu_fp32', 'burn_cubecl_cuda_fp32', 'burn_cubecl_wgpu_fp32')
     executable = @{
         path = 'gigaam-rs.exe'
         size_bytes = (Get-Item -LiteralPath $exe).Length

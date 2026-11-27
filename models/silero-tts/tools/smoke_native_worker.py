@@ -80,10 +80,18 @@ def main():
     parser.add_argument('--en', type=Path)
     parser.add_argument('--ru', type=Path)
     parser.add_argument('--matrix-dir', type=Path)
+    parser.add_argument('--matrix-model')
     args = parser.parse_args()
-    run(args.binary, None)
+    if args.matrix_model and not args.matrix_dir:
+        parser.error('--matrix-model requires --matrix-dir')
+    if not args.matrix_model:
+        run(args.binary, None)
     if args.matrix_dir:
         catalogue = json.loads((Path(__file__).resolve().parent.parent / 'verified_models.json').read_text(encoding='utf-8'))
+        if args.matrix_model:
+            catalogue = [model for model in catalogue if model['model_id'] == args.matrix_model]
+            if not catalogue:
+                parser.error(f'unknown --matrix-model {args.matrix_model}')
         for model in catalogue:
             run(args.binary, args.matrix_dir / (model['model_id'] + '-renamed.pt'), **model['smoke'])
     if args.en:

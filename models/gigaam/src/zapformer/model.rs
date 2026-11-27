@@ -55,6 +55,7 @@ impl AsrHead {
         config: &HeadConfig,
         width: usize,
         tokenizer_dir: &Path,
+        explicit_tokenizer: Option<Option<&Path>>,
         device: &Device,
     ) -> Result<Self> {
         let (classes, tokenizer, decoder) = match config {
@@ -92,14 +93,21 @@ impl AsrHead {
             ),
         };
         let tokenizer = match tokenizer {
-            TokenizerConfig::Vocabulary { tokens } => Tokenizer::load(tokens.clone(), None)?,
+            TokenizerConfig::Vocabulary { tokens } => {
+                ensure!(explicit_tokenizer.flatten().is_none(), "{prefix}: checkpoint uses an embedded vocabulary");
+                Tokenizer::load(tokens.clone(), None)?
+            },
             TokenizerConfig::SentencePiece { checkpoint_path } => {
+                if let Some(path) = explicit_tokenizer {
+                    Tokenizer::load(Vec::new(), Some(path.with_context(|| format!("{prefix}: missing explicit tokenizer path"))?))?
+                } else {
                 let name = checkpoint_path
                     .rsplit(['/', '\\'])
                     .next()
                     .filter(|s| !s.is_empty() && *s != "." && *s != "..")
                     .context("invalid tokenizer filename")?;
                 Tokenizer::load(Vec::new(), Some(&tokenizer_dir.join(name)))?
+                }
             }
         };
         ensure!(
@@ -184,7 +192,21 @@ impl ZapformerModel {
         )
     }
     pub fn load_with_config(path: &Path, config: CheckpointConfig, device: Device) -> Result<Self> {
+        Self::load_with_tokenizers(path, config, device, None)
+    }
+
+    pub(crate) fn load_with_tokenizers(
+        path: &Path, config: CheckpointConfig, device: Device, tokenizers: Option<crate::TokenizerFiles<'_>>,
+    ) -> Result<Self> {
         config.mel.validate()?;
+        if let Some(paths) = tokenizers {
+            let valid = match &config.heads {
+                HeadsConfig::EncoderOnly => paths.single.is_none() && paths.raw.is_none() && paths.e2e.is_none(),
+                HeadsConfig::Single { .. } => paths.raw.is_none() && paths.e2e.is_none(),
+                HeadsConfig::Dual { .. } => paths.single.is_none(),
+            };
+            ensure!(valid, "tokenizer paths do not match the checkpoint heads");
+        }
         let mut weights = Weights::open(path)?;
         let directory = path.parent().context("missing checkpoint parent")?;
         let width = config.encoder.embed_dim;
@@ -203,11 +225,12 @@ impl ZapformerModel {
                 head,
                 width,
                 directory,
+                tokenizers.map(|paths| paths.single),
                 &device,
             )?)),
             HeadsConfig::Dual { raw, e2e } => Heads::Dual {
-                raw: Arc::new(AsrHead::load(&mut weights, "heads.raw", raw, width, directory, &device)?),
-                e2e: Arc::new(AsrHead::load(&mut weights, "heads.e2e", e2e, width, directory, &device)?),
+                raw: Arc::new(AsrHead::load(&mut weights, "heads.raw", raw, width, directory, tokenizers.map(|paths| paths.raw), &device)?),
+                e2e: Arc::new(AsrHead::load(&mut weights, "heads.e2e", e2e, width, directory, tokenizers.map(|paths| paths.e2e), &device)?),
             },
         };
         Ok(Self {

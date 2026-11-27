@@ -112,6 +112,14 @@ pub struct LoadedFishArtifacts {
 
 impl LoadedFishArtifacts {
     pub fn open(paths: &ModelPaths) -> Result<Self> {
+        Self::open_with_weights(paths, None, None)
+    }
+
+    pub fn open_with_weights(
+        paths: &ModelPaths,
+        semantic_weights: Option<&Path>,
+        firefly_weights: Option<&Path>,
+    ) -> Result<Self> {
         let config_bytes = checked_file(&paths.semantic_config, MAX_CONFIG_BYTES)?;
         let firefly_config_bytes = checked_file(&paths.firefly_config_source, MAX_CONFIG_BYTES)?;
         let tokenizer_bytes = checked_file(&paths.semantic_tokenizer, MAX_TOKENIZER_BYTES)?;
@@ -133,14 +141,22 @@ impl LoadedFishArtifacts {
                 "semantic vocabulary or codebooks disagree with Fish tokenizer/Firefly".into(),
             ));
         }
-        let semantic = LoadedWeights::open(&paths.semantic_dir, &paths.semantic_manifest)?;
+        let semantic = LoadedWeights::open_with_shard(
+            &paths.semantic_dir,
+            &paths.semantic_manifest,
+            semantic_weights,
+        )?;
         if semantic.manifest().component != "semantic" {
             return Err(ModelRuntimeError::Invalid(
                 "expected a semantic checkpoint manifest".into(),
             ));
         }
         check_config_hash("semantic", &config_bytes, &semantic)?;
-        let firefly = LoadedWeights::open(&paths.firefly_dir, &paths.firefly_manifest)?;
+        let firefly = LoadedWeights::open_with_shard(
+            &paths.firefly_dir,
+            &paths.firefly_manifest,
+            firefly_weights,
+        )?;
         if firefly.manifest().component != "firefly" {
             return Err(ModelRuntimeError::Invalid(
                 "expected a Firefly checkpoint manifest".into(),

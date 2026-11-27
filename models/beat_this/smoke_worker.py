@@ -33,7 +33,9 @@ def tone(path, frequency):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--exe", required=True, type=Path)
-    parser.add_argument("--model-dir", required=True, type=Path)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--model-dir", type=Path)
+    source.add_argument("--checkpoint", type=Path)
     parser.add_argument("--runtime-dir", required=True, type=Path)
     parser.add_argument("--model-id", default="beat_this_small1", choices=("beat_this_small1", "beat_this_final1"))
     parser.add_argument("--flac", type=Path)
@@ -42,11 +44,13 @@ def main():
     base = [
         str(exe),
         "--ipc-stdio",
-        "--model-dir",
-        str(options.model_dir.resolve(strict=True)),
         "--runtime-dir",
         str(options.runtime_dir.resolve(strict=True)),
     ]
+    if options.checkpoint:
+        base += ["--checkpoint", str(options.checkpoint.resolve(strict=True))]
+    else:
+        base += ["--model-dir", str(options.model_dir.resolve(strict=True))]
     if options.model_id != "beat_this_small1":
         base += ["--model-id", options.model_id]
     base.append("--backend")

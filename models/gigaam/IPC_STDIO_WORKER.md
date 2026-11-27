@@ -5,8 +5,10 @@ This is the **same supervisor-facing stdio envelope and lifecycle** as `models/b
 ## Launch
 
 ```text
-gigaam-rs.exe --ipc-stdio --backend cuda --model-id gigaam_v3_ctc --model-dir D:\AIData\Models\GigaAM\v3_ctc --input-dir D:\AIData\WorkerInput
+gigaam-rs.exe --ipc-stdio --backend cuda --model-id gigaam_v3_ctc --checkpoint "D:\AIData\My weights\recognizer.ckpt" --input-dir D:\AIData\WorkerInput
 ```
+
+Pass absolute paths for each artifact. Use --checkpoint for weights, --config for an external model configuration, --tokenizer for a single external vocabulary, and --raw-tokenizer plus --e2e-tokenizer for dual SentencePiece decoders. Embedded vocabularies need no file. Pass --model-dir alone to use legacy model directory resolution.
 
 As with Beat This!, `--model-dir` and `--input-dir` must be absolute, existing, non-symlink directories. `--runtime-dir` is accepted for host launch compatibility but is optional (GigaAM's native WAV/FLAC decoder needs no SoXR). `--output-dir` is required only for SSL embedding results, also an existing, absolute, non-symlink directory. `--backend` is mandatory (`cuda` when compiled with CUDA, `cpu` when built with Flex or CubeCL CPU). A CPU/Flex build advertises `burn_flex_cpu_fp32`, CUDA advertises `burn_cubecl_cuda_fp32`. An unsupported backend fails at launch without writing to stdout.
 

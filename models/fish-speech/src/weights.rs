@@ -155,26 +155,57 @@ pub struct LoadedWeights {
 
 impl LoadedWeights {
     pub fn open(dir: &Path, manifest_file: &Path) -> Result<Self> {
+        Self::open_with_shard(dir, manifest_file, None)
+    }
+
+    pub(crate) fn open_with_shard(
+        dir: &Path,
+        manifest_file: &Path,
+        explicit: Option<&Path>,
+    ) -> Result<Self> {
         let metadata = fs::metadata(manifest_file)?;
         if metadata.len() > 16 * 1024 * 1024 {
             return Err(WeightError::Invalid("manifest exceeds 16 MiB limit".into()));
         }
         let manifest: WeightManifest = serde_json::from_slice(&fs::read(manifest_file)?)?;
-        Self::load(dir, manifest)
+        Self::load_with_shard(dir, manifest, explicit)
     }
 
     pub fn load(dir: &Path, manifest: WeightManifest) -> Result<Self> {
+        Self::load_with_shard(dir, manifest, None)
+    }
+
+    fn load_with_shard(
+        dir: &Path,
+        manifest: WeightManifest,
+        explicit: Option<&Path>,
+    ) -> Result<Self> {
         manifest.validate_schema()?;
+        if explicit.is_some() && manifest.shards.len() != 1 {
+            return Err(WeightError::Invalid(
+                "an explicit weights file requires a single-shard manifest".into(),
+            ));
+        }
         let root = fs::canonicalize(dir)?;
         let mut shards = BTreeMap::new();
         let mut seen = BTreeSet::new();
         for (name, expected_hash) in &manifest.shards {
-            let resolved = fs::canonicalize(root.join(name))?;
-            if !resolved.starts_with(&root) || !resolved.is_file() {
-                return Err(WeightError::Invalid(format!(
-                    "shard escapes model directory: {name}"
-                )));
-            }
+            let resolved = if let Some(path) = explicit {
+                if !path.is_absolute() || !fs::symlink_metadata(path)?.is_file() {
+                    return Err(WeightError::Invalid(
+                        "explicit shard must be an absolute regular file".into(),
+                    ));
+                }
+                path.to_path_buf()
+            } else {
+                let resolved = fs::canonicalize(root.join(name))?;
+                if !resolved.starts_with(&root) || !resolved.is_file() {
+                    return Err(WeightError::Invalid(format!(
+                        "shard escapes model directory: {name}"
+                    )));
+                }
+                resolved
+            };
             let bytes = fs::read(resolved)?;
             if sha256(&bytes) != *expected_hash {
                 return Err(WeightError::Invalid(format!("shard hash mismatch: {name}")));

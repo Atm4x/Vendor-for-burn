@@ -72,19 +72,21 @@ if ($Compact) {
     $models = @($definition) + @($definition.additional_models)
     $modelEntries = foreach ($model in $models) {
         $weights = $model.weights
-        $checkpoint = Join-Path $modelFiles $weights.name
+        $checkpoint = Join-Path $OutputRoot ("test-" + $weights.name)
         curl.exe --fail --location --silent --show-error --max-time 180 $weights.url --output $checkpoint
         Test-FileDigest $checkpoint $weights.sha256
         if ((Get-Item -LiteralPath $checkpoint).Length -ne $weights.size_bytes) {
             throw "Checkpoint size does not match for $($model.model_id)"
         }
-        python (Join-Path $modelRoot 'smoke_worker.py') --exe $exe --model-dir $modelFiles --runtime-dir $runtimeFiles --model-id $model.model_id
+        python (Join-Path $modelRoot 'smoke_worker.py') --exe $exe --checkpoint $checkpoint --runtime-dir $runtimeFiles --model-id $model.model_id
         $entry = [ordered]@{
             model_id = $model.model_id
             display_name = $model.display_name
             arguments = @('--model-id', $model.model_id)
+            artifact_arguments = @('--checkpoint')
             weights = @{
                 role = 'checkpoint'
+                argument = '--checkpoint'
                 file = ConvertTo-FileReference $checkpoint $weights.name
                 url = $weights.url
             }

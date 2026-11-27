@@ -124,7 +124,7 @@ struct Worker {
     model_id: String,
     model_name: String,
     model_kind: ModelKind,
-    model_dir: PathBuf,
+    weights: WeightsSource,
     input_dir: PathBuf,
     output_dir: Option<PathBuf>,
     backend: String,
@@ -133,6 +133,17 @@ struct Worker {
     model: Option<GigaAmService>,
     warm: bool,
     stream: Option<ActiveStream>,
+}
+
+enum WeightsSource {
+    Directory(PathBuf),
+    Explicit {
+        checkpoint: PathBuf,
+        config: Option<PathBuf>,
+        tokenizer: Option<PathBuf>,
+        raw_tokenizer: Option<PathBuf>,
+        e2e_tokenizer: Option<PathBuf>,
+    },
 }
 
 impl Worker {
@@ -159,9 +170,25 @@ impl Worker {
                 if self.model.is_some() || load.model_id != self.model_id {
                     return Err("model does not match the package or is already loaded".into());
                 }
-                let file = self.checkpoint()?;
-                let service = GigaAmService::load(&file, self.device.clone())
-                    .map_err(|error| format!("{error:#}"))?;
+                let service = match &self.weights {
+                    WeightsSource::Directory(dir) => {
+                        let file = self.checkpoint(dir)?;
+                        GigaAmService::load(&file, self.device.clone())
+                    }
+                    WeightsSource::Explicit { checkpoint, config, tokenizer, raw_tokenizer, e2e_tokenizer } => {
+                        let files = gigaam_rs::CheckpointFiles {
+                            config: config.as_deref(),
+                            model_name: Some(&self.model_name),
+                            tokenizers: gigaam_rs::TokenizerFiles {
+                                single: tokenizer.as_deref(),
+                                raw: raw_tokenizer.as_deref(),
+                                e2e: e2e_tokenizer.as_deref(),
+                            },
+                        };
+                        gigaam_rs::GigaAm::load_files(checkpoint, self.device.clone(), files)
+                            .map(GigaAmService::from_loaded)
+                    }
+                }.map_err(|error| format!("{error:#}"))?;
                 if service.status().model_kind != self.model_kind {
                     return Err("checkpoint model family differs from package model_id".into());
                 }
@@ -277,14 +304,14 @@ impl Worker {
         else { "asr" }
     }
 
-    fn checkpoint(&self) -> Result<PathBuf, String> {
-        let candidate = self.model_dir.join(format!("{}.ckpt", self.model_name));
+    fn checkpoint(&self, directory: &Path) -> Result<PathBuf, String> {
+        let candidate = directory.join(format!("{}.ckpt", self.model_name));
         if candidate.is_file() {
             require_regular_file(&candidate)?;
             return Ok(candidate);
         }
         for fallback in ["model.ckpt", "model.safetensors"] {
-            let path = self.model_dir.join(fallback);
+            let path = directory.join(fallback);
             if path.is_file() {
                 require_regular_file(&path)?;
                 return Ok(path);
@@ -437,6 +464,15 @@ fn absolute_directory(value: String) -> Result<PathBuf, String> {
     path.canonicalize().map_err(|e| e.to_string())
 }
 
+fn absolute_file(value: String) -> Result<PathBuf, String> {
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(format!("worker file must be absolute: {}", path.display()));
+    }
+    require_regular_file(&path)?;
+    Ok(path)
+}
+
 fn runtime_backend(backend: &str) -> Result<(Device, &'static str), String> {
     match backend {
         "cuda" => {
@@ -453,13 +489,24 @@ fn runtime_backend(backend: &str) -> Result<(Device, &'static str), String> {
             #[cfg(not(any(feature = "flex", feature = "cpu")))]
             { Err("CPU backend not enabled in this build".into()) }
         }
-        _ => Err("unsupported worker backend; expected cpu or cuda".into()),
+        "wgpu" => {
+            #[cfg(feature = "wgpu")]
+            { Ok((Device::wgpu(Default::default()), "burn_cubecl_wgpu_fp32")) }
+            #[cfg(not(feature = "wgpu"))]
+            { Err("WGPU backend not enabled in this build".into()) }
+        }
+        _ => Err("unsupported worker backend; expected cpu, cuda or wgpu".into()),
     }
 }
 
 pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let mut model_id = None;
     let mut model_dir = None;
+    let mut checkpoint = None;
+    let mut config = None;
+    let mut tokenizer = None;
+    let mut raw_tokenizer = None;
+    let mut e2e_tokenizer = None;
     let mut runtime_dir = None;
     let mut input_dir = None;
     let mut output_dir = None;
@@ -469,6 +516,11 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
         match flag.as_str() {
             "--model-id" if model_id.is_none() => model_id = Some(value),
             "--model-dir" if model_dir.is_none() => model_dir = Some(absolute_directory(value)?),
+            "--checkpoint" if checkpoint.is_none() => checkpoint = Some(absolute_file(value)?),
+            "--config" if config.is_none() => config = Some(absolute_file(value)?),
+            "--tokenizer" if tokenizer.is_none() => tokenizer = Some(absolute_file(value)?),
+            "--raw-tokenizer" if raw_tokenizer.is_none() => raw_tokenizer = Some(absolute_file(value)?),
+            "--e2e-tokenizer" if e2e_tokenizer.is_none() => e2e_tokenizer = Some(absolute_file(value)?),
             "--runtime-dir" if runtime_dir.is_none() => runtime_dir = Some(absolute_directory(value)?),
             "--input-dir" if input_dir.is_none() => input_dir = Some(absolute_directory(value)?),
             "--output-dir" if output_dir.is_none() => output_dir = Some(absolute_directory(value)?),
@@ -484,12 +536,16 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let kind = ModelKind::from_model_name(&model_name).ok_or("unsupported GigaAM model kind")?;
     let backend = backend.ok_or("missing --backend")?;
     let (device, variant) = runtime_backend(&backend)?;
-    let _runtime = runtime_dir;
+    let weights = match (checkpoint, model_dir) {
+        (Some(checkpoint), None) => WeightsSource::Explicit { checkpoint, config, tokenizer, raw_tokenizer, e2e_tokenizer },
+        (None, Some(dir)) if [config, tokenizer, raw_tokenizer, e2e_tokenizer].iter().all(Option::is_none) => WeightsSource::Directory(dir),
+        _ => return Err("pass --checkpoint with its optional artifact paths or use --model-dir by itself".into()),
+    };
     let mut worker = Worker {
         model_id,
         model_name,
         model_kind: kind,
-        model_dir: model_dir.ok_or("missing --model-dir")?,
+        weights,
         input_dir: input_dir.ok_or("missing --input-dir")?,
         output_dir,
         backend,

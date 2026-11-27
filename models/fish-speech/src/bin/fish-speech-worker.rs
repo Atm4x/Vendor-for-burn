@@ -30,6 +30,8 @@ struct Worker {
     gpu_index: usize,
     seed: u64,
     paths: ModelPaths,
+    semantic_weights: Option<PathBuf>,
+    firefly_weights: Option<PathBuf>,
     input_dir: PathBuf,
     output_dir: PathBuf,
     model: Option<CubeClFishModel>,
@@ -50,8 +52,12 @@ impl Worker {
                 if self.model.is_some() {
                     return Err("model is already loaded".into());
                 }
-                let weights =
-                    LoadedFishArtifacts::open(&self.paths).map_err(|error| error.to_string())?;
+                let weights = LoadedFishArtifacts::open_with_weights(
+                    &self.paths,
+                    self.semantic_weights.as_deref(),
+                    self.firefly_weights.as_deref(),
+                )
+                .map_err(|error| error.to_string())?;
                 let device = match self.backend.as_str() {
                     "cuda" => {
                         cubecl::Device::cuda(self.gpu_index).map_err(|error| error.to_string())?
@@ -200,6 +206,8 @@ fn run() -> Result<(), String> {
             return Err(format!("duplicate option {flag}"));
         }
     }
+    let legacy_layout =
+        options.contains_key("--semantic-dir") || options.contains_key("--firefly-dir");
     let mut take = |name: &str| {
         options
             .remove(name)
@@ -209,11 +217,51 @@ fn run() -> Result<(), String> {
     if !matches!(backend.as_str(), "cuda" | "wgpu") {
         return Err(format!("unsupported backend: {backend}"));
     }
-    let paths = ModelPaths::new(
-        absolute_path(Path::new(&take("--semantic-dir")?), true)?,
-        absolute_path(Path::new(&take("--firefly-dir")?), true)?,
-        absolute_path(Path::new(&take("--firefly-config")?), false)?,
-    );
+    let firefly_config = absolute_path(Path::new(&take("--firefly-config")?), false)?;
+    let (paths, semantic_weights, firefly_weights) = if legacy_layout {
+        (
+            ModelPaths::new(
+                absolute_path(Path::new(&take("--semantic-dir")?), true)?,
+                absolute_path(Path::new(&take("--firefly-dir")?), true)?,
+                firefly_config,
+            ),
+            None,
+            None,
+        )
+    } else {
+        let semantic_manifest = absolute_path(Path::new(&take("--semantic-manifest")?), false)?;
+        let firefly_manifest = absolute_path(Path::new(&take("--firefly-manifest")?), false)?;
+        let semantic_dir = semantic_manifest
+            .parent()
+            .ok_or("invalid semantic manifest location")?
+            .to_owned();
+        let firefly_dir = firefly_manifest
+            .parent()
+            .ok_or("invalid Firefly manifest location")?
+            .to_owned();
+        (
+            ModelPaths {
+                semantic_config: absolute_path(Path::new(&take("--semantic-config")?), false)?,
+                semantic_tokenizer: absolute_path(
+                    Path::new(&take("--semantic-tokenizer")?),
+                    false,
+                )?,
+                semantic_dir,
+                semantic_manifest,
+                firefly_config_source: firefly_config,
+                firefly_dir,
+                firefly_manifest,
+            },
+            Some(absolute_path(
+                Path::new(&take("--semantic-weights")?),
+                false,
+            )?),
+            Some(absolute_path(
+                Path::new(&take("--firefly-weights")?),
+                false,
+            )?),
+        )
+    };
     let input_dir = absolute_path(Path::new(&take("--input-dir")?), true)?;
     let output_dir = absolute_path(Path::new(&take("--output-dir")?), true)?;
     let gpu_index = options
@@ -234,6 +282,8 @@ fn run() -> Result<(), String> {
         gpu_index,
         seed,
         paths,
+        semantic_weights,
+        firefly_weights,
         input_dir,
         output_dir,
         model: None,

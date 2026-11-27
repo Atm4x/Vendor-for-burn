@@ -14,7 +14,7 @@ $definition = switch ($Family) {
             binary = 'fish-speech-worker'
             models = @(@{
                 model_id = 'fish_speech_1_5'
-                artifact_arguments = @('--semantic-dir', '--firefly-dir', '--firefly-config')
+                artifact_arguments = @('--semantic-config', '--semantic-tokenizer', '--semantic-manifest', '--semantic-weights', '--firefly-config', '--firefly-manifest', '--firefly-weights')
             })
         }
     }

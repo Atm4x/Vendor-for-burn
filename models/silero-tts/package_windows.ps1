@@ -49,10 +49,13 @@ Expand-Archive -LiteralPath $zip -DestinationPath $installed
 $manifest = Get-Content -LiteralPath (Join-Path $installed 'worker-package.json') -Raw | ConvertFrom-Json
 $installedExe = Join-Path $installed $manifest.executable.path
 if ((Get-FileHash -LiteralPath $installedExe -Algorithm SHA256).Hash.ToLowerInvariant() -cne $manifest.executable.sha256) { throw 'Invalid executable hash' }
+$env:RAYON_NUM_THREADS = '4'
+$smoke = Join-Path $PSScriptRoot 'tools/smoke_native_worker.py'
+python $smoke $installedExe
 foreach ($model in $manifest.models) {
     $path = Join-Path $OutputRoot ($model.model_id + '-renamed.pt')
     curl.exe --fail --location --retry 3 $model.checkpoint.url --output $path
     if ((Get-Item -LiteralPath $path).Length -ne $model.checkpoint.size_bytes -or (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $model.checkpoint.sha256) { throw 'Invalid checkpoint' }
+    python $smoke $installedExe --matrix-dir $OutputRoot --matrix-model $model.model_id
+    Remove-Item -LiteralPath $path
 }
-$env:RAYON_NUM_THREADS = '4'
-python (Join-Path $PSScriptRoot 'tools/smoke_native_worker.py') $installedExe --matrix-dir $OutputRoot

@@ -3,6 +3,7 @@ name: Build native workers for Windows x64
 on:
   push:
     branches: [main]
+    tags: ['native-workers-v*']
     paths:
       - 'models/**'
       - 'crates/**'
@@ -65,6 +66,9 @@ jobs:
           PACKAGE_FAMILY: ${{ matrix.family }}
         run: |
           $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -cne "native-workers-v$env:WORKER_VERSION") {
+            throw 'Release tag must match WORKER_VERSION'
+          }
           $arguments = @{
             Version = $env:WORKER_VERSION
             OutputRoot = (Join-Path $env:RUNNER_TEMP 'native-worker')
@@ -101,3 +105,54 @@ jobs:
           path: ${{ runner.temp }}/native-worker-release/
           if-no-files-found: error
           retention-days: 14
+
+  publish:
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'native-workers-v')
+    needs: stage-release
+    runs-on: windows-2022
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-workers_v${{ env.WORKER_VERSION }}_win_x86_64
+          path: ${{ runner.temp }}/native-worker-release
+      - name: Sign provenance of the release index
+        uses: actions/attest@v4
+        with:
+          subject-path: '${{ runner.temp }}/native-worker-release/staged-release-index.json'
+          create-storage-record: false
+      - name: Publish the verified Windows packages together
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $tag = "native-workers-v$env:WORKER_VERSION"
+          if ($env:GITHUB_REF_NAME -cne $tag) { throw 'Release tag must match WORKER_VERSION' }
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git merge-base --is-ancestor $env:GITHUB_SHA origin/main
+          $root = Join-Path $env:RUNNER_TEMP 'native-worker-release'
+          $index = Join-Path $root 'staged-release-index.json'
+          $release = Get-Content -LiteralPath $index -Raw | ConvertFrom-Json
+          if ($release.source_revision -cne $env:GITHUB_SHA -or $release.package_version -cne $env:WORKER_VERSION) {
+            throw 'Staged release does not match the tag'
+          }
+          $files = @($index) + @(foreach ($entry in $release.packages) {
+            $file = Join-Path $root $entry.path
+            if ((Get-Item -LiteralPath $file).Length -ne $entry.size_bytes -or
+                (Get-FileHash -LiteralPath $file).Hash.ToLowerInvariant() -cne $entry.sha256) {
+              throw "Staged package failed integrity check: $($entry.path)"
+            }
+            $file
+          })
+          gh release create $tag @files --verify-tag --draft --latest=false --title "Native workers $env:WORKER_VERSION (Windows x64)" --notes "Seven version-matched Windows x64 worker packages. The checksum index records the exact build revision and SHA-256 of every ZIP. Model weights are separate. See each package manifest for launch arguments. Verify the release index with gh attestation verify staged-release-index.json --repo $env:GITHUB_REPOSITORY."
+          gh release edit $tag --draft=false --latest=false

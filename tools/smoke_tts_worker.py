@@ -14,8 +14,9 @@ with tempfile.TemporaryDirectory(prefix="tts-worker-") as directory:
     common = [str(exe), "--ipc-stdio", "--backend", "cuda",
               "--input-dir", directory, "--output-dir", directory]
     if family == "fish-speech-1.5":
-        launches = [common + ["--semantic-dir", directory, "--firefly-dir", directory,
-                              "--firefly-config", str(placeholder)]]
+        flags = ["--semantic-config", "--semantic-tokenizer", "--semantic-manifest",
+                 "--semantic-weights", "--firefly-config", "--firefly-manifest", "--firefly-weights"]
+        launches = [common + [value for flag in flags for value in (flag, str(placeholder))]]
     elif family == "f5-tts":
         launches = [
             common + ["--model-id", model, "--dit-weights", str(placeholder),

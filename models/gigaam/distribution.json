@@ -8,7 +8,9 @@
     "v2_ctc", "v2_rnnt", "v2_ssl",
     "v3_ctc", "v3_rnnt", "v3_e2e_ctc", "v3_e2e_rnnt", "v3_ssl",
     "multilingual_ctc", "multilingual_ssl",
-    "multilingual_large_ctc", "multilingual_large_ssl"
+    "multilingual_large_ctc", "multilingual_large_ssl",
+    "v4_ctc", "v4_rnnt", "v4_ssl",
+    "multilingual_v2_rnnt", "multilingual_v2_ssl"
   ],
   "input_formats": ["wav", "flac"],
   "max_source_bytes": 67108864,
