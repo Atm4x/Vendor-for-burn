@@ -7,8 +7,7 @@ use crate::{spectral::SameIstft, store::TensorStore, vocoder::Vocoder};
 pub struct Synthesizer {
     vocoder: Vocoder,
     istft: SameIstft,
-    pqmf2: Tensor<3>,
-    pqmf6: Tensor<3>,
+    pqmf: Option<(Tensor<3>, Tensor<3>)>,
 }
 
 impl Synthesizer {
@@ -18,7 +17,13 @@ impl Synthesizer {
         let istft = SameIstft::new(window, 600, device)?;
         let pqmf2 = pqmf.float("analysis_2", device)?;
         let pqmf6 = pqmf.float("analysis_6", device)?;
-        Ok(Self { vocoder, istft, pqmf2, pqmf6 })
+        Ok(Self { vocoder, istft, pqmf: Some((pqmf2, pqmf6)) })
+    }
+
+    pub(crate) fn load_fullband(tts: &TensorStore, device: &Device) -> Result<Self> {
+        let vocoder = Vocoder::load(tts, device)?;
+        let istft = SameIstft::new(tts.float_data("istft.window")?, 600, device)?;
+        Ok(Self { vocoder, istft, pqmf: None })
     }
 
     /// Mel must have shape `[batch, 192, frames]`. Returns PCM `[batch, samples]`.
@@ -26,6 +31,7 @@ impl Synthesizer {
         if !matches!(sample_rate, 8000 | 24000 | 48000) {
             bail!("Silero supports 8000, 24000, 48000 Hz only");
         }
+        if sample_rate != 48000 && self.pqmf.is_none() { bail!("Standalone V5 graph only produces 48000 Hz PCM"); }
         let timed = std::env::var_os("SILERO_TIMING").is_some();
         let start = std::time::Instant::now();
         let (magnitude, cosine, sine) = self.vocoder.forward(mel);
@@ -36,7 +42,8 @@ impl Synthesizer {
         if sample_rate == 48000 {
             return Ok(waveform);
         }
-        let kernel = if sample_rate == 24000 { self.pqmf2.clone() } else { self.pqmf6.clone() };
+        let (pqmf2,pqmf6) = self.pqmf.as_ref().expect("rate validated above");
+        let kernel = if sample_rate == 24000 { pqmf2.clone() } else { pqmf6.clone() };
         let bands = if sample_rate == 24000 { 2 } else { 6 };
         let start = std::time::Instant::now();
         let audio = conv1d(waveform.unsqueeze::<3>(), kernel, None,

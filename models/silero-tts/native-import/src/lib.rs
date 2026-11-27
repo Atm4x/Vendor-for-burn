@@ -16,7 +16,7 @@ mod recurrent_accent;
 pub use recurrent_accent::{RecurrentAccentCheckpoint, QuantizedProjection};
 pub use ascii_accent::AsciiAccentCheckpoint;
 pub use v4::V4Checkpoint;
-pub use v5_plain::V5PlainCheckpoint;
+pub use v5_plain::{V5PlainCheckpoint,V5PlainFrontend};
 pub use russian::{RussianCheckpoint, RussianConfig, RussianTokenizer, RussianControls, RussianProsody};
 
 pub enum OfficialCheckpoint { V2(V2Checkpoint), V4(V4Checkpoint), V3(V3Checkpoint), Russian(RussianCheckpoint), V5Plain(V5PlainCheckpoint) }

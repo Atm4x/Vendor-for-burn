@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashSet};
 use crate::{acoustic::TextToMel, longform, store::TensorStore, synthesis::Synthesizer};
 
 pub(crate) struct V5PlainTts {
+    pub(crate) standalone: bool,
     symbols: HashSet<char>,
     symbol_ids: BTreeMap<String, usize>,
     alphabet: HashSet<char>,
@@ -18,20 +19,28 @@ pub(crate) struct V5PlainTts {
 
 impl V5PlainTts {
     pub(crate) fn load(checkpoint: V5PlainCheckpoint, device: &Device) -> Result<Self> {
-        let acoustic = TensorStore::native(checkpoint.acoustic);
-        let filters = TensorStore::native(checkpoint.pqmf);
+        let weights = TensorStore::native(checkpoint.acoustic);
+        let standalone = checkpoint.pqmf.is_none();
+        let synthesizer = match checkpoint.pqmf {
+            Some(filters) => Synthesizer::load(&weights, &TensorStore::native(filters), device)?,
+            None => Synthesizer::load_fullband(&weights, device)?,
+        };
+        let frontend = checkpoint.frontend;
         Ok(Self {
-            symbols: checkpoint.input_symbols.chars().skip(3).collect(),
-            sos: checkpoint.symbol_ids[&checkpoint.sos] as i64,
-            eos: checkpoint.symbol_ids[&checkpoint.eos] as i64,
-            symbol_ids: checkpoint.symbol_ids,
-            alphabet: checkpoint.alphabet,
-            speakers: checkpoint.speakers,
-            transliteration: checkpoint.transliteration,
-            acoustic: TextToMel::load(&acoustic, device)?,
-            synthesizer: Synthesizer::load(&acoustic, &filters, device)?,
+            standalone,
+            symbols: frontend.input_symbols.chars().skip(3).collect(),
+            sos: frontend.symbol_ids[&frontend.sos] as i64,
+            eos: frontend.symbol_ids[&frontend.eos] as i64,
+            symbol_ids: frontend.symbol_ids,
+            alphabet: frontend.alphabet,
+            speakers: frontend.speakers,
+            transliteration: frontend.transliteration,
+            acoustic: TextToMel::load_variant(&weights, device, !standalone)?,
+            synthesizer,
         })
     }
+
+    pub(crate) fn sample_rates(&self) -> &[u32] { if self.standalone { &[48000] } else { &[8000,24000,48000] } }
 
     fn encode(&self, text: &str, speaker: &str) -> Result<Vec<i64>> {
         ensure!(!text.contains('^'), "V5 plain text does not yet support caret controls");
@@ -69,7 +78,7 @@ impl V5PlainTts {
     pub(crate) fn infer_text(&self, text: &str, speaker: &str, rate: u32) -> Result<Vec<f32>> {
         ensure!(speaker != "random", "random voice generation is not implemented");
         let id = *self.speakers.get(speaker).context("unknown V5 speaker")? as i64;
-        ensure!(matches!(rate, 8000 | 24000 | 48000), "unsupported V5 sample rate");
+        ensure!(self.sample_rates().contains(&rate), "unsupported V5 sample rate");
         longform::infer_text_chunks(text, rate, |fragment| {
             let tokens = self.encode(fragment, speaker)?;
             self.infer_token_ids(&tokens, id, rate)?.into_data().try_to_vec::<f32>().map_err(Into::into)
@@ -79,7 +88,7 @@ impl V5PlainTts {
     pub(crate) fn infer_token_ids(&self, tokens: &[i64], speaker: i64, rate: u32) -> Result<Tensor<2>> {
         ensure!(self.speakers.values().any(|&id| id as i64 == speaker), "unknown V5 speaker ID");
         ensure!(tokens.iter().all(|id| self.symbol_ids.values().any(|&v| v as i64 == *id)), "unknown V5 token ID");
-        let (mel, _) = self.acoustic.infer(tokens, speaker)?;
+        let (mel, _) = if self.standalone { self.acoustic.infer_standalone_v5(tokens,speaker)? } else { self.acoustic.infer(tokens, speaker)? };
         self.synthesizer.forward(mel, rate)
     }
 }

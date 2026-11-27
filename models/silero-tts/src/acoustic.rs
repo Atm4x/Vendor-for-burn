@@ -314,6 +314,22 @@ impl TextToMel {
         Ok((self.acoustic.forward(input, speaker, None, durations, pitch, None)?, duration))
     }
 
+    /// Standalone full-band V5 exported graph has no energy/articulation input and
+    /// clamps only the first duration; unlike package V5 it does not rewrite the EOS.
+    pub(crate) fn infer_standalone_v5(&self, symbols: &[i64], speaker_id: i64) -> Result<(Tensor<3>,Vec<f32>)> {
+        let len = symbols.len();
+        ensure!((1..=5000).contains(&len) && symbols.iter().all(|&x| (0..self.acoustic.embedding.dims()[0] as i64).contains(&x)), "invalid standalone V5 token sequence");
+        ensure!((0..self.acoustic.speaker_embedding.dims()[0] as i64).contains(&speaker_id), "invalid standalone V5 speaker");
+        let tokens = Tensor::<2,Int>::from_data(TensorData::new(symbols.to_vec(),[1,len]),&self.device);
+        let speaker = Tensor::<2,Int>::from_data(TensorData::new(vec![speaker_id],[1,1]),&self.device);
+        let mut durations: Vec<f32> = (self.duration.forward(tokens.clone(),speaker.clone(),None,1.0).exp()-1.0).round().clamp_min(0.0).into_data().try_to_vec()?;
+        durations[0] = durations[0].min(5.0);
+        ensure!(durations.iter().all(|x| x.is_finite()) && durations.iter().sum::<f32>() <= self.acoustic.decoder.pos_encoding.dims()[0] as f32,"Standalone V5 positional encoding limit");
+        let pitch = self.pitch.forward(tokens.clone(),speaker.clone(),None,1.0).reshape([1,1,len]);
+        let dur = Tensor::<2>::from_data(TensorData::new(durations.clone(),[1,len]),&self.device);
+        Ok((self.acoustic.forward(tokens,speaker,None,dur,pitch,None)?,durations))
+    }
+
     /// Implements the default one-speaker acoustic inference without optional
     /// SSML, pause overrides, rate modifications, or explicit pitch coefficients.
     pub fn infer(&self, symbols: &[i64], speaker: i64) -> Result<(Tensor<3>, Vec<f32>)> {

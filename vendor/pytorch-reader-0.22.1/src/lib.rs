@@ -76,7 +76,7 @@ mod tests;
 
 pub use pickle_reader::{OpCode, PickleError};
 pub use reader::{
-    ByteOrder, FileFormat, PickleValue, PytorchError, PytorchMetadata, PytorchReader, TorchPackageReader,
+    ByteOrder, FileFormat, PickleValue, PytorchError, PytorchMetadata, PytorchReader, TorchPackageReader, read_script_state,
 };
 pub use tensor::{DType, Tensor};
 

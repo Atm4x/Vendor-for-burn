@@ -42,13 +42,24 @@ impl SileroTts {
     pub fn load(path: &Path, device: &Device) -> Result<Self> {
         use silero_package::OfficialCheckpoint;
         let session = if path.is_file() {
-            match OfficialCheckpoint::open(path)? {
+            if silero_package::ArchiveLayout::inspect(path)? == silero_package::ArchiveLayout::TorchScript {
+                let entry = crate::catalogue::standalone_entry(path)?;
+                if entry.declared_format == crate::catalogue::DeclaredFormat::Jit {
+                    let symbols = entry.tokenset.as_deref().context("missing standalone tokenset")?;
+                    let checkpoint = silero_package::V2Checkpoint::open_standalone(path, symbols, entry.sample_rates[0])?;
+                    Session::V2(Box::new(crate::v2::V2Tts::load(checkpoint,device)?))
+                } else {
+                    let frontend: silero_package::V5PlainFrontend = serde_json::from_str(include_str!("../v5_cis_jit_frontend.json"))?;
+                    let checkpoint = silero_package::V5PlainCheckpoint::open_standalone(path,frontend)?;
+                    Session::V5Plain(Box::new(crate::v5_plain::V5PlainTts::load(checkpoint,device)?))
+                }
+            } else { match OfficialCheckpoint::open(path)? {
                 OfficialCheckpoint::V2(checkpoint) => Session::V2(Box::new(crate::v2::V2Tts::load(checkpoint, device)?)),
                 OfficialCheckpoint::Russian(checkpoint) => Session::Russian(Box::new(RussianTts::from_official(checkpoint, device)?)),
                 OfficialCheckpoint::V5Plain(checkpoint) => Session::V5Plain(Box::new(crate::v5_plain::V5PlainTts::load(checkpoint, device)?)),
                 OfficialCheckpoint::V4(checkpoint) => Session::V4(Box::new(crate::v4::V4Tts::load(checkpoint, device)?)),
                 OfficialCheckpoint::V3(checkpoint) => Session::V3(Box::new(crate::v3::V3Tts::load(checkpoint, device)?)),
-            }
+            }}
         } else {
             Session::Russian(Box::new(RussianTts::load(path, device)?))
         };
@@ -56,7 +67,7 @@ impl SileroTts {
     }
 
     pub fn variant(&self) -> &'static str {
-        match self.0 { Session::V2(_) => "v2_tacotron2", Session::Russian(ref model) => if model.prosody != silero_package::RussianProsody::Legacy { "v5_ru_conditioned" } else { "v5_ru" }, Session::V3(_) => "v3_hifigan", Session::V4(_) => "v4_hifigan", Session::V5Plain(_) => "v5_convnext_plain" }
+        match self.0 { Session::V2(ref model) => if model.standalone { "v1_tacotron2" } else { "v2_tacotron2" }, Session::Russian(ref model) => if model.prosody != silero_package::RussianProsody::Legacy { "v5_ru_conditioned" } else { "v5_ru" }, Session::V3(_) => "v3_hifigan", Session::V4(_) => "v4_hifigan", Session::V5Plain(ref model) => if model.standalone { "v5_convnext_jit" } else { "v5_convnext_plain" } }
     }
 
     pub fn warmup_input(&self) -> Result<(String, String)> {
@@ -80,7 +91,7 @@ impl SileroTts {
         match &self.0 { Session::Russian(model) => Ok(model), _ => anyhow::bail!("Operation requires the neural stress frontend") }
     }
 
-    pub fn sample_rates(&self) -> &[u32] { match &self.0 { Session::V2(model) => &model.rates, _ => &[8000,24000,48000] } }
+    pub fn sample_rates(&self) -> &[u32] { match &self.0 { Session::V2(model) => &model.rates, Session::V5Plain(model) => model.sample_rates(), _ => &[8000,24000,48000] } }
 
     pub fn speakers(&self) -> impl Iterator<Item = &str> {
         let speakers = match &self.0 { Session::V2(model) => &model.speakers, Session::Russian(model) => &model.config.speakers, Session::V3(model) => &model.config.speakers, Session::V4(model) => &model.speakers, Session::V5Plain(model) => &model.speakers };

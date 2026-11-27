@@ -54,10 +54,12 @@ impl Worker {
                 "model_variants": [
                     {"id":"v5_ru", "inputs":["text","ssml","accented","symbol_durations"]},
                     {"id":"v5_ru_conditioned", "inputs":["text","accented"]},
+                    {"id":"v1_tacotron2", "inputs":["text"], "sample_rates":[8000,16000]},
                     {"id":"v2_tacotron2", "inputs":["text"], "sample_rates":[8000,16000,24000,48000]},
                     {"id":"v3_hifigan", "inputs":["text"]},
                     {"id":"v4_hifigan", "inputs":["text"]},
-                    {"id":"v5_convnext_plain", "inputs":["text"]}
+                    {"id":"v5_convnext_plain", "inputs":["text"]},
+                    {"id":"v5_convnext_jit", "inputs":["text"], "sample_rates":[48000]}
                 ],
                 "sample_rates": [8000,16000,24000,48000], "outputs": ["wav_pcm16"],
                 "maximum_input_characters": crate::longform::MAX_INPUT_CHARS,
@@ -75,7 +77,7 @@ impl Worker {
                 let session = self.session.as_mut().ok_or("model is not loaded")?;
                 if session.ready { return Err("model is already ready".into()); }
                 let (text, speaker) = session.model.warmup_input().map_err(|e| format!("{e:#}"))?;
-                session.model.infer_text(&text, &speaker, 8000).map_err(|e| format!("{e:#}"))?;
+                session.model.infer_text(&text, &speaker, session.model.sample_rates()[0]).map_err(|e| format!("{e:#}"))?;
                 self.device.sync().map_err(|e| e.to_string())?;
                 session.ready = true;
                 Ok(self.status())

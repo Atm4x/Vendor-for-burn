@@ -375,6 +375,14 @@ impl TorchPackageReader {
     }
 }
 
+/// Read only the serialized state of a standalone TorchScript module, without executing code.
+pub fn read_script_state(path: impl AsRef<Path>) -> Result<(PickleValue, HashMap<String, Tensor>)> {
+    let zip = ZipSource::open_script(path.as_ref())?;
+    let bytes = zip.pickle()?;
+    let source = Arc::new(StorageSource::Zip(zip));
+    decode_package_pickle(bytes, &source)
+}
+
 fn decode_package_pickle(bytes: Vec<u8>, source: &Arc<StorageSource>) -> Result<(PickleValue, HashMap<String, Tensor>)> {
     fn split(object: Object, path: &mut Vec<String>, tensors: &mut HashMap<String, Tensor>) -> Result<PickleValue> {
         Ok(match object {

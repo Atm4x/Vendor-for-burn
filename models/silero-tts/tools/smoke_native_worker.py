@@ -50,7 +50,7 @@ def run(binary, checkpoint, text=None, speaker=None, variant=None, sample_rate=8
                     assert ask('warmup')['phase'] == 'ready'
                     outputs = [ask('infer', request) for _ in range(2)]
                     assert outputs[0]['audio']['file_name'] != outputs[1]['audio']['file_name']
-                    if variant != 'v2_tacotron2':
+                    if variant not in ('v1_tacotron2', 'v2_tacotron2'):
                         assert outputs[0]['audio']['sha256'] == outputs[1]['audio']['sha256']
                     for result in outputs:
                         desc = result['audio']

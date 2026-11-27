@@ -1,10 +1,13 @@
-use crate::{english_vocoder::V2Vocoder, longform, store::TensorStore, tacotron::Tacotron2};
+use crate::{english_vocoder::{V1Vocoder,V2Vocoder}, longform, store::TensorStore, tacotron::Tacotron2};
 use anyhow::{Context, Result, ensure};
 use burn::tensor::{Device, Tensor};
 use silero_package::{V2Checkpoint, encode_v2};
 use std::collections::BTreeMap;
 
+enum Vocoder { V1(V1Vocoder), V2(V2Vocoder) }
+
 pub(crate) struct V2Tts {
+    pub(crate) standalone: bool,
     symbols: String,
     encoded_symbols: String,
     ascii_symbols: BTreeMap<char, String>,
@@ -12,13 +15,14 @@ pub(crate) struct V2Tts {
     pub(crate) speakers: BTreeMap<String, usize>,
     pub(crate) rates: Vec<u32>,
     acoustic: Tacotron2,
-    vocoder: V2Vocoder,
+    vocoder: Vocoder,
 }
 impl V2Tts {
     pub(crate) fn load(checkpoint: V2Checkpoint, device: &Device) -> Result<Self> {
         let recurrent_accent = checkpoint.recurrent_accent.map(crate::recurrent_accent::RecurrentAccent::load).transpose()?;
         let weights = TensorStore::native(checkpoint.weights);
         Ok(Self {
+            standalone: checkpoint.standalone,
             symbols: checkpoint.symbols,
             encoded_symbols: checkpoint.encoded_symbols,
             ascii_symbols: checkpoint.ascii_symbols,
@@ -32,7 +36,7 @@ impl V2Tts {
                 checkpoint.gate_threshold,
                 device,
             )?,
-            vocoder: V2Vocoder::load(&weights, &checkpoint.sample_rates, device)?,
+            vocoder: if checkpoint.standalone { Vocoder::V1(V1Vocoder::load(&weights, checkpoint.sample_rates[0], device)?) } else { Vocoder::V2(V2Vocoder::load(&weights, &checkpoint.sample_rates, device)?) },
         })
     }
     pub(crate) fn warmup_input(&self) -> Result<(String, String)> {
@@ -74,8 +78,8 @@ impl V2Tts {
             self.rates.contains(&rate) && self.speakers.values().any(|&id| id as i64 == speaker),
             "unsupported V2 sample rate or speaker"
         );
-        self.vocoder
-            .forward(self.acoustic.infer(tokens, speaker)?, rate)
+        let mel = self.acoustic.infer(tokens, speaker)?;
+        match &self.vocoder { Vocoder::V1(v) => v.forward(mel,rate), Vocoder::V2(v) => v.forward(mel,rate) }
     }
 }
 

@@ -23,24 +23,38 @@ CASES = {
 }
 
 
-def create(path, output):
-    p = PackageImporter(str(path)).load_pickle('tts_models', 'model')
-    m = p.model.eval()
-    multi = hasattr(p, 'speaker_to_id')
-    rates = [8000, 24000, 48000] if hasattr(m.vocoder, 'ups_u') else [8000, 16000]
+def create(path, output, standalone=None):
+    if standalone is not None:
+        m = torch.jit.load(str(path), map_location='cpu').eval()
+        multi = False
+        rates = standalone['sample_rates']
+        cases_to_check = [(standalone.get("test_text", standalone["example"]), "default", 0)]
+    else:
+        p = PackageImporter(str(path)).load_pickle('tts_models', 'model')
+        m = p.model.eval()
+        multi = hasattr(p, 'speaker_to_id')
+        rates = [8000, 24000, 48000] if hasattr(m.vocoder, 'ups_u') else [8000, 16000]
+        cases_to_check = CASES[path.stem]
     cases = []
     tensors = {}
-    for index, (text, speaker, sid) in enumerate(CASES[path.stem]):
+    for index, (text, speaker, sid) in enumerate(cases_to_check):
         torch.manual_seed(1847 + index)
-        prepared = p.prepare_text_input(text, p.symbols)
-        if hasattr(m, 'accentor'):
+        if standalone is not None:
+            import re
+            symbols = standalone['tokenset']
+            normalized = re.sub(r'[^{}]'.format(symbols[2:]), '', text.lower())
+            normalized = re.sub(r'\s+', ' ', normalized).strip()
+            if normalized[-1] not in '.!?': normalized += '.'
+            ids = torch.tensor([[symbols.index(s) for s in normalized + symbols[1]]], dtype=torch.long)
+        elif hasattr(m, 'accentor'):
+            prepared = p.prepare_text_input(text, p.symbols)
             sentence, clean = prepared
             graphemes, lengths, boundaries = m.preprocess_batch_accentor([clean])
             predictions = m.get_accentor_preds(graphemes, lengths)
             accented = m.postprocess_batch_accentor([sentence], *predictions, boundaries)[0]
             ids = m.preprocess_tacotron(accented).unsqueeze(0)
         else:
-            ids = prepared.unsqueeze(0)
+            ids = p.prepare_text_input(text, p.symbols).unsqueeze(0)
         tac = m.tacotron
         x = tac.embedding(ids)
         if multi:
@@ -72,7 +86,7 @@ def create(path, output):
         tensors[f'{key}_masks'] = torch.cat(masks, 0).contiguous()
         tensors[f'{key}_mel'] = mel.contiguous()
         for rate in rates:
-            wav = m.vocoder(mel, rate)[:, :, :mel.shape[-1] * (rate // 80)]
+            wav = (m.vocoder(mel) if standalone is not None else m.vocoder(mel, rate))[:, :, :mel.shape[-1] * (rate // 80)]
             tensors[f'{key}_pcm{rate}'] = wav.reshape(-1).contiguous()
         cases.append(dict(key=key, text=text, speaker=speaker, speaker_id=sid, ids=ids.flatten().tolist(), rates=rates))
     output.mkdir(parents=True, exist_ok=True)
@@ -84,9 +98,18 @@ if __name__ == '__main__':
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument('checkpoints', type=Path)
     cli.add_argument('output', type=Path)
-    cli.add_argument('--models', nargs='+', choices=CASES, default=list(CASES))
+    cli.add_argument('--models', nargs='+')
+    cli.add_argument('--standalone', action='store_true')
+    cli.add_argument('--short', action='store_true', help='use one short test sentence per language')
     args = cli.parse_args()
     torch.set_num_threads(4)
     with torch.inference_mode():
-        for name in args.models:
-            create(args.checkpoints / (name + '.pt'), args.output)
+        if args.standalone:
+            catalogue = json.loads((Path(__file__).resolve().parent.parent/'official_catalogue.json').read_text(encoding='utf8'))['models']
+            for entry in catalogue:
+                if entry['declared_format'] == 'jit' and (not args.models or entry['model_id'] in args.models):
+                    if args.short: entry["test_text"] = {"ru":"Прив+ет, мир!","en":"Hello, world!","de":"Guten Tag!","es":"Buenos días.","fr":"Je suis."}[entry["language"]]
+                    create(args.checkpoints / (entry['model_id'] + '.jit'), args.output, entry)
+        else:
+            for name in args.models or list(CASES):
+                create(args.checkpoints / (name + '.pt'), args.output)

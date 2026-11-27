@@ -452,7 +452,7 @@ impl Tacotron2 {
 #[cfg(all(test, feature = "reference-flex"))]
 mod tests {
     use super::*;
-    use crate::english_vocoder::V2Vocoder;
+    use crate::english_vocoder::{V1Vocoder,V2Vocoder};
     use serde::Deserialize;
     use silero_package::V2Checkpoint;
     use std::{fs, path::Path};
@@ -466,7 +466,7 @@ mod tests {
         ids: Vec<i64>,
         rates: Vec<u32>,
     }
-    fn compare(label: &str, actual: Vec<f32>, expected: Vec<f32>, tolerance: f32) {
+    fn compare(label: &str, actual: Vec<f32>, expected: Vec<f32>, tolerance: f32) -> bool {
         assert_eq!(actual.len(), expected.len(), "{label} shape mismatch");
         assert!(actual.iter().all(|v| v.is_finite()));
         let max = actual
@@ -485,24 +485,33 @@ mod tests {
             actual.len(),
             10.0 * (signal / error).log10()
         );
-        assert!(max <= tolerance, "{label} exceeds {tolerance}");
+        if max > tolerance { println!("FAIL {label} exceeds {tolerance}"); }
+        max <= tolerance
     }
     #[test]
     #[ignore = "requires original V2 checkpoints and captured dropout fixture"]
     fn original_v2_fixed_mask_parity() {
         let root = std::env::var("SILERO_V2_CHECKPOINTS").unwrap();
         let fixtures = std::env::var("SILERO_V2_FIXTURES").unwrap();
-        let names = std::env::var("SILERO_V2_MODELS").unwrap_or_else(|_| "lj_v2,multi_v2,mykyta_v2".into());
+        let names = std::env::var("SILERO_V1_MODELS").or_else(|_| std::env::var("SILERO_V2_MODELS")).unwrap_or_else(|_| "lj_v2,multi_v2,mykyta_v2".into());
         let device = Device::flex();
+        let mut all_pass = true;
         for name in names.split(',') {
-            let cp = V2Checkpoint::open(Path::new(&root).join(format!("{name}.pt"))).unwrap();
+            let standalone = std::env::var_os("SILERO_V1_MODELS").is_some();
+            let cp = if standalone {
+                let path = Path::new(&root).join(format!("{name}.jit"));
+                let entry = crate::catalogue::standalone_entry(&path).unwrap();
+                V2Checkpoint::open_standalone(&path,entry.tokenset.as_deref().unwrap(),entry.sample_rates[0]).unwrap()
+            } else { V2Checkpoint::open(Path::new(&root).join(format!("{name}.pt"))).unwrap() };
             let model_rates = cp.sample_rates.clone();
             let accent = cp.recurrent_accent.map(crate::recurrent_accent::RecurrentAccent::load).transpose().unwrap();
             let store = TensorStore::native(cp.weights);
             let acoustic =
                 Tacotron2::load(&store, cp.multi, cp.max_steps, cp.gate_threshold, &device)
                     .unwrap();
-            let vocoder = V2Vocoder::load(&store, &model_rates, &device).unwrap();
+            let v1 = standalone.then(||V1Vocoder::load(&store,model_rates[0],&device).unwrap());
+            let v2 = (!standalone).then(||V2Vocoder::load(&store,&model_rates,&device).unwrap());
+            let vocoder = |mel: Tensor<3>, rate| if let Some(v)=&v1 { v.forward(mel,rate) } else { v2.as_ref().unwrap().forward(mel,rate) };
             let reference =
                 TensorStore::open(&Path::new(&fixtures).join(format!("{name}.safetensors")))
                     .unwrap();
@@ -515,7 +524,7 @@ mod tests {
                 let label = format!("{name}/{k}");
                 assert_eq!(cp.speakers[&case.speaker] as i64, case.speaker_id);
                 assert_eq!(crate::v2::prepare_tokens(&cp.symbols, &cp.encoded_symbols, &cp.ascii_symbols, accent.as_ref(), &case.text).unwrap(), case.ids);
-                compare(
+                all_pass &= compare(
                     &format!("{label}/memory"),
                     acoustic
                         .encode(&case.ids, case.speaker_id)
@@ -539,7 +548,7 @@ mod tests {
                     })
                     .unwrap();
                 assert_eq!(cursor, mask.dims()[0], "{label}: decoder gate mismatch");
-                compare(
+                all_pass &= compare(
                     &format!("{label}/mel"),
                     mel.clone().into_data().try_to_vec().unwrap(),
                     reference.float_data(&format!("{k}_mel")).unwrap(),
@@ -547,8 +556,7 @@ mod tests {
                 );
                 for rate in case.rates {
                     let expected = reference.float_data(&format!("{k}_pcm{rate}")).unwrap();
-                    let isolated = vocoder
-                        .forward(
+                    let isolated = vocoder(
                             reference.float::<3>(&format!("{k}_mel"), &device).unwrap(),
                             rate,
                         )
@@ -556,16 +564,15 @@ mod tests {
                         .into_data()
                         .try_to_vec()
                         .unwrap();
-                    compare(
+                    all_pass &= compare(
                         &format!("{label}/vocoder{rate}"),
                         isolated,
                         expected.clone(),
                         1e-3,
                     );
-                    compare(
+                    all_pass &= compare(
                         &format!("{label}/pcm{rate}"),
-                        vocoder
-                            .forward(mel.clone(), rate)
+                        vocoder(mel.clone(), rate)
                             .unwrap()
                             .into_data()
                             .try_to_vec()
@@ -576,5 +583,6 @@ mod tests {
                 }
             }
         }
+        assert!(all_pass, "fixed-mask parity exceeds original tolerance");
     }
 }

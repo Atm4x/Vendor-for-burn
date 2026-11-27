@@ -78,9 +78,11 @@ pub fn capabilities() -> Value {
             {"id": "v5_ru", "sample_rates": [8000, 24000, 48000], "inference_inputs": ["text", "ssml", "accented", "symbol_durations"]},
             {"id": "v5_ru_conditioned", "sample_rates": [8000, 24000, 48000], "inference_inputs": ["text", "accented"]},
             {"id": "v4_hifigan", "sample_rates": [8000, 24000, 48000], "inference_inputs": ["text"]},
-            {"id": "v2_tacotron2", "sample_rates": [8000,16000,24000,48000], "inference_inputs": ["text"]},
+            {"id": "v1_tacotron2", "sample_rates": [8000,16000], "inference_inputs": ["text"]},
+                    {"id": "v2_tacotron2", "sample_rates": [8000,16000,24000,48000], "inference_inputs": ["text"]},
             {"id": "v3_hifigan", "sample_rates": [8000, 24000, 48000], "inference_inputs": ["text"]},
-            {"id": "v5_convnext_plain", "sample_rates": [8000, 24000, 48000], "inference_inputs": ["text"]}
+            {"id": "v5_convnext_plain", "sample_rates": [8000, 24000, 48000], "inference_inputs": ["text"]},
+                    {"id": "v5_convnext_jit", "sample_rates": [48000], "inference_inputs": ["text"]}
         ],
         "available_backends": compiled_backends(),
         "preferred_backend": if cfg!(feature = "cubecl-cpu") { Some("cpu") } else if cfg!(feature = "cubecl-wgpu") { Some("wgpu") } else if cfg!(feature = "cubecl-cuda") { Some("cuda") } else { None },
@@ -149,7 +151,7 @@ pub enum Request {
         request_id: String,
         #[serde(default)] text: Option<String>,
         #[serde(default)] speaker: Option<String>,
-        #[serde(default = "default_sample_rate")] sample_rate: u32,
+        #[serde(default)] sample_rate: Option<u32>,
     },
     Infer {
         request_id: String,
@@ -164,7 +166,6 @@ pub enum Request {
     Shutdown { request_id: String },
 }
 
-fn default_sample_rate() -> u32 { 8000 }
 
 impl Request {
     fn id(&self) -> &str {
@@ -282,6 +283,7 @@ impl Worker {
                 let loaded = self.loaded.as_mut().context("Model is not loaded")?;
                 let start = Instant::now();
                 let (default_text, default_speaker) = loaded.model.warmup_input()?;
+                let sample_rate = sample_rate.unwrap_or(loaded.model.sample_rates()[0]);
                 let samples = loaded.model.infer_text(text.as_deref().unwrap_or(&default_text), speaker.as_deref().unwrap_or(&default_speaker), sample_rate)?;
                 loaded.warmed = true;
                 Ok((json!({

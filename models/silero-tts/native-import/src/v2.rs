@@ -7,6 +7,7 @@ use std::{
 };
 
 pub struct V2Checkpoint {
+    pub standalone: bool,
     pub encoded_symbols: String,
     pub ascii_symbols: BTreeMap<char, String>,
     pub recurrent_accent: Option<crate::RecurrentAccentCheckpoint>,
@@ -60,13 +61,26 @@ impl V2Checkpoint {
             package.module_ids().len() == 1,
             "unexpected V2 script topology"
         );
-        let (root, mut tensors) = package.module(id)?;
+        let (root, tensors) = package.module(id)?;
         let root = dictionary(&root, "V2 script")?;
         let recurrent_accent = if root.contains_key("accentor") { Some(crate::recurrent_accent::load_recurrent_accent(root,&tensors)?) } else { None };
         if recurrent_accent.is_some() {
             let table = ids(root.get("symbol_to_id"),"V2 script symbols")?;
             ensure!(encoded_symbols.chars().enumerate().all(|(i,c)| table.get(&c.to_string())==Some(&i)),"inconsistent V2 encoded alphabet");
         }
+        Self::from_state(root, tensors, symbols, encoded_symbols, ascii_symbols, recurrent_accent, speakers, multi, None)
+    }
+
+    /// V1 stores the graph in a standalone JIT archive and its alphabet in the upstream catalogue.
+    pub fn open_standalone(path: &Path, symbols: &str, sample_rate: u32) -> Result<Self> {
+        ensure!(symbols.starts_with("_~") && (4..=4096).contains(&symbols.chars().count()) && symbols.chars().collect::<HashSet<_>>().len()==symbols.chars().count(), "invalid standalone V1 alphabet");
+        let (root, tensors) = pytorch_reader::read_script_state(path)?;
+        let root = dictionary(&root, "standalone V1 script")?;
+        Self::from_state(root, tensors, symbols.to_owned(), symbols.to_owned(), BTreeMap::new(), None, BTreeMap::from([("default".into(),0)]), false, Some(sample_rate))
+    }
+
+    fn from_state(root: &std::collections::HashMap<String, V>, mut tensors: std::collections::HashMap<String, crate::Tensor>, symbols: String, encoded_symbols: String, ascii_symbols: BTreeMap<char,String>, recurrent_accent: Option<crate::RecurrentAccentCheckpoint>, speakers: BTreeMap<String,usize>, multi: bool, standalone: Option<u32>) -> Result<Self> {
+        let n = symbols.chars().count();
         let tac = dictionary(
             root.get("tacotron").context("missing V2 Tacotron2")?,
             "Tacotron2",
@@ -121,18 +135,23 @@ impl V2Checkpoint {
             root.get("vocoder").context("missing V2 vocoder")?,
             "V2 vocoder",
         )?;
-        ensure!(
-            matches!(voc.get("multiband"), Some(V::Bool(true)))
-                && matches!(voc.get("resample"), Some(V::Int(1))),
-            "unsupported V2 vocoder mode"
-        );
-        let up = tensors
-            .get("vocoder.ups.0.weight")
-            .context("missing V2 upsample weights")?;
-        let rates = match up.shape() {
-            [512, 256, 4] if !voc.contains_key("ups_u") => vec![8000, 16000],
-            [512, 256, 6] if voc.contains_key("ups_u") => vec![8000, 24000, 48000],
-            _ => bail!("unsupported V2 vocoder topology"),
+        let rates = if let Some(rate) = standalone {
+            ensure!(matches!(rate, 8000 | 16000), "invalid V1 sample rate");
+            ensure!(matches!(voc.get("num_kernels"),Some(V::Int(3))) && matches!(voc.get("num_upsamples"),Some(V::Int(3))), "unsupported standalone V1 vocoder topology");
+            require_tensor(&tensors, "vocoder.conv_pre_layer.weight", DType::F32, &[512,128,7])?;
+            require_tensor(&tensors, "vocoder.conv_post.weight", DType::F32, &[1,64,7])?;
+            for (index, (input, output, stride)) in [(512,256,8),(256,128,5),(128,64,5)].into_iter().enumerate() {
+                require_tensor(&tensors, &format!("vocoder.ups.{index}.weight"), DType::F32, &[input,output,2*stride])?;
+            }
+            vec![rate]
+        } else {
+            ensure!(matches!(voc.get("multiband"), Some(V::Bool(true))) && matches!(voc.get("resample"), Some(V::Int(1))), "unsupported V2 vocoder mode");
+            let up = tensors.get("vocoder.ups.0.weight").context("missing V2 upsample weights")?;
+            match up.shape() {
+                [512, 256, 4] if !voc.contains_key("ups_u") => vec![8000, 16000],
+                [512, 256, 6] if voc.contains_key("ups_u") => vec![8000, 24000, 48000],
+                _ => bail!("unsupported V2 vocoder topology"),
+            }
         };
         tensors.retain(|name, _| {
             !name.contains("._flat_weights.")
@@ -156,6 +175,7 @@ impl V2Checkpoint {
                         ))
         });
         Ok(Self {
+            standalone: standalone.is_some(),
             encoded_symbols, ascii_symbols, recurrent_accent,
             symbols,
             speakers,

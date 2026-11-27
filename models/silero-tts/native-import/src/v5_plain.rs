@@ -3,7 +3,8 @@ use crate::{dictionary, ids, string, require_tensor, WeightSet, DType, PickleVal
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// One V5 ConvNeXt package with an explicit text frontend and no neural accentor.
-pub struct V5PlainCheckpoint {
+#[derive(serde::Deserialize)]
+pub struct V5PlainFrontend {
     pub input_symbols: String,
     pub symbol_ids: BTreeMap<String, usize>,
     pub alphabet: HashSet<char>,
@@ -11,8 +12,12 @@ pub struct V5PlainCheckpoint {
     pub eos: String,
     pub speakers: BTreeMap<String, usize>,
     pub transliteration: BTreeMap<String, BTreeMap<char, String>>,
+}
+
+pub struct V5PlainCheckpoint {
+    pub frontend: V5PlainFrontend,
     pub acoustic: WeightSet,
-    pub pqmf: WeightSet,
+    pub pqmf: Option<WeightSet>,
 }
 
 fn field<'a>(value: &'a HashMap<String, V>, key: &str) -> Result<&'a V> {
@@ -94,7 +99,43 @@ impl V5PlainCheckpoint {
             require_tensor(&tensors, &name, DType::F32, &[bands,1,63])?;
             pqmf.insert(format!("analysis_{bands}"), tensors.remove(&name).unwrap());
         }
-        Ok(Self { input_symbols, symbol_ids, alphabet, sos, eos, speakers, transliteration,
-            acoustic: WeightSet::new(tensors)?, pqmf: WeightSet::new(pqmf)? })
+        Ok(Self { frontend: V5PlainFrontend { input_symbols, symbol_ids, alphabet, sos, eos, speakers, transliteration },
+            acoustic: WeightSet::new(tensors)?, pqmf: Some(WeightSet::new(pqmf)?) })
     }
+
+    /// Standalone full-band CIS graph: read state and bind a separately verified frontend.
+    /// The archive carries token/voice weights but no textual symbol or speaker names.
+    pub fn open_standalone(path: &std::path::Path, frontend: V5PlainFrontend) -> Result<Self> {
+        let (script, raw) = pytorch_reader::read_script_state(path)?;
+        let root = dictionary(&script, "standalone V5 root")?;
+        let encoder = dictionary(field(root, "mel_encoder")?, "standalone V5 encoder")?;
+        ensure!(matches!(encoder.get("articulation_emb"), Some(V::Bool(false))) && matches!(encoder.get("pitch_strength"), Some(V::Float(v)) if *v == 1.0), "unsupported standalone V5 conditioning");
+        ensure!(matches!(root.get("num_speakers"),Some(V::Int(n)) if *n == frontend.speakers.len() as i64), "standalone V5 speaker metadata mismatch");
+        let vocoder = dictionary(field(root,"vocoder")?,"standalone V5 vocoder")?;
+        ensure!(matches!(vocoder.get("multiband"),Some(V::Bool(false))),"standalone V5 requires full-band vocoder");
+        let mut tensors = HashMap::new();
+        for (name,tensor) in raw {
+            let mapped = if let Some(suffix) = name.strip_prefix("mel_encoder.") {
+                if suffix.starts_with("emotion_embedding.") || suffix.starts_with("articulation_embedding.") { continue; }
+                format!("tacotron.{suffix}")
+            } else if let Some(suffix) = name.strip_prefix("mel_decoder.") {
+                format!("tacotron.{suffix}")
+            } else if name.starts_with("dur_predictor.") || name.starts_with("pitch_predictor.") || name.starts_with("vocoder.") || name == "istft.window" { name } else { continue; };
+            ensure!(tensors.insert(mapped,tensor).is_none(), "duplicate standalone V5 tensor path");
+        }
+        let n = frontend.symbol_ids.len();
+        let speakers = frontend.speakers.len();
+        ensure!(n > 3 && n <= 4096 && frontend.symbol_ids.values().copied().collect::<HashSet<_>>().len() == n && frontend.symbol_ids.values().all(|&x| x < n), "invalid standalone V5 symbol map");
+        ensure!(speakers > 0 && speakers <= 4096 && frontend.speakers.values().copied().collect::<HashSet<_>>().len()==speakers && frontend.speakers.values().all(|&x| x < speakers), "invalid standalone V5 speaker map");
+        ensure!(frontend.symbol_ids.get(&frontend.sos)==Some(&2) && frontend.symbol_ids.get(&frontend.eos)==Some(&1) && frontend.input_symbols.chars().skip(3).all(|c| frontend.symbol_ids.contains_key(&c.to_string())),"invalid standalone V5 boundaries");
+        for (prefix,width) in [("dur_predictor.dur_pred",64),("pitch_predictor.pitch_pred",64),("tacotron",128)] {
+            require_tensor(&tensors,&format!("{prefix}.embedding.weight"),DType::F32,&[n,width])?;
+            require_tensor(&tensors,&format!("{prefix}.speaker_embedding.weight"),DType::F32,&[speakers,width])?;
+        }
+        for (name,shape) in [("tacotron.lin.weight",&[192,128][..]),("vocoder.head.out.weight",&[2402,512]),("istft.window",&[2400])] {
+            require_tensor(&tensors,name,DType::F32,shape)?;
+        }
+        Ok(Self { frontend, acoustic: WeightSet::new(tensors)?, pqmf: None })
+    }
+
 }

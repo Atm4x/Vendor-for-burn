@@ -258,3 +258,32 @@ impl V2Vocoder {
         Ok(pcm.slice([0..batch,0..1,0..target]).reshape([batch,target]))
     }
 }
+
+/// Standalone V1 uses full-band synthesis, with the rate selected by the saved pre-convolution.
+pub(crate) struct V1Vocoder {
+    pre: Conv,
+    pre_stride: usize,
+    stages: Vec<Stage>,
+    post: Conv,
+    rate: u32,
+}
+impl V1Vocoder {
+    pub(crate) fn load(store: &TensorStore, rate: u32, device: &Device) -> Result<Self> {
+        ensure!(matches!(rate, 8000 | 16000), "invalid standalone V1 rate");
+        let pre = Conv::load(store, "vocoder.conv_pre_layer", [128,512], 7, 1, device)?;
+        let channels = [512,256,128,64];
+        let stages = [8,5,5].into_iter().enumerate().map(|(i,stride)| Stage::load(store,"",i,channels[i],channels[i+1],stride,Activation::Leaky(0.1),device)).collect::<Result<_>>()?;
+        let post = Conv::load(store,"vocoder.conv_post",[64,1],7,1,device)?;
+        Ok(Self { pre, pre_stride: if rate == 8000 {2} else {1}, stages, post, rate })
+    }
+    pub(crate) fn forward(&self, mel: Tensor<3>, rate: u32) -> Result<Tensor<2>> {
+        let [batch,channels,frames] = mel.dims();
+        ensure!(rate == self.rate && channels == 128 && frames > 0, "invalid standalone V1 input");
+        let mut x = conv1d(mel,self.pre.weight.clone(),Some(self.pre.bias.clone()),ConvOptions::new([self.pre_stride],[3],[1],1));
+        for (i,stage) in self.stages.iter().enumerate() { x = stage.forward(x,false,i); }
+        let pcm = self.post.forward(leaky_relu(x,0.01)).tanh();
+        let target = frames*(rate as usize/80);
+        ensure!(pcm.dims()[2]>=target, "standalone V1 vocoder output too short");
+        Ok(pcm.slice([0..batch,0..1,0..target]).reshape([batch,target]))
+    }
+}

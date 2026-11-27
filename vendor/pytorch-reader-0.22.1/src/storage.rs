@@ -129,16 +129,17 @@ pub(crate) struct ZipSource {
 }
 
 impl ZipSource {
-    pub fn open(path: &Path) -> Result<Self, PytorchError> { Self::open_layout(path, false) }
-    pub(crate) fn open_package(path: &Path) -> Result<Self, PytorchError> { Self::open_layout(path, true) }
-    fn open_layout(path: &Path, package: bool) -> Result<Self, PytorchError> {
+    pub fn open(path: &Path) -> Result<Self, PytorchError> { Self::open_layout(path, false, false) }
+    pub(crate) fn open_package(path: &Path) -> Result<Self, PytorchError> { Self::open_layout(path, true, false) }
+    pub(crate) fn open_script(path: &Path) -> Result<Self, PytorchError> { Self::open_layout(path, false, true) }
+    fn open_layout(path: &Path, package: bool, script: bool) -> Result<Self, PytorchError> {
         let file = File::open(path)?;
         let file_len = file.metadata()?.len();
         // The stream gets a duplicate of the handle rather than an open of its own, so a
         // replacement of `path` cannot slip in between two opens. The duplicate shares the
         // cursor, which is why `file` is only ever read at explicit offsets.
         let reader = BufReader::new(file.try_clone()?);
-        let archive = if package {
+        let archive = if package || script {
             ZipArchive::with_config(zip::read::Config { archive_offset: zip::read::ArchiveOffset::Known(0) }, reader)?
         } else {
             ZipArchive::new(reader)?
@@ -150,6 +151,7 @@ impl ZipSource {
             .iter()
             .filter_map(|name| name.strip_suffix(if package { "tts_models/model" } else { "data.pkl" }))
             .filter(|root| root.is_empty() || root.ends_with('/'))
+            .filter(|root| !script || archive.index_for_name(&format!("{root}constants.pkl")).is_some())
             .min_by_key(|root| root.len())
             .map(str::to_string)
             .ok_or_else(|| {

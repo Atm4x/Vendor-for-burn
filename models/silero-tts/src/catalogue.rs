@@ -74,3 +74,20 @@ mod tests {
         assert_eq!(c.resolve("ru", "v5_cis_base_nostress_jit").unwrap().declared_format, DeclaredFormat::Package);
     }
 }
+
+/// The original standalone models have no vocabulary embedded in their archive. Bind the
+/// external upstream tokenset to the exact artifact digest, not a filename or ZIP root.
+pub(crate) fn standalone_entry(path: &std::path::Path) -> Result<ModelEntry> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0; 1024*1024];
+    loop { let n = file.read(&mut buffer)?; if n == 0 { break; } hasher.update(&buffer[..n]); }
+    let digest = format!("{:x}",hasher.finalize());
+    let records: Vec<serde_json::Value> = serde_json::from_str(include_str!("../verified_models.json"))?;
+    let entry = records.iter().find(|m| m["checkpoint"]["sha256"] == digest && matches!(m["smoke"]["variant"].as_str(), Some("v1_tacotron2" | "v5_convnext_jit"))).context("unrecognized standalone checkpoint; upstream frontend unavailable")?;
+    let id = entry["model_id"].as_str().context("missing standalone model id")?;
+    let catalogue = Catalogue::embedded()?;
+    catalogue.models.into_iter().find(|m| m.model_id == id).context("invalid standalone catalogue binding")
+}
