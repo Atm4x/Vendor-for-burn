@@ -1,30 +1,41 @@
-name: Git Bridge - publish native Silero Tacotron2 candidate
+name: Git Bridge - remaining official V2 weights
 on:
   push:
     branches: [git-bridge/export-silero-ab4d79c7]
     paths: [.github/workflows/git-bridge-export.yml]
 permissions:
-  contents: write
+  contents: read
 jobs:
-  import:
+  models:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [0,1,2,3,4,5]
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-      - name: Verify and import exact native Tacotron2 commit
-        shell: bash
+          ref: 96a470e34e479dc383b6c1452d07b7063d1344af
+      - name: Download exact official packages
+        env:
+          GROUP: ${{ matrix.group }}
         run: |
           set -euo pipefail
-          git fetch origin main feat/silero-tts-native-import
-          test "$(git rev-parse origin/main)" = f3618c635442334f02c47384c01dd13fed1891f7
-          test "$(git rev-parse origin/feat/silero-tts-native-import)" = d2a37d0db8e297d61a7f0539e4a14ddfe1986ac4
-          base64 -d .git-bridge/silero-96a470e3.b64 > "$RUNNER_TEMP/silero.bundle"
-          echo "351f1e1c02aa3c88e8557f1cc22e1fa54b322be6634707d1b1864ffef125f651  $RUNNER_TEMP/silero.bundle" | sha256sum -c -
-          git bundle verify "$RUNNER_TEMP/silero.bundle"
-          git fetch "$RUNNER_TEMP/silero.bundle" refs/heads/feat/silero-tts-native-import:refs/heads/silero-candidate
-          test "$(git rev-parse silero-candidate)" = 96a470e34e479dc383b6c1452d07b7063d1344af
-          test "$(git rev-parse silero-candidate^{tree})" = 030f736ca3b65fd08c2b7296b13f3b879ae646fa
-          git merge-base --is-ancestor origin/feat/silero-tts-native-import silero-candidate
-          git push origin refs/heads/silero-candidate:refs/heads/git-bridge/candidate-silero-96a470e3
+          python - <<'PY'
+          import os,json,pathlib,urllib.request,hashlib
+          out=pathlib.Path(os.environ["RUNNER_TEMP"])/"models";out.mkdir()
+          catalogue=json.loads(pathlib.Path("models/silero-tts/official_catalogue.json").read_text())["models"]
+          wanted=[["baya_v2","irina_v2"],["kseniya_v2","natasha_v2"],["ruslan_v2","thorsten_v2"],["tux_v2","gilles_v2"],["aigul_v2","erdni_v2"],["dilyara_v2","dilnavoz_v2"]][int(os.environ["GROUP"])]
+          for name in wanted:
+              url=next(x["url"] for x in catalogue if x["model_id"]==name)
+              path=out/(name+".pt")
+              urllib.request.urlretrieve(url,path)
+              print(name,path.stat().st_size,hashlib.file_digest(open(path,"rb"),"sha256").hexdigest(),flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: silero-v2-pair-${{ matrix.group }}
+          path: ${{ runner.temp }}/models/
+          compression-level: 0
+          retention-days: 1
