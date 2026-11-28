@@ -13,7 +13,7 @@ on:
 
 concurrency:
   group: native-worker-releases
-  cancel-in-progress: false
+  queue: max
 
 jobs:
   release:
@@ -49,14 +49,9 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           if ($env:WORKER_VERSION -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid package version' }
           $releaseAssets = @(Get-ChildItem -File (Join-Path $env:RUNNER_TEMP 'beat-this-release/assets'))
-          $tag = gh release list --repo $env:GITHUB_REPOSITORY --limit 100 --json tagName,isDraft,isPrerelease,isLatest --jq '.[] | select(.isLatest and (.isDraft | not) and (.isPrerelease | not)) | .tagName'
-          if ($tag) {
-            $existing = @(gh release view $tag --repo $env:GITHUB_REPOSITORY --json assets --jq '.assets[].name')
-            if ($releaseAssets.Name | Where-Object { $_ -in $existing }) {
-              throw 'This package version already has release assets. Bump the model version.'
-            }
-            gh release upload $tag @($releaseAssets.FullName) --repo $env:GITHUB_REPOSITORY
-          } else {
-            $tag = "native-workers-v$env:WORKER_VERSION"
-            gh release create $tag @($releaseAssets.FullName) --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "Native workers $env:WORKER_VERSION" --notes "Beat This! Windows x64 CPU/Flex worker." --latest
+          $tag = 'native-workers-v1.0.0'
+          $existing = @(gh release view $tag --repo $env:GITHUB_REPOSITORY --json assets --jq '.assets[].name')
+          if ($releaseAssets.Name | Where-Object { $_ -in $existing }) {
+            throw 'This package version already has release assets. Bump the model version.'
           }
+          gh release upload $tag @($releaseAssets.FullName) --repo $env:GITHUB_REPOSITORY

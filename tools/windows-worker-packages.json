@@ -1,0 +1,58 @@
+[
+  {
+    "id": "beat-this",
+    "directory": "models/beat_this",
+    "script": "models/beat_this/package_windows.ps1",
+    "compact": true
+  },
+  {
+    "id": "gigaam-v3",
+    "directory": "models/gigaam",
+    "script": "models/gigaam/package_windows.ps1"
+  },
+  {
+    "id": "rvc-v2",
+    "directory": "models/tts-with-rvc-rs",
+    "script": "models/tts-with-rvc-rs/build_windows.ps1"
+  },
+  {
+    "id": "silero-tts",
+    "directory": "models/silero-tts",
+    "script": "models/silero-tts/package_windows.ps1"
+  },
+  {
+    "id": "dettato",
+    "directory": "models/dettato",
+    "script": "models/dettato/package_windows.ps1"
+  },
+  {
+    "id": "f5-tts",
+    "directory": "models/f5_tts",
+    "script": "tools/package_tts_windows.ps1",
+    "family": "f5-tts"
+  },
+  {
+    "id": "fish-speech-1.5",
+    "directory": "models/fish-speech",
+    "script": "tools/package_tts_windows.ps1",
+    "family": "fish-speech-1.5"
+  },
+  {
+    "id": "omnivoice",
+    "directory": "models/omnivoice",
+    "script": "tools/package_burn_worker_windows.ps1",
+    "family": "omnivoice"
+  },
+  {
+    "id": "whisper",
+    "directory": "models/whisper",
+    "script": "tools/package_burn_worker_windows.ps1",
+    "family": "whisper"
+  },
+  {
+    "id": "semantic",
+    "directory": "models/semantic",
+    "script": "tools/package_burn_worker_windows.ps1",
+    "family": "semantic"
+  }
+]

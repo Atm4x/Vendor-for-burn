@@ -3,87 +3,78 @@ name: Build native workers for Windows x64
 on:
   push:
     branches: [main]
-    tags: ['native-workers-v*']
     paths:
       - 'models/**'
-      - 'crates/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'vendor/**'
-      - 'tools/restore_vendor_checksums.py'
-      - 'tools/package_tts_windows.ps1'
-      - 'tools/package_burn_worker_windows.ps1'
-      - 'tools/smoke_tts_worker.py'
-      - 'tools/stage_native_workers_release.ps1'
-      - '.github/workflows/build-native-workers-windows.yml'
   workflow_dispatch:
+    inputs:
+      worker:
+        description: Windows package ID to build from main
+        required: true
+        type: string
+      version:
+        description: Optional package version override (X.Y.Z)
+        required: false
+        type: string
 
 permissions:
   contents: read
 
 env:
-  WORKER_VERSION: '1.1.0'
+  WORKER_RELEASE_TAG: native-workers-v1.0.0
 
 jobs:
+  select:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-2022
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+      has_changes: ${{ steps.select.outputs.has_changes }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          sparse-checkout: |
+            tools
+            models
+      - name: Select changed worker directories
+        id: select
+        shell: pwsh
+        env:
+          PREVIOUS_SHA: ${{ github.event.before }}
+          REQUESTED_WORKER: ${{ inputs.worker }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $matrix = ./tools/select_windows_workers.ps1 -Before $env:PREVIOUS_SHA -Revision $env:GITHUB_SHA -Worker $env:REQUESTED_WORKER -Version $env:REQUESTED_VERSION
+          $hasChanges = (ConvertFrom-Json -InputObject $matrix).include.Count -gt 0
+          "matrix=$matrix" >> $env:GITHUB_OUTPUT
+          "has_changes=$($hasChanges.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          Write-Host $matrix
+
   build:
+    needs: select
+    if: needs.select.outputs.has_changes == 'true'
     runs-on: windows-2022
     timeout-minutes: 90
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - package: beat-this
-            script: models/beat_this/package_windows.ps1
-            compact: true
-          - package: gigaam-v3
-            script: models/gigaam/package_windows.ps1
-            compact: false
-          - package: rvc-v2
-            script: models/tts-with-rvc-rs/build_windows.ps1
-            compact: false
-          - package: silero-tts
-            script: models/silero-tts/package_windows.ps1
-            compact: false
-          - package: dettato
-            script: models/dettato/package_windows.ps1
-            compact: false
-          - package: f5-tts
-            script: tools/package_tts_windows.ps1
-            family: f5-tts
-            compact: false
-          - package: fish-speech-1.5
-            script: tools/package_tts_windows.ps1
-            family: fish-speech-1.5
-            compact: false
-          - package: omnivoice
-            script: tools/package_burn_worker_windows.ps1
-            family: omnivoice
-            compact: false
-          - package: whisper
-            script: tools/package_burn_worker_windows.ps1
-            family: whisper
-            compact: false
-          - package: semantic
-            script: tools/package_burn_worker_windows.ps1
-            family: semantic
-            compact: false
+      matrix: ${{ fromJSON(needs.select.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Build, smoke-test and stage the package
+      - name: Build and stage ${{ matrix.id }}
         shell: pwsh
         env:
           PACKAGE_SCRIPT: ${{ matrix.script }}
           PACKAGE_COMPACT: ${{ matrix.compact }}
           PACKAGE_FAMILY: ${{ matrix.family }}
+          PACKAGE_VERSION: ${{ matrix.version }}
         run: |
           $ErrorActionPreference = 'Stop'
-          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -cne "native-workers-v$env:WORKER_VERSION") {
-            throw 'Release tag must match WORKER_VERSION'
-          }
           $arguments = @{
-            Version = $env:WORKER_VERSION
+            Version = $env:PACKAGE_VERSION
             OutputRoot = (Join-Path $env:RUNNER_TEMP 'native-worker')
           }
           if ($env:PACKAGE_COMPACT -eq 'true') { $arguments.Compact = $true }
@@ -91,37 +82,17 @@ jobs:
           & $env:PACKAGE_SCRIPT @arguments
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.package }}_v${{ env.WORKER_VERSION }}_win_x86_64
-          path: ${{ runner.temp }}/native-worker/assets/${{ matrix.package }}_v${{ env.WORKER_VERSION }}_win_x86_64.zip
-          if-no-files-found: error
-          retention-days: 14
-
-  stage-release:
-    needs: build
-    runs-on: windows-2022
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: '*_v${{ env.WORKER_VERSION }}_win_x86_64'
-          path: ${{ runner.temp }}/native-worker-inputs
-      - name: Verify and stage the complete Windows release
-        shell: pwsh
-        run: |
-          ./tools/stage_native_workers_release.ps1 -Version $env:WORKER_VERSION -Revision $env:GITHUB_SHA -InputRoot (Join-Path $env:RUNNER_TEMP 'native-worker-inputs') -OutputRoot (Join-Path $env:RUNNER_TEMP 'native-worker-release')
-      - uses: actions/upload-artifact@v4
-        with:
-          name: native-workers_v${{ env.WORKER_VERSION }}_win_x86_64
-          path: ${{ runner.temp }}/native-worker-release/
+          name: windows-worker-${{ matrix.id }}
+          path: ${{ runner.temp }}/native-worker/assets/${{ matrix.id }}_v${{ matrix.version }}_win_x86_64.zip
           if-no-files-found: error
           retention-days: 14
 
   publish:
-    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'native-workers-v')
-    needs: stage-release
+    if: ${{ !cancelled() && needs.select.outputs.has_changes == 'true' }}
+    needs: [select, build]
+    concurrency:
+      group: native-worker-releases
+      queue: max
     runs-on: windows-2022
     timeout-minutes: 15
     permissions:
@@ -133,39 +104,45 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+          sparse-checkout: tools
       - uses: actions/download-artifact@v4
         with:
-          name: native-workers_v${{ env.WORKER_VERSION }}_win_x86_64
-          path: ${{ runner.temp }}/native-worker-release
-      - name: Sign provenance of the release index
+          pattern: windows-worker-*
+          path: ${{ runner.temp }}/native-worker-inputs
+      - name: Prepare the update against the current release index
+        id: stage
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_MATRIX: ${{ needs.select.outputs.matrix }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $inputRoot = Join-Path $env:RUNNER_TEMP 'native-worker-inputs'
+          if (!(Test-Path -LiteralPath $inputRoot) -or !(Get-ChildItem -LiteralPath $inputRoot -Filter '*.zip' -File -Recurse)) {
+            Write-Host 'No successful worker builds to publish'
+            exit 0
+          }
+          $prior = Join-Path $env:RUNNER_TEMP 'native-worker-prior'
+          New-Item -ItemType Directory -Path $prior | Out-Null
+          gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:WORKER_RELEASE_TAG" --jq '.assets' |
+            Set-Content -LiteralPath (Join-Path $prior 'assets.json') -Encoding utf8NoBOM
+          gh release download $env:WORKER_RELEASE_TAG --repo $env:GITHUB_REPOSITORY --pattern 'staged-release-index.json' --dir $prior
+          $staged = Join-Path $env:RUNNER_TEMP 'native-worker-release'
+          ./tools/stage_native_workers_release.ps1 -Revision $env:GITHUB_SHA -Matrix $env:PACKAGE_MATRIX -InputRoot $inputRoot -OutputRoot $staged -ExistingIndex (Join-Path $prior 'staged-release-index.json') -ExistingAssets (Join-Path $prior 'assets.json')
+          if (Test-Path -LiteralPath (Join-Path $staged 'publication.json')) {
+            "updated=true" >> $env:GITHUB_OUTPUT
+          }
+      - name: Sign provenance of the updated index
+        if: steps.stage.outputs.updated == 'true'
         uses: actions/attest@v4
         with:
           subject-path: '${{ runner.temp }}/native-worker-release/staged-release-index.json'
           create-storage-record: false
-      - name: Publish the verified Windows packages together
+      - name: Update the existing Windows release
+        if: steps.stage.outputs.updated == 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $true
-          $tag = "native-workers-v$env:WORKER_VERSION"
-          if ($env:GITHUB_REF_NAME -cne $tag) { throw 'Release tag must match WORKER_VERSION' }
-          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
-          git merge-base --is-ancestor $env:GITHUB_SHA origin/main
-          $root = Join-Path $env:RUNNER_TEMP 'native-worker-release'
-          $index = Join-Path $root 'staged-release-index.json'
-          $release = Get-Content -LiteralPath $index -Raw | ConvertFrom-Json
-          if ($release.source_revision -cne $env:GITHUB_SHA -or $release.package_version -cne $env:WORKER_VERSION) {
-            throw 'Staged release does not match the tag'
-          }
-          $files = @($index) + @(foreach ($entry in $release.packages) {
-            $file = Join-Path $root $entry.path
-            if ((Get-Item -LiteralPath $file).Length -ne $entry.size_bytes -or
-                (Get-FileHash -LiteralPath $file).Hash.ToLowerInvariant() -cne $entry.sha256) {
-              throw "Staged package failed integrity check: $($entry.path)"
-            }
-            $file
-          })
-          gh release create $tag @files --verify-tag --draft --latest=false --title "Native workers $env:WORKER_VERSION (Windows x64)" --notes "Ten version-matched Windows x64 worker packages. The checksum index records the exact build revision and SHA-256 of every ZIP. Model weights are separate. See each package manifest for launch arguments. Verify the release index with gh attestation verify staged-release-index.json --repo $env:GITHUB_REPOSITORY."
-          gh release edit $tag --draft=false --latest=false
+          ./tools/publish_native_workers_release.ps1 -Repository $env:GITHUB_REPOSITORY -Tag $env:WORKER_RELEASE_TAG -Staged (Join-Path $env:RUNNER_TEMP 'native-worker-release') -ExistingIndex (Join-Path $env:RUNNER_TEMP 'native-worker-prior/staged-release-index.json')
